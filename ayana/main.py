@@ -211,6 +211,7 @@ class App:
             version=VERSION,
             webhook_token=cfg.get("webhook_token") or "",
             alert_ingest=self.alert_ingest,
+            notifier=self.notifier,
         )
         self._stop = asyncio.Event()
         self._bg_tasks: list[asyncio.Task] = []
@@ -278,6 +279,7 @@ class App:
     async def _bg_outbox(self) -> None:
         while not self._stop.is_set():
             try:
+                self.notifier.compensate_missing()
                 await self.notifier.flush()
             except Exception:
                 log.exception("outbox flush failed")

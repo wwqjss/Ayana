@@ -86,6 +86,11 @@ class AlertIngest:
             pass
 
     def _notify_incident(self, inc_id: str, typ: str, *, episode_id: str = "") -> None:
+        """把通知义务写入 outbox。
+
+        去重键绑定**本次转换产生的 Event**（INSERT 的 rowid），
+        不用「最新事件」查询，避免时钟回拨绑定旧事件。
+        """
         if not self._notifier:
             return
         try:
@@ -95,17 +100,39 @@ class AlertIngest:
             if not inc:
                 return
             body = f"[Ayana] {inc.get('title','')}\n{inc_id} {typ}"
-            # 用持久 Event 作去重键：同一转换只通知一次，可补偿
-            ev = self.db.query_one(
-                "SELECT id FROM events WHERE incident_id=? AND type IN ("
-                " 'incident_opened','incident_reopened','incident_resolved')"
-                " ORDER BY at DESC LIMIT 1",
-                (inc_id,),
-            )
-            key = f"ev:{ev['id']}:{typ}" if ev else f"{inc_id}:{typ}:{episode_id}:{now()}"
-            self._notifier.enqueue(
-                dedup_key=key, target="", body=body
-            )
+            # 通知义务与 Event 同事务提交；失败则由补偿扫描补回
+            with self.db.tx() as conn:
+                cur = conn.execute(
+                    "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
+                    (
+                        inc_id,
+                        now(),
+                        f"notify_{typ}",
+                        f"notify {typ} {inc_id}",
+                        json.dumps(
+                            {"typ": typ, "episode_id": episode_id, "body": body},
+                            ensure_ascii=False,
+                        ),
+                    ),
+                )
+                ev_id = cur.lastrowid
+                target = self._notifier.default_target
+                try:
+                    conn.execute(
+                        "INSERT INTO notification_outbox(id, dedup_key, channel, target, body,"
+                        " state, created_at, last_try_at) VALUES(?,?,?,?,?,?,?,0)",
+                        (
+                            new_id("ntf"),
+                            f"ev:{ev_id}",
+                            "qq",
+                            target or "",
+                            body,
+                            "pending" if target else "failed",
+                            now(),
+                        ),
+                    )
+                except Exception:
+                    pass
         except Exception:
             pass
 

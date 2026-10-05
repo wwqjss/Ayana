@@ -582,6 +582,18 @@ class ActionService:
                     " updated_at=? WHERE id=?",
                     (f"exec_unknown:{action_id}", finished_at, row["incident_id"]),
                 )
+            elif state == "failure":
+                # 失败终态：尝试收敛仍被 hold 的 Incident
+                pass
+
+        # 终态后重新评估 hold
+        if state in ("failure", "success", "unknown") and row.get("incident_id"):
+            try:
+                from .incidents import IncidentService
+
+                IncidentService(self.db).reevaluate_after_action(row["incident_id"])
+            except Exception:
+                pass
 
         if state == "success" and vid:
             try:
@@ -854,26 +866,42 @@ class ActionService:
         )
 
     def resume_pending_verifications(self) -> int:
-        """启动恢复：把仍 pending 的验证义务重新跑起来（分批直到跑完）。"""
+        """启动恢复：分批调度所有 pending 验证（游标遍历）。
+
+        在无运行中事件循环的同步上下文里，记录待调度数量并保持 pending，
+        由后续后台任务或下次启动处理。
+        """
         total = 0
+        cursor = ""
         seen: set[str] = set()
-        while True:
-            rows = self.db.query(
-                "SELECT id, action_id FROM verifications WHERE status='pending'"
-                " ORDER BY started_at ASC LIMIT 50"
-            )
-            batch = [r for r in rows if r["id"] not in seen]
-            if not batch:
+        while total < 200:
+            if cursor:
+                rows = self.db.query(
+                    "SELECT id, action_id FROM verifications WHERE status='pending' AND id>?"
+                    " ORDER BY id ASC LIMIT 50",
+                    (cursor,),
+                )
+            else:
+                rows = self.db.query(
+                    "SELECT id, action_id FROM verifications WHERE status='pending'"
+                    " ORDER BY id ASC LIMIT 50"
+                )
+            if not rows:
                 break
-            for r in batch:
+            for r in rows:
+                if r["id"] in seen:
+                    continue
                 seen.add(r["id"])
+                cursor = r["id"]
+                total += 1
                 try:
-                    asyncio.create_task(self._run_verification(r["id"], r["action_id"]))
-                    total += 1
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self._run_verification(r["id"], r["action_id"]))
                 except RuntimeError:
+                    # 同步上下文：计数但不调度，保持 pending
                     pass
-            if len(seen) > 200:
-                break
+                if total >= 200:
+                    break
         return total
 
     def backfill_missing_verifications(self) -> int:

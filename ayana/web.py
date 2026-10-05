@@ -42,6 +42,7 @@ class WebApp:
         version: str = "0.2.0",
         webhook_token: str = "",
         alert_ingest=None,
+        notifier=None,
     ):
         self.db = db
         self.auth = auth
@@ -54,6 +55,7 @@ class WebApp:
         self.version = version
         self.webhook_token = webhook_token
         self.alert_ingest = alert_ingest
+        self.notifier = notifier
 
     def build(self) -> web.Application:
         app = web.Application(client_max_size=2_000_000)
@@ -85,6 +87,8 @@ class WebApp:
         app.router.add_post("/api/permissions", self.api_permission_upsert)
         app.router.add_post("/api/permissions/delete", self.api_permission_delete)
         app.router.add_get("/api/audit", self.api_audit)
+        app.router.add_get("/api/notifications", self.api_notifications)
+        app.router.add_post("/api/notifications/retry", self.api_notifications_retry)
         app.router.add_get("/api/capabilities", self.api_capabilities)
         app.router.add_get("/api/prom/probe", self.api_prom_probe)
         app.router.add_post("/hooks/alertmanager", self.hook_alertmanager)
@@ -496,6 +500,19 @@ class WebApp:
         rows = self.db.query("SELECT * FROM audit_log ORDER BY at DESC LIMIT ?", (limit,))
         return _json({"ok": True, "audit": [dict(r) for r in rows]})
 
+    async def api_notifications(self, request: web.Request) -> web.Response:
+        self._require_admin(request)
+        failed = self.notifier.failed_summary() if self.notifier else []
+        return _json({"ok": True, "failed": failed})
+
+    async def api_notifications_retry(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        n = self.notifier.retry_failed(body.get("id", "")) if self.notifier else 0
+        self.db.audit("web_user", sess["username"], "notifications_retry", detail={"count": n})
+        return _json({"ok": True, "retried": n})
+
     async def api_capabilities(self, request: web.Request) -> web.Response:
         self._require_auth(request)
         from .capabilities import list_capabilities
@@ -506,15 +523,17 @@ class WebApp:
         sess = self._require_auth(request)
         asset = request.rel_url.query.get("asset", "")
         service = request.rel_url.query.get("service", "")
-        # 与调查路径一致：优先用登记 object id 做授权
+        # 授权用登记对象 ID；查询用登记名称
         object_id = service or "*"
+        service_label = service
         if service:
             row = self.db.query_one(
-                "SELECT id FROM objects WHERE asset_id=? AND (id=? OR name=?)",
+                "SELECT id, name FROM objects WHERE asset_id=? AND (id=? OR name=?)",
                 (asset, service, service),
             )
             if row:
                 object_id = row["id"]
+                service_label = row["name"]
         decision = self.policy.check(
             subject_type="web_user",
             subject_id=sess["username"],
@@ -525,7 +544,7 @@ class WebApp:
         if not decision["allowed"]:
             return _json({"ok": False, "error": "denied"}, 403)
         try:
-            data = await self.prom.probe_success(asset, service)
+            data = await self.prom.probe_success(asset, service_label)
             return _json({"ok": True, "summary": summarize_probe(data), "raw": data})
         except Exception as e:
             return _json({"ok": False, "error": str(e)}, 502)

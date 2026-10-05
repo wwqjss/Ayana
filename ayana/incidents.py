@@ -181,12 +181,24 @@ class IncidentService:
                         ),
                     )
             return
-        self.db.execute(
-            "UPDATE incidents SET status='resolved', resolved_at=?, stage='done', updated_at=?"
-            " WHERE id=? AND status='open'",
-            (now(), now(), inc_id),
-        )
-        self.db.event("incident_resolved", "alerts resolved", incident_id=inc_id)
+        # 仅在实际 open→resolved 时写恢复事件
+        with self.db.tx() as conn:
+            cur = conn.execute(
+                "UPDATE incidents SET status='resolved', resolved_at=?, stage='done', updated_at=?"
+                " WHERE id=? AND status='open'",
+                (now(), now(), inc_id),
+            )
+            if cur.rowcount == 1:
+                conn.execute(
+                    "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
+                    (
+                        inc_id,
+                        now(),
+                        "incident_resolved",
+                        "alerts resolved",
+                        json.dumps({"episode_id": episode_id}, ensure_ascii=False),
+                    ),
+                )
 
     def set_stage(self, inc_id: str, stage: str, note: str = "") -> None:
         self.db.execute(
@@ -238,7 +250,49 @@ class IncidentService:
         ]
         return data
 
-    def summary_text(self, inc_id: str) -> str:
+    def reevaluate_after_action(self, inc_id: str) -> None:
+        """Action 终态或人工义务解除后重新评估 hold。"""
+        if not inc_id:
+            return
+        inc = self.db.query_one("SELECT * FROM incidents WHERE id=?", (inc_id,))
+        if not inc or inc["status"] != "open":
+            return
+        firing = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM alert_episodes WHERE incident_id=? AND status='firing'",
+            (inc_id,),
+        )
+        blocked = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM actions WHERE incident_id=?"
+            " AND (state IN ('unknown','dispatched')"
+            "  OR (state='success' AND id IN (SELECT action_id FROM verifications"
+            "      WHERE status='pending')))",
+            (inc_id,),
+        )
+        need = self.db.query_one(
+            "SELECT need_human FROM incidents WHERE id=?", (inc_id,)
+        )
+        if firing and firing["n"] > 0:
+            return
+        if (blocked and blocked["n"] > 0) or (need and need["need_human"]):
+            return
+        # 无阻塞且无 firing：收敛
+        with self.db.tx() as conn:
+            cur = conn.execute(
+                "UPDATE incidents SET status='resolved', resolved_at=?, stage='done',"
+                " updated_at=? WHERE id=? AND status='open'",
+                (now(), now(), inc_id),
+            )
+            if cur.rowcount == 1:
+                conn.execute(
+                    "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
+                    (
+                        inc_id,
+                        now(),
+                        "incident_resolved",
+                        "obligations cleared",
+                        json.dumps({"reason": "reevaluate"}, ensure_ascii=False),
+                    ),
+                )
         inc = self.get_incident(inc_id)
         if not inc:
             return "未找到 Incident"
