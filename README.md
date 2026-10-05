@@ -1,48 +1,61 @@
-# Ayana v0.1.0
+# Ayana v0.2.0
 
-Ayana — 直接以 OneBot v11 反向 WS 服务端接管 NapCat 的运维平台（最小实验版）。
+运维闭环平台：Alertmanager 事件 → Incident → 调查 → 权限 → 受控处置 → 独立验证 → Web/QQ 展示 → 审计。
 
-## 职责
+## 架构
 
-- 监听 `ws://0.0.0.0:6199/ws`，接受 NapCat 的 WS 客户端连接
-- 收 QQ 消息事件，`/ping` 回 `Ayana v0.1.0 / pong`
-- HTTP `GET :6200/health` 健康检查
-- 独立配置 `config.json`，日志写 stdout + 文件
+- 单进程 + 本地 SQLite（WAL / foreign_keys / synchronous=FULL）
+- OneBot v11 反向 WS 直连 NapCat（无 AstrBot、无中间 LLM 抢答）
+- Web 控制台：本地账号 + 密码（PBKDF2）+ TOTP 2FA + 恢复码
+- 业务权限在 Ayana（Web 可改、带审计与版本快照）
+- **主机侧** `commands.json` / forced-command / sudoers 仍是独立最终安全上限
 
 ## 运行
 
 ```bash
-# KANATA 上
+# KANATA
 cd /root/Ayana
 uv sync
 uv run python -m ayana.main config.json
 ```
 
-## 依赖
+秘密放在 `secrets.json`（权限 600，不入库）：
 
-- Python ≥ 3.11
-- aiohttp ≥ 3.9
-
-## 配置
-
-见 `config.json`：
-
-| 键 | 说明 |
+| 键 | 用途 |
 |----|------|
-| `ws_port` | OneBot 反向 WS 端口（接管 AstrBot 的 6199） |
-| `token` | NapCat `onebot11_*.json` 里的 token |
-| `http_port` | health 端口 |
-| `self_id` | QQ 号 |
+| `onewbot_token` | NapCat WS token |
+| `webhook_token` | Alertmanager Bearer |
+| `web_auth_pepper` | 密码哈希 pepper |
+| `session_signing_key` | 会话 |
+| `totp_encrypt_key` | 预留 |
 
-## 命令
+环境变量 `AYANA_*` 可覆盖同名键。
 
-| 命令 | 响应 |
+## 命令（QQ）
+
+`/ping` `/health` `/help` `/status` `/asset <id>` `/incident [id]`
+`/investigate <asset> [object]` `/actions` `/approve <action_id>` `/cancel <action_id>`
+
+不保留裸数字多选协议；批准必须指定 Action ID。
+
+## HTTP
+
+| 路径 | 说明 |
 |------|------|
-| `/ping` | `Ayana v0.1.0` / `pong` |
-| `/health` | 服务状态 |
-| `/help` | 帮助 |
+| `GET /health` `/ready` | 存活 / 就绪 |
+| `POST /hooks/alertmanager` | 告警入口（Bearer `webhook_token`） |
+| `/api/*` | 业务 API（会话 + CSRF） |
+| `/` `/static/*` | 控制台 |
 
-## 切换说明
+无公共 `/send`。静态路由只服务 `ayana/static/`。
 
-NapCat 侧无需改动：`onebot11_REDACTED-ADMIN-QQ.json` 里已是 `ws://127.0.0.1:6199/ws` 反向连接。
-停掉 AstrBot（释放 6199）后启动本服务，NapCat 会在 30s 内自动重连。
+## 首个闭环对象
+
+NERV `frps`（systemd）+ blackbox `tcp_connect` 探测。
+验证用 `timestamp(probe_success)` 的**两个不同新鲜采样**，不用 instant 评估时间。
+
+## 测试
+
+```bash
+python -m unittest discover -s tests -v
+```

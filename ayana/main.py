@@ -1,48 +1,86 @@
-"""Ayana v0.1.0 — 最小 QQ 收发实验。
-
-脱离 AstrBot，直接以 OneBot v11 反向 WS 服务端接管 NapCat。
-本版只做：/ping、/health、日志、独立配置。
-"""
+"""Ayana 入口：装配业务服务、Web、OneBot、后台任务。"""
 
 from __future__ import annotations
 
+import argparse
 import asyncio
-import json
 import logging
 import signal
 import sys
 import time
 from pathlib import Path
 
-from aiohttp import web, WSMsgType
+from aiohttp import web
+
+from . import VERSION
+from .actions import ActionService
+from .alertmanager import AlertIngest
+from .auth import AuthService
+from .config import load_config
+from .db import Database, now
+from .incidents import IncidentService
+from .investigation import InvestigationService
+from .ntsafe import AssetBinding, IdentityGate, NTClient
+from .notify import Notifier
+from .onewbot import OneBotServer
+from .policy import Policy
+from .prom import PromClient
+from .qqbot import QQBot
+from .web import WebApp
 
 log = logging.getLogger("ayana")
 
-VERSION = "0.1.0"
-
-# ---------------------------------------------------------------------------
-# 配置
-# ---------------------------------------------------------------------------
-
-
-def load_config(path: str | Path) -> dict:
-    p = Path(path)
-    if not p.exists():
-        log.error("config not found: %s", p)
-        sys.exit(1)
-    cfg = json.loads(p.read_text(encoding="utf-8"))
-    required = ("ws_port", "token")
-    for k in required:
-        if k not in cfg:
-            log.error("config missing key: %s", k)
-            sys.exit(1)
-    cfg.setdefault("ws_host", "0.0.0.0")
-    cfg.setdefault("ws_path", "/ws")
-    cfg.setdefault("http_host", "0.0.0.0")
-    cfg.setdefault("http_port", 6200)
-    cfg.setdefault("log_level", "INFO")
-    cfg.setdefault("self_id", 0)
-    return cfg
+DEFAULT_ASSETS = [
+    {
+        "id": "nerv",
+        "display_name": "NERV",
+        "read_alias": "nerv",
+        "write_alias": "nerv-exec",
+        "expected_host_id": "NERV",
+        "prom_asset": "nerv",
+        "objects": [
+            {"kind": "service", "name": "frps", "unit": "frps", "auto_recover": 1},
+            {"kind": "service", "name": "nginx", "unit": "nginx"},
+            {"kind": "service", "name": "php-fpm", "unit": "php-fpm"},
+            {"kind": "port", "name": "frps-32659", "port": 32659, "protocol": "tcp"},
+            {"kind": "probe", "name": "frps-probe", "external_probe": "tcp_connect"},
+        ],
+    },
+    {
+        "id": "kanata",
+        "display_name": "KANATA",
+        "read_alias": "kanata",
+        "write_alias": "kanata-exec",
+        "expected_host_id": "KANATA",
+        "prom_asset": "kanata",
+        "objects": [
+            {"kind": "container", "name": "harbor-core", "container": "harbor-core"},
+            {"kind": "container", "name": "nginx", "container": "nginx"},
+            {"kind": "service", "name": "alist", "unit": "alist"},
+        ],
+    },
+    {
+        "id": "sora",
+        "display_name": "Sora",
+        "read_alias": "sora",
+        "write_alias": "sora-exec",
+        "expected_host_id": "sora",
+        "prom_asset": "sora",
+        "objects": [
+            {"kind": "service", "name": "hysteria-server", "unit": "hysteria-server"},
+            {"kind": "port", "name": "hy2-443", "port": 443, "protocol": "udp"},
+        ],
+    },
+    {
+        "id": "yomi",
+        "display_name": "Yomi",
+        "read_alias": "yomi",
+        "write_alias": "yomi-exec",
+        "expected_host_id": "iZDEMOINSTANCEID000001",
+        "prom_asset": "yomi",
+        "objects": [],
+    },
+]
 
 
 def setup_logging(level: str, log_file: str | None = None) -> None:
@@ -56,289 +94,269 @@ def setup_logging(level: str, log_file: str | None = None) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# OneBot v11 反向 WS 服务端
-# ---------------------------------------------------------------------------
+def seed_assets(db: Database) -> None:
+    row = db.query_one("SELECT COUNT(*) AS n FROM assets")
+    if row and row["n"] > 0:
+        return
+    t = now()
+    for a in DEFAULT_ASSETS:
+        db.execute(
+            "INSERT INTO assets(id, display_name, read_alias, write_alias, expected_host_id,"
+            " prom_asset, enabled, notes, created_at, updated_at)"
+            " VALUES(?,?,?,?,?,?,1,'',?,?)",
+            (
+                a["id"],
+                a["display_name"],
+                a["read_alias"],
+                a["write_alias"],
+                a["expected_host_id"],
+                a["prom_asset"],
+                t,
+                t,
+            ),
+        )
+        for o in a.get("objects") or []:
+            db.execute(
+                "INSERT INTO objects(id, asset_id, kind, name, unit, container, port, protocol,"
+                " external_probe, auto_recover, created_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    f"{a['id']}:{o['kind']}:{o['name']}",
+                    a["id"],
+                    o["kind"],
+                    o["name"],
+                    o.get("unit", ""),
+                    o.get("container", ""),
+                    o.get("port"),
+                    o.get("protocol", ""),
+                    o.get("external_probe", ""),
+                    int(o.get("auto_recover", 0)),
+                    t,
+                ),
+            )
+    db.audit("system", "seed", "assets_seeded")
 
 
-class OneBotReverseWS:
-    """接受 NapCat 的 WS 客户端连接，收事件、发动作。"""
+def load_bindings(db: Database) -> list[AssetBinding]:
+    out = []
+    for r in db.query("SELECT * FROM assets WHERE enabled=1"):
+        out.append(
+            AssetBinding(
+                asset_id=r["id"],
+                read_alias=r["read_alias"],
+                write_alias=r["write_alias"],
+                expected_host_id=r["expected_host_id"] or "",
+                host_id_verified_at=r["host_id_verified_at"],
+            )
+        )
+    return out
 
+
+class App:
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.token = cfg["token"]
-        self.self_id = int(cfg.get("self_id") or 0)
-        self._connections: set[web.WebSocketResponse] = set()
-        self._echo_counter = 0
-
-    # -- 连接管理 --
-
-    @property
-    def connected(self) -> bool:
-        return bool(self._connections)
-
-    async def handle_ws(self, request: web.Request) -> web.WebSocketResponse:
-        # token 校验：Authorization: Bearer <token>  或  ?access_token=
-        auth = request.headers.get("Authorization", "")
-        qtoken = request.rel_url.query.get("access_token", "")
-        supplied = ""
-        if auth.lower().startswith("bearer "):
-            supplied = auth[7:].strip()
-        elif qtoken:
-            supplied = qtoken
-        if supplied != self.token:
-            log.warning("ws auth failed from %s", request.remote)
-            return web.Response(status=401, text="unauthorized")
-
-        ws = web.WebSocketResponse(heartbeat=30)
-        await ws.prepare(request)
-        self._connections.add(ws)
-        log.info("ws connected from %s (total=%d)", request.remote, len(self._connections))
-
-        try:
-            async for msg in ws:
-                if msg.type == WSMsgType.TEXT:
-                    await self._on_event(ws, msg.data)
-                elif msg.type == WSMsgType.ERROR:
-                    log.error("ws error: %s", ws.exception())
-        finally:
-            self._connections.discard(ws)
-            log.info("ws disconnected (total=%d)", len(self._connections))
-        return ws
-
-    # -- 事件处理 --
-
-    async def _on_event(self, ws: web.WebSocketResponse, raw: str) -> None:
-        try:
-            event = json.loads(raw)
-        except json.JSONDecodeError:
-            log.warning("bad json event: %.200s", raw)
-            return
-
-        post_type = event.get("post_type", "")
-        if post_type == "meta_event":
-            # 心跳，仅 debug
-            log.debug("heartbeat ok")
-            return
-        if post_type == "message":
-            await self._on_message(ws, event)
-            return
-        if post_type == "notice":
-            log.info("notice: %s", event.get("notice_type"))
-            return
-        if post_type == "request":
-            log.info("request: %s", event.get("request_type"))
-            return
-        log.debug("unhandled post_type=%s", post_type)
-
-    async def _on_message(self, ws: web.WebSocketResponse, event: dict) -> None:
-        message_type = event.get("message_type", "")
-        user_id = event.get("user_id", 0)
-        group_id = event.get("group_id", 0)
-        raw_text = self._extract_text(event)
-        log.info(
-            "msg type=%s user=%s group=%s text=%.100s",
-            message_type, user_id, group_id, raw_text,
+        self.db = Database(cfg["db_path"])
+        seed_assets(self.db)
+        self.auth = AuthService(
+            self.db,
+            pepper=cfg.get("web_auth_pepper") or cfg["onewbot_token"],
+            session_ttl=int(cfg.get("web_session_ttl_sec", 43200)),
+            max_failed=int(cfg.get("web_max_failed_logins", 8)),
+            lockout=int(cfg.get("web_lockout_sec", 900)),
         )
-
-        reply = self._dispatch(raw_text)
-        if not reply:
-            return
-
-        if message_type == "private":
-            await self.send_private_msg(ws, user_id, reply)
-        elif message_type == "group":
-            await self.send_group_msg(ws, group_id, reply)
-        else:
-            log.warning("unknown message_type=%s", message_type)
-
-    @staticmethod
-    def _extract_text(event: dict) -> str:
-        """从 array / string 两种 message 格式提取纯文本。"""
-        msg = event.get("message")
-        if isinstance(msg, str):
-            return msg.strip()
-        if isinstance(msg, list):
-            parts = []
-            for seg in msg:
-                if isinstance(seg, dict) and seg.get("type") == "text":
-                    parts.append(seg.get("data", {}).get("text", ""))
-            return "".join(parts).strip()
-        raw = event.get("raw_message", "")
-        return raw.strip() if isinstance(raw, str) else ""
-
-    # -- 命令分发 --
-
-    def _dispatch(self, text: str) -> str | None:
-        if not text:
-            return None
-        if text in ("/ping", "/Ping", "/PING"):
-            return f"Ayana v{VERSION}\npong"
-        if text in ("/health", "/Health", "/HEALTH"):
-            return self._health_text()
-        if text in ("/help", "/Help"):
-            return (
-                f"Ayana v{VERSION}\n"
-                "/ping   响应测试\n"
-                "/health 服务状态\n"
-                "/help   本帮助"
-            )
-        return None
-
-    def _health_text(self) -> str:
-        status = "connected" if self.connected else "disconnected"
-        return (
-            f"Ayana v{VERSION}\n"
-            f"status: ok\n"
-            f"napcat: {status}\n"
-            f"connections: {len(self._connections)}\n"
-            f"uptime: {int(time.time() - _START_TIME)}s"
+        self.policy = Policy(self.db)
+        self.nt = NTClient(privilege_mode="restricted_dispatcher")
+        self.gate = IdentityGate(self.nt, load_bindings(self.db))
+        self.prom = PromClient(cfg.get("prometheus_url", "http://127.0.0.1:9090"))
+        self.incidents = IncidentService(self.db)
+        self.investigation = InvestigationService(
+            self.db, self.nt, self.gate, self.prom, self.policy
         )
+        self.actions = ActionService(
+            self.db,
+            self.nt,
+            self.gate,
+            self.policy,
+            self.prom,
+            action_ttl=int(cfg.get("action_ttl_sec", 1800)),
+            verify_window=int(cfg.get("verify_window_sec", 90)),
+            verify_timeout=int(cfg.get("verify_timeout_sec", 300)),
+        )
+        self.notifier = Notifier(self.db, default_target="")
+        self.alert_ingest = AlertIngest(self.db, incidents=self.incidents, notifier=self.notifier)
+        self.notifier.set_default_target(
+            f"user:{cfg['admin_qq']}" if cfg.get("admin_qq") else ""
+        )
+        self.ob = OneBotServer(cfg["onewbot_token"], int(cfg.get("self_id") or 0))
+        self.qq = QQBot(
+            self.db,
+            self.ob,
+            self.incidents,
+            self.investigation,
+            self.actions,
+            self.policy,
+            self.notifier,
+            admin_qq=str(cfg.get("admin_qq") or ""),
+            version=VERSION,
+        )
+        self.webapp = WebApp(
+            self.db,
+            self.auth,
+            self.policy,
+            self.incidents,
+            self.investigation,
+            self.actions,
+            self.prom,
+            static_dir=Path(__file__).resolve().parent / "static",
+            version=VERSION,
+            webhook_token=cfg.get("webhook_token") or "",
+            alert_ingest=self.alert_ingest,
+        )
+        self._stop = asyncio.Event()
+        self._bg_tasks: list[asyncio.Task] = []
 
-    # -- 发送 --
+    async def start(self) -> None:
+        # 启动安全检查
+        unknown = self.actions.mark_unknown_unfinished()
+        if unknown:
+            log.warning("marked %d dispatched actions as unknown after restart", unknown)
+        backfilled = self.actions.backfill_missing_verifications()
+        if backfilled:
+            log.info("backfilled %d verification obligations", backfilled)
+        resumed = self.actions.resume_pending_verifications()
+        if resumed:
+            log.info("resumed %d pending verifications", resumed)
 
-    async def _send_action(self, ws: web.WebSocketResponse, action: str, params: dict) -> dict | None:
-        self._echo_counter += 1
-        payload = {"action": action, "params": params, "echo": str(self._echo_counter)}
-        try:
-            await ws.send_str(json.dumps(payload, ensure_ascii=False))
-        except Exception as e:
-            log.error("send action failed: %s", e)
-            return None
-        return payload
+        admin = self.auth.ensure_bootstrap_admin("admin")
+        if admin:
+            log.warning("BOOTSTRAP admin password (rotate after first login): %s", admin)
 
-    async def send_private_msg(self, ws: web.WebSocketResponse, user_id: int, text: str) -> None:
-        await self._send_action(ws, "send_private_msg", {
-            "user_id": user_id,
-            "message": [{"type": "text", "data": {"text": text}}],
-        })
+        ws_app = web.Application()
+        ws_app.router.add_get(self.cfg.get("ws_path", "/ws"), self.ob.handle_ws)
+        http_app = self.webapp.build()
 
-    async def send_group_msg(self, ws: web.WebSocketResponse, group_id: int, text: str) -> None:
-        await self._send_action(ws, "send_group_msg", {
-            "group_id": group_id,
-            "message": [{"type": "text", "data": {"text": text}}],
-        })
+        ws_runner = web.AppRunner(ws_app)
+        http_runner = web.AppRunner(http_app)
+        await ws_runner.setup()
+        await http_runner.setup()
+        ws_site = web.TCPSite(
+            ws_runner, self.cfg.get("ws_host", "127.0.0.1"), int(self.cfg.get("ws_port", 6199))
+        )
+        http_site = web.TCPSite(
+            http_runner, self.cfg.get("http_host", "127.0.0.1"), int(self.cfg.get("http_port", 6200))
+        )
+        await ws_site.start()
+        await http_site.start()
+        log.info("Ayana v%s ws=%s:%s%s http=%s:%s", VERSION,
+                 self.cfg.get("ws_host"), self.cfg.get("ws_port"), self.cfg.get("ws_path"),
+                 self.cfg.get("http_host"), self.cfg.get("http_port"))
 
-    async def send_private_to_napcat(self, user_id: int, text: str) -> bool:
-        """向 NapCat 连接推送私聊消息；返回是否至少发出一次。"""
-        ok = False
-        for ws in list(self._connections):
-            if ws.closed:
-                continue
-            payload = await self._send_action(ws, "send_private_msg", {
-                "user_id": user_id,
-                "message": [{"type": "text", "data": {"text": text}}],
-            })
-            if payload:
-                ok = True
-        return ok
+        # 后台：outbox、周期对账、事件关联
+        self._bg_tasks.append(asyncio.create_task(self._bg_outbox()))
+        self._bg_tasks.append(asyncio.create_task(self._bg_reconcile()))
+        self._bg_tasks.append(asyncio.create_task(self._bg_correlate()))
+
+        # 推送通道
+        async def _sender(target: str, body: str) -> bool:
+            return await self.ob.send_to_target(target, body)
+
+        self.notifier.set_sender(_sender)
+
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, self._stop.set)
+            except NotImplementedError:
+                pass
+        await self._stop.wait()
+        log.info("shutting down")
+        for t in self._bg_tasks:
+            t.cancel()
+        await ws_runner.cleanup()
+        await http_runner.cleanup()
+
+    async def _bg_outbox(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await self.notifier.flush()
+            except Exception:
+                log.exception("outbox flush failed")
+            await asyncio.sleep(3)
+
+    async def _bg_reconcile(self) -> None:
+        while not self._stop.is_set():
+            try:
+                if self.cfg.get("alertmanager_url"):
+                    alerts = await self.alert_ingest.fetch_am_alerts(self.cfg["alertmanager_url"])
+                    self.alert_ingest.reconcile(alerts)
+            except Exception as e:
+                log.warning("AM reconcile failed: %s", e)
+            await asyncio.sleep(60)
+
+    async def _bg_correlate(self) -> None:
+        """同步 episode→Incident。
+
+        只消费「未处理转换」：
+        - incident_id='' 的 episode
+        - episode=resolved 且对应 Incident 仍 open，且本 episode 无 hold 标记
+        """
+        while not self._stop.is_set():
+            try:
+                rows = self.db.query(
+                    "SELECT e.id, e.status, e.incident_id FROM alert_episodes e"
+                    " LEFT JOIN incidents i ON i.id = e.incident_id"
+                    " LEFT JOIN events h ON h.incident_id = e.incident_id"
+                    "   AND h.type='alert_resolved_hold'"
+                    "   AND h.payload_json LIKE '%' || e.id || '%'"
+                    " WHERE e.incident_id=''"
+                    "    OR (e.status='resolved' AND e.incident_id!=''"
+                    "        AND (i.id IS NULL OR i.status='open') AND h.id IS NULL)"
+                    " ORDER BY e.first_seen ASC LIMIT 30"
+                )
+                for r in rows:
+                    rid = r["id"]
+                    if not r["incident_id"]:
+                        inc_id = self.incidents.upsert_from_episode(rid)
+                        if inc_id:
+                            self.notifier.enqueue(
+                                dedup_key=f"ev:corr:{inc_id}:{rid}",
+                                target=f"user:{self.qq.admin_qq}" if self.qq.admin_qq else "",
+                                body=f"[Ayana] incident {inc_id} opened",
+                            )
+                    if r["status"] == "resolved" and r["incident_id"]:
+                        self.incidents.on_episode_resolved(rid)
+            except Exception:
+                log.exception("correlate failed")
+            await asyncio.sleep(5)
+
+    def reload_gate(self) -> None:
+        self.gate = IdentityGate(self.nt, load_bindings(self.db))
+        self.investigation.gate = self.gate
+        self.actions.gate = self.gate
 
 
-# ---------------------------------------------------------------------------
-# HTTP health
-# ---------------------------------------------------------------------------
-
-_START_TIME = time.time()
-
-
-def make_http_app(agent: OneBotReverseWS) -> web.Application:
-    app = web.Application()
-
-    async def health(_req: web.Request) -> web.Response:
-        return web.json_response({
-            "ok": True,
-            "service": "ayana",
-            "version": VERSION,
-            "napcat_connected": agent.connected,
-            "connections": len(agent._connections),
-            "uptime_sec": int(time.time() - _START_TIME),
-        })
-
-    app.router.add_get("/health", health)
-
-    async def index(_req: web.Request) -> web.Response:
-        html = Path(__file__).resolve().parent.parent / "index.html"
-        if html.exists():
-            return web.FileResponse(html)
-        return web.Response(text="Ayana v0.1.0", content_type="text/plain")
-
-    async def static_file(req: web.Request) -> web.Response:
-        name = req.match_info.get("name", "")
-        base = Path(__file__).resolve().parent.parent
-        target = (base / name).resolve()
-        if not str(target).startswith(str(base)) or not target.is_file():
-            return web.Response(status=404, text="Not Found")
-        return web.FileResponse(target)
-
-    app.router.add_get("/", index)
-    app.router.add_get("/{name}", static_file)
-
-    async def send(req: web.Request) -> web.Response:
-        try:
-            body = await req.json()
-        except Exception:
-            return web.json_response({"ok": False, "error": "invalid json"}, status=400)
-        user_id = body.get("user_id")
-        message = body.get("message", "")
-        if not user_id or not message:
-            return web.json_response({"ok": False, "error": "user_id and message required"}, status=400)
-        sent = await agent.send_private_to_napcat(int(user_id), str(message))
-        return web.json_response({"ok": sent, "sent": sent})
-
-    app.router.add_post("/send", send)
-    return app
-
-
-# ---------------------------------------------------------------------------
-# 入口
-# ---------------------------------------------------------------------------
-
-
-async def main(config_path: str) -> None:
+async def amain(config_path: str) -> None:
     cfg = load_config(config_path)
-    setup_logging(cfg["log_level"], cfg.get("log_file"))
+    setup_logging(cfg.get("log_level", "INFO"), cfg.get("log_file"))
     log.info("Ayana v%s starting", VERSION)
-
-    agent = OneBotReverseWS(cfg)
-
-    # WS 路由
-    ws_app = web.Application()
-    ws_app.router.add_get(cfg["ws_path"], agent.handle_ws)
-
-    # HTTP health
-    http_app = make_http_app(agent)
-
-    ws_runner = web.AppRunner(ws_app)
-    http_runner = web.AppRunner(http_app)
-    await ws_runner.setup()
-    await http_runner.setup()
-
-    ws_site = web.TCPSite(ws_runner, cfg["ws_host"], cfg["ws_port"])
-    http_site = web.TCPSite(http_runner, cfg["http_host"], cfg["http_port"])
-    await ws_site.start()
-    await http_site.start()
-
-    log.info("ws  server listening on ws://%s:%s%s", cfg["ws_host"], cfg["ws_port"], cfg["ws_path"])
-    log.info("http health on http://%s:%s/health", cfg["http_host"], cfg["http_port"])
-
-    # 等待退出
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop.set)
-        except NotImplementedError:
-            pass
-    await stop.wait()
-    log.info("shutting down …")
-    await ws_runner.cleanup()
-    await http_runner.cleanup()
+    app = App(cfg)
+    await app.start()
 
 
 def cli() -> None:
-    path = sys.argv[1] if len(sys.argv) > 1 else "config.json"
+    parser = argparse.ArgumentParser(prog="ayana")
+    parser.add_argument("config", nargs="?", default="config.json")
+    parser.add_argument("--seed-only", action="store_true")
+    args = parser.parse_args()
+    if args.seed_only:
+        cfg = load_config(args.config)
+        setup_logging(cfg.get("log_level", "INFO"), None)
+        db = Database(cfg["db_path"])
+        seed_assets(db)
+        print("seeded", db.query("SELECT id FROM assets"))
+        return
     try:
-        asyncio.run(main(path))
+        asyncio.run(amain(args.config))
     except KeyboardInterrupt:
         pass
 

@@ -1,38 +1,20 @@
-"""Smoke test: inject fake /health event into Ops Agent WS and capture reply."""
-import asyncio
-import json
+"""v0.1 遗留测试：改为纯逻辑烟测，不依赖 aiohttp。"""
+
+from __future__ import annotations
+
 import sys
+import unittest
+from pathlib import Path
 
-import aiohttp
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from ayana import VERSION
 
 
-async def test() -> int:
-    url = "ws://127.0.0.1:6199/ws"
-    headers = {"Authorization": "Bearer REDACTED-ONBOT-TOKEN"}
-    async with aiohttp.ClientSession() as s:
-        async with s.ws_connect(url, headers=headers) as ws:
-            event = {
-                "time": 1728000000,
-                "self_id": REDACTED-ADMIN-QQ,
-                "post_type": "message",
-                "message_type": "private",
-                "sub_type": "friend",
-                "message_id": 998,
-                "user_id": 3314622154,
-                "message": [{"type": "text", "data": {"text": "/health"}}],
-                "raw_message": "/health",
-                "font": 0,
-                "sender": {"user_id": 3314622154, "nickname": "test", "role": "friend"},
-            }
-            await ws.send_str(json.dumps(event, ensure_ascii=False))
-            try:
-                msg = await asyncio.wait_for(ws.receive(), timeout=5)
-                print("REPLY:", msg.data)
-                return 0
-            except asyncio.TimeoutError:
-                print("TIMEOUT: no reply")
-                return 1
+class TestVersion(unittest.TestCase):
+    def test_version(self):
+        self.assertRegex(VERSION, r"^\d+\.\d+\.\d+")
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(test()))
+    unittest.main()

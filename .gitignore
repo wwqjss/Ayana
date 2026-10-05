@@ -1,0 +1,12 @@
+# 秘密与运行时
+secrets.json
+ayana.db
+ayana.db-wal
+ayana.db-shm
+ayana.log
+ayana.out
+*.egg-info/
+.venv/
+__pycache__/
+*.pyc
+uv.lock

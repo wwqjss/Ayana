@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ayana</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div id="app">
+  <div id="login-view" class="login-wrap hidden">
+    <form id="login-form" class="card login-card">
+      <h1>Ayana</h1>
+      <p class="muted">运维控制台</p>
+      <label>用户名 <input name="username" autocomplete="username" required></label>
+      <label>密码 <input name="password" type="password" autocomplete="current-password" required></label>
+      <label id="totp-field">TOTP <input name="totp" inputmode="numeric" maxlength="6" placeholder="6 位动态码"></label>
+      <label id="recovery-field" class="hidden">恢复码 <input name="recovery_code" placeholder="XXXX-XXXX-XXXX"></label>
+      <button type="submit" class="btn primary">登录</button>
+      <p class="error" id="login-error"></p>
+      <p class="muted small"><a href="#" id="use-recovery">使用恢复码</a></p>
+    </form>
+  </div>
+
+  <div id="main-view" class="hidden">
+    <header class="topbar">
+      <div class="brand">Ayana <span class="ver" id="ver"></span></div>
+      <nav>
+        <button data-tab="overview" class="tab active">总览</button>
+        <button data-tab="assets" class="tab">资产</button>
+        <button data-tab="incidents" class="tab">事件</button>
+        <button data-tab="actions" class="tab">操作</button>
+        <button data-tab="permissions" class="tab">权限</button>
+        <button data-tab="audit" class="tab">审计</button>
+      </nav>
+      <div class="user-box">
+        <span id="username"></span>
+        <button id="totp-btn" class="btn ghost small">2FA</button>
+        <button id="logout-btn" class="btn ghost small">退出</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="tab-overview" class="tab-panel">
+        <div class="banner ok hidden" id="quiet-banner">没有需要你处理的事情</div>
+        <div class="banner warn hidden" id="human-banner">需要人工介入</div>
+        <div class="grid" id="overview-grid"></div>
+      </section>
+
+      <section id="tab-assets" class="tab-panel hidden">
+        <div id="assets-list"></div>
+      </section>
+
+      <section id="tab-incidents" class="tab-panel hidden">
+        <div id="incidents-list"></div>
+      </section>
+
+      <section id="tab-actions" class="tab-panel hidden">
+        <div class="card">
+          <h2>发起操作</h2>
+          <div class="form-row">
+            <label>资产 <select id="act-asset"></select></label>
+            <label>对象 <input id="act-object" placeholder="如 frps"></label>
+            <label>能力 <select id="act-cap"></select></label>
+            <label>原因 <input id="act-reason" placeholder="为什么要做"></label>
+            <button class="btn primary" id="act-propose">生成提案</button>
+          </div>
+        </div>
+        <div id="actions-list"></div>
+      </section>
+
+      <section id="tab-permissions" class="tab-panel hidden">
+        <div class="card">
+          <h2>业务权限（Ayana）</h2>
+          <p class="muted">主机侧 commands.json / forced-command / sudoers 为独立最终安全上限，此处不能扩大主机边界。</p>
+          <div class="form-row">
+            <label>主体类型
+              <select id="perm-subject-type">
+                <option value="web_user">web_user</option>
+                <option value="qq_user">qq_user</option>
+                <option value="qq_group">qq_group</option>
+                <option value="auto_rule">auto_rule</option>
+              </select>
+            </label>
+            <label>主体 ID <input id="perm-subject-id" placeholder="用户名 / QQ 号"></label>
+            <label>能力 <select id="perm-cap"></select></label>
+            <label>资产 <select id="perm-asset"></select></label>
+            <label>对象 <input id="perm-object" value="*" ></label>
+            <label class="chk"><input type="checkbox" id="perm-allow" checked> 允许</label>
+            <label class="chk"><input type="checkbox" id="perm-approval" checked> 需批准</label>
+            <label class="chk"><input type="checkbox" id="perm-auto"> 允许自动</label>
+            <button class="btn primary" id="perm-save">保存</button>
+          </div>
+        </div>
+        <div id="perm-list"></div>
+      </section>
+
+      <section id="tab-audit" class="tab-panel hidden">
+        <div id="audit-list"></div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<div id="modal" class="modal hidden">
+  <div class="modal-card">
+    <h3 id="modal-title"></h3>
+    <div id="modal-body"></div>
+    <div class="modal-actions">
+      <button class="btn" id="modal-close">关闭</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

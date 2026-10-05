@@ -1,7 +1,7 @@
 [project]
 name = "ayana"
-version = "0.1.0"
-description = "Ayana — OneBot v11 reverse WS server for NapCat (ops platform)"
+version = "0.2.0"
+description = "Ayana — ops closed loop (OneBot v11 reverse WS + Web console)"
 requires-python = ">=3.11"
 dependencies = ["aiohttp>=3.9"]
 
@@ -14,3 +14,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["ayana*"]
+
+[tool.setuptools.package-data]
+ayana = ["static/*"]

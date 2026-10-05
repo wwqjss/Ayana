@@ -1,12 +1,17 @@
 {
-  "ws_host": "0.0.0.0",
+  "ws_host": "127.0.0.1",
   "ws_port": 6199,
   "ws_path": "/ws",
-  "token": "REDACTED-ONBOT-TOKEN",
-  "http_host": "0.0.0.0",
+  "http_host": "127.0.0.1",
   "http_port": 6200,
   "log_level": "INFO",
   "log_file": "ayana.log",
-  "version": "0.1.0",
-  "self_id": REDACTED-ADMIN-QQ
+  "self_id": REDACTED-ADMIN-QQ,
+  "db_path": "ayana.db",
+  "prometheus_url": "http://127.0.0.1:9090",
+  "alertmanager_url": "http://127.0.0.1:9093",
+  "admin_qq": "REDACTED-ADMIN-QQ",
+  "auto_remediation_enabled": false,
+  "verify_window_sec": 90,
+  "verify_timeout_sec": 300
 }
