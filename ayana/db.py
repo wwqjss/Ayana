@@ -226,6 +226,7 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
   last_error TEXT NOT NULL DEFAULT '',
   created_at REAL NOT NULL,
   last_try_at REAL NOT NULL DEFAULT 0,
+  next_try_at REAL NOT NULL DEFAULT 0,
   sent_at REAL
 );
 
@@ -297,6 +298,10 @@ class Database:
             if cols and "last_try_at" not in cols:
                 conn.execute(
                     "ALTER TABLE notification_outbox ADD COLUMN last_try_at REAL NOT NULL DEFAULT 0"
+                )
+            if cols and "next_try_at" not in cols:
+                conn.execute(
+                    "ALTER TABLE notification_outbox ADD COLUMN next_try_at REAL NOT NULL DEFAULT 0"
                 )
             conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)",

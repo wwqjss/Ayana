@@ -54,17 +54,17 @@ class TestNotificationCompensation(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         db = Database(Path(tmp.name) / "t.db")
         n = Notifier(db, default_target="user:1")
-        # 模拟：Event 已写但 outbox 入队失败
+        # 模拟：生命周期 Event 已写但 outbox 入队失败
         db.execute(
             "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
-            ("inc1", now(), "notify_opened", "x", '{"body":"hello"}'),
+            ("inc1", now(), "incident_opened", "x", '{"body":"hello"}'),
         )
         self.assertEqual(db.query_one("SELECT COUNT(*) n FROM notification_outbox")["n"], 0)
         fixed = n.compensate_missing()
         self.assertEqual(fixed, 1)
         row = db.query_one("SELECT dedup_key, body FROM notification_outbox")
         self.assertTrue(row["dedup_key"].startswith("ev:"))
-        self.assertEqual(row["body"], "hello")
+        self.assertIn("hello", row["body"])
         db.close()
         tmp.cleanup()
 
@@ -75,18 +75,18 @@ class TestOutboxPagination(unittest.TestCase):
         db = Database(Path(tmp.name) / "t.db")
         n = Notifier(db, default_target="user:1")
         t0 = now()
-        # 201 条旧通知（tries=1，未到期）
+        # 201 条旧通知（未到期，next_try_at 在未来）
         for i in range(201):
             db.execute(
                 "INSERT INTO notification_outbox(id, dedup_key, channel, target, body, state,"
-                " tries, created_at, last_try_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (f"old{i}", f"k{i}", "qq", "user:1", "old", "pending", 1, t0, now()),
+                " tries, created_at, last_try_at, next_try_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (f"old{i}", f"k{i}", "qq", "user:1", "old", "pending", 1, t0, now(), t0 + 600),
             )
-        # 1 条紧急（tries=0，立即到期）
+        # 1 条紧急（立即到期）
         db.execute(
             "INSERT INTO notification_outbox(id, dedup_key, channel, target, body, state,"
-            " tries, created_at, last_try_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            ("urgent", "k-urgent", "qq", "user:1", "urgent", "pending", 0, now(), 0),
+            " tries, created_at, last_try_at, next_try_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("urgent", "k-urgent", "qq", "user:1", "urgent", "pending", 0, now(), 0, 0),
         )
 
         sent_boxes = []

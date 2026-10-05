@@ -1,8 +1,13 @@
-"""通知 outbox：退避基于最后尝试时间，连接不可用不迅速耗尽预算。"""
+"""通知 outbox。
+
+- 到期用 `next_try_at` 在 SQL 层筛选，无固定扫描预算
+- 补偿以真实生命周期事件为源（incident_opened/reopened/resolved、verified_recovered）
+- 空目标重试时补填当前默认目标并审计
+"""
 
 from __future__ import annotations
 
-import time
+import json
 from typing import Any, Awaitable, Callable
 
 from .db import Database, new_id, now
@@ -10,6 +15,14 @@ from .db import Database, new_id, now
 MAX_TRIES = 15
 BASE_BACKOFF = 15.0
 MAX_BACKOFF = 600.0
+
+# 通知义务来源：真实生命周期事件
+LIFECYCLE_TYPES = (
+    "incident_opened",
+    "incident_reopened",
+    "incident_resolved",
+    "verified_recovered",
+)
 
 
 class Notifier:
@@ -26,156 +39,122 @@ class Notifier:
 
     def enqueue(self, *, dedup_key: str, target: str, body: str, channel: str = "qq") -> bool:
         target = target or self.default_target
+        t = now()
         if not target:
+            try:
+                self.db.execute(
+                    "INSERT INTO notification_outbox(id, dedup_key, channel, target, body,"
+                    " state, created_at, last_try_at, next_try_at, last_error)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        new_id("ntf"), dedup_key, channel, "", body,
+                        "failed", t, 0, 0, "missing_target",
+                    ),
+                )
+            except Exception:
+                pass
             return False
         try:
             self.db.execute(
                 "INSERT INTO notification_outbox(id, dedup_key, channel, target, body, state,"
-                " created_at, last_try_at) VALUES(?,?,?,?,?,?,?,0)",
-                (new_id("ntf"), dedup_key, channel, target, body, "pending", now()),
+                " created_at, last_try_at, next_try_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (new_id("ntf"), dedup_key, channel, target, body, "pending", t, 0, 0),
             )
             return True
         except Exception:
             return False
 
-    def compensate_missing(self) -> int:
-        """Event→缺失 outbox 补偿：为 notify_* 事件补回通知义务。"""
+    def enqueue_for_event(self, event_id: int | str, *, body: str, typ: str = "") -> bool:
+        """按生命周期 Event 建立通知义务（幂等：dedup_key=ev:<id>）。"""
+        return self.enqueue(
+            dedup_key=f"ev:{event_id}", target="", body=body, channel="qq"
+        )
+
+    def compensate_missing(self, limit: int = 100) -> int:
+        """扫生命周期事件，为缺失 outbox 的补回义务。"""
+        placeholders = ",".join("?" for _ in LIFECYCLE_TYPES)
         rows = self.db.query(
-            "SELECT e.id AS ev_id, e.payload_json FROM events e"
-            " WHERE e.type LIKE 'notify_%'"
-            " AND NOT EXISTS (SELECT 1 FROM notification_outbox o WHERE o.dedup_key = 'ev:' || e.id)"
-            " ORDER BY e.id ASC LIMIT 50"
+            f"SELECT e.id AS ev_id, e.type, e.payload_json, e.incident_id"
+            f" FROM events e WHERE e.type IN ({placeholders})"
+            f" AND NOT EXISTS (SELECT 1 FROM notification_outbox o"
+            f"               WHERE o.dedup_key = 'ev:' || e.id)"
+            f" ORDER BY e.id ASC LIMIT ?",
+            (*LIFECYCLE_TYPES, limit),
         )
         n = 0
         for r in rows:
+            body = f"[Ayana] {r['type']} {r['incident_id'] or ''}".strip()
             try:
-                import json as _json
-
-                payload = _json.loads(r["payload_json"] or "{}")
-                body = payload.get("body") or ""
-                target = self.default_target
-                self.db.execute(
-                    "INSERT INTO notification_outbox(id, dedup_key, channel, target, body,"
-                    " state, created_at, last_try_at) VALUES(?,?,?,?,?,?,?,0)",
-                    (
-                        new_id("ntf"),
-                        f"ev:{r['ev_id']}",
-                        "qq",
-                        target or "",
-                        body,
-                        "pending" if target else "failed",
-                        now(),
-                    ),
-                )
-                n += 1
+                payload = json.loads(r["payload_json"] or "{}")
+                if payload.get("body"):
+                    body = payload["body"]
             except Exception:
                 pass
+            if self.enqueue(dedup_key=f"ev:{r['ev_id']}", target="", body=body):
+                n += 1
+            else:
+                # 目标缺失也记一条，便于后续补填重试
+                n += 1
         return n
 
-    def retry_failed(self, outbox_id: str = "") -> int:
-        """把 failed 通知重新置为 pending，便于审计重试。"""
-        if outbox_id:
-            cur = self.db.execute(
-                "UPDATE notification_outbox SET state='pending', tries=0, last_error='retry'"
-                " WHERE id=? AND state='failed'",
-                (outbox_id,),
-            )
-        else:
-            cur = self.db.execute(
-                "UPDATE notification_outbox SET state='pending', tries=0, last_error='retry'"
-                " WHERE state='failed'"
-            )
-        return int(cur.rowcount or 0)
-
-    def failed_summary(self, limit: int = 20) -> list[dict]:
-        return [
-            dict(r)
-            for r in self.db.query(
-                "SELECT id, dedup_key, target, last_error, tries, created_at"
-                " FROM notification_outbox WHERE state='failed'"
-                " ORDER BY created_at DESC LIMIT ?",
-                (limit,),
-            )
-        ]
-
-    def incident_key(self, incident_id: str, typ: str, rev: int = 0) -> str:
-        """每次转换唯一：rev 用事件序号/时间戳，避免复发永久去重。"""
-        return f"{incident_id}:{typ}:{rev}"
-
-    def enqueue_transition(
-        self,
-        *,
-        incident_id: str,
-        typ: str,
-        target: str,
-        body: str,
-        at: float | None = None,
-    ) -> bool:
-        rev = int((at or now()) * 1000)
-        # 同毫秒内可能多次转换：加随机后缀保证唯一
-        import uuid
-
-        key = f"{incident_id}:{typ}:{rev}:{uuid.uuid4().hex[:8]}"
-        return self.enqueue(dedup_key=key, target=target, body=body)
+    def _next_try_delay(self, tries: int) -> float:
+        if tries <= 0:
+            return 0.0
+        return min(MAX_BACKOFF, BASE_BACKOFF * (2 ** (tries - 1)))
 
     def _due(self, row: dict) -> bool:
         tries = int(row.get("tries") or 0)
         if tries >= MAX_TRIES:
             return False
-        if tries == 0:
-            return True
-        delay = min(MAX_BACKOFF, BASE_BACKOFF * (2 ** (tries - 1)))
-        last_try = float(row.get("last_try_at") or 0)
-        return (now() - last_try) >= delay
+        return float(row.get("next_try_at") or 0) <= now()
 
     async def flush(self, limit: int = 20) -> int:
         if not self._sender:
             return 0
         self.mark_failed_exhausted()
-        # 分页寻找到期项，避免未到期旧通知挡住新通知
+        # SQL 层筛到期；无固定前缀预算
+        rows = self.db.query(
+            "SELECT * FROM notification_outbox"
+            " WHERE state='pending' AND tries<? AND next_try_at<=?"
+            " ORDER BY created_at ASC LIMIT ?",
+            (MAX_TRIES, now(), limit),
+        )
         sent = 0
-        offset = 0
-        batch = 50
-        scanned = 0
-        while sent < limit and scanned < 500:
-            rows = self.db.query(
-                "SELECT * FROM notification_outbox WHERE state='pending' AND tries<?"
-                " ORDER BY created_at ASC LIMIT ? OFFSET ?",
-                (MAX_TRIES, batch, offset),
-            )
-            if not rows:
-                break
-            for r in rows:
-                d = dict(r)
-                scanned += 1
-                if not self._due(d):
-                    continue
-                rid = d["id"]
-                try:
-                    ok = await self._sender(d["target"], d["body"])
-                except Exception as e:
-                    self.db.execute(
-                        "UPDATE notification_outbox SET tries=tries+1, last_try_at=?, last_error=?"
-                        " WHERE id=?",
-                        (now(), str(e)[:200], rid),
-                    )
-                    continue
-                if ok:
-                    self.db.execute(
-                        "UPDATE notification_outbox SET state='sent', sent_at=?, tries=tries+1,"
-                        " last_try_at=? WHERE id=?",
-                        (now(), now(), rid),
-                    )
-                    sent += 1
-                    if sent >= limit:
-                        break
-                else:
-                    self.db.execute(
-                        "UPDATE notification_outbox SET tries=tries+1, last_try_at=?,"
-                        " last_error='send_failed' WHERE id=?",
-                        (now(), rid),
-                    )
-            offset += batch
+        for r in rows:
+            d = dict(r)
+            rid = d["id"]
+            target = d.get("target") or self.default_target
+            if not target:
+                self.db.execute(
+                    "UPDATE notification_outbox SET tries=tries+1, last_try_at=?, next_try_at=?,"
+                    " last_error='missing_target' WHERE id=?",
+                    (now(), now() + self._next_try_delay(int(d.get("tries") or 0) + 1), rid),
+                )
+                continue
+            try:
+                ok = await self._sender(target, d["body"])
+            except Exception as e:
+                tries = int(d.get("tries") or 0) + 1
+                self.db.execute(
+                    "UPDATE notification_outbox SET tries=?, last_try_at=?, next_try_at=?, last_error=?"
+                    " WHERE id=?",
+                    (tries, now(), now() + self._next_try_delay(tries), str(e)[:200], rid),
+                )
+                continue
+            if ok:
+                self.db.execute(
+                    "UPDATE notification_outbox SET state='sent', sent_at=?, tries=tries+1,"
+                    " last_try_at=?, next_try_at=?, target=? WHERE id=?",
+                    (now(), now(), 0, target, rid),
+                )
+                sent += 1
+            else:
+                tries = int(d.get("tries") or 0) + 1
+                self.db.execute(
+                    "UPDATE notification_outbox SET tries=?, last_try_at=?, next_try_at=?,"
+                    " last_error='send_failed', target=? WHERE id=?",
+                    (tries, now(), now() + self._next_try_delay(tries), target, rid),
+                )
         return sent
 
     def mark_failed_exhausted(self) -> int:
@@ -187,3 +166,58 @@ class Notifier:
             ).rowcount
             or 0
         )
+
+    def retry_failed(self, outbox_id: str = "") -> int:
+        """失败重试：空目标补填当前默认目标；记审计。"""
+        if outbox_id:
+            rows = self.db.query(
+                "SELECT * FROM notification_outbox WHERE id=? AND state='failed'", (outbox_id,)
+            )
+        else:
+            rows = self.db.query(
+                "SELECT * FROM notification_outbox WHERE state='failed' LIMIT 50"
+            )
+        n = 0
+        for r in rows:
+            d = dict(r)
+            target = d.get("target") or ""
+            if not target and self.default_target:
+                target = self.default_target
+            if not target:
+                self.db.execute(
+                    "UPDATE notification_outbox SET last_error='missing_target_no_default'"
+                    " WHERE id=?",
+                    (d["id"],),
+                )
+                continue
+            self.db.execute(
+                "UPDATE notification_outbox SET state='pending', tries=0, last_error='retry',"
+                " target=?, next_try_at=0 WHERE id=?",
+                (target, d["id"]),
+            )
+            self.db.audit(
+                "web_user",
+                "admin",
+                "notification_retry",
+                detail={
+                    "outbox_id": d["id"],
+                    "dedup_key": d.get("dedup_key"),
+                    "target_filled": bool(not d.get("target") and target),
+                },
+            )
+            n += 1
+        return n
+
+    def failed_summary(self, limit: int = 20) -> list[dict[str, Any]]:
+        return [
+            dict(r)
+            for r in self.db.query(
+                "SELECT id, dedup_key, target, last_error, tries, created_at"
+                " FROM notification_outbox WHERE state='failed'"
+                " ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            )
+        ]
+
+    def incident_key(self, incident_id: str, typ: str, rev: int = 0) -> str:
+        return f"{incident_id}:{typ}:{rev}"

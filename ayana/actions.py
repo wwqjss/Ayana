@@ -804,6 +804,32 @@ class ActionService:
                             json.dumps({"verification_id": vid, "note": note}, ensure_ascii=False),
                         ),
                     )
+                    # 验证恢复通知义务与转换同事务
+                    try:
+                        ev = conn.execute(
+                            "SELECT id FROM events WHERE incident_id=?"
+                            " AND type='verified_recovered' ORDER BY id DESC LIMIT 1",
+                            (inc_id,),
+                        ).fetchone()
+                        if ev:
+                            conn.execute(
+                                "INSERT OR IGNORE INTO notification_outbox(id, dedup_key,"
+                                " channel, target, body, state, created_at, last_try_at,"
+                                " next_try_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                                (
+                                    new_id("ntf"),
+                                    f"ev:{ev['id']}",
+                                    "qq",
+                                    "",
+                                    f"[Ayana] verified_recovered {inc_id}",
+                                    "pending",
+                                    now(),
+                                    0,
+                                    0,
+                                ),
+                            )
+                    except Exception:
+                        pass
                 else:
                     conn.execute(
                         "INSERT INTO events(incident_id, at, type, title, payload_json)"

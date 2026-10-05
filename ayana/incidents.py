@@ -250,6 +250,22 @@ class IncidentService:
         ]
         return data
 
+    def summary_text(self, inc_id: str) -> str:
+        inc = self.get_incident(inc_id)
+        if not inc:
+            return "未找到 Incident"
+        lines = [
+            f"Incident {inc['id']}",
+            inc.get("title") or "",
+            f"状态: {inc['status']} / 阶段: {inc['stage']}"
+            + (" / 需人工" if inc.get("need_human") else ""),
+        ]
+        if inc.get("need_human_reason"):
+            lines.append(f"原因: {inc['need_human_reason']}")
+        for e in (inc.get("events") or [])[-5:]:
+            lines.append(f"- {e.get('title') or e.get('type')}")
+        return "\n".join(lines)
+
     def reevaluate_after_action(self, inc_id: str) -> None:
         """Action 终态或人工义务解除后重新评估 hold。"""
         if not inc_id:
@@ -293,17 +309,3 @@ class IncidentService:
                         json.dumps({"reason": "reevaluate"}, ensure_ascii=False),
                     ),
                 )
-        inc = self.get_incident(inc_id)
-        if not inc:
-            return "未找到 Incident"
-        lines = [
-            f"Incident {inc['id']}",
-            inc.get("title") or "",
-            f"状态: {inc['status']} / 阶段: {inc['stage']}"
-            + (" / 需人工" if inc.get("need_human") else ""),
-        ]
-        if inc.get("need_human_reason"):
-            lines.append(f"原因: {inc['need_human_reason']}")
-        for e in (inc.get("events") or [])[-5:]:
-            lines.append(f"- {e.get('title') or e.get('type')}")
-        return "\n".join(lines)

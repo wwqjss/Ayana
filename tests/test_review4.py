@@ -210,10 +210,10 @@ class TestVerifyFailureReopens(unittest.TestCase):
 class TestOutboxDueFilter(unittest.TestCase):
     def test_due_filtered_before_limit(self):
         src = (Path(__file__).resolve().parents[1] / "ayana" / "notify.py").read_text(encoding="utf-8")
-        # 分页寻找到期项，不允许先截取再过滤
-        self.assertIn("OFFSET", src)
-        self.assertIn("if not self._due(d)", src)
-        self.assertLess(src.index("if not self._due(d)"), src.index("if sent >= limit"))
+        # SQL 层按 next_try_at 筛到期，无固定扫描预算
+        self.assertIn("next_try_at<=?", src)
+        self.assertNotIn("OFFSET", src)
+        self.assertIn("next_try_at", src)
 
 
 class TestHoldIdempotent(unittest.TestCase):

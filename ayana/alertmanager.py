@@ -86,53 +86,27 @@ class AlertIngest:
             pass
 
     def _notify_incident(self, inc_id: str, typ: str, *, episode_id: str = "") -> None:
-        """把通知义务写入 outbox。
-
-        去重键绑定**本次转换产生的 Event**（INSERT 的 rowid），
-        不用「最新事件」查询，避免时钟回拨绑定旧事件。
-        """
+        """以生命周期 Event 为源建立通知义务（幂等 ev:<id>）。"""
         if not self._notifier:
             return
         try:
+            event_type = {
+                "opened": "incident_opened",
+                "reopened": "incident_reopened",
+                "resolved": "incident_resolved",
+            }.get(typ, f"incident_{typ}")
+            ev = self.db.query_one(
+                "SELECT id FROM events WHERE incident_id=? AND type=?"
+                " ORDER BY id DESC LIMIT 1",
+                (inc_id, event_type),
+            )
+            if not ev:
+                return
             inc = self._row_dict(
                 self.db.query_one("SELECT * FROM incidents WHERE id=?", (inc_id,))
             )
-            if not inc:
-                return
             body = f"[Ayana] {inc.get('title','')}\n{inc_id} {typ}"
-            # 通知义务与 Event 同事务提交；失败则由补偿扫描补回
-            with self.db.tx() as conn:
-                cur = conn.execute(
-                    "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
-                    (
-                        inc_id,
-                        now(),
-                        f"notify_{typ}",
-                        f"notify {typ} {inc_id}",
-                        json.dumps(
-                            {"typ": typ, "episode_id": episode_id, "body": body},
-                            ensure_ascii=False,
-                        ),
-                    ),
-                )
-                ev_id = cur.lastrowid
-                target = self._notifier.default_target
-                try:
-                    conn.execute(
-                        "INSERT INTO notification_outbox(id, dedup_key, channel, target, body,"
-                        " state, created_at, last_try_at) VALUES(?,?,?,?,?,?,?,0)",
-                        (
-                            new_id("ntf"),
-                            f"ev:{ev_id}",
-                            "qq",
-                            target or "",
-                            body,
-                            "pending" if target else "failed",
-                            now(),
-                        ),
-                    )
-                except Exception:
-                    pass
+            self._notifier.enqueue_for_event(ev["id"], body=body, typ=typ)
         except Exception:
             pass
 

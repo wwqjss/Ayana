@@ -230,17 +230,16 @@ class TestAssetBindingDuringWait(unittest.TestCase):
 
 
 class TestNotificationKeys(unittest.TestCase):
-    def test_transition_keys_unique(self):
+    def test_event_keys_unique(self):
         tmp = tempfile.TemporaryDirectory()
         db = Database(Path(tmp.name) / "t.db")
         n = Notifier(db, default_target="user:1")
-        a = n.incident_key("i1", "opened", 1)
-        b = n.incident_key("i1", "opened", 2)
-        self.assertNotEqual(a, b)
-        self.assertTrue(n.enqueue_transition(incident_id="i1", typ="opened", target="user:1", body="x"))
-        self.assertTrue(n.enqueue_transition(incident_id="i1", typ="opened", target="user:1", body="y"))
+        self.assertTrue(n.enqueue_for_event(1, body="x"))
+        self.assertTrue(n.enqueue_for_event(2, body="y"))
         row = db.query_one("SELECT COUNT(*) AS n FROM notification_outbox")
         self.assertEqual(row["n"], 2)
+        keys = {r["dedup_key"] for r in db.query("SELECT dedup_key FROM notification_outbox")}
+        self.assertEqual(keys, {"ev:1", "ev:2"})
         db.close()
         tmp.cleanup()
 
