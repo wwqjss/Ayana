@@ -34,6 +34,21 @@ async function api(path, opts = {}) {
 }
 
 /* ---- i18n maps ---- */
+const ZH_CAP = {
+  "service.restart": "重启服务",
+  "service.start": "启动服务",
+  "service.stop": "停止服务",
+  "container.restart": "重启容器",
+  "asset.summary": "资产摘要",
+  "service.status": "服务状态",
+  "service.logs": "服务日志",
+  "port.listen": "端口监听",
+  "disk.usage": "磁盘使用",
+  "memory.available": "内存可用",
+  "load.current": "负载",
+  "probe.status": "探测状态",
+};
+
 const ZH = {
   // status
   open: "处理中",
