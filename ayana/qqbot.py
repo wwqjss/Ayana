@@ -144,7 +144,7 @@ class QQBot:
         if incs:
             lines.append("活动事件:")
             for i in incs:
-                flag = "⚠ " if i.get("need_human") else ""
+                flag = "需人工 " if i.get("need_human") else ""
                 lines.append(
                     f"{flag}{i['id']} {i['title'][:40]} [{_zstage(i['stage'])}]"
                 )

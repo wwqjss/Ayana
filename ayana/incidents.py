@@ -286,7 +286,7 @@ class IncidentService:
 
         if for_qq:
             lines = [
-                f"📋 事件详情",
+                f"事件详情",
                 title,
                 f"资产: {inc.get('asset_id') or '?'} / 对象: {inc.get('object_id') or '?'}",
                 f"状态: {status} / 阶段: {stage}",
@@ -295,7 +295,7 @@ class IncidentService:
             if resolved:
                 lines.append(f"解决: {_t(resolved)}")
             if inc.get("need_human"):
-                lines.append(f"⚠ 需人工: {inc.get('need_human_reason', '')[:80]}")
+                lines.append(f"需人工: {inc.get('need_human_reason', '')[:80]}")
             for e in (inc.get("events") or [])[-4:]:
                 etype = e.get("type", "")
                 zh_map = {

@@ -53,7 +53,7 @@ def alert_name(text: str) -> str:
 def fmt_incident_open(inc: dict) -> str:
     """新事件通知。"""
     return (
-        f"⚠ 告警\n"
+        f"告警\n"
         f"{alert_name(inc.get('title', ''))}\n"
         f"资产: {inc.get('asset_id', '?')} / 对象: {inc.get('object_id', '?')}\n"
         f"时间: {_t(inc.get('created_at'))}"
@@ -62,7 +62,7 @@ def fmt_incident_open(inc: dict) -> str:
 
 def fmt_incident_resolved(inc: dict) -> str:
     return (
-        f"✅ 已恢复\n"
+        f"已恢复\n"
         f"{alert_name(inc.get('title', ''))}\n"
         f"资产: {inc.get('asset_id', '?')} / 对象: {inc.get('object_id', '?')}\n"
         f"持续: {_t(inc.get('created_at'))} → {_t(inc.get('resolved_at'))}"
@@ -72,7 +72,7 @@ def fmt_incident_resolved(inc: dict) -> str:
 def fmt_verified(inc: dict, action: dict | None = None, verification: dict | None = None) -> str:
     cap = ZH_CAP.get((action or {}).get("capability", ""), (action or {}).get("capability", ""))
     return (
-        f"✅ 恢复验证通过\n"
+        f"恢复验证通过\n"
         f"{alert_name(inc.get('title', ''))}\n"
         f"资产: {inc.get('asset_id', '?')} / 对象: {inc.get('object_id', '?')}\n"
         f"处置: {cap}\n"
@@ -82,7 +82,7 @@ def fmt_verified(inc: dict, action: dict | None = None, verification: dict | Non
 
 def fmt_agent_exec(inc: dict, rule_name: str, capability: str) -> str:
     return (
-        f"🔧 自动处置\n"
+        f"自动处置\n"
         f"{alert_name(inc.get('title', ''))}\n"
         f"资产: {inc.get('asset_id', '?')} / 对象: {inc.get('object_id', '?')}\n"
         f"动作: {ZH_CAP.get(capability, capability)}\n"
@@ -107,7 +107,7 @@ def fmt_escalate(inc: dict, reason: str, llm_summary: str = "") -> str:
         zh_reason = "执行出错"
 
     body = (
-        f"🙋 需要你\n"
+        f"需要你处理\n"
         f"{alert_name(inc.get('title', ''))}\n"
         f"资产: {inc.get('asset_id', '?')} / 对象: {inc.get('object_id', '?')}\n"
         f"原因: {zh_reason}"
@@ -120,7 +120,7 @@ def fmt_escalate(inc: dict, reason: str, llm_summary: str = "") -> str:
 def fmt_action_result(inc: dict, action: dict, state: str) -> str:
     cap = ZH_CAP.get(action.get("capability", ""), action.get("capability", ""))
     return (
-        f"🔧 处置{'完成' if state == 'success' else '结果: ' + _z(ZH_STATE, state)}\n"
+        f"处置{'完成' if state == 'success' else '结果: ' + _z(ZH_STATE, state)}\n"
         f"{alert_name(inc.get('title', ''))}\n"
         f"资产: {action.get('asset_id', '?')} / 对象: {action.get('object_id', '?')}\n"
         f"动作: {cap}"
