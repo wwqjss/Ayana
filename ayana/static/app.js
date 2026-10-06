@@ -185,29 +185,35 @@ $("totp-btn").addEventListener("click", async () => {
 /* ---- tabs ---- */
 function currentTabFromHash() {
   const h = (location.hash || "").replace(/^#/, "");
-  const m = h.match(/^(overview|assets|incidents|actions|permissions|audit)(?:\/(.+))?$/);
-  return m ? { tab: m[1], focus: m[2] || "" } : { tab: "overview", focus: "" };
+  const assetM = h.match(/^assets\/(.+)$/);
+  if (assetM) return { tab: "overview", focus: assetM[1], assetView: true };
+  const m = h.match(/^(overview|incidents|actions|permissions|audit)(?:\/(.+))?$/);
+  return m ? { tab: m[1], focus: m[2] || "", assetView: false } : { tab: "overview", focus: "", assetView: false };
 }
 
-function setTabHash(tab, focus) {
-  const h = focus ? `#${tab}/${focus}` : `#${tab}`;
-  if (location.hash !== h) {
-    history.replaceState(null, "", h);
+function setTabHash(tab, focus, assetView) {
+  if (assetView && focus) {
+    const h = `#assets/${focus}`;
+    if (location.hash !== h) history.replaceState(null, "", h);
+    return;
   }
+  const h = focus ? `#${tab}/${focus}` : `#${tab}`;
+  if (location.hash !== h) history.replaceState(null, "", h);
 }
 
-function activateTab(tab, focus) {
-  const valid = ["overview", "assets", "incidents", "actions", "permissions", "audit"];
+function activateTab(tab, focus, assetView) {
+  const valid = ["overview", "incidents", "actions", "permissions", "audit"];
   if (!valid.includes(tab)) tab = "overview";
   state.tab = tab;
   state.focus = focus || "";
+  state.assetView = !!assetView;
   document.querySelectorAll(".tab").forEach((b) => {
     b.classList.toggle("active", b.dataset.tab === tab);
   });
   document.querySelectorAll(".tab-panel").forEach((p) => p.classList.add("hidden"));
   const panel = $("tab-" + tab);
   if (panel) panel.classList.remove("hidden");
-  setTabHash(tab, state.focus);
+  setTabHash(tab, state.focus, state.assetView);
   refreshTab();
 }
 
@@ -218,9 +224,9 @@ document.querySelectorAll(".tab").forEach((btn) => {
 });
 
 window.addEventListener("hashchange", () => {
-  const { tab, focus } = currentTabFromHash();
-  if (tab !== state.tab || (focus || "") !== (state.focus || "")) {
-    activateTab(tab, focus);
+  const { tab, focus, assetView } = currentTabFromHash();
+  if (tab !== state.tab || (focus || "") !== (state.focus || "") || !!state.assetView !== !!assetView) {
+    activateTab(tab, focus, assetView);
   }
 });
 
@@ -397,16 +403,92 @@ async function renderOverview() {
   g.appendChild(tile("最近操作", String((res.recent_actions || []).length), (res.recent_actions || []).slice(0, 2).map((a) => zh(a.state)).join(", ") || "-"));
 
   const openIncs = res.open_incidents || [];
+  const incByObj = buildIncIndex(openIncs);
+
+  // 资产长条列表
+  const list = el("div", { style: "margin-top:16px" });
+  list.appendChild(el("h2", { text: "监控状态", style: "margin-bottom:8px;font-size:14px" }));
   (res.assets || []).forEach((a) => {
     const h = computeAssetHealth(a, openIncs);
-    const card = el("div", { class: "tile", style: "cursor:pointer", onclick: () => activateTab("assets", a.id) });
-    card.appendChild(el("div", { class: "label", text: a.id }));
-    card.appendChild(el("div", { class: "value", text: a.display_name }));
-    card.appendChild(el("div", { class: "sub", text: h.openCount ? `${h.openCount} 个异常` : "全部正常" }));
-    card.appendChild(badge(h.health, h.healthCls));
-    card.appendChild(badge(h.coverage, h.coverageCls));
-    g.appendChild(card);
+    const expanded = state.focus === a.id;
+    // 长条行
+    const row = el("div", {
+      style: `background:var(--card);border:1px solid var(--line);border-radius:10px;margin-bottom:6px;overflow:hidden`,
+    });
+    const head = el("div", {
+      style: "display:flex;align-items:center;gap:12px;padding:12px 16px;cursor:pointer",
+      onclick: () => {
+        const newFocus = expanded ? "" : a.id;
+        activateTab("overview", newFocus, false);
+      },
+    }, [
+      el("span", { text: expanded ? "▾" : "▸", style: "width:16px;color:var(--dim)" }),
+      el("span", { text: `${a.id} · ${a.display_name}`, style: "font-weight:500;flex:1" }),
+      badge(h.health, h.healthCls),
+      badge(h.coverage, h.coverageCls),
+      el("button", {
+        class: "btn small", text: "详情",
+        onclick: (e) => {
+          e.stopPropagation();
+          activateTab("overview", a.id, true);
+        },
+      }),
+    ]);
+    row.appendChild(head);
+
+    // 展开区：对象表 + 操作
+    if (expanded) {
+      const body = el("div", {
+        style: "padding:0 16px 16px;border-top:1px solid var(--line)",
+      });
+      body.appendChild(el("p", {
+        class: "muted small",
+        text: `read=${a.read_alias} write=${a.write_alias} host_id=${a.expected_host_id || "未登记"}`,
+        style: "margin:12px 0",
+      }));
+      const objs = a.objects || [];
+      if (objs.length) {
+        const table = el("table");
+        table.appendChild(el("tr", {}, [
+          el("th", { text: "对象" }), el("th", { text: "类型" }), el("th", { text: "配置" }), el("th", { text: "状态" }),
+        ]));
+        objs.forEach((o) => {
+          const st = computeObjectStatus(o, a.id, incByObj);
+          const cfg = o.unit || o.container || (o.port ? `${o.port}/${o.protocol}` : (o.external_probe || "-"));
+          table.appendChild(el("tr", {}, [
+            el("td", { text: o.name }),
+            el("td", { class: "muted small", text: o.kind }),
+            el("td", { class: "muted small", text: cfg }),
+            el("td", {}, [badge(st.label, st.cls)]),
+          ]));
+        });
+        body.appendChild(table);
+      }
+      const actions = el("div", { class: "row-actions", style: "margin-top:12px" }, [
+        el("button", {
+          class: "btn", text: "只读调查",
+          onclick: async () => {
+            const r = await api(`/api/assets/${a.id}/investigate`, {
+              method: "POST",
+              body: JSON.stringify({ capability: "asset.summary" }),
+            });
+            showModal("调查结果", [el("pre", { text: JSON.stringify(r, null, 2) })]);
+          },
+        }),
+        el("button", {
+          class: "btn", text: "探测状态",
+          onclick: async () => {
+            const r = await api(`/api/prom/probe?asset=${encodeURIComponent(a.id)}`);
+            showModal("Prometheus 探测", [el("pre", { text: JSON.stringify(r, null, 2) })]);
+          },
+        }),
+      ]);
+      body.appendChild(actions);
+      row.appendChild(body);
+    }
+    list.appendChild(row);
   });
+  g.appendChild(list);
 }
 
 function tile(label, value, sub, badgeCls, badgeText) {
@@ -427,27 +509,26 @@ async function renderAssets() {
   const incRes = await api("/api/incidents?status=open");
   const openIncs = (incRes && incRes.ok && incRes.incidents) || [];
   const incByObj = buildIncIndex(openIncs);
-  const allAssets = res.assets || [];
   const focusId = state.focus;
 
-  // 有 focus 时只显示单个资产 + 返回按钮
-  const showAssets = focusId ? allAssets.filter((a) => a.id === focusId) : allAssets;
-  if (focusId && showAssets.length === 0) {
+  if (!focusId) {
+    activateTab("overview", "", false);
+    return;
+  }
+
+  const a = (res.assets || []).find((x) => x.id === focusId);
+  root.appendChild(el("div", { style: "margin-bottom:12px" }, [
+    el("button", {
+      class: "btn", text: "< 返回总览",
+      onclick: () => activateTab("overview", "", false),
+    }),
+  ]));
+  if (!a) {
     root.appendChild(el("div", { class: "card muted", text: `未找到资产 ${focusId}` }));
+    return;
   }
 
-  if (focusId) {
-    const back = el("div", { style: "margin-bottom:12px" }, [
-      el("button", {
-        class: "btn", text: "< 返回全部资产",
-        onclick: () => activateTab("assets", ""),
-      }),
-    ]);
-    root.appendChild(back);
-  }
-
-  showAssets.forEach((a) => {
-    const h = computeAssetHealth(a, openIncs);
+  const h = computeAssetHealth(a, openIncs);
     const card = el("div", { class: "card" });
     const head = el("div", { style: "display:flex;justify-content:space-between;align-items:center" });
     head.appendChild(el("h2", { text: `${a.id} · ${a.display_name}` }));
@@ -502,7 +583,6 @@ async function renderAssets() {
     ]);
     card.appendChild(actions);
     root.appendChild(card);
-  });
 }
 
 async function renderIncidents() {
