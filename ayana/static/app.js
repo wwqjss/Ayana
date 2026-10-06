@@ -482,7 +482,7 @@ async function renderOverview() {
         style: "margin:12px 0",
       }));
 
-      // 对象表 + 状态
+      // 对象表：监控状态融入状态列
       const objs = a.objects || [];
       if (objs.length) {
         const table = el("table");
@@ -502,45 +502,32 @@ async function renderOverview() {
         body.appendChild(table);
       }
 
-      // 实时探测数据
-      const probeDiv = el("div", { id: `probe-${a.id}`, style: "margin-top:12px" });
-      body.appendChild(probeDiv);
-
-      // 直接用 overview 返回的探测数据
+      // 探测状态融入：作为表格下方一行（不另起标题段）
       const probe = a.probe || {};
       const hysteria = a.hysteria_proxy || {};
+      const probeLine = el("div", {
+        style: "margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap",
+      });
 
       if (probe.state === "ok") {
-        probeDiv.appendChild(el("div", { style: "display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap" }, [
-          el("span", { class: "muted small", text: "探测:" }),
-          badge("探测正常", "ok"),
-          probe.sample_at ? el("span", { class: "muted small", text: fmtTime(probe.sample_at) }) : "",
-        ]));
+        probeLine.appendChild(badge("探测正常", "ok"));
+        if (probe.sample_at) probeLine.appendChild(el("span", { class: "muted small", text: fmtTime(probe.sample_at) }));
       } else if (probe.state === "fail") {
-        probeDiv.appendChild(el("div", { style: "display:flex;gap:8px;align-items:center;margin-bottom:8px" }, [
-          el("span", { class: "muted small", text: "探测:" }),
-          badge("探测失败", "bad"),
-        ]));
+        probeLine.appendChild(badge("探测失败", "bad"));
       } else if (probe.state === "unavailable") {
-        probeDiv.appendChild(el("div", { class: "muted small", text: "探测: 无数据（未配外部探测）" }));
+        probeLine.appendChild(badge("无外部探测", "warn"));
       }
 
-      // Hysteria 代理探测
       if (hysteria.targets && hysteria.targets.length) {
-        probeDiv.appendChild(el("div", { class: "muted small", text: "代理探测:", style: "margin-top:8px" }));
         hysteria.targets.forEach((t) => {
           const ok = t.value === 1;
-          probeDiv.appendChild(el("div", {
-            style: "display:flex;gap:8px;align-items:center;padding:2px 0",
-          }, [
-            badge(t.target, ok ? "ok" : "bad"),
-            el("span", { class: "muted small", text: ok ? "可达" : "不可达" }),
-          ]));
+          probeLine.appendChild(badge(t.target, ok ? "ok" : "bad"));
         });
       }
 
-      // 操作按钮
-      const actions = el("div", { class: "row-actions", style: "margin-top:12px" }, [
+      if (probeLine.children.length) body.appendChild(probeLine);
+
+      body.appendChild(el("div", { class: "row-actions", style: "margin-top:12px" }, [
         el("button", {
           class: "btn", text: "只读调查",
           onclick: async () => {
@@ -551,8 +538,7 @@ async function renderOverview() {
             showModal("调查结果", [el("pre", { text: JSON.stringify(r, null, 2) })]);
           },
         }),
-      ]);
-      body.appendChild(actions);
+      ]));
       row.appendChild(body);
     }
     list.appendChild(row);
@@ -718,6 +704,31 @@ async function openIncidentDetail(incId) {
     body.appendChild(el("p", { class: "muted small", text: sum.suggestion }));
   }
 
+  // 关联操作（左右对应）
+  const relatedActions = inc.actions || [];
+  if (relatedActions.length) {
+    body.appendChild(el("h3", { text: "关联操作", style: "margin:16px 0 8px;font-size:14px" }));
+    relatedActions.forEach((a) => {
+      const st = a.state;
+      const cls = st === "success" ? "ok" : st === "failure" || st === "unknown" ? "bad" : "warn";
+      const cap = ZH_CAP && ZH_CAP[a.capability] || a.capability;
+      const row = el("div", {
+        style: "display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--line);cursor:pointer",
+        onclick: () => {
+          $("modal").classList.add("hidden");
+          activateTab("actions", a.id);
+        },
+      }, [
+        el("div", {}, [
+          el("div", { text: `${cap} · ${zh(st)}` }),
+          el("div", { class: "muted small", text: `${a.asset_id}/${a.object_id} · ${fmtTime(a.finished_at || a.created_at)}` }),
+        ]),
+        badge(zh(st), cls),
+      ]);
+      body.appendChild(row);
+    });
+  }
+
   // 时间线
   if ((sum.timeline || []).length) {
     body.appendChild(el("h3", { text: "时间线", style: "margin:16px 0 8px;font-size:14px" }));
@@ -728,15 +739,6 @@ async function openIncidentDetail(incId) {
         style: "padding:3px 0",
       }));
     });
-  }
-
-  // 最近操作
-  if (sum.last_action) {
-    body.appendChild(el("p", {
-      class: "muted small",
-      text: `最近操作: ${sum.last_action.capability_zh || ""} · ${sum.last_action.state_zh || ""}`,
-      style: "margin-top:12px",
-    }));
   }
 
   // 操作按钮
@@ -783,22 +785,43 @@ async function renderActions() {
     const card = el("div", { class: "card" });
     const st = a.state;
     const cls = st === "success" ? "ok" : st === "failure" || st === "unknown" ? "bad" : st === "proposed" ? "warn" : "dim";
-    card.appendChild(el("h2", {}, [
-      document.createTextNode(a.capability + " "),
-      badge(zh(st), cls),
+    const cap = zh(a.capability) || a.capability;
+
+    // 头部：标题+状态 | 完成时间
+    const head = el("div", { style: "display:flex;justify-content:space-between;align-items:flex-start" });
+    head.appendChild(el("div", {}, [
+      el("h2", {}, [
+        document.createTextNode(cap + " "),
+        badge(zh(st), cls),
+      ]),
+      el("p", {
+        class: "muted small",
+        text: `${a.id} · ${a.asset_id}/${a.object_id} · ${a.reason || ""}`,
+      }),
     ]));
-    card.appendChild(el("p", {
+    // 右上角完成时间
+    const doneTime = a.finished_at || a.approved_at || a.created_at;
+    head.appendChild(el("div", {
       class: "muted small",
-      text: `${a.id} · ${a.asset_id}/${a.object_id} · ${a.reason || ""}`,
+      text: fmtTime(doneTime),
+      style: "flex-shrink:0;white-space:nowrap",
     }));
+    card.appendChild(head);
+
     card.appendChild(el("p", {
       class: "muted small",
       text: `发起 ${fmtTime(a.created_at)}`
         + (a.approved_at ? ` · 批准 ${fmtTime(a.approved_at)}` : "")
-        + (a.finished_at ? ` · 结束 ${fmtTime(a.finished_at)}` : "")
         + (a.approver_id ? ` · 批准人 ${a.approver_id}` : ""),
     }));
+    // 操作按钮 + 关联事件
     const row = el("div", { class: "row-actions" });
+    if (a.incident_id) {
+      row.appendChild(el("button", {
+        class: "btn small", text: "查看事件",
+        onclick: () => openIncidentDetail(a.incident_id),
+      }));
+    }
     if (st === "proposed") {
       row.appendChild(el("button", {
         class: "btn primary small", text: "批准",
