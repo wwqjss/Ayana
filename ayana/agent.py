@@ -211,10 +211,13 @@ class AgentLoop:
                     incident_id=inc_id,
                     payload={"action_id": action_id, "rule": rule.id},
                 )
+                from .fmt import fmt_agent_exec
+
+                inc_d = dict(self.db.query_one("SELECT * FROM incidents WHERE id=?", (inc_id,)) or {})
                 self.notifier.enqueue(
                     dedup_key=f"agent:{inc_id}:{rule.id}:{int(now())}",
                     target="",
-                    body=f"[Ayana] Agent 执行 {rule.name}\n{inc_id} → {rule.capability}\n{action_id}",
+                    body=fmt_agent_exec(inc_d, rule.name, rule.capability),
                 )
             else:
                 self._escalate(inc_id, f"exec_{exec_result.get('state')}", llm_result)
@@ -257,6 +260,12 @@ class AgentLoop:
         )
 
     def _escalate(self, inc_id: str, reason: str, llm_result: dict | None = None) -> None:
+        from .fmt import fmt_escalate
+
+        inc = self.db.query_one("SELECT * FROM incidents WHERE id=?", (inc_id,))
+        inc_d = dict(inc) if inc else {"id": inc_id, "title": "", "asset_id": "", "object_id": ""}
+        llm_summary = (llm_result or {}).get("summary", "")
+        body = fmt_escalate(inc_d, reason, llm_summary)
         detail = reason
         if llm_result:
             detail += f" | llm: {llm_result.get('summary', '')[:80]}"
@@ -273,5 +282,5 @@ class AgentLoop:
         self.notifier.enqueue(
             dedup_key=f"agent:esc:{inc_id}:{int(now())}",
             target="",
-            body=f"[Ayana] Agent 需要你\n{inc_id}\n原因: {detail[:200]}",
+            body=body,
         )

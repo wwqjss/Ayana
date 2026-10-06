@@ -29,7 +29,7 @@ class TestSummaryText(unittest.TestCase):
         self.assertIn("inc1", text)
         self.assertIn("nerv/frps", text)
         self.assertIn("处理中", text)
-        self.assertEqual(inc.summary_text("nope"), "未找到 Incident")
+        self.assertEqual(inc.summary_text("nope"), "未找到事件")
         db.close()
         tmp.cleanup()
 

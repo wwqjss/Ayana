@@ -176,7 +176,7 @@ class QQBot:
                 f"{r['id']} [{_zstage(r['stage'])}/{_zstatus(r['status'])}] {r['title'][:50]}"
                 for r in rows
             )
-        return self.incidents.summary_text(inc_id)
+        return self.incidents.summary_text(inc_id, for_qq=True)
 
     async def _investigate(self, args: list[str], actor_type: str, actor_id: str) -> str:
         if not args:

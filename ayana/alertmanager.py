@@ -90,6 +90,8 @@ class AlertIngest:
         if not self._notifier:
             return
         try:
+            from .fmt import fmt_incident_open, fmt_incident_resolved
+
             event_type = {
                 "opened": "incident_opened",
                 "reopened": "incident_reopened",
@@ -105,7 +107,10 @@ class AlertIngest:
             inc = self._row_dict(
                 self.db.query_one("SELECT * FROM incidents WHERE id=?", (inc_id,))
             )
-            body = f"[Ayana] {inc.get('title','')}\n{inc_id} {typ}"
+            if typ == "resolved":
+                body = fmt_incident_resolved(inc)
+            else:
+                body = fmt_incident_open(inc)
             self._notifier.enqueue_for_event(ev["id"], body=body, typ=typ)
         except Exception:
             pass

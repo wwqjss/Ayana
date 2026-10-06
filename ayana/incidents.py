@@ -261,22 +261,65 @@ class IncidentService:
         ]
         return data
 
-    def summary_text(self, inc_id: str) -> str:
+    def summary_text(self, inc_id: str, *, for_qq: bool = False) -> str:
         inc = self.get_incident(inc_id)
         if not inc:
-            return "未找到 Incident"
+            return "未找到事件"
         title = inc.get("title") or ""
         for en, cn in (
-            ("TargetDown", "探测目标不可达"),
-            ("PrometheusJobMissing", "采集目标丢失"),
-            ("DiskUsageHigh", "磁盘使用率过高"),
-            ("MemoryLow", "可用内存不足"),
+            ("TargetDown", "服务不可达"),
+            ("PrometheusJobMissing", "采集丢失"),
+            ("DiskUsageHigh", "磁盘过高"),
+            ("MemoryLow", "内存不足"),
         ):
             title = title.replace(en, cn)
+        status = _z(inc.get("status"), ZH_STATUS)
+        stage = _z(inc.get("stage"), ZH_STAGE)
+        created = inc.get("created_at")
+        resolved = inc.get("resolved_at")
+        from datetime import datetime, timezone, timedelta
+
+        cst = timezone(timedelta(hours=8))
+
+        def _t(ts):
+            return datetime.fromtimestamp(ts, cst).strftime("%m-%d %H:%M") if ts else "-"
+
+        if for_qq:
+            lines = [
+                f"📋 事件详情",
+                title,
+                f"资产: {inc.get('asset_id') or '?'} / 对象: {inc.get('object_id') or '?'}",
+                f"状态: {status} / 阶段: {stage}",
+                f"发现: {_t(created)}",
+            ]
+            if resolved:
+                lines.append(f"解决: {_t(resolved)}")
+            if inc.get("need_human"):
+                lines.append(f"⚠ 需人工: {inc.get('need_human_reason', '')[:80]}")
+            for e in (inc.get("events") or [])[-4:]:
+                etype = e.get("type", "")
+                zh_map = {
+                    "incident_opened": "发现异常",
+                    "alert_fired": "告警触发",
+                    "alert_resolved": "告警恢复",
+                    "investigation": "完成调查",
+                    "action_proposed": "提出处置",
+                    "action_approved": "批准处置",
+                    "action_success": "处置完成",
+                    "action_failure": "处置失败",
+                    "action_unknown": "处置结果未知",
+                    "verified_recovered": "验证通过",
+                    "verify_not_passed": "验证未通过",
+                    "agent_auto_exec": "自动处置",
+                    "agent_escalated": "转人工",
+                }
+                label = zh_map.get(etype, e.get("title") or etype)
+                lines.append(f"  · {_t(e.get('at'))} {label}")
+            return "\n".join(lines)
         lines = [
             f"Incident {inc['id']}",
             title,
-            f"状态: {_z(inc.get('status'), ZH_STATUS)} / 阶段: {_z(inc.get('stage'), ZH_STAGE)}"
+            f"状态: {status} / 阶段: {stage}"
             + (" / 需人工" if inc.get("need_human") else ""),
         ]
         if inc.get("need_human_reason"):
