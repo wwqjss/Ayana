@@ -325,6 +325,45 @@ async function refreshTab() {
   if (state.tab === "audit") await renderAudit();
 }
 
+/* ---- 统一健康状态 ---- */
+function computeAssetHealth(asset, openIncs) {
+  const openCount = openIncs.filter((i) => i.asset_id === asset.id).length;
+  const hasProbe = (asset.objects || []).some((o) => o.kind === "probe" || o.external_probe);
+  return {
+    openCount,
+    hasProbe,
+    health: openCount > 0 ? "异常" : "正常",
+    healthCls: openCount > 0 ? "bad" : "ok",
+    coverage: hasProbe ? "已覆盖" : "未覆盖外部探测",
+    coverageCls: hasProbe ? "ok" : "warn",
+  };
+}
+
+function computeObjectStatus(obj, assetId, incByObj) {
+  const keys = [
+    `${assetId}/${obj.id}`,
+    `${assetId}/${obj.name}`,
+    `${assetId}/${assetId}:${obj.kind}:${obj.name}`,
+  ];
+  const hit = keys.map((k) => incByObj[k]).find(Boolean);
+  return hit ? { label: "异常", cls: "bad", inc: hit } : { label: "正常", cls: "ok", inc: null };
+}
+
+function buildIncIndex(openIncs) {
+  const idx = {};
+  openIncs.forEach((i) => {
+    const keys = [
+      `${i.asset_id}/${i.object_id}`,
+      `${i.asset_id}/${i.asset_id}:service:${i.object_id}`,
+      `${i.asset_id}/${i.asset_id}:container:${i.object_id}`,
+      `${i.asset_id}/${i.asset_id}:port:${i.object_id}`,
+      `${i.asset_id}/${i.asset_id}:probe:${i.object_id}`,
+    ];
+    keys.forEach((k) => { idx[k] = i; });
+  });
+  return idx;
+}
+
 async function renderOverview() {
   const res = await api("/api/overview");
   if (!res.ok) return;
@@ -332,10 +371,8 @@ async function renderOverview() {
   g.innerHTML = "";
   $("quiet-banner").classList.toggle("hidden", !res.quiet);
   $("human-banner").classList.toggle("hidden", !(res.need_human || []).length);
-  // 需人工 banner 可点击跳到事件
   $("human-banner").onclick = () => activateTab("incidents", "");
 
-  // 需人工列表
   if ((res.need_human || []).length) {
     const list = el("div", { class: "card", style: "margin-bottom:12px" });
     list.appendChild(el("h2", { text: "需要人工处理" }));
@@ -355,32 +392,21 @@ async function renderOverview() {
     g.appendChild(list);
   }
 
-  // 监控状态卡片
   g.appendChild(tile("活动事件", String((res.open_incidents || []).length), "处理中的异常", (res.open_incidents || []).length ? "warn" : "ok", (res.open_incidents || []).length ? "有异常" : "正常"));
   g.appendChild(tile("需人工", String((res.need_human || []).length), (res.need_human || []).map((i) => i.id).join(", ") || "无需人工", (res.need_human || []).length ? "bad" : "ok", (res.need_human || []).length ? "有" : "无"));
   g.appendChild(tile("最近操作", String((res.recent_actions || []).length), (res.recent_actions || []).slice(0, 2).map((a) => zh(a.state)).join(", ") || "-"));
 
-  // 各资产监控状态（按 probe / open incidents 判断）
-  const assets = res.assets || [];
-  const openByAsset = {};
-  (res.open_incidents || []).forEach((i) => {
-    openByAsset[i.asset_id] = (openByAsset[i.asset_id] || 0) + 1;
-  });
-
-  for (const a of assets) {
-    const openCount = openByAsset[a.id] || 0;
-    const hasProbe = (a.objects || []).some((o) => o.kind === "probe");
-    let status = "正常", cls = "ok";
-    if (openCount > 0) { status = `${openCount} 个异常`; cls = "bad"; }
-    else if (!hasProbe) { status = "无探测配置"; cls = "warn"; }
-
-    const card = el("div", { class: "tile", style: "cursor:pointer", onclick: () => { activateTab("assets", a.id); } });
+  const openIncs = res.open_incidents || [];
+  (res.assets || []).forEach((a) => {
+    const h = computeAssetHealth(a, openIncs);
+    const card = el("div", { class: "tile", style: "cursor:pointer", onclick: () => activateTab("assets", a.id) });
     card.appendChild(el("div", { class: "label", text: a.id }));
     card.appendChild(el("div", { class: "value", text: a.display_name }));
-    card.appendChild(el("div", { class: "sub", text: `read=${a.read_alias} write=${a.write_alias}` }));
-    card.appendChild(badge(status, cls));
+    card.appendChild(el("div", { class: "sub", text: h.openCount ? `${h.openCount} 个异常` : "全部正常" }));
+    card.appendChild(badge(h.health, h.healthCls));
+    card.appendChild(badge(h.coverage, h.coverageCls));
     g.appendChild(card);
-  }
+  });
 }
 
 function tile(label, value, sub, badgeCls, badgeText) {
@@ -400,30 +426,42 @@ async function renderAssets() {
   root.innerHTML = "";
   const incRes = await api("/api/incidents?status=open");
   const openIncs = (incRes && incRes.ok && incRes.incidents) || [];
-  const incByObj = {};
-  openIncs.forEach((i) => {
-    incByObj[`${i.asset_id}/${i.object_id}`] = i;
-    incByObj[`${i.asset_id}/${i.asset_id}:service:${i.object_id}`] = i;
-    incByObj[`${i.asset_id}/${i.asset_id}:container:${i.object_id}`] = i;
-    incByObj[`${i.asset_id}/${i.asset_id}:port:${i.object_id}`] = i;
-    incByObj[`${i.asset_id}/${i.asset_id}:probe:${i.object_id}`] = i;
-  });
-  (res.assets || []).forEach((a) => {
-    const openCount = openIncs.filter((i) => i.asset_id === a.id).length;
-    const hasProbe = (a.objects || []).some((o) => o.kind === "probe" || o.external_probe);
-    let status = "正常", cls = "ok";
-    if (openCount > 0) { status = `${openCount} 个异常`; cls = "bad"; }
-    else if (!hasProbe && a.id !== "kanata") { status = "无外部探测"; cls = "warn"; }
+  const incByObj = buildIncIndex(openIncs);
+  const allAssets = res.assets || [];
+  const focusId = state.focus;
 
+  // 有 focus 时只显示单个资产 + 返回按钮
+  const showAssets = focusId ? allAssets.filter((a) => a.id === focusId) : allAssets;
+  if (focusId && showAssets.length === 0) {
+    root.appendChild(el("div", { class: "card muted", text: `未找到资产 ${focusId}` }));
+  }
+
+  if (focusId) {
+    const back = el("div", { style: "margin-bottom:12px" }, [
+      el("button", {
+        class: "btn", text: "< 返回全部资产",
+        onclick: () => activateTab("assets", ""),
+      }),
+    ]);
+    root.appendChild(back);
+  }
+
+  showAssets.forEach((a) => {
+    const h = computeAssetHealth(a, openIncs);
     const card = el("div", { class: "card" });
     const head = el("div", { style: "display:flex;justify-content:space-between;align-items:center" });
     head.appendChild(el("h2", { text: `${a.id} · ${a.display_name}` }));
-    head.appendChild(badge(status, cls));
+    const badges = el("div", { style: "display:flex;gap:8px" }, [
+      badge(h.health, h.healthCls),
+      badge(h.coverage, h.coverageCls),
+    ]);
+    head.appendChild(badges);
     card.appendChild(head);
     card.appendChild(el("p", {
       class: "muted small",
       text: `read=${a.read_alias} write=${a.write_alias} host_id=${a.expected_host_id || "未登记"}`,
     }));
+
     const objs = a.objects || [];
     if (objs.length) {
       const table = el("table");
@@ -431,20 +469,18 @@ async function renderAssets() {
         el("th", { text: "对象" }), el("th", { text: "类型" }), el("th", { text: "配置" }), el("th", { text: "状态" }),
       ]));
       objs.forEach((o) => {
-        const objInc = incByObj[`${a.id}/${o.id}`] || incByObj[`${a.id}/${o.name}`]
-          || incByObj[`${a.id}/${a.id}:${o.kind}:${o.name}`] || incByObj[`${a.id}/${o.name}`];
-        const st = objInc ? "异常" : "正常";
-        const stCls = objInc ? "bad" : "ok";
+        const st = computeObjectStatus(o, a.id, incByObj);
         const cfg = o.unit || o.container || (o.port ? `${o.port}/${o.protocol}` : (o.external_probe || "-"));
         table.appendChild(el("tr", {}, [
           el("td", { text: o.name }),
           el("td", { class: "muted small", text: o.kind }),
           el("td", { class: "muted small", text: cfg }),
-          el("td", {}, [badge(st, stCls)]),
+          el("td", {}, [badge(st.label, st.cls)]),
         ]));
       });
       card.appendChild(table);
     }
+
     const actions = el("div", { class: "row-actions", style: "margin-top:12px" }, [
       el("button", {
         class: "btn", text: "只读调查",
@@ -453,7 +489,6 @@ async function renderAssets() {
             method: "POST",
             body: JSON.stringify({ capability: "asset.summary" }),
           });
-          setTabHash("assets", a.id);
           showModal("调查结果", [el("pre", { text: JSON.stringify(r, null, 2) })]);
         },
       }),
@@ -461,7 +496,6 @@ async function renderAssets() {
         class: "btn", text: "探测状态",
         onclick: async () => {
           const r = await api(`/api/prom/probe?asset=${encodeURIComponent(a.id)}`);
-          setTabHash("assets", a.id);
           showModal("Prometheus 探测", [el("pre", { text: JSON.stringify(r, null, 2) })]);
         },
       }),
@@ -469,10 +503,6 @@ async function renderAssets() {
     card.appendChild(actions);
     root.appendChild(card);
   });
-  if (state.focus) {
-    const hit = (res.assets || []).find((x) => x.id === state.focus);
-    if (hit) setTabHash("assets", hit.id);
-  }
 }
 
 async function renderIncidents() {
