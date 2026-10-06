@@ -92,6 +92,7 @@ class WebApp:
         app.router.add_post("/api/assets/{asset_id}/investigate", self.api_investigate)
         app.router.add_get("/api/incidents", self.api_incidents)
         app.router.add_get("/api/incidents/{inc_id}", self.api_incident_detail)
+        app.router.add_post("/api/incidents/{inc_id}/close", self.api_incident_close)
         app.router.add_get("/api/actions", self.api_actions)
         app.router.add_post("/api/actions", self.api_action_propose)
         app.router.add_post("/api/actions/{aid}/approve", self.api_action_approve)
@@ -402,10 +403,117 @@ class WebApp:
 
     async def api_incident_detail(self, request: web.Request) -> web.Response:
         self._require_auth(request)
-        inc = self.incidents.get_incident(request.match_info["inc_id"])
+        inc_id = request.match_info["inc_id"]
+        inc = self.incidents.get_incident(inc_id)
         if not inc:
             return _json({"ok": False, "error": "not_found"}, 404)
-        return _json({"ok": True, "incident": inc})
+        # 附加人话摘要
+        from .fmt import alert_name
+
+        actions_list = inc.get("actions") or []
+        last_action = actions_list[-1] if actions_list else None
+        summary = self._incident_human_summary(inc, last_action)
+        return _json({"ok": True, "incident": inc, "summary": summary})
+
+    def _incident_human_summary(self, inc: dict, action: dict | None) -> dict:
+        from .fmt import ZH_CAP, ZH_STAGE, ZH_STATE, alert_name
+
+        timeline = []
+        zh_event = {
+            "incident_opened": "发现异常",
+            "alert_fired": "告警触发",
+            "alert_resolved": "告警恢复",
+            "investigation": "完成调查",
+            "action_proposed": "提出处置",
+            "action_approved": "批准处置",
+            "action_dispatched": "派发执行",
+            "action_success": "处置完成",
+            "action_failure": "处置失败",
+            "action_unknown": "处置结果未知",
+            "verified_recovered": "验证通过",
+            "verify_not_passed": "验证未通过",
+            "agent_auto_exec": "自动处置",
+            "agent_escalated": "转人工",
+            "incident_resolved": "事件解决",
+        }
+        for e in (inc.get("events") or [])[-8:]:
+            timeline.append({
+                "time": e.get("at"),
+                "label": zh_event.get(e.get("type", ""), e.get("title", "")),
+            })
+
+        what = alert_name(inc.get("title", ""))
+        why_human = inc.get("need_human_reason", "")
+        zh_reason = why_human
+        for en, cn in (
+            ("no_runbook_match", "没有匹配的自动处置规则"),
+            ("policy_denied", "没有自动处置权限"),
+            ("budget_exhausted", "自动处置次数已用完"),
+            ("auto_remediation_disabled", "自动处置未开启"),
+            ("exec_unknown", "执行结果未知，无法确认是否生效"),
+            ("exec_failure", "执行失败"),
+            ("verify_failed", "恢复验证未通过"),
+            ("verify_inconclusive", "恢复验证不充分"),
+        ):
+            if en in why_human:
+                zh_reason = cn
+                break
+
+        suggestion = ""
+        cap = (action or {}).get("capability", "")
+        if inc.get("need_human"):
+            if "verify" in why_human or "exec_unknown" in why_human:
+                suggestion = "手动检查服务状态，确认后可重新发起处置"
+            elif "no_runbook" in why_human or "policy" in why_human:
+                suggestion = "手动处理或添加处置规则/权限"
+            elif "budget" in why_human:
+                suggestion = "等待冷却期结束或手动处置"
+            else:
+                suggestion = "查看详情后决定下一步"
+        elif inc.get("status") == "open":
+            suggestion = "系统正在处理，稍候刷新"
+
+        return {
+            "title": what,
+            "status_zh": {"open": "处理中", "resolved": "已解决", "closed": "已关闭"}.get(inc.get("status"), inc.get("status")),
+            "stage_zh": ZH_STAGE.get(inc.get("stage"), inc.get("stage")),
+            "why_human": zh_reason if inc.get("need_human") else "",
+            "suggestion": suggestion,
+            "timeline": timeline,
+            "last_action": {
+                "capability_zh": ZH_CAP.get(cap, cap),
+                "state_zh": ZH_STATE.get((action or {}).get("state", ""), ""),
+            } if action else None,
+        }
+
+    async def api_incident_close(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        self._check_csrf(request, sess)
+        inc_id = request.match_info["inc_id"]
+        body = await request.json()
+        reason = body.get("reason", "人工关闭")
+        row = self.db.query_one("SELECT * FROM incidents WHERE id=?", (inc_id,))
+        if not row:
+            return _json({"ok": False, "error": "not_found"}, 404)
+        with self.db.tx() as conn:
+            conn.execute(
+                "UPDATE incidents SET status='closed', stage='done', need_human=0,"
+                " need_human_reason='', resolved_at=?, updated_at=? WHERE id=?",
+                (now(), now(), inc_id),
+            )
+            conn.execute(
+                "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
+                (inc_id, now(), "incident_closed", f"人工关闭: {reason}",
+                 json.dumps({"reason": reason}, ensure_ascii=False)),
+            )
+            conn.execute(
+                "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, object_id,"
+                " detail_json) VALUES(?,?,?,?,?,?,?)",
+                (now(), "web_user", sess["username"], "incident_closed",
+                 row["asset_id"] or "", inc_id,
+                 json.dumps({"reason": reason}, ensure_ascii=False)),
+            )
+        return _json({"ok": True})
 
     async def api_actions(self, request: web.Request) -> web.Response:
         self._require_auth(request)

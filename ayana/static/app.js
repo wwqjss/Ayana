@@ -398,24 +398,49 @@ async function renderAssets() {
   if (!res.ok) return;
   const root = $("assets-list");
   root.innerHTML = "";
+  const incRes = await api("/api/incidents?status=open");
+  const openIncs = (incRes && incRes.ok && incRes.incidents) || [];
+  const incByObj = {};
+  openIncs.forEach((i) => {
+    incByObj[`${i.asset_id}/${i.object_id}`] = i;
+    incByObj[`${i.asset_id}/${i.asset_id}:service:${i.object_id}`] = i;
+    incByObj[`${i.asset_id}/${i.asset_id}:container:${i.object_id}`] = i;
+    incByObj[`${i.asset_id}/${i.asset_id}:port:${i.object_id}`] = i;
+    incByObj[`${i.asset_id}/${i.asset_id}:probe:${i.object_id}`] = i;
+  });
   (res.assets || []).forEach((a) => {
+    const openCount = openIncs.filter((i) => i.asset_id === a.id).length;
+    const hasProbe = (a.objects || []).some((o) => o.kind === "probe" || o.external_probe);
+    let status = "正常", cls = "ok";
+    if (openCount > 0) { status = `${openCount} 个异常`; cls = "bad"; }
+    else if (!hasProbe && a.id !== "kanata") { status = "无外部探测"; cls = "warn"; }
+
     const card = el("div", { class: "card" });
-    card.appendChild(el("h2", { text: `${a.id} · ${a.display_name}` }));
+    const head = el("div", { style: "display:flex;justify-content:space-between;align-items:center" });
+    head.appendChild(el("h2", { text: `${a.id} · ${a.display_name}` }));
+    head.appendChild(badge(status, cls));
+    card.appendChild(head);
     card.appendChild(el("p", {
       class: "muted small",
-      text: `read=${a.read_alias} write=${a.write_alias} host_id=${a.expected_host_id || "未登记"} prom=${a.prom_asset || "-"}`,
+      text: `read=${a.read_alias} write=${a.write_alias} host_id=${a.expected_host_id || "未登记"}`,
     }));
     const objs = a.objects || [];
     if (objs.length) {
       const table = el("table");
       table.appendChild(el("tr", {}, [
-        el("th", { text: "kind" }), el("th", { text: "name" }), el("th", { text: "unit/container" }), el("th", { text: "auto" }),
+        el("th", { text: "对象" }), el("th", { text: "类型" }), el("th", { text: "配置" }), el("th", { text: "状态" }),
       ]));
       objs.forEach((o) => {
+        const objInc = incByObj[`${a.id}/${o.id}`] || incByObj[`${a.id}/${o.name}`]
+          || incByObj[`${a.id}/${a.id}:${o.kind}:${o.name}`] || incByObj[`${a.id}/${o.name}`];
+        const st = objInc ? "异常" : "正常";
+        const stCls = objInc ? "bad" : "ok";
+        const cfg = o.unit || o.container || (o.port ? `${o.port}/${o.protocol}` : (o.external_probe || "-"));
         table.appendChild(el("tr", {}, [
-          el("td", { text: o.kind }), el("td", { text: o.name }),
-          el("td", { text: o.unit || o.container || (o.port ? o.port + "/" + o.protocol : "-") }),
-          el("td", { text: o.auto_recover ? "是" : "否" }),
+          el("td", { text: o.name }),
+          el("td", { class: "muted small", text: o.kind }),
+          el("td", { class: "muted small", text: cfg }),
+          el("td", {}, [badge(st, stCls)]),
         ]));
       });
       card.appendChild(table);
@@ -437,7 +462,7 @@ async function renderAssets() {
         onclick: async () => {
           const r = await api(`/api/prom/probe?asset=${encodeURIComponent(a.id)}`);
           setTabHash("assets", a.id);
-          showModal("Prometheus probe", [el("pre", { text: JSON.stringify(r, null, 2) })]);
+          showModal("Prometheus 探测", [el("pre", { text: JSON.stringify(r, null, 2) })]);
         },
       }),
     ]);
@@ -489,7 +514,80 @@ async function renderIncidents() {
 async function openIncidentDetail(incId) {
   setTabHash("incidents", incId);
   const d = await api("/api/incidents/" + incId);
-  showModal(incId, [el("pre", { text: JSON.stringify(d.incident || d, null, 2) })]);
+  if (!d.ok) return;
+  const inc = d.incident || {};
+  const sum = d.summary || {};
+  const body = el("div");
+
+  // 标题
+  body.appendChild(el("h2", { text: sum.title || inc.title || "" }));
+  body.appendChild(el("p", {
+    class: "muted small",
+    text: `状态: ${sum.status_zh || ""} · 阶段: ${sum.stage_zh || ""}`,
+  }));
+
+  // 为什么需要人工
+  if (sum.why_human) {
+    const box = el("div", {
+      style: "background:rgba(229,192,123,.12);border-radius:8px;padding:12px;margin:12px 0",
+    });
+    box.appendChild(el("div", { text: "为什么需要你", style: "font-weight:600;margin-bottom:4px" }));
+    box.appendChild(el("div", { text: sum.why_human }));
+    if (sum.suggestion) box.appendChild(el("div", { class: "muted small", text: sum.suggestion, style: "margin-top:6px" }));
+    body.appendChild(box);
+  } else if (sum.suggestion) {
+    body.appendChild(el("p", { class: "muted small", text: sum.suggestion }));
+  }
+
+  // 时间线
+  if ((sum.timeline || []).length) {
+    body.appendChild(el("h3", { text: "时间线", style: "margin:16px 0 8px;font-size:14px" }));
+    (sum.timeline || []).forEach((t) => {
+      body.appendChild(el("div", {
+        class: "muted small",
+        text: `${fmtTime(t.time)}  ${t.label}`,
+        style: "padding:3px 0",
+      }));
+    });
+  }
+
+  // 最近操作
+  if (sum.last_action) {
+    body.appendChild(el("p", {
+      class: "muted small",
+      text: `最近操作: ${sum.last_action.capability_zh || ""} · ${sum.last_action.state_zh || ""}`,
+      style: "margin-top:12px",
+    }));
+  }
+
+  // 操作按钮
+  const actions = el("div", { class: "row-actions", style: "margin-top:16px" });
+  if (inc.status === "open" || inc.status === "resolved") {
+    actions.appendChild(el("button", {
+      class: "btn danger", text: "手动关闭",
+      onclick: async () => {
+        const reason = prompt("关闭原因:", "问题已解决");
+        if (!reason) return;
+        await api(`/api/incidents/${incId}/close`, { method: "POST", body: JSON.stringify({ reason }) });
+        $("modal").classList.add("hidden");
+        refreshTab();
+      },
+    }));
+  }
+  actions.appendChild(el("button", {
+    class: "btn", text: "原始数据",
+    onclick: () => {
+      $("modal-body").innerHTML = "";
+      $("modal-body").appendChild(el("pre", { text: JSON.stringify(inc, null, 2) }));
+      $("modal-body").appendChild(el("div", { class: "modal-actions" }, [
+        el("button", { class: "btn", text: "关闭", onclick: () => $("modal").classList.add("hidden") }),
+      ]));
+    },
+  }));
+  body.appendChild(actions);
+
+  showModal("", [body]);
+  $("modal-title").textContent = "事件详情";
 }
 
 async function renderActions() {
