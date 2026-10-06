@@ -332,15 +332,55 @@ async function renderOverview() {
   g.innerHTML = "";
   $("quiet-banner").classList.toggle("hidden", !res.quiet);
   $("human-banner").classList.toggle("hidden", !(res.need_human || []).length);
+  // 需人工 banner 可点击跳到事件
+  $("human-banner").onclick = () => activateTab("incidents", "");
 
-  g.appendChild(tile("资产", String((res.assets || []).length), "已登记对象"));
-  g.appendChild(tile("活动事件", String((res.open_incidents || []).length), "open incidents"));
-  g.appendChild(tile("需人工", String((res.need_human || []).length), (res.need_human || []).map((i) => i.id).join(", ")));
-  g.appendChild(tile("最近操作", String((res.recent_actions || []).length), (res.recent_actions || []).slice(0, 2).map((a) => a.state).join(", ")));
+  // 需人工列表
+  if ((res.need_human || []).length) {
+    const list = el("div", { class: "card", style: "margin-bottom:12px" });
+    list.appendChild(el("h2", { text: "需要人工处理" }));
+    res.need_human.forEach((i) => {
+      const row = el("div", {
+        style: "display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--line);cursor:pointer",
+        onclick: () => openIncidentDetail(i.id),
+      }, [
+        el("div", {}, [
+          el("div", { text: zh(i.title || ""), style: "font-size:14px" }),
+          el("div", { class: "muted small", text: `${i.id} · ${zh(i.need_human_reason || "")}` }),
+        ]),
+        el("button", { class: "btn small", text: "查看" }),
+      ]);
+      list.appendChild(row);
+    });
+    g.appendChild(list);
+  }
 
-  (res.assets || []).forEach((a) => {
-    g.appendChild(tile(a.id, a.display_name, `read=${a.read_alias} write=${a.write_alias}`, a.expected_host_id ? "ok" : "warn", a.expected_host_id ? "host_id 已登记" : "host_id 未核实"));
+  // 监控状态卡片
+  g.appendChild(tile("活动事件", String((res.open_incidents || []).length), "处理中的异常", (res.open_incidents || []).length ? "warn" : "ok", (res.open_incidents || []).length ? "有异常" : "正常"));
+  g.appendChild(tile("需人工", String((res.need_human || []).length), (res.need_human || []).map((i) => i.id).join(", ") || "无需人工", (res.need_human || []).length ? "bad" : "ok", (res.need_human || []).length ? "有" : "无"));
+  g.appendChild(tile("最近操作", String((res.recent_actions || []).length), (res.recent_actions || []).slice(0, 2).map((a) => zh(a.state)).join(", ") || "-"));
+
+  // 各资产监控状态（按 probe / open incidents 判断）
+  const assets = res.assets || [];
+  const openByAsset = {};
+  (res.open_incidents || []).forEach((i) => {
+    openByAsset[i.asset_id] = (openByAsset[i.asset_id] || 0) + 1;
   });
+
+  for (const a of assets) {
+    const openCount = openByAsset[a.id] || 0;
+    const hasProbe = (a.objects || []).some((o) => o.kind === "probe");
+    let status = "正常", cls = "ok";
+    if (openCount > 0) { status = `${openCount} 个异常`; cls = "bad"; }
+    else if (!hasProbe) { status = "无探测配置"; cls = "warn"; }
+
+    const card = el("div", { class: "tile", style: "cursor:pointer", onclick: () => { activateTab("assets", a.id); } });
+    card.appendChild(el("div", { class: "label", text: a.id }));
+    card.appendChild(el("div", { class: "value", text: a.display_name }));
+    card.appendChild(el("div", { class: "sub", text: `read=${a.read_alias} write=${a.write_alias}` }));
+    card.appendChild(badge(status, cls));
+    g.appendChild(card);
+  }
 }
 
 function tile(label, value, sub, badgeCls, badgeText) {
@@ -617,23 +657,67 @@ $("perm-save").addEventListener("click", async () => {
 });
 
 async function renderAudit() {
-  const res = await api("/api/audit?limit=80");
   const root = $("audit-list");
   root.innerHTML = "";
-  if (!res.ok) return;
-  const table = el("table");
-  table.appendChild(el("tr", {}, [
-    el("th", { text: "时间" }), el("th", { text: "主体" }), el("th", { text: "条目" }), el("th", { text: "资产/对象" }),
-  ]));
-  (res.audit || []).forEach((a) => {
+
+  // 筛选栏
+  const bar = el("div", { class: "card" });
+  bar.appendChild(el("h2", { text: "审计日志" }));
+  const row = el("div", { class: "form-row" });
+  const kw = el("input", { id: "audit-kw", placeholder: "搜索关键词…" });
+  const from = el("input", { id: "audit-from", type: "datetime-local" });
+  const to = el("input", { id: "audit-to", type: "datetime-local" });
+  const btn = el("button", { class: "btn primary", text: "搜索", onclick: () => doSearch() });
+  const btnReset = el("button", { class: "btn", text: "重置", onclick: () => {
+    kw.value = ""; from.value = ""; to.value = ""; doSearch();
+  }});
+  row.appendChild(el("label", { text: "关键词" }, [kw]));
+  row.appendChild(el("label", { text: "从" }, [from]));
+  row.appendChild(el("label", { text: "到" }, [to]));
+  row.appendChild(btn);
+  row.appendChild(btnReset);
+  bar.appendChild(row);
+  root.appendChild(bar);
+
+  const resultDiv = el("div");
+  root.appendChild(resultDiv);
+
+  async function doSearch() {
+    const params = new URLSearchParams();
+    if (kw.value) params.set("q", kw.value);
+    if (from.value) params.set("from", String(new Date(from.value).getTime() / 1000));
+    if (to.value) params.set("to", String(new Date(to.value).getTime() / 1000));
+    params.set("limit", "200");
+    const res = await api(`/api/audit?${params}`);
+    resultDiv.innerHTML = "";
+    if (!res.ok) return;
+    const list = res.audit || [];
+    if (!list.length) {
+      resultDiv.appendChild(el("div", { class: "card muted", text: "无匹配记录" }));
+      return;
+    }
+    const table = el("table");
     table.appendChild(el("tr", {}, [
-      el("td", { text: fmtTime(a.at) }),
-      el("td", { text: a.actor_type + ":" + a.actor_id }),
-      el("td", { text: a.entry }),
-      el("td", { text: (a.asset_id || "-") + "/" + (a.object_id || "-") }),
+      el("th", { text: "时间" }), el("th", { text: "主体" }), el("th", { text: "条目" }), el("th", { text: "资产/对象" }), el("th", { text: "详情" }),
     ]));
-  });
-  root.appendChild(table);
+    list.forEach((a) => {
+      const detail = (() => {
+        try {
+          const d = JSON.parse(a.detail_json || "{}");
+          return Object.entries(d).map(([k, v]) => `${k}=${v}`).join(" ").slice(0, 80);
+        } catch { return ""; }
+      })();
+      table.appendChild(el("tr", {}, [
+        el("td", { text: fmtTime(a.at) }),
+        el("td", { text: a.actor_type + ":" + a.actor_id }),
+        el("td", { text: a.entry }),
+        el("td", { text: (a.asset_id || "-") + "/" + (a.object_id || "-") }),
+        el("td", { class: "muted small", text: detail }),
+      ]));
+    });
+    resultDiv.appendChild(table);
+  }
+  doSearch();
 }
 
 /* ---- modal ---- */

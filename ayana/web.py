@@ -516,8 +516,36 @@ class WebApp:
 
     async def api_audit(self, request: web.Request) -> web.Response:
         self._require_auth(request)
-        limit = min(200, int(request.rel_url.query.get("limit", "50")))
-        rows = self.db.query("SELECT * FROM audit_log ORDER BY at DESC LIMIT ?", (limit,))
+        limit = min(500, int(request.rel_url.query.get("limit", "50")))
+        q = request.rel_url.query.get("q", "").strip()
+        ts_from = request.rel_url.query.get("from", "")
+        ts_to = request.rel_url.query.get("to", "")
+
+        where = []
+        params: list[Any] = []
+        if q:
+            where.append("(entry LIKE ? OR actor_id LIKE ? OR asset_id LIKE ? OR object_id LIKE ? OR detail_json LIKE ?)")
+            like = f"%{q}%"
+            params.extend([like, like, like, like, like])
+        if ts_from:
+            try:
+                where.append("at>=?")
+                params.append(float(ts_from))
+            except ValueError:
+                pass
+        if ts_to:
+            try:
+                where.append("at<=?")
+                params.append(float(ts_to))
+            except ValueError:
+                pass
+
+        sql = "SELECT * FROM audit_log"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY at DESC LIMIT ?"
+        params.append(limit)
+        rows = self.db.query(sql, tuple(params))
         return _json({"ok": True, "audit": [dict(r) for r in rows]})
 
     async def api_notifications(self, request: web.Request) -> web.Response:
