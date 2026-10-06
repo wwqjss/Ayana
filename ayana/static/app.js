@@ -334,14 +334,33 @@ async function refreshTab() {
 /* ---- 统一健康状态 ---- */
 function computeAssetHealth(asset, openIncs) {
   const openCount = openIncs.filter((i) => i.asset_id === asset.id).length;
-  const hasProbe = (asset.objects || []).some((o) => o.kind === "probe" || o.external_probe);
+  const hasProbe = (asset.objects || []).some((o) =>
+    o.kind === "probe" || o.external_probe || o.name.includes("probe")
+  );
+  // 用真实探测数据
+  const probe = asset.probe || {};
+  const hysteria = asset.hysteria_proxy || {};
+  let health = "正常", healthCls = "ok";
+  if (openCount > 0) {
+    health = `${openCount} 个异常`;
+    healthCls = "bad";
+  } else if (probe.state === "fail" || hysteria.state === "fail") {
+    health = "探测失败";
+    healthCls = "bad";
+  } else if (probe.state === "ok" || hysteria.state === "ok") {
+    health = "正常";
+    healthCls = "ok";
+  }
   return {
     openCount,
     hasProbe,
-    health: openCount > 0 ? "异常" : "正常",
-    healthCls: openCount > 0 ? "bad" : "ok",
+    health,
+    healthCls,
     coverage: hasProbe ? "已覆盖" : "未覆盖外部探测",
     coverageCls: hasProbe ? "ok" : "warn",
+    probeState: probe.state,
+    hysteriaState: hysteria.state,
+    hysteriaTargets: hysteria.targets || [],
   };
 }
 
@@ -375,12 +394,14 @@ async function renderOverview() {
   if (!res.ok) return;
   const g = $("overview-grid");
   g.innerHTML = "";
+  g.style.display = "block";
   $("quiet-banner").classList.toggle("hidden", !res.quiet);
   $("human-banner").classList.toggle("hidden", !(res.need_human || []).length);
   $("human-banner").onclick = () => activateTab("incidents", "");
 
+  // 需人工列表
   if ((res.need_human || []).length) {
-    const list = el("div", { class: "card", style: "margin-bottom:12px" });
+    const list = el("div", { class: "card", style: "margin-bottom:16px" });
     list.appendChild(el("h2", { text: "需要人工处理" }));
     res.need_human.forEach((i) => {
       const row = el("div", {
@@ -398,32 +419,47 @@ async function renderOverview() {
     g.appendChild(list);
   }
 
-  g.appendChild(tile("活动事件", String((res.open_incidents || []).length), "处理中的异常", (res.open_incidents || []).length ? "warn" : "ok", (res.open_incidents || []).length ? "有异常" : "正常"));
-  g.appendChild(tile("需人工", String((res.need_human || []).length), (res.need_human || []).map((i) => i.id).join(", ") || "无需人工", (res.need_human || []).length ? "bad" : "ok", (res.need_human || []).length ? "有" : "无"));
-  g.appendChild(tile("最近操作", String((res.recent_actions || []).length), (res.recent_actions || []).slice(0, 2).map((a) => zh(a.state)).join(", ") || "-"));
+  // 紧凑统计条
+  const stats = el("div", {
+    style: "display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap",
+  });
+  const mkStat = (label, value, cls) => {
+    return el("div", {
+      style: "flex:1;min-width:120px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 16px;display:flex;align-items:center;gap:10px",
+    }, [
+      el("span", { class: `badge ${cls}`, text: value, style: "font-size:18px;min-width:32px;text-align:center" }),
+      el("span", { text: label, style: "font-size:13px;color:var(--dim)" }),
+    ]);
+  };
+  const openN = (res.open_incidents || []).length;
+  const humanN = (res.need_human || []).length;
+  const actN = (res.recent_actions || []).length;
+  stats.appendChild(mkStat("活动事件", String(openN), openN ? "warn" : "ok"));
+  stats.appendChild(mkStat("需人工", String(humanN), humanN ? "bad" : "ok"));
+  stats.appendChild(mkStat("最近操作", String(actN), "dim"));
+  g.appendChild(stats);
 
+  // 资产长条
   const openIncs = res.open_incidents || [];
   const incByObj = buildIncIndex(openIncs);
-
-  // 资产长条列表
-  const list = el("div", { style: "margin-top:16px" });
+  const list = el("div", {});
   list.appendChild(el("h2", { text: "监控状态", style: "margin-bottom:8px;font-size:14px" }));
+
   (res.assets || []).forEach((a) => {
     const h = computeAssetHealth(a, openIncs);
     const expanded = state.focus === a.id;
-    // 长条行
     const row = el("div", {
-      style: `background:var(--card);border:1px solid var(--line);border-radius:10px;margin-bottom:6px;overflow:hidden`,
+      style: "background:var(--card);border:1px solid var(--line);border-radius:10px;margin-bottom:6px;overflow:hidden",
     });
     const head = el("div", {
-      style: "display:flex;align-items:center;gap:12px;padding:12px 16px;cursor:pointer",
+      style: "display:flex;align-items:center;gap:10px;padding:10px 16px;cursor:pointer",
       onclick: () => {
         const newFocus = expanded ? "" : a.id;
         activateTab("overview", newFocus, false);
       },
     }, [
-      el("span", { text: expanded ? "▾" : "▸", style: "width:16px;color:var(--dim)" }),
-      el("span", { text: `${a.id} · ${a.display_name}`, style: "font-weight:500;flex:1" }),
+      el("span", { text: expanded ? "▾" : "▸", style: "width:16px;color:var(--dim);flex-shrink:0" }),
+      el("span", { text: `${a.id} · ${a.display_name}`, style: "font-weight:500;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" }),
       badge(h.health, h.healthCls),
       badge(h.coverage, h.coverageCls),
       el("button", {
@@ -436,7 +472,6 @@ async function renderOverview() {
     ]);
     row.appendChild(head);
 
-    // 展开区：对象表 + 操作
     if (expanded) {
       const body = el("div", {
         style: "padding:0 16px 16px;border-top:1px solid var(--line)",
@@ -446,6 +481,8 @@ async function renderOverview() {
         text: `read=${a.read_alias} write=${a.write_alias} host_id=${a.expected_host_id || "未登记"}`,
         style: "margin:12px 0",
       }));
+
+      // 对象表 + 状态
       const objs = a.objects || [];
       if (objs.length) {
         const table = el("table");
@@ -464,6 +501,45 @@ async function renderOverview() {
         });
         body.appendChild(table);
       }
+
+      // 实时探测数据
+      const probeDiv = el("div", { id: `probe-${a.id}`, style: "margin-top:12px" });
+      body.appendChild(probeDiv);
+
+      // 直接用 overview 返回的探测数据
+      const probe = a.probe || {};
+      const hysteria = a.hysteria_proxy || {};
+
+      if (probe.state === "ok") {
+        probeDiv.appendChild(el("div", { style: "display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap" }, [
+          el("span", { class: "muted small", text: "探测:" }),
+          badge("探测正常", "ok"),
+          probe.sample_at ? el("span", { class: "muted small", text: fmtTime(probe.sample_at) }) : "",
+        ]));
+      } else if (probe.state === "fail") {
+        probeDiv.appendChild(el("div", { style: "display:flex;gap:8px;align-items:center;margin-bottom:8px" }, [
+          el("span", { class: "muted small", text: "探测:" }),
+          badge("探测失败", "bad"),
+        ]));
+      } else if (probe.state === "unavailable") {
+        probeDiv.appendChild(el("div", { class: "muted small", text: "探测: 无数据（未配外部探测）" }));
+      }
+
+      // Hysteria 代理探测
+      if (hysteria.targets && hysteria.targets.length) {
+        probeDiv.appendChild(el("div", { class: "muted small", text: "代理探测:", style: "margin-top:8px" }));
+        hysteria.targets.forEach((t) => {
+          const ok = t.value === 1;
+          probeDiv.appendChild(el("div", {
+            style: "display:flex;gap:8px;align-items:center;padding:2px 0",
+          }, [
+            badge(t.target, ok ? "ok" : "bad"),
+            el("span", { class: "muted small", text: ok ? "可达" : "不可达" }),
+          ]));
+        });
+      }
+
+      // 操作按钮
       const actions = el("div", { class: "row-actions", style: "margin-top:12px" }, [
         el("button", {
           class: "btn", text: "只读调查",
@@ -473,13 +549,6 @@ async function renderOverview() {
               body: JSON.stringify({ capability: "asset.summary" }),
             });
             showModal("调查结果", [el("pre", { text: JSON.stringify(r, null, 2) })]);
-          },
-        }),
-        el("button", {
-          class: "btn", text: "探测状态",
-          onclick: async () => {
-            const r = await api(`/api/prom/probe?asset=${encodeURIComponent(a.id)}`);
-            showModal("Prometheus 探测", [el("pre", { text: JSON.stringify(r, null, 2) })]);
           },
         }),
       ]);

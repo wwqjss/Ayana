@@ -306,7 +306,36 @@ class WebApp:
 
     async def api_overview(self, request: web.Request) -> web.Response:
         self._require_auth(request)
-        assets = self.db.query("SELECT * FROM assets ORDER BY id")
+        assets_raw = self.db.query("SELECT * FROM assets ORDER BY id")
+        assets = []
+        for a in assets_raw:
+            d = dict(a)
+            d["objects"] = [
+                dict(o)
+                for o in self.db.query("SELECT * FROM objects WHERE asset_id=?", (a["id"],))
+            ]
+            # 实时探测状态
+            try:
+                probe = await self.prom.probe_success(a["id"], "")
+                d["probe"] = summarize_probe(probe)
+            except Exception:
+                d["probe"] = {"state": "unavailable"}
+            # hysteria 代理探测
+            if a["id"] == "sora":
+                try:
+                    hy = await self.prom.query('hysteria_proxy_up')
+                    hy_samples = hy.get("result") or []
+                    hy_ok = all(s.get("value") == 1 for s in hy_samples) if hy_samples else False
+                    d["hysteria_proxy"] = {
+                        "state": "ok" if hy_ok else "fail",
+                        "targets": [
+                            {"target": s.get("metric", {}).get("target", "?"), "value": s.get("value")}
+                            for s in hy_samples
+                        ],
+                    }
+                except Exception:
+                    d["hysteria_proxy"] = {"state": "unavailable"}
+            assets.append(d)
         open_inc = self.incidents.list_incidents(status="open", limit=10)
         need = [i for i in open_inc if i.get("need_human")]
         actions = self.actions.list_actions(limit=10)
@@ -324,7 +353,7 @@ class WebApp:
             {
                 "ok": True,
                 "version": self.version,
-                "assets": [dict(a) for a in assets],
+                "assets": assets,
                 "open_incidents": open_inc,
                 "need_human": need,
                 "recent_actions": actions,
