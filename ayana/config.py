@@ -42,6 +42,9 @@ SECRET_KEYS = (
     "web_auth_pepper",
     "session_signing_key",
     "totp_encrypt_key",
+    "llm_api_key",
+    "llm_base_url",
+    "llm_model",
 )
 
 

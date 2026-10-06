@@ -33,6 +33,42 @@ async function api(path, opts = {}) {
   return data;
 }
 
+/* ---- i18n maps ---- */
+const ZH = {
+  // status
+  open: "处理中",
+  resolved: "已解决",
+  closed: "已关闭",
+  // stage
+  pending: "待调查",
+  investigating: "调查中",
+  awaiting_approval: "待批准",
+  executing: "执行中",
+  verifying: "验证中",
+  watching: "观察中",
+  done: "完成",
+  need_human: "需人工",
+  // action state
+  proposed: "已提案",
+  approved: "已批准",
+  dispatched: "已派发",
+  success: "成功",
+  failure: "失败",
+  unknown: "结果未知",
+  cancelled: "已取消",
+  expired: "已过期",
+  // alert names
+  TargetDown: "探测目标不可达",
+  PrometheusJobMissing: "采集目标丢失",
+  PrometheusNotConnectedToAlertmanager: "Prometheus 未连接告警",
+  DiskUsageHigh: "磁盘使用率过高",
+  MemoryLow: "可用内存不足",
+};
+
+function zh(s) {
+  return ZH[s] || s;
+}
+
 function fmtTime(ts) {
   if (!ts) return "-";
   const d = new Date(ts * 1000);
@@ -54,7 +90,8 @@ function showMain() {
   $("main-view").classList.remove("hidden");
   $("username").textContent = state.user && state.user.username || "";
   $("ver").textContent = state.version || "";
-  refreshTab();
+  const { tab, focus } = currentTabFromHash();
+  activateTab(tab, focus);
 }
 
 $("use-recovery").addEventListener("click", (e) => {
@@ -100,16 +137,19 @@ $("totp-btn").addEventListener("click", async () => {
     return;
   }
   showModal("绑定 TOTP", [
-    el("p", { class: "muted small", text: "使用 Microsoft Authenticator 等扫码或手动输入：" }),
-    el("pre", { text: setup.otpauth }),
-    el("p", { class: "muted small", text: "Secret: " + setup.secret }),
-    el("label", { text: "当前密码（首次绑定可留空；更换必填）" }, [
-      el("input", { id: "totp-setup-password", type: "password", style: "width:100%;margin-top:8px;padding:8px" }),
-    ]),
+    el("p", { class: "muted small", text: "用 Microsoft Authenticator / 谷歌验证器扫码：" }),
+    el("div", {
+      id: "totp-qr",
+      style: "background:#fff;padding:12px;border-radius:8px;display:inline-block;margin:8px 0",
+    }),
+    el("p", { class: "muted small", text: "扫码不可用时，手动输入 Secret：" }),
+    el("pre", { id: "totp-secret", text: setup.secret, style: "user-select:all" }),
+    el("p", { class: "muted small", text: "otpauth：" }),
+    el("pre", { text: setup.otpauth, style: "user-select:all;font-size:10px;max-height:80px" }),
     el("label", { text: "输入 6 位验证码确认" }, [
       el("input", { id: "totp-confirm-code", maxlength: "6", style: "width:140px;margin-top:8px;padding:8px" }),
     ]),
-    el("label", { text: "当前密码（更换 2FA 时必填）" }, [
+    el("label", { text: "当前密码（首次绑定可留空；更换必填）" }, [
       el("input", { id: "totp-confirm-password", type: "password", style: "width:100%;margin-top:8px;padding:8px" }),
     ]),
     el("div", { id: "totp-result" }),
@@ -126,7 +166,6 @@ $("totp-btn").addEventListener("click", async () => {
           $("totp-result").textContent = res.message || res.error || "失败";
           return;
         }
-        // 服务端已换发 CSRF / 新会话
         if (res.csrf_token) state.csrf = res.csrf_token;
         $("modal-body").innerHTML = "";
         $("modal-body").appendChild(el("p", { text: "已启用 2FA。请保存恢复码（仅显示一次）：" }));
@@ -134,18 +173,55 @@ $("totp-btn").addEventListener("click", async () => {
       },
     }),
   ]);
+  // 渲染 QR
+  try {
+    const qr = window.QR.encode(setup.otpauth, 4);
+    $("totp-qr").innerHTML = window.QR.toSvg(qr, 4);
+  } catch (e) {
+    $("totp-qr").innerHTML = '<span class="muted small">二维码生成失败，请用 Secret 手动添加</span>';
+  }
 });
 
 /* ---- tabs ---- */
+function currentTabFromHash() {
+  const h = (location.hash || "").replace(/^#/, "");
+  const m = h.match(/^(overview|assets|incidents|actions|permissions|audit)(?:\/(.+))?$/);
+  return m ? { tab: m[1], focus: m[2] || "" } : { tab: "overview", focus: "" };
+}
+
+function setTabHash(tab, focus) {
+  const h = focus ? `#${tab}/${focus}` : `#${tab}`;
+  if (location.hash !== h) {
+    history.replaceState(null, "", h);
+  }
+}
+
+function activateTab(tab, focus) {
+  const valid = ["overview", "assets", "incidents", "actions", "permissions", "audit"];
+  if (!valid.includes(tab)) tab = "overview";
+  state.tab = tab;
+  state.focus = focus || "";
+  document.querySelectorAll(".tab").forEach((b) => {
+    b.classList.toggle("active", b.dataset.tab === tab);
+  });
+  document.querySelectorAll(".tab-panel").forEach((p) => p.classList.add("hidden"));
+  const panel = $("tab-" + tab);
+  if (panel) panel.classList.remove("hidden");
+  setTabHash(tab, state.focus);
+  refreshTab();
+}
+
 document.querySelectorAll(".tab").forEach((btn) => {
   btn.addEventListener("click", () => {
-    document.querySelectorAll(".tab").forEach((b) => b.classList.remove("active"));
-    btn.classList.add("active");
-    state.tab = btn.dataset.tab;
-    document.querySelectorAll(".tab-panel").forEach((p) => p.classList.add("hidden"));
-    $("tab-" + state.tab).classList.remove("hidden");
-    refreshTab();
+    activateTab(btn.dataset.tab, "");
   });
+});
+
+window.addEventListener("hashchange", () => {
+  const { tab, focus } = currentTabFromHash();
+  if (tab !== state.tab || (focus || "") !== (state.focus || "")) {
+    activateTab(tab, focus);
+  }
 });
 
 async function boot() {
@@ -171,8 +247,9 @@ function fillSelects() {
   const capOpts = state.caps.map((c) => ({ v: c.name, t: c.name + " (" + c.kind + ")" }));
   fillSelect("act-asset", assetOpts);
   fillSelect("perm-asset", [{ v: "*", t: "*(全部)" }, ...assetOpts]);
-  fillSelect("act-cap", capOpts.filter((c) => c.t.includes("write") || true));
+  fillSelect("act-cap", capOpts);
   fillSelect("perm-cap", capOpts);
+  refreshObjectSelect();
 }
 
 function fillSelect(id, opts) {
@@ -186,6 +263,58 @@ function fillSelect(id, opts) {
     s.appendChild(op);
   });
 }
+
+function refreshObjectSelect() {
+  const assetId = $("act-asset").value;
+  const asset = state.assets.find((a) => a.id === assetId);
+  const objs = (asset && asset.objects) || [];
+  const sel = $("act-object");
+  const prev = sel.value;
+  sel.innerHTML = "";
+  objs.forEach((o) => {
+    const op = document.createElement("option");
+    op.value = o.name;
+    op.textContent = `${o.name} (${o.kind})`;
+    sel.appendChild(op);
+  });
+  if (prev && objs.some((o) => o.name === prev)) sel.value = prev;
+  refreshCapabilitySelect();
+}
+
+function refreshCapabilitySelect() {
+  const assetId = $("act-asset").value;
+  const asset = state.assets.find((a) => a.id === assetId);
+  const objName = $("act-object").value;
+  const obj = ((asset && asset.objects) || []).find((o) => o.name === objName);
+  const kind = obj ? obj.kind : "";
+  // 对象类型 → 可用能力
+  const KIND_CAPS = {
+    service: ["asset.summary", "service.status", "service.logs", "service.restart", "service.start", "service.stop"],
+    container: ["asset.summary", "service.status", "service.logs", "container.restart"],
+    port: ["port.listen", "asset.summary"],
+    probe: ["probe.status"],
+    filesystem: ["disk.usage", "asset.summary"],
+    "": ["asset.summary", "disk.usage", "memory.available", "load.current"],
+  };
+  const allowed = new Set(KIND_CAPS[kind] || KIND_CAPS[""]);
+  const sel = $("act-cap");
+  const prev = sel.value;
+  sel.innerHTML = "";
+  state.caps
+    .filter((c) => allowed.has(c.name))
+    .forEach((c) => {
+      const op = document.createElement("option");
+      op.value = c.name;
+      const kindLabel = c.kind === "write" ? "写" : "读";
+      const desc = c.description || "";
+      op.textContent = `${c.name} (${kindLabel})` + (desc ? ` — ${desc}` : "");
+      sel.appendChild(op);
+    });
+  if (prev && Array.from(sel.options).some((o) => o.value === prev)) sel.value = prev;
+}
+
+$("act-asset").addEventListener("change", refreshObjectSelect);
+$("act-object").addEventListener("change", refreshCapabilitySelect);
 
 async function refreshTab() {
   if (state.tab === "overview") await renderOverview();
@@ -259,6 +388,7 @@ async function renderAssets() {
             method: "POST",
             body: JSON.stringify({ capability: "asset.summary" }),
           });
+          setTabHash("assets", a.id);
           showModal("调查结果", [el("pre", { text: JSON.stringify(r, null, 2) })]);
         },
       }),
@@ -266,6 +396,7 @@ async function renderAssets() {
         class: "btn", text: "探测状态",
         onclick: async () => {
           const r = await api(`/api/prom/probe?asset=${encodeURIComponent(a.id)}`);
+          setTabHash("assets", a.id);
           showModal("Prometheus probe", [el("pre", { text: JSON.stringify(r, null, 2) })]);
         },
       }),
@@ -273,6 +404,10 @@ async function renderAssets() {
     card.appendChild(actions);
     root.appendChild(card);
   });
+  if (state.focus) {
+    const hit = (res.assets || []).find((x) => x.id === state.focus);
+    if (hit) setTabHash("assets", hit.id);
+  }
 }
 
 async function renderIncidents() {
@@ -287,22 +422,34 @@ async function renderIncidents() {
   }
   list.forEach((i) => {
     const card = el("div", { class: "card" });
-    card.appendChild(el("h2", { text: i.title }));
+    // 标题里的告警名翻成中文
+    const title = (i.title || "").replace(/TargetDown|PrometheusJobMissing|DiskUsageHigh|MemoryLow/g, (m) => zh(m));
+    card.appendChild(el("h2", { text: title }));
     card.appendChild(el("p", {
       class: "muted small",
-      text: `${i.id} · ${i.status} · ${i.stage}` + (i.need_human ? " · 需人工: " + (i.need_human_reason || "") : ""),
+      text: `${i.id} · ${zh(i.status)} · ${zh(i.stage)}`
+        + (i.need_human ? " · 需人工: " + (i.need_human_reason || "") : ""),
+    }));
+    card.appendChild(el("p", {
+      class: "muted small",
+      text: `发现 ${fmtTime(i.created_at)} · 更新 ${fmtTime(i.updated_at)}`
+        + (i.resolved_at ? ` · 解决 ${fmtTime(i.resolved_at)}` : ""),
     }));
     card.appendChild(el("div", { class: "row-actions" }, [
       el("button", {
         class: "btn small", text: "详情",
-        onclick: async () => {
-          const d = await api("/api/incidents/" + i.id);
-          showModal(i.id, [el("pre", { text: JSON.stringify(d.incident || d, null, 2) })]);
-        },
+        onclick: () => openIncidentDetail(i.id),
       }),
     ]));
     root.appendChild(card);
   });
+  if (state.focus) openIncidentDetail(state.focus);
+}
+
+async function openIncidentDetail(incId) {
+  setTabHash("incidents", incId);
+  const d = await api("/api/incidents/" + incId);
+  showModal(incId, [el("pre", { text: JSON.stringify(d.incident || d, null, 2) })]);
 }
 
 async function renderActions() {
@@ -321,11 +468,18 @@ async function renderActions() {
     const cls = st === "success" ? "ok" : st === "failure" || st === "unknown" ? "bad" : st === "proposed" ? "warn" : "dim";
     card.appendChild(el("h2", {}, [
       document.createTextNode(a.capability + " "),
-      badge(st, cls),
+      badge(zh(st), cls),
     ]));
     card.appendChild(el("p", {
       class: "muted small",
       text: `${a.id} · ${a.asset_id}/${a.object_id} · ${a.reason || ""}`,
+    }));
+    card.appendChild(el("p", {
+      class: "muted small",
+      text: `发起 ${fmtTime(a.created_at)}`
+        + (a.approved_at ? ` · 批准 ${fmtTime(a.approved_at)}` : "")
+        + (a.finished_at ? ` · 结束 ${fmtTime(a.finished_at)}` : "")
+        + (a.approver_id ? ` · 批准人 ${a.approver_id}` : ""),
     }));
     const row = el("div", { class: "row-actions" });
     if (st === "proposed") {
@@ -356,14 +510,20 @@ async function renderActions() {
     }
     row.appendChild(el("button", {
       class: "btn small", text: "详情",
-      onclick: async () => {
-        // 用 list 中的数据
-        showModal(a.id, [el("pre", { text: JSON.stringify(a, null, 2) })]);
-      },
+      onclick: () => openActionDetail(a),
     }));
     card.appendChild(row);
     root.appendChild(card);
   });
+  if (state.focus) {
+    const hit = (res.actions || []).find((x) => x.id === state.focus);
+    if (hit) openActionDetail(hit);
+  }
+}
+
+function openActionDetail(a) {
+  setTabHash("actions", a.id);
+  showModal(a.id, [el("pre", { text: JSON.stringify(a, null, 2) })]);
 }
 
 $("act-propose").addEventListener("click", async () => {
@@ -375,7 +535,28 @@ $("act-propose").addEventListener("click", async () => {
     params: {},
   };
   const res = await api("/api/actions", { method: "POST", body: JSON.stringify(body) });
-  showModal(res.ok ? "提案已创建" : "提案失败", [el("pre", { text: JSON.stringify(res, null, 2) })]);
+  if (res.ok) {
+    showModal("提案已创建", [
+      el("pre", { text: JSON.stringify(res, null, 2) }),
+      el("p", { class: "muted small", text: "请在下方列表批准后执行。" }),
+    ]);
+  } else {
+    const err = res.error || "";
+    let hint = res.message || err;
+    if (err.includes("denied_by_policy") || err.includes("denied")) {
+      hint = `权限不足：${body.capability} @ ${body.asset_id}/${body.object_id}\n`
+        + `请到「权限」页为你的账号添加该能力（勾选允许）。`;
+    } else if (err.includes("object_locked")) {
+      hint = "该对象有进行中/结果未知的操作，请先处理完。";
+    } else if (err.includes("object_not_registered")) {
+      const assetId = body.asset_id;
+      const asset = state.assets.find((a) => a.id === assetId);
+      const names = ((asset && asset.objects) || []).map((o) => o.name).join(", ") || "无";
+      hint = `对象未登记：「${body.object_id}」\n`
+        + `资产 ${assetId} 下可选对象：${names}`;
+    }
+    showModal("提案失败", [el("pre", { text: hint })]);
+  }
   refreshTab();
 });
 
@@ -463,7 +644,10 @@ function showModal(title, children) {
   (children || []).forEach((c) => body.appendChild(c));
   $("modal").classList.remove("hidden");
 }
-$("modal-close").addEventListener("click", () => $("modal").classList.add("hidden"));
+$("modal-close").addEventListener("click", () => {
+  $("modal").classList.add("hidden");
+  setTabHash(state.tab, "");
+});
 
 /* ---- init ---- */
 boot();

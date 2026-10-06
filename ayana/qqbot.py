@@ -29,6 +29,30 @@ HELP = """Ayana 命令
 /cancel <action_id> 取消操作
 """
 
+ZH_STATUS = {"open": "处理中", "resolved": "已解决", "closed": "已关闭"}
+ZH_STAGE = {
+    "pending": "待调查", "investigating": "调查中", "awaiting_approval": "待批准",
+    "executing": "执行中", "verifying": "验证中", "watching": "观察中",
+    "done": "完成", "need_human": "需人工",
+}
+ZH_STATE = {
+    "proposed": "已提案", "approved": "已批准", "dispatched": "已派发",
+    "success": "成功", "failure": "失败", "unknown": "结果未知",
+    "cancelled": "已取消", "expired": "已过期",
+}
+
+
+def _zstatus(s: str) -> str:
+    return ZH_STATUS.get(s, s)
+
+
+def _zstage(s: str) -> str:
+    return ZH_STAGE.get(s, s)
+
+
+def _zstate(s: str) -> str:
+    return ZH_STATE.get(s, s)
+
 
 class QQBot:
     def __init__(
@@ -121,7 +145,9 @@ class QQBot:
             lines.append("活动事件:")
             for i in incs:
                 flag = "⚠ " if i.get("need_human") else ""
-                lines.append(f"{flag}{i['id']} {i['title'][:40]} [{i['stage']}]")
+                lines.append(
+                    f"{flag}{i['id']} {i['title'][:40]} [{_zstage(i['stage'])}]"
+                )
         else:
             lines.append("没有需要你处理的事情")
         return "\n".join(lines)
@@ -147,7 +173,8 @@ class QQBot:
             if not rows:
                 return "无 Incident"
             return "\n".join(
-                f"{r['id']} [{r['stage']}] {r['title'][:50]}" for r in rows
+                f"{r['id']} [{_zstage(r['stage'])}/{_zstatus(r['status'])}] {r['title'][:50]}"
+                for r in rows
             )
         return self.incidents.summary_text(inc_id)
 
@@ -182,7 +209,9 @@ class QQBot:
             return "无操作记录"
         lines = []
         for r in rows:
-            lines.append(f"{r['id']} [{r['state']}] {r['capability']} {r['asset_id']}/{r['object_id']}")
+            lines.append(
+                f"{r['id']} [{_zstate(r['state'])}] {r['capability']} {r['asset_id']}/{r['object_id']}"
+            )
         return "\n".join(lines)
 
     def _approve(self, args: list[str], actor_type: str, actor_id: str) -> str:

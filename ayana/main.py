@@ -14,12 +14,14 @@ from aiohttp import web
 
 from . import VERSION
 from .actions import ActionService
+from .agent import AgentLoop
 from .alertmanager import AlertIngest
 from .auth import AuthService
 from .config import load_config
 from .db import Database, now
 from .incidents import IncidentService
 from .investigation import InvestigationService
+from .llm import make_llm
 from .ntsafe import AssetBinding, IdentityGate, NTClient
 from .notify import Notifier
 from .onewbot import OneBotServer
@@ -135,6 +137,20 @@ def seed_assets(db: Database) -> None:
                 ),
             )
     db.audit("system", "seed", "assets_seeded")
+    # auto_rule 基础权限：只读调查 + runbook 执行
+    from .policy import Policy
+
+    policy = Policy(db)
+    policy.upsert_permission(
+        subject_type="auto_rule", subject_id="agent", capability="asset.summary",
+        asset_id="*", object_id="*", allow=True, require_approval=False, auto_allowed=False, actor="system",
+    )
+    for cap in ("service.restart", "service.start", "service.stop"):
+        policy.upsert_permission(
+            subject_type="auto_rule", subject_id="agent", capability=cap,
+            asset_id="*", object_id="*", allow=True, require_approval=False,
+            auto_allowed=True, actor="system",
+        )
 
 
 def load_bindings(db: Database) -> list[AssetBinding]:
@@ -187,6 +203,12 @@ class App:
         self.notifier.set_default_target(
             f"user:{cfg['admin_qq']}" if cfg.get("admin_qq") else ""
         )
+        self.llm = make_llm(cfg)
+        self.agent = AgentLoop(
+            self.db, self.investigation, self.actions, self.policy,
+            self.llm, self.notifier,
+            auto_enabled=bool(cfg.get("auto_remediation_enabled", False)),
+        )
         self.ob = OneBotServer(cfg["onewbot_token"], int(cfg.get("self_id") or 0))
         self.qq = QQBot(
             self.db,
@@ -212,6 +234,7 @@ class App:
             webhook_token=cfg.get("webhook_token") or "",
             alert_ingest=self.alert_ingest,
             notifier=self.notifier,
+            agent=self.agent,
         )
         self._stop = asyncio.Event()
         self._bg_tasks: list[asyncio.Task] = []
@@ -252,10 +275,11 @@ class App:
                  self.cfg.get("ws_host"), self.cfg.get("ws_port"), self.cfg.get("ws_path"),
                  self.cfg.get("http_host"), self.cfg.get("http_port"))
 
-        # 后台：outbox、周期对账、事件关联
+        # 后台：outbox、周期对账、事件关联、Agent
         self._bg_tasks.append(asyncio.create_task(self._bg_outbox()))
         self._bg_tasks.append(asyncio.create_task(self._bg_reconcile()))
         self._bg_tasks.append(asyncio.create_task(self._bg_correlate()))
+        self._bg_tasks.append(asyncio.create_task(self._bg_agent()))
 
         # 推送通道
         async def _sender(target: str, body: str) -> bool:
@@ -286,6 +310,30 @@ class App:
             await asyncio.sleep(3)
 
     async def _bg_reconcile(self) -> None:
+        while not self._stop.is_set():
+            try:
+                if self.cfg.get("alertmanager_url"):
+                    alerts = await self.alert_ingest.fetch_am_alerts(self.cfg["alertmanager_url"])
+                    self.alert_ingest.reconcile(alerts)
+            except Exception as e:
+                log.warning("AM reconcile failed: %s", e)
+            await asyncio.sleep(60)
+
+    async def _bg_agent(self) -> None:
+        """Agent 自动闭环：处理新建 Incident。"""
+        while not self._stop.is_set():
+            try:
+                if self.agent.auto_enabled:
+                    rows = self.db.query(
+                        "SELECT id FROM incidents WHERE status='open' AND need_human=0"
+                        " AND stage='pending'"
+                        " ORDER BY created_at ASC LIMIT 3"
+                    )
+                    for r in rows:
+                        await self.agent.handle_incident(r["id"])
+            except Exception:
+                log.exception("agent loop failed")
+            await asyncio.sleep(15)
         while not self._stop.is_set():
             try:
                 if self.cfg.get("alertmanager_url"):

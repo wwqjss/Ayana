@@ -43,6 +43,7 @@ class WebApp:
         webhook_token: str = "",
         alert_ingest=None,
         notifier=None,
+        agent=None,
     ):
         self.db = db
         self.auth = auth
@@ -56,12 +57,26 @@ class WebApp:
         self.webhook_token = webhook_token
         self.alert_ingest = alert_ingest
         self.notifier = notifier
+        self.agent = agent
 
     def build(self) -> web.Application:
         app = web.Application(client_max_size=2_000_000)
         app.router.add_get("/", self.page_index)
         app.router.add_get("/login", self.page_index)
-        app.router.add_static("/static/", self.static_dir, show_index=False)
+
+        async def static_with_nocache(request: web.Request) -> web.Response:
+            # 静态资源不缓存，避免每次都要无痕/强刷
+            name = request.match_info.get("name", "")
+            target = (self.static_dir / name).resolve()
+            if not str(target).startswith(str(self.static_dir.resolve())) or not target.is_file():
+                return web.Response(status=404, text="Not Found")
+            resp = web.FileResponse(target)
+            resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+            resp.headers["Pragma"] = "no-cache"
+            return resp
+
+        app.router.add_get("/static/{name}", static_with_nocache)
+        app.router.add_get("/static/{name:.+}", static_with_nocache)
         app.router.add_get("/health", self.health)
         app.router.add_get("/ready", self.ready)
         app.router.add_get("/api/me", self.api_me)
@@ -89,6 +104,9 @@ class WebApp:
         app.router.add_get("/api/audit", self.api_audit)
         app.router.add_get("/api/notifications", self.api_notifications)
         app.router.add_post("/api/notifications/retry", self.api_notifications_retry)
+        app.router.add_get("/api/runbook", self.api_runbook)
+        app.router.add_post("/api/agent/auto", self.api_agent_auto_toggle)
+        app.router.add_get("/api/agent/status", self.api_agent_status)
         app.router.add_get("/api/capabilities", self.api_capabilities)
         app.router.add_get("/api/prom/probe", self.api_prom_probe)
         app.router.add_post("/hooks/alertmanager", self.hook_alertmanager)
@@ -135,7 +153,9 @@ class WebApp:
     async def page_index(self, request: web.Request) -> web.Response:
         index = self.static_dir / "index.html"
         if index.exists():
-            return web.FileResponse(index)
+            resp = web.FileResponse(index)
+            resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+            return resp
         return web.Response(text="Ayana", content_type="text/plain")
 
     async def health(self, request: web.Request) -> web.Response:
@@ -512,6 +532,35 @@ class WebApp:
         n = self.notifier.retry_failed(body.get("id", "")) if self.notifier else 0
         self.db.audit("web_user", sess["username"], "notifications_retry", detail={"count": n})
         return _json({"ok": True, "retried": n})
+
+    async def api_runbook(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        from .runbook import list_runbook
+
+        return _json({"ok": True, "runbook": list_runbook()})
+
+    async def api_agent_auto_toggle(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        enabled = bool(body.get("enabled"))
+        if self.agent:
+            self.agent.set_auto_enabled(enabled)
+        self.db.audit("web_user", sess["username"], f"agent_auto_{enabled}")
+        return _json({"ok": True, "auto_enabled": enabled})
+
+    async def api_agent_status(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        from .runbook import list_runbook
+
+        auto = self.agent.auto_enabled if self.agent else False
+        llm_ok = getattr(self.agent, "llm", None) and self.agent.llm.enabled
+        return _json({
+            "ok": True,
+            "auto_enabled": auto,
+            "llm_enabled": bool(llm_ok),
+            "runbook_count": len(list_runbook()),
+        })
 
     async def api_capabilities(self, request: web.Request) -> web.Response:
         self._require_auth(request)

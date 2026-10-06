@@ -11,6 +11,17 @@ from .db import Database, new_id, now
 # 短期复发窗口（秒）
 RECURRENCE_WINDOW = 30 * 60
 
+ZH_STATUS = {"open": "处理中", "resolved": "已解决", "closed": "已关闭"}
+ZH_STAGE = {
+    "pending": "待调查", "investigating": "调查中", "awaiting_approval": "待批准",
+    "executing": "执行中", "verifying": "验证中", "watching": "观察中",
+    "done": "完成", "need_human": "需人工",
+}
+
+
+def _z(s, m):
+    return m.get(s or "", s or "")
+
 
 class IncidentService:
     def __init__(self, db: Database):
@@ -254,10 +265,18 @@ class IncidentService:
         inc = self.get_incident(inc_id)
         if not inc:
             return "未找到 Incident"
+        title = inc.get("title") or ""
+        for en, cn in (
+            ("TargetDown", "探测目标不可达"),
+            ("PrometheusJobMissing", "采集目标丢失"),
+            ("DiskUsageHigh", "磁盘使用率过高"),
+            ("MemoryLow", "可用内存不足"),
+        ):
+            title = title.replace(en, cn)
         lines = [
             f"Incident {inc['id']}",
-            inc.get("title") or "",
-            f"状态: {inc['status']} / 阶段: {inc['stage']}"
+            title,
+            f"状态: {_z(inc.get('status'), ZH_STATUS)} / 阶段: {_z(inc.get('stage'), ZH_STAGE)}"
             + (" / 需人工" if inc.get("need_human") else ""),
         ]
         if inc.get("need_human_reason"):

@@ -98,6 +98,19 @@ main { padding: 20px 22px 40px; max-width: 1100px; margin: 0 auto; }
   padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line);
   background: rgba(255,255,255,.04); color: var(--ink); min-width: 120px; font-size: 13px;
 }
+.form-row select, select {
+  background-color: #1e222b;
+  color: #e8eaed;
+  color-scheme: dark;
+}
+select option {
+  background-color: #1e222b;
+  color: #e8eaed;
+}
+select option:checked {
+  background-color: #2a3140;
+  color: #ffffff;
+}
 .form-row .chk { flex-direction: row; align-items: center; gap: 6px; padding-bottom: 8px; }
 
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
