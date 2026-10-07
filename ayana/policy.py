@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .capabilities import get_capability, list_capabilities
+from .capabilities import assert_within_ceiling, get_capability, list_capabilities
 from .db import Database, now
 
 # 主体
@@ -56,8 +56,8 @@ class Policy:
         if subject_type not in SUBJECT_TYPES:
             raise PolicyDeny(f"bad subject_type: {subject_type}")
         try:
-            get_capability(capability)
-        except KeyError:
+            assert_within_ceiling(capability)
+        except Exception:
             raise PolicyDeny(f"unknown capability: {capability}") from None
         t = now()
         payload = {

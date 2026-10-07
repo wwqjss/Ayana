@@ -245,6 +245,23 @@ def get_capability(name: str) -> Capability:
     return c
 
 
+def assert_within_ceiling(name: str) -> Capability:
+    """Node capability ceiling：运行时只允许已登记能力。
+
+    Policy / PermissionChange / Agent 不得发明新能力（如 shell.root）。
+    能力定义只存在于本模块源码，不由数据库或 LLM 写入。
+    """
+    if not isinstance(name, str) or not name:
+        raise ObjectBindingError("capability name required")
+    if name not in CAPABILITIES:
+        raise ObjectBindingError(f"capability not in node ceiling: {name}")
+    return CAPABILITIES[name]
+
+
+def ceiling() -> list[str]:
+    return sorted(CAPABILITIES.keys())
+
+
 def list_capabilities() -> list[dict[str, Any]]:
     return [
         {

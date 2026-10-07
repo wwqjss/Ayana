@@ -28,6 +28,7 @@ from .llm import make_llm
 from .ntsafe import AssetBinding, IdentityGate, NTClient
 from .notify import Notifier
 from .onewbot import OneBotServer
+from .permission_change import PermissionChangeService
 from .policy import Policy
 from .prom import PromClient
 from .qqbot import QQBot
@@ -229,6 +230,11 @@ class App:
             admin_qq=str(cfg.get("admin_qq") or ""),
             version=VERSION,
         )
+        self.permission_changes = PermissionChangeService(
+            self.db,
+            self.policy,
+            totp_verifier=lambda username, code: self.auth.verify_totp(username, code),
+        )
         self.webapp = WebApp(
             self.db,
             self.auth,
@@ -243,6 +249,7 @@ class App:
             alert_ingest=self.alert_ingest,
             notifier=self.notifier,
             agent=self.agent,
+            permission_changes=self.permission_changes,
         )
         self._stop = asyncio.Event()
         self._bg_tasks: list[asyncio.Task] = []

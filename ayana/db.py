@@ -308,6 +308,31 @@ CREATE TABLE IF NOT EXISTS work_items (
   UNIQUE(kind, identity)
 );
 
+CREATE TABLE IF NOT EXISTS permission_changes (
+  id TEXT PRIMARY KEY,
+  subject_type TEXT NOT NULL,
+  subject_id TEXT NOT NULL,
+  capability TEXT NOT NULL,
+  asset_id TEXT NOT NULL DEFAULT '*',
+  object_id TEXT NOT NULL DEFAULT '*',
+  to_allow INTEGER NOT NULL DEFAULT 0,
+  to_require_approval INTEGER NOT NULL DEFAULT 1,
+  to_auto_allowed INTEGER NOT NULL DEFAULT 0,
+  reason TEXT NOT NULL DEFAULT '',
+  incident_id TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL DEFAULT 'proposed',
+  created_by TEXT NOT NULL DEFAULT '',
+  created_channel TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL,
+  decided_by TEXT NOT NULL DEFAULT '',
+  decided_channel TEXT NOT NULL DEFAULT '',
+  decided_at REAL,
+  totp_verified_at REAL,
+  applied_at REAL,
+  from_snapshot_json TEXT NOT NULL DEFAULT '{}',
+  result_json TEXT NOT NULL DEFAULT '{}'
+);
+
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,
   kind TEXT NOT NULL,
@@ -650,10 +675,13 @@ class Database:
         object_id: str = "",
         action_id: str = "",
         detail: dict | None = None,
+        decision_id: str = "",
+        incident_id: str = "",
+        channel: str = "",
     ) -> None:
         self.execute(
             "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, object_id,"
-            " action_id, detail_json) VALUES(?,?,?,?,?,?,?,?)",
+            " action_id, detail_json, decision_id, incident_id, channel) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (
                 now(),
                 actor_type,
@@ -663,6 +691,9 @@ class Database:
                 object_id,
                 action_id,
                 json.dumps(detail or {}, ensure_ascii=False),
+                decision_id,
+                incident_id,
+                channel,
             ),
         )
 

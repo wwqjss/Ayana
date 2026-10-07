@@ -45,6 +45,7 @@ class WebApp:
         alert_ingest=None,
         notifier=None,
         agent=None,
+        permission_changes=None,
     ):
         self.db = db
         self.auth = auth
@@ -59,6 +60,7 @@ class WebApp:
         self.alert_ingest = alert_ingest
         self.notifier = notifier
         self.agent = agent
+        self.permission_changes = permission_changes
 
     def build(self) -> web.Application:
         app = web.Application(client_max_size=2_000_000)
@@ -106,6 +108,11 @@ class WebApp:
         app.router.add_get("/api/permissions", self.api_permissions)
         app.router.add_post("/api/permissions", self.api_permission_upsert)
         app.router.add_post("/api/permissions/delete", self.api_permission_delete)
+        app.router.add_get("/api/permission-changes", self.api_permission_changes)
+        app.router.add_post("/api/permission-changes", self.api_permission_change_propose)
+        app.router.add_get("/api/permission-changes/{cid}", self.api_permission_change_present)
+        app.router.add_post("/api/permission-changes/{cid}/authorize", self.api_permission_change_authorize)
+        app.router.add_post("/api/permission-changes/{cid}/reject", self.api_permission_change_reject)
         app.router.add_get("/api/knowledge", self.api_knowledge)
         app.router.add_get("/api/audit", self.api_audit)
         app.router.add_get("/api/notifications", self.api_notifications)
@@ -932,6 +939,96 @@ class WebApp:
         except (PolicyDeny, KeyError, ValueError) as e:
             return _json({"ok": False, "error": str(e)}, 400)
         return _json({"ok": True})
+
+    # ---- Permission Change（0.4：TOTP 只签一笔）----
+
+    def _pcsvc(self):
+        if not self.permission_changes:
+            return None
+        return self.permission_changes
+
+    async def api_permission_changes(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        svc = self._pcsvc()
+        if not svc:
+            return _json({"ok": False, "error": "unavailable"}, 503)
+        state = request.rel_url.query.get("state", "")
+        return _json({"ok": True, "changes": svc.list_changes(state=state)})
+
+    async def api_permission_change_propose(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        self._check_csrf(request, sess)
+        svc = self._pcsvc()
+        if not svc:
+            return _json({"ok": False, "error": "unavailable"}, 503)
+        body = await request.json()
+        try:
+            res = svc.propose(
+                subject_type=body.get("subject_type") or "auto_rule",
+                subject_id=body.get("subject_id") or "",
+                capability=body.get("capability") or "",
+                asset_id=body.get("asset_id") or "*",
+                object_id=body.get("object_id") or "*",
+                to_allow=bool(body.get("to_allow", True)),
+                to_require_approval=bool(body.get("to_require_approval", True)),
+                to_auto_allowed=bool(body.get("to_auto_allowed", False)),
+                reason=body.get("reason", ""),
+                incident_id=body.get("incident_id", ""),
+                created_by=sess["username"],
+                created_channel="web",
+            )
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True, **res})
+
+    async def api_permission_change_present(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        svc = self._pcsvc()
+        if not svc:
+            return _json({"ok": False, "error": "unavailable"}, 503)
+        try:
+            return _json({"ok": True, "change": svc.present(request.match_info["cid"])})
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 404)
+
+    async def api_permission_change_authorize(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        svc = self._pcsvc()
+        if not svc:
+            return _json({"ok": False, "error": "unavailable"}, 503)
+        body = await request.json()
+        try:
+            res = svc.authorize(
+                request.match_info["cid"],
+                actor_id=sess["username"],
+                totp_code=body.get("totp") or body.get("totp_code") or "",
+                channel="web",
+                is_admin=bool(sess.get("is_admin")),
+            )
+        except Exception as e:
+            code = getattr(e, "code", "error")
+            return _json({"ok": False, "error": code, "message": str(e)}, 400)
+        return _json({"ok": True, **res})
+
+    async def api_permission_change_reject(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        svc = self._pcsvc()
+        if not svc:
+            return _json({"ok": False, "error": "unavailable"}, 503)
+        body = await request.json()
+        try:
+            res = svc.reject(
+                request.match_info["cid"],
+                actor_id=sess["username"],
+                reason=body.get("reason", ""),
+                channel="web",
+                is_admin=bool(sess.get("is_admin")),
+            )
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True, **res})
 
     async def api_knowledge(self, request: web.Request) -> web.Response:
         """运维知识库只读：Markdown 主题（front matter + 正文）。"""
