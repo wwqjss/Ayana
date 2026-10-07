@@ -15,10 +15,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-# status: active 可用于调查 | deprecated 废弃 | historical 仅历史
+# status: active 可用于调查 | draft 草稿不进自动上下文 | deprecated 废弃 | historical 仅历史
+#         invalid 非法 status，隔离，绝不默认 active
 # type: system | issue | procedure
-VALID_STATUS = {"active", "deprecated", "historical"}
+VALID_STATUS = {"active", "draft", "deprecated", "historical", "invalid"}
 VALID_TYPE = {"system", "issue", "procedure", "note"}
+# 仅 active 进入 Investigation 当前依据
+USABLE_STATUS = {"active"}
 
 
 @dataclass
@@ -32,6 +35,7 @@ class KnowledgeDoc:
     body: str = ""
     path: str = ""
     hash: str = ""
+    depends_on: list[str] = field(default_factory=list)
 
     def to_public(self) -> dict[str, Any]:
         return {
@@ -44,7 +48,12 @@ class KnowledgeDoc:
             "body": self.body,
             "path": self.path,
             "hash": self.hash,
+            "depends_on": list(self.depends_on),
         }
+
+    def ref(self) -> dict[str, Any]:
+        """Investigation 固定记录用：doc_id + hash + status。"""
+        return {"id": self.id, "hash": self.hash, "status": self.status, "title": self.title}
 
     def asset_ids(self) -> list[str]:
         out = []
@@ -112,8 +121,9 @@ def parse_doc(path: Path, text: str | None = None) -> KnowledgeDoc:
     doc_id = str(meta.get("id") or path.stem)
     title = str(meta.get("title") or doc_id)
     status = str(meta.get("status") or "active").lower()
+    # 未知/非法 status 不得默认 active
     if status not in VALID_STATUS:
-        status = "active"
+        status = "invalid"
     typ = str(meta.get("type") or "system").lower()
     if typ not in VALID_TYPE:
         typ = "system"
@@ -123,6 +133,9 @@ def parse_doc(path: Path, text: str | None = None) -> KnowledgeDoc:
     tags = meta.get("tags") or []
     if isinstance(tags, str):
         tags = [tags]
+    depends = meta.get("depends_on") or meta.get("depends") or []
+    if isinstance(depends, str):
+        depends = [depends]
     return KnowledgeDoc(
         id=doc_id,
         title=title,
@@ -133,6 +146,7 @@ def parse_doc(path: Path, text: str | None = None) -> KnowledgeDoc:
         body=body,
         path=str(path),
         hash=hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16],
+        depends_on=[str(x) for x in depends],
     )
 
 
@@ -193,6 +207,12 @@ class KnowledgeBase:
                 continue
         return len(self._docs)
 
+    @property
+    def revision(self) -> str:
+        """当前知识集 revision（原子 reload 后可复算）。"""
+        blob = "|".join(f"{d.id}:{d.hash}:{d.status}" for d in sorted(self._docs, key=lambda x: x.id))
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
+
     # ---- 查询 ----
 
     def list_docs(self, *, status: str = "", typ: str = "", q: str = "") -> list[KnowledgeDoc]:
@@ -228,7 +248,8 @@ class KnowledgeBase:
         ]
         if include_inactive:
             return hits
-        return [d for d in hits if d.status == "active"]
+        # 仅 active 进入当前调查依据；draft/deprecated/historical/invalid 一律排除
+        return [d for d in hits if d.status in USABLE_STATUS]
 
     def docs_for_objects(
         self, pairs: list[tuple[str, str]], *, include_inactive: bool = False
@@ -256,7 +277,7 @@ class KnowledgeBase:
         object_id: str = "",
         extra_failures: list[str] | None = None,
     ) -> dict[str, Any]:
-        """只用 active 知识生成调查上下文；deprecated/historical 不作为当前依据。"""
+        """只用 active 知识生成调查上下文；draft/deprecated/historical/invalid 不作为当前依据。"""
         name = object_id.split(":")[-1] if object_id else ""
         pairs: list[tuple[str, str]] = []
         if asset_id and name:
@@ -274,7 +295,7 @@ class KnowledgeBase:
                     seen.add(d.id)
                     active_docs.append(d)
 
-        # 共同命中
+        # 共同命中 / shared dependency
         shared_info = self.docs_for_objects(pairs, include_inactive=False) if len(pairs) >= 2 else {
             "shared_docs": [],
             "per_doc": {},
@@ -291,24 +312,35 @@ class KnowledgeBase:
             common_text = (
                 f"多个异常对象共同命中知识：{titles}。"
                 "优先按这些知识中的共同依赖/链路调查，不要先假定各探测目标本身同时故障。"
+                "共同发生≠已证明共同根因，只能形成 hypothesis。"
             )
             parts.append(f"### 多对象异常解读\n{common_text}")
 
-        # 仅作历史参考的（不作为当前操作依据）
-        historical = []
+        # 仅作历史/草稿参考的（不作为当前操作依据）
+        inactive = []
         for a, o in pairs:
             for d in self.docs_for_object(a, o, include_inactive=True):
-                if d.status != "active" and d.id not in seen:
-                    historical.append(d)
+                if d.status not in USABLE_STATUS and d.id not in seen:
+                    inactive.append(d)
+
+        # depends_on 邻接提示（不授予执行权）
+        dep_hints: list[str] = []
+        for d in active_docs:
+            for dep in d.depends_on:
+                dep_hints.append(f"{d.id} depends_on {dep}")
 
         return {
             "docs": [d.to_public() for d in active_docs],
             "shared_docs": [d.to_public() for d in shared_docs],
-            "historical_docs": [d.to_public() for d in historical],
+            "historical_docs": [d.to_public() for d in inactive],
+            "knowledge_refs": [d.ref() for d in active_docs],
+            "revision": self.revision,
             "common": {
                 "shared_ids": [d.id for d in shared_docs],
                 "shared_failure_meaning": common_text,
                 "hint": "优先调查共同依赖" if shared_docs else "",
+                "depends_on": dep_hints,
+                "note": "共同发生只能形成 hypothesis，不能直接认定共同根因",
             },
             "context_text": "\n\n".join(parts),
             "primary": active_docs[0].to_public() if active_docs else None,

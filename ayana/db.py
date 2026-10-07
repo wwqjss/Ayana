@@ -192,7 +192,15 @@ CREATE TABLE IF NOT EXISTS investigations (
   evidence_json TEXT NOT NULL DEFAULT '[]',
   conclusion TEXT NOT NULL DEFAULT '',
   created_at REAL NOT NULL,
-  finished_at REAL
+  finished_at REAL,
+  stop_reason TEXT NOT NULL DEFAULT '',
+  facts_json TEXT NOT NULL DEFAULT '[]',
+  hypotheses_json TEXT NOT NULL DEFAULT '[]',
+  missing_json TEXT NOT NULL DEFAULT '[]',
+  knowledge_refs_json TEXT NOT NULL DEFAULT '[]',
+  knowledge_revision TEXT NOT NULL DEFAULT '',
+  rounds INTEGER NOT NULL DEFAULT 0,
+  tool_calls INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS actions (
@@ -409,6 +417,20 @@ class Database:
                 ("deadline_at", "ALTER TABLE verifications ADD COLUMN deadline_at REAL"),
             ):
                 if vcols and name not in vcols:
+                    conn.execute(ddl)
+            # P1-02: investigation 有限循环 / 证据分层 / knowledge refs
+            icols2 = [r[1] for r in conn.execute("PRAGMA table_info(investigations)")]
+            for name, ddl in (
+                ("stop_reason", "ALTER TABLE investigations ADD COLUMN stop_reason TEXT NOT NULL DEFAULT ''"),
+                ("facts_json", "ALTER TABLE investigations ADD COLUMN facts_json TEXT NOT NULL DEFAULT '[]'"),
+                ("hypotheses_json", "ALTER TABLE investigations ADD COLUMN hypotheses_json TEXT NOT NULL DEFAULT '[]'"),
+                ("missing_json", "ALTER TABLE investigations ADD COLUMN missing_json TEXT NOT NULL DEFAULT '[]'"),
+                ("knowledge_refs_json", "ALTER TABLE investigations ADD COLUMN knowledge_refs_json TEXT NOT NULL DEFAULT '[]'"),
+                ("knowledge_revision", "ALTER TABLE investigations ADD COLUMN knowledge_revision TEXT NOT NULL DEFAULT ''"),
+                ("rounds", "ALTER TABLE investigations ADD COLUMN rounds INTEGER NOT NULL DEFAULT 0"),
+                ("tool_calls", "ALTER TABLE investigations ADD COLUMN tool_calls INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if icols2 and name not in icols2:
                     conn.execute(ddl)
             conn.execute(
                 "INSERT OR IGNORE INTO global_stops(key, enabled, reason, actor, updated_at)"

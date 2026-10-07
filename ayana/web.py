@@ -854,16 +854,19 @@ class WebApp:
     async def api_knowledge(self, request: web.Request) -> web.Response:
         """运维知识库只读：Markdown 主题（front matter + 正文）。"""
         self._require_auth(request)
-        from .knowledge import KnowledgeBase
+        # 与 Agent/Investigation 共用同一 KnowledgeBase，保证 revision 一致
+        kb = getattr(self.investigation, "knowledge", None)
+        if kb is None:
+            from .knowledge import KnowledgeBase
 
-        kb = KnowledgeBase(self.db)
+            kb = KnowledgeBase(self.db)
         q = request.rel_url.query
         doc_id = q.get("id", "")
         if doc_id:
             doc = kb.get(doc_id)
             if not doc:
                 return _json({"ok": False, "error": "not_found"}, 404)
-            return _json({"ok": True, "knowledge": doc.to_public()})
+            return _json({"ok": True, "knowledge": doc.to_public(), "revision": kb.revision})
         items = kb.list_docs(
             status=q.get("status", ""),
             typ=q.get("type", ""),
@@ -872,6 +875,7 @@ class WebApp:
         return _json({
             "ok": True,
             "knowledge": [d.to_public() for d in items],
+            "revision": kb.revision,
             "note": "Markdown 为知识正文事实源；仅 active 可作为当前调查依据。",
         })
 

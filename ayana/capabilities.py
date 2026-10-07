@@ -63,9 +63,38 @@ _reg(
         object_kinds=("*",),
         risk="read",
         description="资产摘要（uptime/负载/磁盘/内存/监听）",
-        probe_tokens=lambda o: [["uptime"], ["df", "-h"], ["free", "-m"], ["ss", "-lnt"]],
+        probe_tokens=lambda o: [
+            ["uptime"],
+            ["df", "-h"],
+            ["free", "-m"],
+            ["ss", "-lntu"],
+        ],
     )
 )
+
+# service.status / service.logs 对 systemd 与 container 表达不同事实
+def _svc_status_tokens(o: dict) -> list[list[str]]:
+    name = _obj_name(o)
+    if o.get("kind") == "container" or o.get("container"):
+        return [["docker", "inspect", "--format",
+                 "{{.State.Status}} {{.State.Running}} {{.State.ExitCode}}",
+                 _obj_container(o)]]
+    # systemd：active/enabled/MainPID 分开观察，不是 pgrep
+    return [
+        ["systemctl", "is-active", name],
+        ["systemctl", "is-enabled", name],
+        ["systemctl", "show", name, "--property=MainPID,SubState,ActiveState,UnitFileState",
+         "--value"],
+    ]
+
+
+def _svc_logs_tokens(o: dict) -> list[list[str]]:
+    name = _obj_name(o)
+    if o.get("kind") == "container" or o.get("container"):
+        return [["docker", "logs", "--tail", "40", _obj_container(o)]]
+    # 真实有限 journal 日志，不用 pgrep 冒充
+    return [["journalctl", "-u", name, "-n", "40", "--no-pager", "-o", "short-iso"]]
+
 
 _reg(
     Capability(
@@ -73,11 +102,8 @@ _reg(
         kind="read",
         object_kinds=("service", "container"),
         risk="read",
-        description="登记服务/容器状态",
-        probe_tokens=lambda o: (
-            [["docker", "ps"]] if o.get("kind") == "container" or o.get("container")
-            else [["pgrep", "-a", _obj_name(o)]]
-        ),
+        description="登记服务/容器状态（systemd is-active/is-enabled/show 或 docker inspect）",
+        probe_tokens=_svc_status_tokens,
     )
 )
 
@@ -87,26 +113,35 @@ _reg(
         kind="read",
         object_kinds=("service", "container"),
         risk="read",
-        description="有限日志（固定尾数）",
-        probe_tokens=lambda o: (
-            [["docker", "logs", "--tail", "40", _obj_container(o)]]
-            if o.get("kind") == "container" or o.get("container")
-            else [["pgrep", "-a", _obj_name(o)]]
-        ),
+        description="有限日志（journalctl -u / docker logs，固定尾数）",
+        probe_tokens=_svc_logs_tokens,
         max_output=6000,
     )
 )
+
+def _port_listen_tokens(o: dict) -> list[list[str]]:
+    proto = (o.get("protocol") or "tcp").lower()
+    port = o.get("port")
+    flag = ["ss", "-lnu"] if proto == "udp" else ["ss", "-lnt"]
+    if port:
+        try:
+            p = int(port)
+        except Exception:
+            return [flag]
+        # ss 过滤器拆成安全 argv（每 token 无空格/元字符）
+        return [flag + ["sport", "=", f":{p}"], flag]
+    return [flag]
+
 
 _reg(
     Capability(
         name="port.listen",
         kind="read",
-        object_kinds=("port",),
+        # service 对象可自带 port 字段，表达“该服务期望端口是否在听”
+        object_kinds=("port", "service"),
         risk="read",
         description="登记端口监听状态",
-        probe_tokens=lambda o: (
-            [["ss", "-lnu"]] if (o.get("protocol") or "tcp").lower() == "udp" else [["ss", "-lnt"]]
-        ),
+        probe_tokens=_port_listen_tokens,
     )
 )
 

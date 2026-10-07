@@ -95,6 +95,52 @@ class LLMClient:
             pass
         return {"summary": resp[:200], "category": "其他", "confidence": "low", "need_human": True}
 
+    async def propose_next_tools(
+        self,
+        *,
+        asset_id: str,
+        object_id: str,
+        evidence_brief: list[dict],
+        hypotheses: list[dict],
+        missing: list[str],
+        knowledge_text: str = "",
+        extra_failures: list[str] | None = None,
+        allowed_capabilities: list[str] | None = None,
+    ) -> str | None:
+        """只提出下一步想获取什么证据；不执行、不扩权。
+
+        返回原始文本（由 Investigation 解析并验证）；失败返回 None。
+        """
+        if not self.enabled:
+            return None
+        caps = ", ".join(allowed_capabilities or [])
+        user = (
+            f"资产: {asset_id}\n对象: {object_id}\n"
+            f"相关异常对象: {', '.join(extra_failures or []) or '-'}\n"
+            f"运维知识（非实时、不授执行权）:\n{(knowledge_text or '')[:1200]}\n"
+            f"已有证据摘要:\n{json.dumps(evidence_brief, ensure_ascii=False)[:2500]}\n"
+            f"当前假设: {json.dumps(hypotheses, ensure_ascii=False)[:800]}\n"
+            f"缺失证据: {json.dumps(missing, ensure_ascii=False)[:500]}\n"
+            f"允许的只读 capability: {caps}\n\n"
+            "请用 JSON 回答（不要写 shell）:\n"
+            '{"facts": ["..."],'
+            ' "hypotheses": [{"text": "...", "confidence": "high|medium|low",'
+            ' "supporting": ["ev_id"], "contradicting": ["ev_id"]}],'
+            ' "missing_evidence": ["..."],'
+            ' "next_tools": [{"capability": "service.status", "object_id": "frps", "why": "..."}],'
+            ' "stop": false, "stop_reason": ""}\n'
+            "stop_reason 取值之一: enough_evidence/need_more_evidence/need_human/"
+            "transport_unavailable/deadline_reached/tool_budget_exhausted/no_progress。"
+            "下一步工具最多 2 个，且必须来自允许列表和已登记对象。"
+        )
+        return await self.chat(
+            [
+                {"role": "system", "content": DEFAULT_SYSTEM},
+                {"role": "user", "content": user},
+            ],
+            max_tokens=500,
+        )
+
 
 def make_llm(cfg: dict) -> LLMClient:
     return LLMClient(

@@ -84,42 +84,58 @@ class AgentLoop:
             result["action_id"] = prior["id"]
             return result
 
-        # 0. 运维知识（Markdown）：主题正文 / 共同命中
+        # 0. 运维知识（Markdown）：主题正文 / 共同命中（含 extra_failures）
+        extra_failures = self._related_failures(inc["asset_id"], inc.get("object_id") or "")
         knol = self.knowledge.investigation_context(
-            inc["asset_id"], inc.get("object_id") or ""
+            inc["asset_id"], inc.get("object_id") or "", extra_failures=extra_failures
         )
         result["steps"].append({
             "step": "knowledge",
             "ok": bool(knol.get("docs")),
             "docs": [d.get("id") for d in (knol.get("docs") or [])],
             "shared": [d.get("id") for d in (knol.get("shared_docs") or [])],
+            "revision": knol.get("revision", ""),
+            "extra_failures": extra_failures,
         })
         knowledge_text = knol.get("context_text") or ""
 
-        # 1. 固定只读调查（与自动写解耦；auto_rule 读权限）
+        # 1. 证据驱动有限循环只读调查（与自动写解耦）
         try:
-            inv = await self.investigation.run(
+            inv = await self.investigation.run_loop(
                 asset_id=inc["asset_id"],
                 object_id=inc.get("object_id") or "",
-                capability="asset.summary",
                 incident_id=inc_id,
                 actor_type="auto_rule",
                 actor_id="agent",
+                extra_failures=extra_failures,
             )
             evidence = inv.get("evidence") or []
             result["steps"].append({
                 "step": "investigate",
-                "ok": inv.get("ok", False),
+                "ok": bool(inv.get("id")) and inv.get("stop_reason") != "all_tools_rejected",
                 "count": len(evidence),
+                "stop_reason": inv.get("stop_reason", ""),
+                "rounds": inv.get("rounds", 0),
+                "tool_calls": inv.get("tool_calls", 0),
+                "confidence": inv.get("confidence", ""),
                 "err": inv.get("error", ""),
             })
-            evidence_text = "\n".join(
-                e.get("output", "")[:300] for e in evidence if e.get("output")
-            )[:2000]
+            evidence_text = self._evidence_text(evidence)
             inv_knol = inv.get("knowledge") or {}
             if inv_knol.get("context_text"):
                 knowledge_text = inv_knol["context_text"]
             result["investigation_id"] = inv.get("id", "")
+            result["investigation_stop_reason"] = inv.get("stop_reason", "")
+            result["facts"] = inv.get("facts") or []
+            result["hypotheses"] = inv.get("hypotheses") or []
+            # 全工具失败 / transport 不可用：不得进入自动写
+            if inv.get("stop_reason") in ("transport_unavailable", "tool_budget_exhausted"):
+                if not any(
+                    (e.get("classification") == "observed") for e in evidence
+                ):
+                    self._escalate(inc_id, f"investigation_{inv.get('stop_reason')}", None)
+                    result["action"] = "escalated_investigation"
+                    return result
         except Exception as e:
             result["steps"].append({"step": "investigate", "ok": False, "error": str(e)})
             evidence_text = ""
@@ -225,16 +241,49 @@ class AgentLoop:
                 result["action"] = "escalated_precondition"
                 return result
             if pre_result.get("status") != "satisfied":
-                # 不满足前置：仍形成 proposal 等人，不自动派发
                 return self._propose_for_human(
                     inc, rule, result, decision, pre_result, llm_result, evidence_text
                 )
             return await self._auto_dispatch(inc, rule, result, decision, pre_result)
 
-        # approval_required，或 auto 关闭：创建 proposed 并等人
         return self._propose_for_human(
             inc, rule, result, decision, pre_result, llm_result, evidence_text
         )
+
+    def _related_failures(self, asset_id: str, object_id: str) -> list[str]:
+        """同一资产上其他仍在 firing 的对象 → shared dependency 线索。"""
+        try:
+            name = (object_id or "").split(":")[-1]
+            rows = self.db.query(
+                "SELECT DISTINCT object_id FROM alert_episodes"
+                " WHERE asset_id=? AND status='firing' AND object_id != ?"
+                " AND object_id != '' LIMIT 8",
+                (asset_id, name or object_id or ""),
+            )
+            out = []
+            for r in rows:
+                oid = r["object_id"] or ""
+                if oid and oid not in out:
+                    out.append(oid)
+            return out
+        except Exception:
+            return []
+
+    def _evidence_text(self, evidence: list) -> str:
+        parts = []
+        for e in evidence or []:
+            if e.get("classification") == "rejected":
+                continue
+            obs = e.get("observed") or {}
+            line = (
+                f"[{e.get('classification')}] {e.get('tool')} {e.get('object_id')}: "
+                f"{obs.get('service_state') or obs.get('kind') or ''}"
+            )
+            raw = (obs.get("raw_output") or e.get("output") or "")[:200]
+            if raw:
+                line += f" | {raw}"
+            parts.append(line)
+        return "\n".join(parts)[:2500]
 
     def _propose_for_human(
         self,
@@ -451,8 +500,13 @@ class AgentLoop:
         except Exception:
             probe_failed_recent = None
 
-        # 调查证据是否全部运输失败
-        transport_ok = any(e.get("ok") for e in evidence) if evidence else None
+        # 调查证据是否全部运输失败（只看真实 transport 结果，不含 rejected gap）
+        transport_evs = [
+            e for e in (evidence or [])
+            if e.get("source") in ("nt_probe", "prometheus")
+            or e.get("classification") in ("observed", "transport_failure", "tool_failure")
+        ]
+        transport_ok = any(e.get("ok") for e in transport_evs) if transport_evs else None
 
         stop = self.db.query_one("SELECT enabled FROM global_stops WHERE key='auto_dispatch'")
         policy = self.policy.check(

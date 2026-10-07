@@ -210,6 +210,7 @@ class App:
             f"user:{cfg['admin_qq']}" if cfg.get("admin_qq") else ""
         )
         self.llm = make_llm(cfg)
+        self.investigation.llm = self.llm
         self.agent = AgentLoop(
             self.db, self.investigation, self.actions, self.policy,
             self.llm, self.notifier,
