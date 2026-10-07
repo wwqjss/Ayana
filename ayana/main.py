@@ -313,6 +313,10 @@ class App:
             try:
                 self.notifier.compensate_missing()
                 await self.notifier.flush()
+                self.db.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES('worker_outbox_last_ok', ?)",
+                    (str(time.time()),),
+                )
             except Exception:
                 log.exception("outbox flush failed")
             await asyncio.sleep(3)
@@ -324,10 +328,15 @@ class App:
                     try:
                         alerts = await self.alert_ingest.fetch_am_alerts(self.cfg["alertmanager_url"])
                         self.alert_ingest.reconcile(alerts, source_ok=True)
+                        self.alert_ingest.last_status = "available"
                     except Exception as e:
                         log.warning("AM fetch failed: %s", e)
-                        # 上游失败 ≠ 恢复
+                        self.alert_ingest.last_status = "unavailable"
                         self.alert_ingest.reconcile([], source_ok=False)
+                self.db.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES('worker_reconcile_last_ok', ?)",
+                    (str(time.time()),),
+                )
             except Exception as e:
                 log.warning("AM reconcile failed: %s", e)
             await asyncio.sleep(60)
@@ -348,6 +357,10 @@ class App:
                     self.actions.expire_stale_proposals()
                 except Exception:
                     log.exception("expire proposals failed")
+                self.db.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES('worker_agent_last_ok', ?)",
+                    (str(time.time()),),
+                )
             except Exception:
                 log.exception("agent loop failed")
             await asyncio.sleep(15)

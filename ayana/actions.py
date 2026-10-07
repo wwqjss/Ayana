@@ -1399,13 +1399,161 @@ class ActionService:
         return total
 
     def mark_unknown_unfinished(self) -> int:
+        """重启恢复：dispatched 无确定结果 → unknown；绝不自动重放写。"""
         n = self.db.execute(
             "UPDATE actions SET state='unknown', result_detail='restart_recovery'"
             " WHERE state='dispatched'"
         ).rowcount
-        for r in self.db.query("SELECT id, incident_id FROM actions WHERE state='unknown'"):
+        for r in self.db.query(
+            "SELECT id, incident_id FROM actions WHERE state='unknown'"
+            " AND (adjudication IS NULL OR adjudication='')"
+        ):
             self._mark_need_human(r["incident_id"], f"exec_unknown:{r['id']}")
         return int(n or 0)
+
+    def restart_semantics(self) -> dict[str, Any]:
+        """重启后各状态语义摘要（供 /ready 与测试）。"""
+        rows = self.db.query("SELECT state, COUNT(*) AS n FROM actions GROUP BY state")
+        counts = {r["state"]: int(r["n"]) for r in rows}
+        return {
+            "proposed_safe_to_wait": counts.get("proposed", 0),
+            "approved_need_recheck": counts.get("approved", 0),
+            "dispatched_to_unknown": counts.get("dispatched", 0),
+            "unknown_need_adjudication": counts.get("unknown", 0),
+            "terminal_no_replay": (
+                counts.get("success", 0)
+                + counts.get("failure", 0)
+                + counts.get("cancelled", 0)
+                + counts.get("expired", 0)
+            ),
+            "counts": counts,
+        }
+
+    def adjudicate(
+        self,
+        action_id: str,
+        *,
+        outcome: str,
+        reason: str = "",
+        actor_type: str = "web_user",
+        actor_id: str = "system",
+        channel: str = "web",
+        evidence_note: str = "",
+    ) -> dict[str, Any]:
+        """人工核清 uncertain write。
+
+        outcome: executed | not_executed | still_unknown
+        不伪造原始执行结果；核清进入 audit + timeline。
+        """
+        if outcome not in ("executed", "not_executed", "still_unknown"):
+            raise ActionError("bad_adjudication", outcome)
+        row = self._get(action_id)
+        if row["state"] != "unknown":
+            raise ActionError("bad_state", row["state"])
+        t = now()
+        # still_unknown：保持锁，不结束占用
+        if outcome == "still_unknown":
+            with self.db.tx() as conn:
+                conn.execute(
+                    "UPDATE actions SET adjudication='still_unknown', adjudicated_at=?,"
+                    " adjudication_reason=? WHERE id=?",
+                    (t, reason or "still_unknown", action_id),
+                )
+                conn.execute(
+                    "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, object_id,"
+                    " action_id, detail_json, incident_id, channel) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        t, actor_type, actor_id, "action_adjudicated",
+                        row["asset_id"], row["object_id"], action_id,
+                        json.dumps(
+                            {
+                                "outcome": "still_unknown",
+                                "reason": reason,
+                                "evidence_note": evidence_note[:500],
+                                "note": "lock retained",
+                            },
+                            ensure_ascii=False,
+                        ),
+                        row.get("incident_id") or "",
+                        channel,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO events(incident_id, at, type, title, payload_json)"
+                    " VALUES(?,?,?,?,?)",
+                    (
+                        row.get("incident_id") or "",
+                        t,
+                        "action_adjudicated",
+                        f"adjudicated still_unknown {action_id}",
+                        json.dumps(
+                            {"action_id": action_id, "outcome": "still_unknown", "reason": reason},
+                            ensure_ascii=False,
+                        ),
+                    ),
+                )
+            return {"id": action_id, "state": "unknown", "adjudication": "still_unknown"}
+
+        # executed / not_executed：结束 unknown 占用，但不改写原始 result_detail
+        release_state = "success" if outcome == "executed" else "cancelled"
+        with self.db.tx() as conn:
+            conn.execute(
+                "UPDATE actions SET adjudication=?, adjudicated_at=?, adjudication_reason=?,"
+                " state=?, finished_at=COALESCE(finished_at, ?)"
+                " WHERE id=? AND state='unknown'",
+                (outcome, t, reason or outcome, release_state, t, action_id),
+            )
+            conn.execute(
+                "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, object_id,"
+                " action_id, detail_json, incident_id, channel) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    t, actor_type, actor_id, "action_adjudicated",
+                    row["asset_id"], row["object_id"], action_id,
+                    json.dumps(
+                        {
+                            "outcome": outcome,
+                            "reason": reason,
+                            "evidence_note": evidence_note[:500],
+                            "released_to": release_state,
+                            "original_result_detail": (row.get("result_detail") or "")[:200],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    row.get("incident_id") or "",
+                    channel,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO events(incident_id, at, type, title, payload_json)"
+                " VALUES(?,?,?,?,?)",
+                (
+                    row.get("incident_id") or "",
+                    t,
+                    "action_adjudicated",
+                    f"adjudicated {outcome} {action_id}",
+                    json.dumps(
+                        {
+                            "action_id": action_id,
+                            "outcome": outcome,
+                            "reason": reason,
+                            "released_to": release_state,
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+        if row.get("incident_id"):
+            try:
+                from .incidents import IncidentService
+
+                IncidentService(self.db).reevaluate_after_action(row["incident_id"])
+            except Exception:
+                pass
+        return {
+            "id": action_id,
+            "state": release_state,
+            "adjudication": outcome,
+        }
 
     def _object_locked(self, asset_id: str, object_id: str, exclude: str = "") -> bool:
         sql = (

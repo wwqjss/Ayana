@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -164,6 +165,7 @@ class WebApp:
         return web.Response(text="Ayana", content_type="text/plain")
 
     async def health(self, request: web.Request) -> web.Response:
+        """进程活着。不因外部依赖不可用而 503。"""
         return _json(
             {
                 "ok": True,
@@ -174,12 +176,92 @@ class WebApp:
         )
 
     async def ready(self, request: web.Request) -> web.Response:
+        """是否具备可信处理工作的条件。
+
+        - DB / schema 必须可用，否则 503
+        - 外部依赖（Prom/AM/NT/LLM）降级展示，不拖死全局
+        - worker 最近成功时间 / backlog 可见
+        """
+        checks: dict[str, Any] = {}
+        reasons: list[str] = []
+
+        # DB
         try:
             self.db.query_one("SELECT 1 AS x")
-            db_ok = True
+            checks["db"] = "available"
+        except Exception as e:
+            checks["db"] = f"unavailable:{e}"
+            reasons.append("db")
+
+        # schema
+        try:
+            ver = self.db.schema_version()
+            from .db import SCHEMA_VERSION
+
+            checks["schema"] = "current" if ver == SCHEMA_VERSION else f"mismatch:{ver}"
+            if ver != SCHEMA_VERSION:
+                reasons.append("schema")
+        except Exception as e:
+            checks["schema"] = f"error:{e}"
+            reasons.append("schema")
+
+        # durable work backlog
+        try:
+            n = self.db.query_one(
+                "SELECT COUNT(*) AS n FROM work_items WHERE state='pending'"
+            )
+            checks["work_backlog"] = int(n["n"] if n else 0)
         except Exception:
-            db_ok = False
-        return _json({"ok": db_ok, "db": db_ok, "version": self.version}, 200 if db_ok else 503)
+            checks["work_backlog"] = -1
+
+        # outbox backlog
+        try:
+            n = self.db.query_one(
+                "SELECT COUNT(*) AS n FROM notification_outbox"
+                " WHERE state IN ('pending','retry')"
+            )
+            checks["outbox_backlog"] = int(n["n"] if n else 0)
+        except Exception:
+            checks["outbox_backlog"] = -1
+
+        # worker 心跳（main 后台任务写入 meta）
+        for key, label in (
+            ("worker_outbox_last_ok", "outbox"),
+            ("worker_reconcile_last_ok", "reconcile"),
+            ("worker_agent_last_ok", "agent"),
+        ):
+            try:
+                row = self.db.query_one("SELECT value FROM meta WHERE key=?", (key,))
+                last = float(row["value"]) if row and row["value"] else 0.0
+                age = time.time() - last if last else -1
+                checks[f"{label}_age_sec"] = round(age, 1) if age >= 0 else None
+                checks[label] = "ok" if 0 <= age < 300 else ("stale" if last else "unknown")
+                if last and age > 600:
+                    checks[label] = "dead"
+                    reasons.append(label)
+            except Exception:
+                checks[label] = "unknown"
+
+        # 外部依赖：degraded 不阻塞 ready
+        try:
+            from .db import SCHEMA_VERSION as _sv
+
+            checks["prometheus"] = getattr(self.prom, "last_status", "unknown")
+            checks["alertmanager"] = getattr(self.alert_ingest, "last_status", "unknown")
+        except Exception:
+            pass
+
+        ok = not reasons
+        return _json(
+            {
+                "ok": ok,
+                "version": self.version,
+                "checks": checks,
+                "reasons": reasons,
+                "note": "外部依赖降级不影响 ready；DB/schema 不可用则 not ready",
+            },
+            200 if ok else 503,
+        )
 
     # ---- auth api ----
 
