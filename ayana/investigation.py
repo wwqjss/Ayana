@@ -17,6 +17,7 @@ from .capabilities import (
     object_matches_capability,
 )
 from .db import Database, new_id, now
+from .knowledge import KnowledgeBase
 from .ntsafe import IdentityGate, NTClient, NTResult
 from .policy import Policy
 from .prom import PromClient, summarize_probe
@@ -37,12 +38,14 @@ class InvestigationService:
         gate: IdentityGate,
         prom: PromClient,
         policy: Policy,
+        knowledge: KnowledgeBase | None = None,
     ):
         self.db = db
         self.nt = nt
         self.gate = gate
         self.prom = prom
         self.policy = policy
+        self.knowledge = knowledge or KnowledgeBase(db)
 
     async def run(
         self,
@@ -113,6 +116,9 @@ class InvestigationService:
         binding = self.gate.get(asset_id)
         evidence: list[dict[str, Any]] = []
 
+        # 业务语义知识（长期知识，不含实时状态）
+        knol = self.knowledge.investigation_context(asset_id, object_id)
+
         if capability == "probe.status":
             service = (obj or {}).get("name") or params.get("service") or object_id or ""
             data = await self.prom.probe_success(asset_id, service)
@@ -128,7 +134,13 @@ class InvestigationService:
             )
             self._finish(inv_id, "done", evidence, summary.get("state", ""))
             self._audit(inv_id, asset_id, object_id, capability, actor_type, actor_id, incident_id)
-            return {"id": inv_id, "ok": True, "evidence": evidence, "summary": summary}
+            return {
+                "id": inv_id,
+                "ok": True,
+                "evidence": evidence,
+                "summary": summary,
+                "knowledge": knol,
+            }
 
         # 资产级能力：不需要 Object，可直接对 Asset 执行
         asset_level = {"asset.summary", "disk.usage", "memory.available", "load.current"}
@@ -165,9 +177,13 @@ class InvestigationService:
             "investigation",
             f"investigate {asset_id} {capability}",
             incident_id=incident_id,
-            payload={"investigation_id": inv_id, "capability": capability},
+            payload={
+                "investigation_id": inv_id,
+                "capability": capability,
+                "knowledge_ids": [d.get("id") for d in (knol.get("docs") or [])],
+            },
         )
-        return {"id": inv_id, "ok": True, "evidence": evidence}
+        return {"id": inv_id, "ok": True, "evidence": evidence, "knowledge": knol}
 
     def _resolve_object(self, asset_id: str, object_id: str) -> dict | None:
         if not object_id:

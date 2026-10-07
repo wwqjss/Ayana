@@ -259,7 +259,40 @@ class IncidentService:
                 "SELECT * FROM actions WHERE incident_id=? ORDER BY created_at ASC", (inc_id,)
             )
         ]
+        for a in data["actions"]:
+            a["verifications"] = [
+                dict(r)
+                for r in self.db.query(
+                    "SELECT * FROM verifications WHERE action_id=? ORDER BY started_at ASC",
+                    (a["id"],),
+                )
+            ]
+        data["investigations"] = [
+            dict(r)
+            for r in self.db.query(
+                "SELECT * FROM investigations WHERE incident_id=? ORDER BY created_at ASC",
+                (inc_id,),
+            )
+        ]
+        data["verifications"] = [
+            dict(r)
+            for r in self.db.query(
+                "SELECT * FROM verifications WHERE incident_id=? ORDER BY started_at ASC",
+                (inc_id,),
+            )
+        ]
         return data
+
+    def list_closed_loops(self, limit: int = 50) -> list[dict[str, Any]]:
+        """故障闭环：Incident + Investigation + Action + Verification 一体。"""
+        out = []
+        for r in self.db.query(
+            "SELECT * FROM incidents ORDER BY updated_at DESC LIMIT ?", (limit,)
+        ):
+            full = self.get_incident(r["id"])
+            if full:
+                out.append(full)
+        return out
 
     def summary_text(self, inc_id: str, *, for_qq: bool = False) -> str:
         inc = self.get_incident(inc_id)

@@ -136,3 +136,154 @@ pre {
 
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+/* 权限三态分段选择 */
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  background: rgba(255,255,255,.03);
+}
+.seg button {
+  border: 0;
+  background: transparent;
+  color: var(--dim);
+  padding: 6px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.seg button:hover { color: var(--ink); background: rgba(255,255,255,.05); }
+.seg button.on-deny { background: rgba(240,113,120,.22); color: var(--bad); }
+.seg button.on-confirm { background: rgba(229,192,123,.22); color: var(--warn); }
+.seg button.on-auto { background: rgba(61,214,140,.22); color: var(--ok); }
+
+.perm-legend {
+  display: flex; gap: 16px; flex-wrap: wrap;
+  margin: 8px 0 16px; font-size: 12px; color: var(--dim);
+}
+.perm-legend .dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px;
+}
+.perm-asset { margin-bottom: 18px; }
+.perm-obj {
+  background: var(--card); border: 1px solid var(--line);
+  border-radius: 12px; padding: 12px 16px; margin-top: 8px;
+}
+.perm-obj h3 { font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+.perm-obj .sub { font-size: 11px; color: var(--dim); margin-bottom: 10px; }
+.perm-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 8px 0; border-top: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+.perm-row .cap-name { font-size: 13px; min-width: 110px; }
+.perm-adv { margin-top: 20px; }
+.perm-adv > summary {
+  cursor: pointer; font-size: 13px; color: var(--dim);
+  padding: 10px 0; user-select: none;
+}
+.perm-adv > summary:hover { color: var(--ink); }
+.perm-adv[open] > summary { margin-bottom: 8px; color: var(--ink); }
+
+/* 知识文档页（阿里云文档 / CSDN 风格） */
+.kb-layout {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+@media (max-width: 860px) {
+  .kb-layout { grid-template-columns: 1fr; }
+}
+.kb-side {
+  position: sticky;
+  top: 72px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 10px;
+  max-height: calc(100vh - 100px);
+  overflow: auto;
+}
+.kb-side .side-title {
+  font-size: 11px;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  margin: 4px 8px 8px;
+}
+.kb-side a {
+  display: block;
+  color: var(--dim);
+  text-decoration: none;
+  font-size: 12px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  line-height: 1.35;
+}
+.kb-side a:hover { color: var(--ink); background: rgba(255,255,255,.05); }
+.kb-side a.on { color: var(--acc); background: rgba(108,182,255,.12); }
+.kb-side a.l2 { padding-left: 18px; font-size: 11.5px; }
+.kb-side a.l3 { padding-left: 28px; font-size: 11px; }
+.kb-main {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 22px 28px 32px;
+  min-width: 0;
+}
+.kb-main .crumb {
+  font-size: 12px;
+  color: var(--dim);
+  margin-bottom: 12px;
+}
+.kb-main .crumb a { color: var(--acc); text-decoration: none; cursor: pointer; }
+.kb-main .doc-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin: 8px 0 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+.kb-main h1.doc-title {
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.35;
+  margin: 0;
+}
+.md-body h2 { scroll-margin-top: 80px; }
+.md-body h3, .md-body h4 { scroll-margin-top: 80px; }
+.md-body pre, .kb-main pre {
+  background: rgba(0,0,0,.35);
+  padding: 12px 14px;
+  border-radius: 8px;
+  overflow: auto;
+  font-size: 12.5px;
+  line-height: 1.55;
+  margin: 8px 0;
+}
+.md-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  background: rgba(255,255,255,.06);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.md-body pre code { background: transparent; padding: 0; }
+.md-body table { margin: 10px 0; }
+.md-body blockquote {
+  border-left: 3px solid var(--acc);
+  padding: 4px 12px;
+  margin: 8px 0;
+  color: var(--dim);
+}
+.kb-list-item {
+  cursor: pointer;
+  transition: border-color .15s;
+}
+.kb-list-item:hover { border-color: rgba(108,182,255,.45); }
+.kb-list-item h2 { cursor: pointer; }

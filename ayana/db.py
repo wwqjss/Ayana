@@ -242,6 +242,24 @@ CREATE TABLE IF NOT EXISTS jobs (
   updated_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS object_knowledge (
+  id TEXT PRIMARY KEY,
+  asset_id TEXT NOT NULL,
+  object_name TEXT NOT NULL,
+  object_kind TEXT NOT NULL DEFAULT '',
+  display_name TEXT NOT NULL DEFAULT '',
+  purpose TEXT NOT NULL DEFAULT '',
+  related_objects TEXT NOT NULL DEFAULT '[]',
+  dependencies TEXT NOT NULL DEFAULT '[]',
+  expected_state TEXT NOT NULL DEFAULT '',
+  failure_meaning TEXT NOT NULL DEFAULT '',
+  investigation_hints TEXT NOT NULL DEFAULT '[]',
+  remediation_hints TEXT NOT NULL DEFAULT '[]',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  UNIQUE(asset_id, object_name)
+);
+
 CREATE INDEX IF NOT EXISTS idx_episodes_incident ON alert_episodes(incident_id);
 CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_events_incident ON events(incident_id, at);
@@ -249,6 +267,7 @@ CREATE INDEX IF NOT EXISTS idx_actions_state ON actions(state, created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_log(at);
 CREATE INDEX IF NOT EXISTS idx_outbox_state ON notification_outbox(state, created_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state, due_at);
+CREATE INDEX IF NOT EXISTS idx_knowledge_asset ON object_knowledge(asset_id, object_name);
 """
 
 

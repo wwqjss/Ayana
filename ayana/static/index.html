@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ayana</title>
-<link rel="stylesheet" href="/static/app.css?v=2">
+<link rel="stylesheet" href="/static/app.css?v=6">
 </head>
 <body>
 <div id="app">
@@ -28,7 +28,7 @@
       <nav>
         <button data-tab="overview" class="tab active">总览</button>
         <button data-tab="incidents" class="tab">事件</button>
-        <button data-tab="actions" class="tab">操作</button>
+        <button data-tab="knowledge" class="tab">知识</button>
         <button data-tab="permissions" class="tab">权限</button>
         <button data-tab="audit" class="tab">审计</button>
       </nav>
@@ -54,14 +54,53 @@
         <div id="incidents-list"></div>
       </section>
 
-      <section id="tab-actions" class="tab-panel hidden">
-        <div id="actions-list"></div>
+      <section id="tab-knowledge" class="tab-panel hidden">
+        <div class="card">
+          <h2>运维知识库</h2>
+          <p class="muted small">一个知识主题 = 一个 Markdown。供 Agent 调查与人工查阅；不授予执行权。</p>
+          <div class="form-row" id="kb-filters">
+            <label>搜索 <input id="kb-q" placeholder="标题 / 标签 / 正文…"></label>
+            <label>类型
+              <select id="kb-type">
+                <option value="">全部</option>
+                <option value="system">system 系统/链路</option>
+                <option value="issue">issue 典型故障</option>
+                <option value="procedure">procedure 方法</option>
+              </select>
+            </label>
+            <label>状态
+              <select id="kb-status">
+                <option value="">全部</option>
+                <option value="active">active 有效</option>
+                <option value="deprecated">deprecated 废弃</option>
+                <option value="historical">historical 历史</option>
+              </select>
+            </label>
+            <button class="btn primary" id="kb-search" type="button">搜索</button>
+          </div>
+        </div>
+        <div id="knowledge-list"></div>
       </section>
 
       <section id="tab-permissions" class="tab-panel hidden">
         <div class="card">
-          <h2>业务权限（Ayana）</h2>
-          <p class="muted">主机侧 commands.json / forced-command / sudoers 为独立最终安全上限，此处不能扩大主机边界。</p>
+          <h2>谁能做什么</h2>
+          <p class="muted small">
+            按「资产 / 对象」选择处置方式。默认管理 Ayana Agent 自动处置；
+            QQ / Web 个人授权见下方「高级权限」。
+          </p>
+          <p class="muted small">
+            主机侧 commands.json / forced-command / sudoers 仍是最终安全上限，此处不能扩大。
+          </p>
+          <div class="perm-legend">
+            <span><span class="dot" style="background:var(--bad)"></span>禁止</span>
+            <span><span class="dot" style="background:var(--warn)"></span>需要我确认</span>
+            <span><span class="dot" style="background:var(--ok)"></span>Ayana 可以自动执行</span>
+          </div>
+          <div id="perm-agent"></div>
+        </div>
+        <details class="perm-adv card">
+          <summary>高级权限（QQ / Web 用户等细规则）</summary>
           <div class="form-row">
             <label>主体类型
               <select id="perm-subject-type">
@@ -80,8 +119,8 @@
             <label class="chk"><input type="checkbox" id="perm-auto"> 允许自动</label>
             <button class="btn primary" id="perm-save">保存</button>
           </div>
-        </div>
-        <div id="perm-list"></div>
+          <div id="perm-list"></div>
+        </details>
       </section>
 
       <section id="tab-audit" class="tab-panel hidden">
@@ -101,7 +140,7 @@
   </div>
 </div>
 
-<script src="/static/qrcode.js?v=2"></script>
-<script src="/static/app.js?v=2"></script>
+<script src="/static/qrcode.js?v=6"></script>
+<script src="/static/app.js?v=6"></script>
 </body>
 </html>

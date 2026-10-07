@@ -13,6 +13,7 @@ from typing import Any
 from .actions import ActionService
 from .db import Database, now
 from .investigation import InvestigationService
+from .knowledge import KnowledgeBase
 from .llm import LLMClient
 from .notify import Notifier
 from .policy import Policy
@@ -32,6 +33,7 @@ class AgentLoop:
         notifier: Notifier,
         *,
         auto_enabled: bool = False,
+        knowledge: KnowledgeBase | None = None,
     ):
         self.db = db
         self.investigation = investigation
@@ -40,6 +42,7 @@ class AgentLoop:
         self.llm = llm
         self.notifier = notifier
         self.auto_enabled = auto_enabled
+        self.knowledge = knowledge or KnowledgeBase(db)
 
     def set_auto_enabled(self, enabled: bool) -> None:
         self.auto_enabled = enabled
@@ -56,6 +59,18 @@ class AgentLoop:
 
         result: dict[str, Any] = {"incident_id": inc_id, "steps": []}
 
+        # 0. 运维知识（Markdown）：主题正文 / 共同命中
+        knol = self.knowledge.investigation_context(
+            inc["asset_id"], inc.get("object_id") or ""
+        )
+        result["steps"].append({
+            "step": "knowledge",
+            "ok": bool(knol.get("docs")),
+            "docs": [d.get("id") for d in (knol.get("docs") or [])],
+            "shared": [d.get("id") for d in (knol.get("shared_docs") or [])],
+        })
+        knowledge_text = knol.get("context_text") or ""
+
         # 1. 固定只读调查（auto_rule 需要读权限）
         try:
             inv = await self.investigation.run(
@@ -71,11 +86,15 @@ class AgentLoop:
             evidence_text = "\n".join(
                 e.get("output", "")[:300] for e in evidence if e.get("output")
             )[:2000]
+            # investigation 也可能带上知识（对象级）
+            inv_knol = inv.get("knowledge") or {}
+            if inv_knol.get("context_text"):
+                knowledge_text = inv_knol["context_text"]
         except Exception as e:
             result["steps"].append({"step": "investigate", "ok": False, "error": str(e)})
             evidence_text = ""
 
-        # 2. LLM 分析（可选，仅建议）
+        # 2. LLM 分析（可选，仅建议；注入知识语义）
         llm_result = None
         if self.llm.enabled:
             try:
@@ -83,6 +102,7 @@ class AgentLoop:
                     title=inc.get("title", ""),
                     evidence_text=evidence_text,
                     alertname=inc.get("title", "").split(":")[-1].strip() if ":" in inc.get("title", "") else "",
+                    knowledge_text=knowledge_text,
                 )
                 result["steps"].append({
                     "step": "llm_analyze",

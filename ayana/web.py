@@ -92,8 +92,10 @@ class WebApp:
         app.router.add_post("/api/assets/{asset_id}/investigate", self.api_investigate)
         app.router.add_get("/api/incidents", self.api_incidents)
         app.router.add_get("/api/incidents/{inc_id}", self.api_incident_detail)
+        app.router.add_get("/api/loops", self.api_loops)
         app.router.add_post("/api/incidents/{inc_id}/close", self.api_incident_close)
         app.router.add_get("/api/actions", self.api_actions)
+        app.router.add_get("/api/actions/{aid}", self.api_action_detail)
         app.router.add_post("/api/actions", self.api_action_propose)
         app.router.add_post("/api/actions/{aid}/approve", self.api_action_approve)
         app.router.add_post("/api/actions/{aid}/cancel", self.api_action_cancel)
@@ -102,6 +104,7 @@ class WebApp:
         app.router.add_get("/api/permissions", self.api_permissions)
         app.router.add_post("/api/permissions", self.api_permission_upsert)
         app.router.add_post("/api/permissions/delete", self.api_permission_delete)
+        app.router.add_get("/api/knowledge", self.api_knowledge)
         app.router.add_get("/api/audit", self.api_audit)
         app.router.add_get("/api/notifications", self.api_notifications)
         app.router.add_post("/api/notifications/retry", self.api_notifications_retry)
@@ -430,6 +433,13 @@ class WebApp:
         status = request.rel_url.query.get("status", "")
         return _json({"ok": True, "incidents": self.incidents.list_incidents(status=status)})
 
+    async def api_loops(self, request: web.Request) -> web.Response:
+        """故障闭环：Incident 关联 Investigation / Action / Verification。"""
+        self._require_auth(request)
+        limit = int(request.rel_url.query.get("limit", "50"))
+        loops = self.incidents.list_closed_loops(limit=limit)
+        return _json({"ok": True, "loops": loops})
+
     async def api_incident_detail(self, request: web.Request) -> web.Response:
         self._require_auth(request)
         inc_id = request.match_info["inc_id"]
@@ -546,7 +556,19 @@ class WebApp:
 
     async def api_actions(self, request: web.Request) -> web.Response:
         self._require_auth(request)
-        return _json({"ok": True, "actions": self.actions.list_actions()})
+        q = request.rel_url.query
+        manual_only = q.get("manual", "") in ("1", "true", "yes")
+        return _json({
+            "ok": True,
+            "actions": self.actions.list_actions(manual_only=manual_only),
+        })
+
+    async def api_action_detail(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        data = self.actions.get_action(request.match_info["aid"])
+        if not data:
+            return _json({"ok": False, "error": "not_found"}, 404)
+        return _json({"ok": True, "action": data})
 
     async def api_action_propose(self, request: web.Request) -> web.Response:
         sess = self._require_auth(request)
@@ -650,6 +672,30 @@ class WebApp:
         except (PolicyDeny, KeyError, ValueError) as e:
             return _json({"ok": False, "error": str(e)}, 400)
         return _json({"ok": True})
+
+    async def api_knowledge(self, request: web.Request) -> web.Response:
+        """运维知识库只读：Markdown 主题（front matter + 正文）。"""
+        self._require_auth(request)
+        from .knowledge import KnowledgeBase
+
+        kb = KnowledgeBase(self.db)
+        q = request.rel_url.query
+        doc_id = q.get("id", "")
+        if doc_id:
+            doc = kb.get(doc_id)
+            if not doc:
+                return _json({"ok": False, "error": "not_found"}, 404)
+            return _json({"ok": True, "knowledge": doc.to_public()})
+        items = kb.list_docs(
+            status=q.get("status", ""),
+            typ=q.get("type", ""),
+            q=q.get("q", ""),
+        )
+        return _json({
+            "ok": True,
+            "knowledge": [d.to_public() for d in items],
+            "note": "Markdown 为知识正文事实源；仅 active 可作为当前调查依据。",
+        })
 
     async def api_audit(self, request: web.Request) -> web.Response:
         self._require_auth(request)

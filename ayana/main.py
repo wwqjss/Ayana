@@ -21,6 +21,7 @@ from .config import load_config
 from .db import Database, now
 from .incidents import IncidentService
 from .investigation import InvestigationService
+from .knowledge import KnowledgeBase
 from .llm import make_llm
 from .ntsafe import AssetBinding, IdentityGate, NTClient
 from .notify import Notifier
@@ -78,7 +79,7 @@ DEFAULT_ASSETS = [
         "display_name": "Yomi",
         "read_alias": "yomi",
         "write_alias": "yomi-exec",
-        "expected_host_id": "iZDEMOINSTANCEID000001",
+        "expected_host_id": "yomi",
         "prom_asset": "yomi",
         "objects": [],
     },
@@ -137,6 +138,7 @@ def seed_assets(db: Database) -> None:
                 ),
             )
     db.audit("system", "seed", "assets_seeded")
+    # 知识正文在 knowledge/*.md；此处仅建索引可重建，不再写 object_knowledge 正文
     # auto_rule 基础权限：只读调查 + runbook 执行
     from .policy import Policy
 
@@ -183,10 +185,12 @@ class App:
         self.policy = Policy(self.db)
         self.nt = NTClient(privilege_mode="restricted_dispatcher")
         self.gate = IdentityGate(self.nt, load_bindings(self.db))
+        self.knowledge = KnowledgeBase(self.db)
         self.prom = PromClient(cfg.get("prometheus_url", "http://127.0.0.1:9090"))
         self.incidents = IncidentService(self.db)
         self.investigation = InvestigationService(
-            self.db, self.nt, self.gate, self.prom, self.policy
+            self.db, self.nt, self.gate, self.prom, self.policy,
+            knowledge=self.knowledge,
         )
         self.actions = ActionService(
             self.db,
@@ -208,6 +212,7 @@ class App:
             self.db, self.investigation, self.actions, self.policy,
             self.llm, self.notifier,
             auto_enabled=bool(cfg.get("auto_remediation_enabled", False)),
+            knowledge=self.knowledge,
         )
         self.ob = OneBotServer(cfg["onewbot_token"], int(cfg.get("self_id") or 0))
         self.qq = QQBot(

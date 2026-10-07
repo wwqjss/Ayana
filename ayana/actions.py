@@ -996,16 +996,22 @@ class ActionService:
         obj = self._object(row["asset_id"], row["object_id"])
         return (obj or {}).get("name") or ""
 
-    def list_actions(self, state: str = "", limit: int = 50) -> list[dict[str, Any]]:
+    def list_actions(
+        self, state: str = "", limit: int = 50, manual_only: bool = False
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM actions"
+        args: list[Any] = []
+        where = []
         if state:
-            rows = self.db.query(
-                "SELECT * FROM actions WHERE state=? ORDER BY created_at DESC LIMIT ?",
-                (state, limit),
-            )
-        else:
-            rows = self.db.query(
-                "SELECT * FROM actions ORDER BY created_at DESC LIMIT ?", (limit,)
-            )
+            where.append("state=?")
+            args.append(state)
+        if manual_only:
+            where.append("(incident_id IS NULL OR incident_id='')")
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        args.append(limit)
+        rows = self.db.query(sql, tuple(args))
         return [dict(r) for r in rows]
 
     def get_action(self, action_id: str) -> dict[str, Any] | None:

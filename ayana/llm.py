@@ -58,13 +58,21 @@ class LLMClient:
             return None
 
     async def analyze_incident(
-        self, *, title: str, evidence_text: str, alertname: str = ""
+        self,
+        *,
+        title: str,
+        evidence_text: str,
+        alertname: str = "",
+        knowledge_text: str = "",
     ) -> dict[str, Any] | None:
         """分析事件，返回摘要/分类/建议。仅分析，不执行。"""
+        knol_block = f"\n运维知识（长期语义，非实时状态）:\n{knowledge_text[:2500]}\n" if knowledge_text else ""
         user = (
             f"事件: {title}\n"
             f"告警类型: {alertname}\n"
+            f"{knol_block}"
             f"证据:\n{evidence_text[:3000]}\n\n"
+            "请结合知识中的依赖关系判断：若多个探测同时失败，优先考虑共同依赖。\n"
             "请用 JSON 回答:\n"
             '{"summary": "一句话结论", "category": "服务退出/网络/磁盘/内存/其他",'
             ' "confidence": "high/medium/low", "suggestion": "建议处置(仅建议)", "need_human": true/false}'
