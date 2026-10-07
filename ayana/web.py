@@ -98,6 +98,7 @@ class WebApp:
         app.router.add_get("/api/actions/{aid}", self.api_action_detail)
         app.router.add_post("/api/actions", self.api_action_propose)
         app.router.add_post("/api/actions/{aid}/approve", self.api_action_approve)
+        app.router.add_post("/api/actions/{aid}/reject", self.api_action_reject)
         app.router.add_post("/api/actions/{aid}/cancel", self.api_action_cancel)
         app.router.add_post("/api/actions/{aid}/execute", self.api_action_execute)
         app.router.add_post("/api/actions/{aid}/verify", self.api_action_verify)
@@ -309,42 +310,51 @@ class WebApp:
 
     async def api_overview(self, request: web.Request) -> web.Response:
         self._require_auth(request)
+        from .health import REQUIRED_CHECKS, asset_health
+
         assets_raw = self.db.query("SELECT * FROM assets ORDER BY id")
         assets = []
+        open_inc = self.incidents.list_incidents(status="open", limit=50)
+        open_by_asset = {}
+        for i in open_inc:
+            aid = i.get("asset_id") or ""
+            open_by_asset[aid] = open_by_asset.get(aid, 0) + 1
         for a in assets_raw:
             d = dict(a)
             d["objects"] = [
                 dict(o)
                 for o in self.db.query("SELECT * FROM objects WHERE asset_id=?", (a["id"],))
             ]
-            # 实时探测状态
-            try:
-                probe = await self.prom.probe_success(a["id"], "")
-                d["probe"] = summarize_probe(probe)
-            except Exception:
-                d["probe"] = {"state": "unavailable"}
-            # hysteria 代理探测
-            if a["id"] == "sora":
+            samples_by_metric = {}
+            req = REQUIRED_CHECKS.get(a["id"], [])
+            metrics = {c.get("metric") for c in req if c.get("metric")}
+            for metric in metrics:
                 try:
-                    hy = await self.prom.query('hysteria_proxy_up')
-                    hy_samples = hy.get("result") or []
-                    hy_ok = all(s.get("value") == 1 for s in hy_samples) if hy_samples else False
-                    d["hysteria_proxy"] = {
-                        "state": "ok" if hy_ok else "fail",
-                        "targets": [
-                            {"target": s.get("metric", {}).get("target", "?"), "value": s.get("value")}
-                            for s in hy_samples
-                        ],
-                    }
+                    if metric == "hysteria_proxy_up":
+                        hy = await self.prom.query("hysteria_proxy_up")
+                        samples_by_metric[metric] = hy.get("result") or []
+                    elif metric == "probe_success":
+                        samples_by_metric[metric] = await self.prom.probe_success_since(
+                            a["id"], "", start=now() - 300
+                        )
+                    else:
+                        samples_by_metric[metric] = []
                 except Exception:
-                    d["hysteria_proxy"] = {"state": "unavailable"}
+                    samples_by_metric[metric] = []
+            health = asset_health(
+                asset_id=a["id"],
+                objects=d["objects"],
+                samples_by_metric=samples_by_metric,
+                open_incidents=open_by_asset.get(a["id"], 0),
+            )
+            d["health"] = health
+            d["probe"] = {"state": health.get("state", "unknown")}
             assets.append(d)
-        open_inc = self.incidents.list_incidents(status="open", limit=10)
         need = [i for i in open_inc if i.get("need_human")]
         actions = self.actions.list_actions(limit=10)
-        pending_actions = [a for a in actions if a.get("state") in ("proposed", "approved", "dispatched")]
-        unknown_actions = [a for a in actions if a.get("state") == "unknown"]
-        sources: dict[str, Any] = {}
+        pending_actions = [x for x in actions if x.get("state") in ("proposed", "approved", "dispatched")]
+        unknown_actions = [x for x in actions if x.get("state") == "unknown"]
+        sources = {}
         try:
             targets = await self.prom.targets()
             sources["prometheus_targets"] = len(targets)
@@ -452,7 +462,109 @@ class WebApp:
         actions_list = inc.get("actions") or []
         last_action = actions_list[-1] if actions_list else None
         summary = self._incident_human_summary(inc, last_action)
-        return _json({"ok": True, "incident": inc, "summary": summary})
+        disposition = self._incident_disposition(inc)
+        return _json({
+            "ok": True,
+            "incident": inc,
+            "summary": summary,
+            "disposition": disposition,
+        })
+
+    def _incident_disposition(self, inc: dict) -> dict:
+        """P1-01：事件详情处置上下文（服务端求值，前端不重算 Policy）。"""
+        from .fmt import ZH_CAP
+
+        actions_list = inc.get("actions") or []
+        pending = [a for a in actions_list if a.get("state") in ("proposed", "approved")]
+        invs = inc.get("investigations") or []
+        last_inv = invs[-1] if invs else None
+        evidence_summary = ""
+        if last_inv:
+            ev = last_inv.get("evidence") or []
+            if isinstance(ev, str):
+                try:
+                    ev = json.loads(ev or "[]")
+                except Exception:
+                    ev = []
+            parts = []
+            for e in (ev or [])[:4]:
+                if isinstance(e, dict):
+                    parts.append(
+                        (e.get("summary") or e.get("output") or e.get("source") or "")[:160]
+                    )
+            evidence_summary = "\n".join(p for p in parts if p)[:600]
+
+        items = []
+        for a in pending:
+            payload = {}
+            try:
+                payload = json.loads(a.get("params_json") or "{}")
+            except Exception:
+                payload = {}
+            eff = {}
+            try:
+                eff = json.loads(a.get("decision_snapshot_json") or a.get("policy_snapshot_json") or "{}")
+            except Exception:
+                eff = {}
+            vers = a.get("verifications") or []
+            ver_target = ""
+            if vers:
+                v = vers[-1]
+                ver_target = v.get("note") or v.get("profile_id") or v.get("status") or ""
+            items.append({
+                "action_id": a.get("id"),
+                "state": a.get("state"),
+                "capability": a.get("capability"),
+                "capability_zh": ZH_CAP.get(a.get("capability", ""), a.get("capability", "")),
+                "asset_id": a.get("asset_id"),
+                "object_id": a.get("object_id"),
+                "reason": a.get("reason", ""),
+                "mode": a.get("mode", ""),
+                "runbook_id": a.get("runbook_id", ""),
+                "runbook_rev": a.get("runbook_rev", ""),
+                "template_id": a.get("template_id", ""),
+                "approval_deadline": a.get("approval_deadline"),
+                "created_at": a.get("created_at"),
+                "decision": eff.get("decision", ""),
+                "decision_reason": eff.get("reason", ""),
+                "matched_rule": eff.get("matched_rule") or (eff.get("rule") or {}),
+                "readable": eff.get("readable", ""),
+                "verification_target": ver_target,
+                "tokens": payload.get("tokens") or [],
+                "proposer_type": a.get("proposer_type", ""),
+                "proposer_id": a.get("proposer_id", ""),
+            })
+
+        policy_view = None
+        ref = items[0] if items else (actions_list[-1] if actions_list else None)
+        if ref:
+            asset_id = ref.get("asset_id") or ""
+            object_id = ref.get("object_id") or ""
+            capability = ref.get("capability") or ""
+            obj_row = self.db.query_one(
+                "SELECT id FROM objects WHERE asset_id=? AND (id=? OR name=?)",
+                (asset_id, object_id, object_id),
+            )
+            policy_obj = (obj_row["id"] if obj_row else object_id) or "*"
+            subject_type = ref.get("proposer_type") or "web_user"
+            subject_id = ref.get("proposer_id") or "system"
+            try:
+                policy_view = self.policy.effective_decision(
+                    subject_type=subject_type,
+                    subject_id=subject_id,
+                    capability=capability,
+                    asset_id=asset_id,
+                    object_id=policy_obj,
+                )
+            except Exception:
+                policy_view = None
+
+        return {
+            "evidence_summary": evidence_summary,
+            "investigation_id": (last_inv or {}).get("id", ""),
+            "proposals": items,
+            "policy": policy_view,
+        }
 
     def _incident_human_summary(self, inc: dict, action: dict | None) -> dict:
         from .fmt import ZH_CAP, ZH_STAGE, ZH_STATE, alert_name
@@ -462,9 +574,15 @@ class WebApp:
             "incident_opened": "发现异常",
             "alert_fired": "告警触发",
             "alert_resolved": "告警恢复",
+            "alert_resolved_hold": "告警恢复但义务未清",
+            "episode_attached": "告警并入事件",
             "investigation": "完成调查",
             "action_proposed": "提出处置",
+            "proposal_waiting": "等待人工确认",
             "action_approved": "批准处置",
+            "action_rejected": "拒绝处置",
+            "action_cancelled": "取消处置",
+            "action_expired": "提案过期",
             "action_dispatched": "派发执行",
             "action_success": "处置完成",
             "action_failure": "处置失败",
@@ -474,11 +592,20 @@ class WebApp:
             "agent_auto_exec": "自动处置",
             "agent_escalated": "转人工",
             "incident_resolved": "事件解决",
+            "incident_reopened": "事件复发",
+            "incident_closed": "事件关闭",
+            "reconcile_not_seen": "对账未见",
+            "reconcile_observed": "对账观察",
+            "generation_bumped": "轮次递增",
         }
-        for e in (inc.get("events") or [])[-8:]:
+        # 默认优先保证最新事件可见（接口 desc 返回，此处取最新 8 条再正序展示）
+        events = list(inc.get("events") or [])
+        latest = events[:8] if events else []
+        for e in reversed(latest):
             timeline.append({
                 "time": e.get("at"),
                 "label": zh_event.get(e.get("type", ""), e.get("title", "")),
+                "type": e.get("type", ""),
             })
 
         what = alert_name(inc.get("title", ""))
@@ -531,28 +658,16 @@ class WebApp:
         inc_id = request.match_info["inc_id"]
         body = await request.json()
         reason = body.get("reason", "人工关闭")
-        row = self.db.query_one("SELECT * FROM incidents WHERE id=?", (inc_id,))
-        if not row:
-            return _json({"ok": False, "error": "not_found"}, 404)
-        with self.db.tx() as conn:
-            conn.execute(
-                "UPDATE incidents SET status='closed', stage='done', need_human=0,"
-                " need_human_reason='', resolved_at=?, updated_at=? WHERE id=?",
-                (now(), now(), inc_id),
-            )
-            conn.execute(
-                "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
-                (inc_id, now(), "incident_closed", f"人工关闭: {reason}",
-                 json.dumps({"reason": reason}, ensure_ascii=False)),
-            )
-            conn.execute(
-                "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, object_id,"
-                " detail_json) VALUES(?,?,?,?,?,?,?)",
-                (now(), "web_user", sess["username"], "incident_closed",
-                 row["asset_id"] or "", inc_id,
-                 json.dumps({"reason": reason}, ensure_ascii=False)),
-            )
-        return _json({"ok": True})
+        # P0-04：closed ≠ recovered，不伪造 resolved_at
+        res = self.incidents.close_manual(inc_id, reason, actor=sess["username"])
+        if not res.get("ok"):
+            return _json({"ok": False, "error": res.get("error", "not_found")}, 404)
+        self.db.audit(
+            "web_user", sess["username"], "incident_closed",
+            asset_id="", object_id=inc_id,
+            detail={"reason": reason, "outcome": res.get("outcome")},
+        )
+        return _json({"ok": True, "outcome": res.get("outcome")})
 
     async def api_actions(self, request: web.Request) -> web.Response:
         self._require_auth(request)
@@ -592,14 +707,54 @@ class WebApp:
     async def api_action_approve(self, request: web.Request) -> web.Response:
         sess = self._require_auth(request)
         self._check_csrf(request, sess)
+        body = {}
         try:
-            res = self.actions.approve(
-                request.match_info["aid"],
-                approver_type="web_user",
-                approver_id=sess["username"],
-            )
+            body = await request.json()
+        except Exception:
+            body = {}
+        execute = bool(body.get("execute", True))
+        reason = body.get("reason", "") or ""
+        try:
+            if execute:
+                res = await self.actions.approve_and_execute(
+                    request.match_info["aid"],
+                    actor_type="web_user",
+                    actor_id=sess["username"],
+                    channel="web",
+                    reason=reason,
+                    is_admin=bool(sess.get("is_admin")),
+                )
+            else:
+                res = self.actions.approve(
+                    request.match_info["aid"],
+                    approver_type="web_user",
+                    approver_id=sess["username"],
+                    channel="web",
+                    reason=reason,
+                )
         except ActionError as e:
             return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True, **res})
+
+    async def api_action_reject(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        self._check_csrf(request, sess)
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        reason = body.get("reason", "") or ""
+        try:
+            res = self.actions.reject(
+                request.match_info["aid"],
+                actor_type="web_user",
+                actor_id=sess["username"],
+                channel="web",
+                reason=reason,
+            )
+        except ActionError as e:
+            return _json({"ok": False, "error": e.code, "message": str(e)}, 400)
         return _json({"ok": True, **res})
 
     async def api_action_cancel(self, request: web.Request) -> web.Response:
@@ -641,7 +796,30 @@ class WebApp:
 
     async def api_permissions(self, request: web.Request) -> web.Response:
         self._require_auth(request)
-        return _json({"ok": True, **self.policy.effective_summary()})
+        data = self.policy.effective_summary()
+        # 服务端附带三态，前端不自行求优先级
+        for p in data.get("permissions") or []:
+            try:
+                cap_kind = "write"
+                from .capabilities import get_capability
+
+                cap_kind = get_capability(p.get("capability") or "").kind
+            except Exception:
+                cap_kind = "write"
+            decision = Policy._three_state(
+                allow=bool(p.get("allow")),
+                require_approval=bool(p.get("require_approval")),
+                auto_allowed=bool(p.get("auto_allowed")),
+            )
+            if cap_kind != "write":
+                decision = "automatic" if p.get("allow") else "forbidden"
+            p["decision"] = decision
+            p["readable"] = {
+                "forbidden": "禁止",
+                "approval_required": "需要我确认",
+                "automatic": "自动执行" if cap_kind == "write" else "允许读取",
+            }.get(decision, decision)
+        return _json({"ok": True, **data})
 
     async def api_permission_upsert(self, request: web.Request) -> web.Response:
         sess = self._require_admin(request)

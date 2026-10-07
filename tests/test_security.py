@@ -62,8 +62,36 @@ class FakeGate:
 
 
 class FakeProm:
+    """契约对齐 prom.PromClient：验证器调用 probe_success_since。"""
+
     def __init__(self):
         self.samples = []
+        self.since_calls = []
+
+    async def probe_success_since(
+        self,
+        asset,
+        service="",
+        *,
+        start,
+        end=None,
+        step=15.0,
+        window_sec=None,
+        max_window_sec=600.0,
+    ):
+        self.since_calls.append({"asset": asset, "service": service, "start": start})
+        out = []
+        for s in self.samples:
+            ts = s.get("sample_at")
+            if ts is None or float(ts) <= float(start):
+                continue
+            labels = s.get("metric") or {}
+            if labels.get("asset") != asset:
+                continue
+            if service and labels.get("service") != service:
+                continue
+            out.append(s)
+        return out
 
     async def probe_success(self, asset, service=""):
         return {
@@ -280,6 +308,43 @@ class TestActionSecurity(unittest.TestCase):
         self.assertNotEqual(res["status"], "passed")
         inc = self.db.query_one("SELECT status FROM incidents WHERE id='inc1'")
         self.assertEqual(inc["status"], "open")
+        # 正向：样本必须进入 probe_success_since（避免“没取到样本所以绿”）
+        self.assertTrue(self.prom.since_calls, "verifier never sampled via probe_success_since")
+
+    def test_positive_matching_samples_can_pass(self):
+        """正向契约：匹配 service 的双样本可 passed（证明路径真实可恢复）。"""
+        aid = "act_frps_ok"
+        self.db.execute(
+            "INSERT INTO actions(id, incident_id, asset_id, object_id, capability, params_json,"
+            " state, proposer_type, proposer_id, created_at, finished_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                aid, "inc2", "nerv", "nerv:service:frps", "service.restart",
+                '{"tokens":["systemctl","restart","frps"],"object_name":"frps"}',
+                "success", "web_user", "admin", now() - 30, now() - 30,
+            ),
+        )
+        self.db.execute(
+            "INSERT INTO incidents(id, title, asset_id, object_id, status, stage, created_at,"
+            " updated_at) VALUES('inc2','t','nerv','frps','open','pending',?,?)",
+            (now(), now()),
+        )
+        base = now() - 5
+        self.prom.samples = [
+            {"metric": {"asset": "nerv", "service": "frps"}, "value": 1, "sample_at": base + i * 15.0}
+            for i in range(16)
+        ]
+
+        async def run():
+            return await self.actions.verify(aid)
+
+        res = asyncio.run(run())
+        self.assertTrue(self.prom.since_calls)
+        self.assertEqual(res["status"], "passed", res)
+        v = self.db.query_one(
+            "SELECT evidence_json FROM verifications WHERE action_id=?", (aid,)
+        )
+        self.assertIn("frps", v["evidence_json"] or "")
 
 
 class TestMatchSeries(unittest.TestCase):

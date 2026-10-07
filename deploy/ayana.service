@@ -1,0 +1,36 @@
+[Unit]
+Description=Ayana ops agent (non-root)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ayana
+Group=ayana
+WorkingDirectory=/opt/ayana
+# 固定虚拟环境入口；不使用 root
+ExecStart=/opt/ayana/.venv/bin/python -m ayana.main /etc/ayana/config.json
+Restart=on-failure
+RestartSec=5
+# 单实例由应用 flock 保证；systemd 也拒绝并发
+KillMode=mixed
+TimeoutStopSec=20
+
+# 环境
+Environment=PYTHONUNBUFFERED=1
+# Environment=AYANA_* 可覆盖非秘密项
+
+# 基础加固（按实际 SSH 连通性逐步启用，勿一次加满）
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ayana /var/log/ayana
+# SSH 需要写 known_hosts / 读密钥：
+# ReadWritePaths+=/var/lib/ayana/.ssh
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

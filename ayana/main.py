@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 import time
@@ -21,6 +22,7 @@ from .config import load_config
 from .db import Database, now
 from .incidents import IncidentService
 from .investigation import InvestigationService
+from .instance import acquire_single_instance_lock
 from .knowledge import KnowledgeBase
 from .llm import make_llm
 from .ntsafe import AssetBinding, IdentityGate, NTClient
@@ -318,35 +320,36 @@ class App:
         while not self._stop.is_set():
             try:
                 if self.cfg.get("alertmanager_url"):
-                    alerts = await self.alert_ingest.fetch_am_alerts(self.cfg["alertmanager_url"])
-                    self.alert_ingest.reconcile(alerts)
+                    try:
+                        alerts = await self.alert_ingest.fetch_am_alerts(self.cfg["alertmanager_url"])
+                        self.alert_ingest.reconcile(alerts, source_ok=True)
+                    except Exception as e:
+                        log.warning("AM fetch failed: %s", e)
+                        # 上游失败 ≠ 恢复
+                        self.alert_ingest.reconcile([], source_ok=False)
             except Exception as e:
                 log.warning("AM reconcile failed: %s", e)
             await asyncio.sleep(60)
 
     async def _bg_agent(self) -> None:
-        """Agent 自动闭环：处理新建 Incident。"""
+        """Agent 闭环：只读调查 + 提案（始终）；自动派发仅 auto_enabled。"""
         while not self._stop.is_set():
             try:
-                if self.agent.auto_enabled:
-                    rows = self.db.query(
-                        "SELECT id FROM incidents WHERE status='open' AND need_human=0"
-                        " AND stage='pending'"
-                        " ORDER BY created_at ASC LIMIT 3"
-                    )
-                    for r in rows:
-                        await self.agent.handle_incident(r["id"])
+                rows = self.db.query(
+                    "SELECT id FROM incidents WHERE status='open' AND need_human=0"
+                    " AND stage IN ('pending','investigating')"
+                    " ORDER BY created_at ASC LIMIT 3"
+                )
+                for r in rows:
+                    await self.agent.handle_incident(r["id"])
+                # 过期 proposal 清扫（TTL / approval_deadline）
+                try:
+                    self.actions.expire_stale_proposals()
+                except Exception:
+                    log.exception("expire proposals failed")
             except Exception:
                 log.exception("agent loop failed")
             await asyncio.sleep(15)
-        while not self._stop.is_set():
-            try:
-                if self.cfg.get("alertmanager_url"):
-                    alerts = await self.alert_ingest.fetch_am_alerts(self.cfg["alertmanager_url"])
-                    self.alert_ingest.reconcile(alerts)
-            except Exception as e:
-                log.warning("AM reconcile failed: %s", e)
-            await asyncio.sleep(60)
 
     async def _bg_correlate(self) -> None:
         """同步 episode→Incident。
@@ -393,9 +396,23 @@ class App:
 async def amain(config_path: str) -> None:
     cfg = load_config(config_path)
     setup_logging(cfg.get("log_level", "INFO"), cfg.get("log_file"))
-    log.info("Ayana v%s starting", VERSION)
-    app = App(cfg)
-    await app.start()
+    lock = acquire_single_instance_lock(cfg.get("instance_lock") or "/tmp/ayana.lock")
+    try:
+        log.info("Ayana v%s starting", VERSION)
+        app = App(cfg)
+        await app.start()
+    finally:
+        try:
+            if os.name != "nt":
+                import fcntl
+
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            lock.close()
+        except Exception:
+            pass
 
 
 def cli() -> None:

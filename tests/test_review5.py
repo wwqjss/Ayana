@@ -159,7 +159,18 @@ class TestHoldConvergence(unittest.TestCase):
             " VALUES('ep1','am','fp','s1','T','resolved','nerv','frps','inc1',?,?,1)",
             (now(), now()),
         )
-        # 无 firing、无 blocked、无 need_human → 收敛
+        db.execute(
+            "INSERT INTO actions(id, incident_id, asset_id, object_id, capability, params_json,"
+            " state, created_at, finished_at) VALUES('a1','inc1','nerv','nerv:service:frps',"
+            " 'service.restart','{}','success',?,?)",
+            (now(), now()),
+        )
+        db.execute(
+            "INSERT INTO verifications(id, action_id, incident_id, status, generation, started_at)"
+            " VALUES('v1','a1','inc1','passed',1,?)",
+            (now(),),
+        )
+        # 无 firing、无 blocked、无 need_human、有恢复证据 → 收敛
         inc.reevaluate_after_action("inc1")
         row = db.query_one("SELECT status FROM incidents WHERE id='inc1'")
         self.assertEqual(row["status"], "resolved")
@@ -182,6 +193,17 @@ class TestDuplicateResolved(unittest.TestCase):
             " status, asset_id, object_id, incident_id, first_seen, last_seen, receive_count)"
             " VALUES('ep1','am','fp','s1','T','resolved','nerv','frps','inc1',?,?,1)",
             (now(), now()),
+        )
+        db.execute(
+            "INSERT INTO actions(id, incident_id, asset_id, object_id, capability, params_json,"
+            " state, created_at, finished_at) VALUES('a1','inc1','nerv','nerv:service:frps',"
+            " 'service.restart','{}','success',?,?)",
+            (now(), now()),
+        )
+        db.execute(
+            "INSERT INTO verifications(id, action_id, incident_id, status, generation, started_at)"
+            " VALUES('v1','a1','inc1','passed',1,?)",
+            (now(),),
         )
         for _ in range(3):
             inc.on_episode_resolved("ep1")

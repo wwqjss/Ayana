@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from typing import Any
@@ -89,10 +90,29 @@ class ActionService:
         incident_id: str = "",
         proposer_type: str = "web_user",
         proposer_id: str = "system",
+        mode: str = "manual",
+        runbook_id: str = "",
+        runbook_rev: str = "",
+        template_id: str = "",
     ) -> dict[str, Any]:
         cap = get_capability(capability)
         if cap.kind != "write":
             raise ActionError("not_a_write_capability")
+        if mode not in ("manual", "auto"):
+            raise ActionError("bad_mode", mode)
+        # 自动必须带 runbook；人工必须带 template 或 runbook（显式契约）
+        if mode == "auto" and not runbook_id:
+            raise ActionError("runbook_required", "auto mode requires runbook_id")
+        if mode == "manual" and not (runbook_id or template_id):
+            from .runbook import CAPABILITY_TEMPLATE, get_manual_template
+
+            guess = CAPABILITY_TEMPLATE.get(capability, "")
+            if guess and get_manual_template(guess):
+                template_id = guess
+            else:
+                raise ActionError(
+                    "template_required", "manual write requires template_id or runbook_id"
+                )
         obj = self._object(asset_id, object_id)
         if not obj:
             raise ActionError("object_not_registered", object_id)
@@ -104,19 +124,30 @@ class ActionService:
         except Exception as e:
             raise ActionError("bad_params", str(e)) from e
 
+        object_ref = obj["id"]
+        params_digest = hashlib.sha256(
+            json.dumps({"tokens": tokens, "params": params or {}}, sort_keys=True).encode()
+        ).hexdigest()[:16]
+
         # Incident 关联校验：资产一致，对象要么空要么对应
         if incident_id:
             self._assert_incident_matches(incident_id, asset_id, obj)
 
-        decision = self.policy.check(
+        # 自动语义与人工语义分开（P1-01：服务端三态）
+        decision = self.policy.effective_decision(
             subject_type=proposer_type,
             subject_id=proposer_id,
             capability=capability,
             asset_id=asset_id,
             object_id=obj["id"],
+            auto=(mode == "auto"),
         )
-        if not decision["allowed"]:
-            raise ActionError("denied", decision["reason"])
+        if decision.get("decision") == "forbidden" or not decision["allowed"]:
+            if mode == "auto" and decision.get("reason") == "auto_not_allowed":
+                raise ActionError("auto_not_allowed", decision.get("reason", ""))
+            raise ActionError("denied", decision.get("reason") or "forbidden")
+        if mode == "auto" and decision.get("decision") != "automatic":
+            raise ActionError("auto_not_allowed", decision.get("reason", ""))
 
         if self._object_locked(asset_id, obj["id"]):
             raise ActionError("object_locked", f"{asset_id}/{obj['id']}")
@@ -127,13 +158,21 @@ class ActionService:
             "tokens": tokens,
             "object_name": resolve_object_name(obj),
             "object_kind": obj.get("kind") or "",
+            "object_ref": object_ref,
+            "params_digest": params_digest,
+            "mode": mode,
+            "runbook_id": runbook_id,
+            "runbook_rev": runbook_rev,
+            "template_id": template_id,
         }
+        approval_deadline = now() + float(self.action_ttl)
         with self.db.tx() as conn:
             conn.execute(
                 "INSERT INTO actions(id, incident_id, asset_id, object_id, capability,"
                 " params_json, reason, state, proposer_type, proposer_id, created_at,"
-                " policy_snapshot_json)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                " policy_snapshot_json, mode, runbook_id, runbook_rev, template_id,"
+                " object_ref, params_digest, approval_deadline)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     aid,
                     incident_id,
@@ -147,6 +186,13 @@ class ActionService:
                     proposer_id,
                     now(),
                     json.dumps(decision, ensure_ascii=False, default=str),
+                    mode,
+                    runbook_id,
+                    runbook_rev,
+                    template_id,
+                    object_ref,
+                    params_digest,
+                    approval_deadline,
                 ),
             )
             conn.execute(
@@ -156,7 +202,7 @@ class ActionService:
                     now(),
                     "action_proposed",
                     f"{capability} on {asset_id}/{obj['id']}",
-                    json.dumps({"action_id": aid, "tokens": tokens}, ensure_ascii=False),
+                    json.dumps({"action_id": aid, "tokens": tokens, "mode": mode}, ensure_ascii=False),
                 ),
             )
             conn.execute(
@@ -170,14 +216,31 @@ class ActionService:
                     asset_id,
                     obj["id"],
                     aid,
-                    json.dumps({"capability": capability, "reason": reason}, ensure_ascii=False),
+                    json.dumps(
+                        {
+                            "capability": capability,
+                            "reason": reason,
+                            "mode": mode,
+                            "runbook_id": runbook_id,
+                            "runbook_rev": runbook_rev,
+                            "template_id": template_id,
+                            "params_digest": params_digest,
+                        },
+                        ensure_ascii=False,
+                    ),
                 ),
             )
         return {
             "id": aid,
             "state": "proposed",
             "tokens": tokens,
+            "mode": mode,
+            "runbook_id": runbook_id,
+            "runbook_rev": runbook_rev,
+            "template_id": template_id,
             "require_approval": decision.get("require_approval", True),
+            "decision": decision.get("decision", "approval_required"),
+            "effective_decision": decision,
         }
 
     def _assert_incident_matches(self, incident_id: str, asset_id: str, obj: dict) -> None:
@@ -198,7 +261,7 @@ class ActionService:
             )
 
     # ------------------------------------------------------------------
-    # 批准 / 取消
+    # 批准 / 拒绝 / 取消（Web / QQ 共用；幂等）
     # ------------------------------------------------------------------
 
     def approve(
@@ -207,22 +270,38 @@ class ActionService:
         *,
         approver_type: str = "web_user",
         approver_id: str = "system",
+        channel: str = "web",
+        reason: str = "",
     ) -> dict[str, Any]:
+        """批准提案。幂等：已批准/已派发不重复产生第二次 dispatch。"""
         row = self._get(action_id)
-        if row["state"] != "proposed":
-            raise ActionError("bad_state", row["state"])
-        if now() - row["created_at"] > self.action_ttl:
-            self.db.execute("UPDATE actions SET state='expired' WHERE id=?", (action_id,))
+        state = row["state"]
+        if state in ("approved", "dispatched", "success", "failure", "unknown"):
+            return {
+                "id": action_id,
+                "state": state,
+                "idempotent": True,
+                "already": True,
+            }
+        if state != "proposed":
+            raise ActionError("bad_state", state)
+        if now() - row["created_at"] > self.action_ttl or (
+            row.get("approval_deadline") and now() > float(row["approval_deadline"])
+        ):
+            self.db.execute(
+                "UPDATE actions SET state='expired', finished_at=? WHERE id=? AND state='proposed'",
+                (now(), action_id),
+            )
             raise ActionError("expired")
 
-        decision = self.policy.check(
+        decision = self.policy.effective_decision(
             subject_type=approver_type,
             subject_id=approver_id,
             capability=row["capability"],
             asset_id=row["asset_id"],
             object_id=row["object_id"],
         )
-        if not decision["allowed"]:
+        if not decision["allowed"] or decision.get("decision") == "forbidden":
             self.db.audit(
                 approver_type,
                 approver_id,
@@ -230,30 +309,212 @@ class ActionService:
                 asset_id=row["asset_id"],
                 object_id=row["object_id"],
                 action_id=action_id,
-                detail={"reason": decision["reason"]},
+                detail={
+                    "reason": decision.get("reason", ""),
+                    "decision": decision.get("decision"),
+                    "channel": channel,
+                },
             )
-            raise ActionError("approve_denied", decision["reason"])
+            raise ActionError("approve_denied", decision.get("reason", "forbidden"))
 
-        self.db.execute(
-            "UPDATE actions SET state='approved', approver_type=?, approver_id=?, approved_at=?"
-            " WHERE id=? AND state='proposed'",
-            (approver_type, approver_id, now(), action_id),
+        t = now()
+        with self.db.tx() as conn:
+            cur = conn.execute(
+                "UPDATE actions SET state='approved', approver_type=?, approver_id=?,"
+                " approved_at=?, decision_channel=?, decision_reason=?, decided_at=?,"
+                " decision_snapshot_json=?"
+                " WHERE id=? AND state='proposed'",
+                (
+                    approver_type,
+                    approver_id,
+                    t,
+                    channel,
+                    reason,
+                    t,
+                    json.dumps(decision, ensure_ascii=False, default=str),
+                    action_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                # 并发下已被别人批准/处理：幂等返回当前态
+                fresh = conn.execute(
+                    "SELECT state FROM actions WHERE id=?", (action_id,)
+                ).fetchone()
+                return {
+                    "id": action_id,
+                    "state": (fresh["state"] if fresh else "unknown"),
+                    "idempotent": True,
+                    "already": True,
+                }
+            conn.execute(
+                "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, object_id,"
+                " action_id, detail_json) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    t,
+                    approver_type,
+                    approver_id,
+                    "action_approved",
+                    row["asset_id"],
+                    row["object_id"],
+                    action_id,
+                    json.dumps(
+                        {
+                            "channel": channel,
+                            "reason": reason,
+                            "decision": decision.get("decision"),
+                            "matched_rule": decision.get("matched_rule"),
+                            "policy_snapshot": {
+                                "allowed": decision.get("allowed"),
+                                "require_approval": decision.get("require_approval"),
+                                "auto_allowed": decision.get("auto_allowed"),
+                                "reason": decision.get("reason"),
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+            conn.execute(
+                "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
+                (
+                    row["incident_id"] or "",
+                    t,
+                    "action_approved",
+                    f"approved {action_id}",
+                    json.dumps(
+                        {
+                            "action_id": action_id,
+                            "approver": f"{approver_type}:{approver_id}",
+                            "channel": channel,
+                            "reason": reason,
+                            "decision": decision.get("decision"),
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+        return {"id": action_id, "state": "approved", "idempotent": False, "decision": decision.get("decision")}
+
+    def reject(
+        self,
+        action_id: str,
+        *,
+        actor_type: str = "web_user",
+        actor_id: str = "system",
+        channel: str = "web",
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """拒绝提案：零派发。幂等。"""
+        row = self._get(action_id)
+        state = row["state"]
+        if state in ("cancelled", "expired", "rejected"):
+            return {"id": action_id, "state": state, "idempotent": True, "already": True}
+        if state != "proposed":
+            raise ActionError("bad_state", state)
+        t = now()
+        with self.db.tx() as conn:
+            cur = conn.execute(
+                "UPDATE actions SET state='cancelled', finished_at=?, result_detail=?,"
+                " decision_channel=?, decision_reason=?, decided_at=?"
+                " WHERE id=? AND state='proposed'",
+                (
+                    t,
+                    f"rejected:{reason or 'no reason'}",
+                    channel,
+                    reason,
+                    t,
+                    action_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                fresh = conn.execute(
+                    "SELECT state FROM actions WHERE id=?", (action_id,)
+                ).fetchone()
+                return {
+                    "id": action_id,
+                    "state": (fresh["state"] if fresh else "unknown"),
+                    "idempotent": True,
+                    "already": True,
+                }
+            conn.execute(
+                "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, object_id,"
+                " action_id, detail_json) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    t,
+                    actor_type,
+                    actor_id,
+                    "action_rejected",
+                    row["asset_id"],
+                    row["object_id"],
+                    action_id,
+                    json.dumps({"channel": channel, "reason": reason}, ensure_ascii=False),
+                ),
+            )
+            conn.execute(
+                "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
+                (
+                    row["incident_id"] or "",
+                    t,
+                    "action_rejected",
+                    f"rejected {action_id}",
+                    json.dumps(
+                        {
+                            "action_id": action_id,
+                            "actor": f"{actor_type}:{actor_id}",
+                            "channel": channel,
+                            "reason": reason,
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+        return {"id": action_id, "state": "cancelled", "idempotent": False}
+
+    async def approve_and_execute(
+        self,
+        action_id: str,
+        *,
+        actor_type: str = "web_user",
+        actor_id: str = "system",
+        channel: str = "web",
+        reason: str = "",
+        is_admin: bool = False,
+    ) -> dict[str, Any]:
+        """Web / QQ 共用：批准并提交执行。恰好一次 dispatch。"""
+        res = self.approve(
+            action_id,
+            approver_type=actor_type,
+            approver_id=actor_id,
+            channel=channel,
+            reason=reason,
         )
-        self.db.audit(
-            approver_type,
-            approver_id,
-            "action_approved",
-            asset_id=row["asset_id"],
-            object_id=row["object_id"],
-            action_id=action_id,
-        )
-        self.db.event(
-            "action_approved",
-            f"approved {action_id}",
-            incident_id=row["incident_id"],
-            payload={"action_id": action_id, "approver": approver_id},
-        )
-        return {"id": action_id, "state": "approved"}
+        if res.get("already"):
+            return res
+        try:
+            exec_res = await self.execute(
+                action_id,
+                actor_type=actor_type,
+                actor_id=actor_id,
+                is_admin=is_admin,
+            )
+            return {
+                "id": action_id,
+                "state": exec_res.get("state"),
+                "approved": True,
+                "executed": True,
+                "detail": exec_res.get("detail", ""),
+                "channel": channel,
+            }
+        except ActionError as e:
+            return {
+                "id": action_id,
+                "state": self._get(action_id).get("state", "approved"),
+                "approved": True,
+                "executed": False,
+                "error": e.code,
+                "message": str(e),
+                "channel": channel,
+            }
 
     def cancel(
         self,
@@ -262,10 +523,14 @@ class ActionService:
         actor_type: str = "web_user",
         actor_id: str = "system",
         is_admin: bool = False,
+        channel: str = "web",
+        reason: str = "",
     ) -> None:
         row = self._get(action_id)
         if row["state"] in ("success", "failure", "unknown", "dispatched"):
             raise ActionError("cannot_cancel", row["state"])
+        if row["state"] in ("cancelled", "expired"):
+            return
         if not is_admin and not (
             actor_type == row.get("proposer_type") and actor_id == row.get("proposer_id")
         ):
@@ -279,11 +544,117 @@ class ActionService:
                 detail={"reason": "not_owner"},
             )
             raise ActionError("cancel_denied", "not_owner")
-        self.db.execute(
-            "UPDATE actions SET state='cancelled', finished_at=? WHERE id=?",
-            (now(), action_id),
+        t = now()
+        with self.db.tx() as conn:
+            conn.execute(
+                "UPDATE actions SET state='cancelled', finished_at=?, result_detail=?,"
+                " decision_channel=?, decision_reason=?, decided_at=? WHERE id=?",
+                (t, f"cancelled:{reason or ''}", channel, reason, t, action_id),
+            )
+            conn.execute(
+                "INSERT INTO audit_log(at, actor_type, actor_id, entry, action_id, detail_json)"
+                " VALUES(?,?,?,?,?,?)",
+                (
+                    t,
+                    actor_type,
+                    actor_id,
+                    "action_cancelled",
+                    action_id,
+                    json.dumps({"channel": channel, "reason": reason}, ensure_ascii=False),
+                ),
+            )
+            conn.execute(
+                "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
+                (
+                    row["incident_id"] or "",
+                    t,
+                    "action_cancelled",
+                    f"cancelled {action_id}",
+                    json.dumps(
+                        {"action_id": action_id, "reason": reason, "channel": channel},
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+
+    def expire_stale_proposals(self) -> int:
+        """TTL / approval_deadline 到期的 proposed → expired。"""
+        t = now()
+        rows = self.db.query(
+            "SELECT id, incident_id FROM actions WHERE state='proposed'"
+            " AND (approval_deadline IS NOT NULL AND ? > approval_deadline"
+            "      OR ? - created_at > ?)",
+            (t, t, float(self.action_ttl)),
         )
-        self.db.audit(actor_type, actor_id, "action_cancelled", action_id=action_id)
+        n = 0
+        for r in rows:
+            with self.db.tx() as conn:
+                cur = conn.execute(
+                    "UPDATE actions SET state='expired', finished_at=?,"
+                    " result_detail='approval_expired' WHERE id=? AND state='proposed'",
+                    (t, r["id"]),
+                )
+                if cur.rowcount:
+                    n += 1
+                    conn.execute(
+                        "INSERT INTO audit_log(at, actor_type, actor_id, entry, action_id,"
+                        " detail_json) VALUES(?,?,?,?,?,?)",
+                        (t, "system", "sweeper", "action_expired", r["id"],
+                         json.dumps({"reason": "approval_deadline"})),
+                    )
+                    conn.execute(
+                        "INSERT INTO events(incident_id, at, type, title, payload_json)"
+                        " VALUES(?,?,?,?,?)",
+                        (
+                            r["incident_id"] or "",
+                            t,
+                            "action_expired",
+                            f"proposal expired {r['id']}",
+                            json.dumps({"action_id": r["id"]}, ensure_ascii=False),
+                        ),
+                    )
+        return n
+
+    def cancel_pending_for_incident(self, incident_id: str, reason: str = "incident_recovered") -> int:
+        """故障自然恢复 / 事件关闭后，取消不再必要的过时 proposal。"""
+        if not incident_id:
+            return 0
+        t = now()
+        n = 0
+        rows = self.db.query(
+            "SELECT id FROM actions WHERE incident_id=? AND state='proposed'",
+            (incident_id,),
+        )
+        for r in rows:
+            with self.db.tx() as conn:
+                cur = conn.execute(
+                    "UPDATE actions SET state='cancelled', finished_at=?, result_detail=?"
+                    " WHERE id=? AND state='proposed'",
+                    (t, f"stale:{reason}", r["id"]),
+                )
+                if cur.rowcount:
+                    n += 1
+                    conn.execute(
+                        "INSERT INTO audit_log(at, actor_type, actor_id, entry, action_id,"
+                        " detail_json) VALUES(?,?,?,?,?,?)",
+                        (t, "system", "sweeper", "action_cancelled_stale", r["id"],
+                         json.dumps({"reason": reason, "incident_id": incident_id})),
+                    )
+                    conn.execute(
+                        "INSERT INTO events(incident_id, at, type, title, payload_json)"
+                        " VALUES(?,?,?,?,?)",
+                        (
+                            incident_id,
+                            t,
+                            "action_cancelled",
+                            f"stale proposal cancelled {r['id']}",
+                            json.dumps(
+                                {"action_id": r["id"], "reason": reason},
+                                ensure_ascii=False,
+                            ),
+                        ),
+                    )
+        return n
 
     # ------------------------------------------------------------------
     # 执行
@@ -363,8 +734,11 @@ class ActionService:
 
             if reject is None and now() - (fresh["approved_at"] or 0) > self.approval_ttl:
                 reject = ("approval_expired", "approval_ttl")
+            if reject is None and fresh["approval_deadline"] and now() > float(fresh["approval_deadline"]):
+                reject = ("approval_expired", "approval_deadline")
 
-            # 提案人、批准人当前授权复查
+            # 唯一派发门：当前 Policy 复查（P0-02）
+            action_mode = (fresh["mode"] or "manual") if "mode" in fresh.keys() else "manual"
             if reject is None:
                 for subject_type, subject_id in (
                     (fresh["proposer_type"] or "web_user", fresh["proposer_id"] or "system"),
@@ -378,10 +752,34 @@ class ActionService:
                         capability=fresh["capability"],
                         asset_id=fresh["asset_id"],
                         object_id=fresh["object_id"],
+                        auto=(action_mode == "auto"),
                     )
                     if not decision["allowed"]:
                         reject = ("policy_revoked", f"{subject_type}:{subject_id}")
                         break
+                    if action_mode == "auto" and not decision.get("auto_allowed"):
+                        reject = ("auto_revoked", f"{subject_type}:{subject_id}")
+                        break
+
+            # runbook / 模板版本未变（先于派发者检查，便于精确拒绝）
+            if reject is None:
+                rb_id = (fresh["runbook_id"] or "") if "runbook_id" in fresh.keys() else ""
+                rb_rev = (fresh["runbook_rev"] or "") if "runbook_rev" in fresh.keys() else ""
+                tmpl_id = (fresh["template_id"] or "") if "template_id" in fresh.keys() else ""
+                from .runbook import get_manual_template, get_runbook_rule
+
+                if rb_id:
+                    rule = get_runbook_rule(rb_id)
+                    if not rule:
+                        reject = ("runbook_missing", rb_id)
+                    elif rb_rev and rule.rev != rb_rev:
+                        reject = ("runbook_changed", f"{rb_id} rev {rb_rev}->{rule.rev}")
+                elif tmpl_id:
+                    tmpl = get_manual_template(tmpl_id)
+                    if not tmpl:
+                        reject = ("template_missing", tmpl_id)
+                else:
+                    reject = ("template_required", "no runbook/template on action")
 
             # 实际派发人必须具备该能力（非管理员）
             if reject is None and not is_admin:
@@ -391,9 +789,18 @@ class ActionService:
                     capability=fresh["capability"],
                     asset_id=fresh["asset_id"],
                     object_id=fresh["object_id"],
+                    auto=(action_mode == "auto"),
                 )
-                if not d["allowed"]:
+                if not d["allowed"] or (action_mode == "auto" and not d.get("auto_allowed")):
                     reject = ("dispatcher_denied", f"{actor_type}:{actor_id}")
+
+            # 全局暂停（P0-03）
+            if reject is None:
+                stop = conn.execute(
+                    "SELECT enabled FROM global_stops WHERE key='auto_dispatch'"
+                ).fetchone()
+                if stop and stop["enabled"] and action_mode == "auto":
+                    reject = ("global_pause", "auto_dispatch paused")
 
             if reject is None:
                 obj = conn.execute(
@@ -426,6 +833,36 @@ class ActionService:
                 ).fetchone()
                 if locked and locked["n"] > 0:
                     reject = ("object_locked", fresh["object_id"])
+
+            # 预算：派发前原子占用（P0-03）；unknown 也计数
+            if reject is None and action_mode == "auto":
+                rb_id_b = (fresh["runbook_id"] or "") if "runbook_id" in fresh.keys() else ""
+                from .runbook import get_runbook_rule
+
+                rule = get_runbook_rule(rb_id_b) if rb_id_b else None
+                max_day = rule.max_per_day if rule else 3
+                cooldown = rule.cooldown_sec if rule else 1800
+                since = now() - 86400
+                used = conn.execute(
+                    "SELECT COUNT(*) AS n FROM actions"
+                    " WHERE asset_id=? AND object_id=? AND mode='auto'"
+                    " AND state IN ('dispatched','success','failure','unknown')"
+                    " AND created_at > ?",
+                    (fresh["asset_id"], fresh["object_id"], since),
+                ).fetchone()
+                n_used = int(used["n"] if used else 0)
+                if n_used >= max_day:
+                    reject = ("budget_exhausted", f"max_per_day {n_used}/{max_day}")
+                else:
+                    last = conn.execute(
+                        "SELECT COALESCE(dispatched_at, created_at) AS at FROM actions"
+                        " WHERE asset_id=? AND object_id=? AND mode='auto'"
+                        " AND state IN ('dispatched','success','failure','unknown')"
+                        " AND id != ? ORDER BY at DESC LIMIT 1",
+                        (fresh["asset_id"], fresh["object_id"], action_id),
+                    ).fetchone()
+                    if last and (now() - float(last["at"] or 0)) < cooldown:
+                        reject = ("cooldown", f"{int(now() - float(last['at']))}s < {cooldown}s")
 
             if reject is not None:
                 code, detail = reject
@@ -467,9 +904,9 @@ class ActionService:
                     )
             else:
                 cur = conn.execute(
-                    "UPDATE actions SET state='dispatched', dispatched_at=?, exec_account=?"
-                    " WHERE id=? AND state='approved'",
-                    (now(), dispatcher, action_id),
+                    "UPDATE actions SET state='dispatched', dispatched_at=?, exec_account=?,"
+                    " budget_claimed_at=? WHERE id=? AND state='approved'",
+                    (now(), dispatcher, now(), action_id),
                 )
                 if cur.rowcount != 1:
                     reject = ("claim_failed", "")
@@ -549,6 +986,18 @@ class ActionService:
                     (row["asset_id"], row["object_id"], row["object_id"]),
                 ).fetchone()
                 service = (obj_row["name"] if obj_row else "") or ""
+                from .verify_profiles import profile_for_action
+
+                _prof = profile_for_action(
+                    capability=row["capability"],
+                    asset_id=row["asset_id"],
+                    object_id=row["object_id"] or "",
+                )
+                profile_id_guess = _prof.id if _prof else ""
+                _incg = conn.execute(
+                    "SELECT generation FROM incidents WHERE id=?", (row["incident_id"],)
+                ).fetchone() if row["incident_id"] else None
+                gen_guess = int(_incg["generation"] if _incg else 1) or 1
                 criteria = {
                     "window_sec": self.verify_window,
                     "timeout_sec": self.verify_timeout,
@@ -563,10 +1012,12 @@ class ActionService:
                     "object_id": row["object_id"],
                     "incident_id": row["incident_id"],
                     "baseline_finished_at": finished_at,
+                    "profile_id": profile_id_guess,
                 }
                 conn.execute(
                     "INSERT INTO verifications(id, action_id, incident_id, status,"
-                    " criteria_json, started_at) VALUES(?,?,?,?,?,?)",
+                    " criteria_json, started_at, profile_id, generation, deadline_at)"
+                    " VALUES(?,?,?,?,?,?,?,?,?)",
                     (
                         vid,
                         action_id,
@@ -574,6 +1025,9 @@ class ActionService:
                         "pending",
                         json.dumps(criteria, ensure_ascii=False),
                         finished_at,
+                        profile_id_guess,
+                        gen_guess,
+                        finished_at + 180.0,
                     ),
                 )
             elif state == "unknown":
@@ -620,6 +1074,12 @@ class ActionService:
         # 补建义务（也在短事务）
         vid = new_id("ver")
         service = self._registered_service_label(row)
+        from .verify_profiles import profile_for_action
+
+        _prof = profile_for_action(
+            capability=row["capability"], asset_id=row["asset_id"],
+            object_id=row["object_id"] or "",
+        )
         criteria = {
             "window_sec": self.verify_window,
             "timeout_sec": self.verify_timeout,
@@ -629,10 +1089,11 @@ class ActionService:
             "object_id": row["object_id"],
             "incident_id": row["incident_id"],
             "baseline_finished_at": row.get("finished_at") or now(),
+            "profile_id": _prof.id if _prof else "",
         }
         self.db.execute(
             "INSERT INTO verifications(id, action_id, incident_id, status, criteria_json,"
-            " started_at) VALUES(?,?,?,?,?,?)",
+            " started_at, profile_id, generation) VALUES(?,?,?,?,?,?,?,?)",
             (
                 vid,
                 action_id,
@@ -640,6 +1101,8 @@ class ActionService:
                 "pending",
                 json.dumps(criteria, ensure_ascii=False),
                 now(),
+                _prof.id if _prof else "",
+                1,
             ),
         )
         return await self._run_verification(vid, action_id)
@@ -655,32 +1118,58 @@ class ActionService:
         baseline = float(crit.get("baseline_finished_at") or row.get("finished_at") or now())
         asset = crit.get("asset_id") or row["asset_id"]
         service = crit.get("service") or ""
-        window = float(crit.get("window_sec") or self.verify_window)
-        timeout = float(crit.get("timeout_sec") or self.verify_timeout)
+        from .verify_profiles import get_profile, profile_for_action
 
-        deadline = time.time() + timeout
-        # 按完整序列保存：series_key -> {sample_at: sample}
+        profile_id = (vrow["profile_id"] if vrow else "") or crit.get("profile_id") or ""
+        profile = get_profile(profile_id) if profile_id else None
+        if profile is None:
+            profile = profile_for_action(
+                capability=row["capability"], asset_id=asset, object_id=row.get("object_id") or ""
+            )
+        if profile is None:
+            # unsupported：不得退回通用 probe_success 猜测
+            self._finish_verification(vid, "unknown", {}, "unsupported_verification_profile")
+            return {"id": vid, "status": "unknown", "note": "unsupported_verification_profile"}
+
+        # 固定 deadline：不因重试重新开始
+        deadline_at = float(vrow["deadline_at"] or 0) if vrow else 0.0
+        if not deadline_at:
+            deadline_at = baseline + float(profile.deadline_sec)
+            self.db.execute(
+                "UPDATE verifications SET deadline_at=?, profile_id=? WHERE id=?",
+                (deadline_at, profile.id, vid),
+            )
+        # 测试/配置可用 verify_timeout 提前截止（不小于 1s）
+        if self.verify_timeout and self.verify_timeout < (deadline_at - now()):
+            deadline_at = now() + max(1.0, float(self.verify_timeout))
+            self.db.execute(
+                "UPDATE verifications SET deadline_at=? WHERE id=?", (deadline_at, vid)
+            )
+        gen = int((vrow["generation"] if vrow else 1) or 1)
+
         by_series: dict[str, dict[float, dict]] = {}
         note = ""
         status = "inconclusive"
-        # 新鲜度上限：最新样本距 now 超过该值不得判恢复
-        max_age_sec = max(60.0, min(window, 120.0))
+        warmup_end = baseline + float(profile.warmup_sec)
+        need_span = float(profile.continuous_success_sec)
+        max_gap = float(profile.max_sample_gap_sec)
+        success_val = 1 if profile.expect == "up" else 0
 
-        while time.time() < deadline:
+        while time.time() < deadline_at:
             try:
-                now_ts = time.time()
+                check = (profile.checks or [{}])[0]
                 samples = await self.prom.probe_success_since(
                     asset,
                     service,
-                    start=baseline + 0.01,
-                    end=now_ts,
-                    window_sec=min(600.0, max(120.0, now_ts - baseline + 60.0)),
+                    start=baseline,
+                    end=deadline_at,
+                    window_sec=min(600.0, max(120.0, deadline_at - baseline + 60.0)),
                 )
                 matched = match_series(samples, asset=asset, service=service)
                 groups = group_by_series(matched)
                 if len(groups) > 1:
                     status = "inconclusive"
-                    note = f"ambiguous series: {len(groups)} distinct label sets"
+                    note = f"ambiguous series: {len(groups)}"
                     break
                 for key, arr in groups.items():
                     bucket = by_series.setdefault(key, {})
@@ -691,47 +1180,53 @@ class ActionService:
                         bucket[round(float(ts), 3)] = s
 
                 if not by_series:
-                    await asyncio.sleep(min(15, max(5, window // 3)))
+                    await asyncio.sleep(min(15, max(5, need_span // 4)))
                     continue
 
                 key = next(iter(by_series))
                 timeline = sorted(by_series[key].values(), key=lambda s: s["sample_at"])
-                if len(timeline) >= 2 and all(s.get("value") == 1 for s in timeline):
-                    span = timeline[-1]["sample_at"] - timeline[0]["sample_at"]
-                    latest_age = now_ts - timeline[-1]["sample_at"]
-                    # 恢复必须是「现在」仍新鲜：最新样本在 max_age_sec 内
-                    if (
-                        span >= min(15.0, window / 3)
-                        and timeline[-1]["sample_at"] - timeline[-2]["sample_at"] >= 5
-                        and latest_age <= max_age_sec
-                    ):
+                # warmup 后：连续成功窗口；失败样本重置
+                post = [s for s in timeline if s["sample_at"] >= warmup_end]
+                if not post:
+                    await asyncio.sleep(min(15, max(5, need_span // 4)))
+                    continue
+                # 业务明确失败（期望 up 但看到 0）
+                if any(s.get("value") != success_val for s in post):
+                    # 若仍有后续连续成功可继续；否则等
+                    fail_ts = max(s["sample_at"] for s in post if s.get("value") != success_val)
+                    post = [s for s in post if s["sample_at"] > fail_ts]
+                if len(post) >= 2:
+                    # 连续成功跨度
+                    span = post[-1]["sample_at"] - post[0]["sample_at"]
+                    gaps_ok = all(
+                        post[i]["sample_at"] - post[i - 1]["sample_at"] <= max_gap
+                        for i in range(1, len(post))
+                    )
+                    all_ok = all(s.get("value") == success_val for s in post)
+                    latest_age = time.time() - post[-1]["sample_at"]
+                    if all_ok and span >= need_span and gaps_ok and latest_age <= max_gap:
                         status = "passed"
                         note = (
-                            f"exact series ok x{len(timeline)} span={span:.1f}s "
-                            f"service={service or '-'} age={latest_age:.1f}s"
+                            f"profile={profile.id} continuous_ok span={span:.1f}s>={need_span:.0f}s "
+                            f"n={len(post)} gap<={max_gap:.0f}s age={latest_age:.1f}s"
                         )
                         break
             except Exception as e:
                 note = f"prom error: {e}"
-            await asyncio.sleep(min(15, max(5, window // 3)))
+            await asyncio.sleep(min(15, max(5, need_span // 4)))
         else:
             all_samples = [s for b in by_series.values() for s in b.values()]
             if not all_samples:
-                status = "failed"
-                note = "no fresh samples"
-            elif any(s.get("value") != 1 for s in all_samples):
-                status = "failed"
-                note = "fresh samples include failures"
+                status = "unknown"
+                note = "no samples / source unavailable"
             else:
-                # 有样本但不新鲜 / 不稳定：不得宣布恢复
-                latest = max((s.get("sample_at") or 0) for s in all_samples)
-                age = time.time() - latest
-                if age > max_age_sec:
-                    status = "inconclusive"
-                    note = f"stale samples age={age:.0f}s > {max_age_sec:.0f}s"
+                post = [s for s in all_samples if s.get("sample_at", 0) >= warmup_end]
+                if any(s.get("value") != success_val for s in post) and post:
+                    status = "failed"
+                    note = "business failure observed"
                 else:
                     status = "inconclusive"
-                    note = f"stability not reached; samples={len(all_samples)}"
+                    note = f"deadline hit; stability not reached need={need_span}s"
 
         all_samples = sorted(
             [s for b in by_series.values() for s in b.values()],
@@ -741,13 +1236,17 @@ class ActionService:
             "baseline": baseline,
             "asset": asset,
             "service": service,
-            "samples": all_samples[-30:],
+            "profile_id": profile.id,
+            "warmup_sec": profile.warmup_sec,
+            "need_span": need_span,
+            "max_gap": max_gap,
+            "deadline_at": deadline_at,
+            "samples": all_samples[-40:],
             "series_keys": list(by_series.keys()),
             "action_id": action_id,
-            "window_sec": window,
+            "generation": gen,
         }
 
-        # 终态提交：核对验证仍属于该 Action 且 Incident 匹配
         with self.db.tx() as conn:
             vchk = conn.execute(
                 "SELECT action_id, incident_id, status FROM verifications WHERE id=?", (vid,)
@@ -761,115 +1260,42 @@ class ActionService:
             if not a_now or a_now["state"] != "success":
                 self._finish_verification(vid, "failed", evidence, "action_not_success")
                 return {"id": vid, "status": "failed", "note": "action_not_success"}
-
             conn.execute(
-                "UPDATE verifications SET status=?, evidence_json=?, note=?, finished_at=?"
-                " WHERE id=?",
+                "UPDATE verifications SET status=?, evidence_json=?, note=?, finished_at=?,"
+                " profile_id=?, generation=?, deadline_at=? WHERE id=?",
                 (
                     status,
                     json.dumps(evidence, ensure_ascii=False, default=str),
                     note,
                     now(),
+                    profile.id,
+                    gen,
+                    deadline_at,
                     vid,
                 ),
             )
             inc_id = a_now["incident_id"]
-            if status == "passed" and inc_id:
-                inc = conn.execute(
-                    "SELECT * FROM incidents WHERE id=?", (inc_id,)
-                ).fetchone()
-                # 关闭前必须核对资产与对象
-                ok_inc = False
-                if inc and inc["status"] == "open":
-                    if (not inc["asset_id"] or inc["asset_id"] == a_now["asset_id"]) and (
-                        not inc["object_id"]
-                        or inc["object_id"] == a_now["object_id"]
-                        or inc["object_id"] == (crit.get("service") or "")
-                    ):
-                        ok_inc = True
-                if ok_inc:
-                    conn.execute(
-                        "UPDATE incidents SET stage='done', status='resolved', resolved_at=?,"
-                        " updated_at=? WHERE id=?",
-                        (now(), now(), inc_id),
-                    )
-                    conn.execute(
-                        "INSERT INTO events(incident_id, at, type, title, payload_json)"
-                        " VALUES(?,?,?,?,?)",
-                        (
-                            inc_id,
-                            now(),
-                            "verified_recovered",
-                            f"verified {action_id}",
-                            json.dumps({"verification_id": vid, "note": note}, ensure_ascii=False),
-                        ),
-                    )
-                    # 验证恢复通知义务与转换同事务
-                    try:
-                        ev = conn.execute(
-                            "SELECT id FROM events WHERE incident_id=?"
-                            " AND type='verified_recovered' ORDER BY id DESC LIMIT 1",
-                            (inc_id,),
-                        ).fetchone()
-                        if ev:
-                            conn.execute(
-                                "INSERT OR IGNORE INTO notification_outbox(id, dedup_key,"
-                                " channel, target, body, state, created_at, last_try_at,"
-                                " next_try_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                                (
-                                    new_id("ntf"),
-                                    f"ev:{ev['id']}",
-                                    "qq",
-                                    "",
-                                    f"[Ayana] verified_recovered {inc_id}",
-                                    "pending",
-                                    now(),
-                                    0,
-                                    0,
-                                ),
-                            )
-                    except Exception:
-                        pass
-                else:
-                    conn.execute(
-                        "INSERT INTO events(incident_id, at, type, title, payload_json)"
-                        " VALUES(?,?,?,?,?)",
-                        (
-                            inc_id,
-                            now(),
-                            "verify_passed_incident_skipped",
-                            f"verified {action_id} but incident not closed",
-                            json.dumps(
-                                {
-                                    "verification_id": vid,
-                                    "reason": "incident_mismatch_or_not_open",
-                                },
-                                ensure_ascii=False,
-                            ),
-                        ),
-                    )
-            elif status != "passed" and inc_id:
-                # 验证失败：若 Incident 已被误关，恢复 open 并转人工
+            # 非 passed：标记需人工；若已 resolved 则重开（不得假 recovered）
+            if status in ("failed", "inconclusive", "unknown") and inc_id:
                 conn.execute(
                     "UPDATE incidents SET need_human=1, need_human_reason=?,"
                     " status=CASE WHEN status='resolved' THEN 'open' ELSE status END,"
-                    " stage='need_human', updated_at=?,"
-                    " resolved_at=CASE WHEN status='resolved' THEN NULL ELSE resolved_at END"
-                    " WHERE id=?",
-                    (f"verify_{status}:{action_id}", now(), inc_id),
+                    " resolved_at=CASE WHEN status='resolved' THEN NULL ELSE resolved_at END,"
+                    " outcome=CASE WHEN status='resolved' THEN 'unrecovered' ELSE outcome END,"
+                    " updated_at=? WHERE id=?",
+                    (f"verify_{status}:{vid}", now(), inc_id),
                 )
-                conn.execute(
-                    "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
-                    (
-                        inc_id,
-                        now(),
-                        "verify_not_passed",
-                        f"verify {status} {action_id}",
-                        json.dumps({"verification_id": vid, "note": note}, ensure_ascii=False),
-                    ),
-                )
-        return {"id": vid, "status": status, "note": note, "evidence": evidence}
+            # 统一收敛：passed 不单独 recovered
+            if inc_id:
+                try:
+                    from .incidents import IncidentService
 
+                    IncidentService(self.db).reconcile(
+                        inc_id, resolution_basis=f"verification:{vid}"
+                    )
+                except Exception:
+                    pass
+        return {"id": vid, "status": status, "note": note, "profile": profile.id}
     def _finish_verification(self, vid: str, status: str, evidence: Any, note: str) -> None:
         self.db.execute(
             "UPDATE verifications SET status=?, evidence_json=?, note=?, finished_at=? WHERE id=?",

@@ -197,6 +197,22 @@ def summarize_probe(data: dict[str, Any]) -> dict[str, Any]:
     usable = [s for s in samples if s.get("sample_at") is not None]
     if not usable:
         return {"state": "unknown", "reason": "sample_time_unknown", "value": None, "age_sec": None}
+    # 不得用最新样本掩盖稍旧失败（P0-06）
+    if any(s.get("value") == 0 for s in usable):
+        latest_fail = max(
+            (s for s in usable if s.get("value") == 0),
+            key=lambda x: x.get("sample_at") or 0,
+        )
+        ts = latest_fail.get("sample_at")
+        age = (time.time() - ts) if ts else None
+        return {
+            "state": "fail",
+            "reason": "failure_sample_present",
+            "value": 0,
+            "sample_at": ts,
+            "age_sec": age,
+            "labels": latest_fail.get("metric") or {},
+        }
     s = max(usable, key=lambda x: x.get("sample_at") or 0)
     ts = s.get("sample_at")
     age = (time.time() - ts) if ts else None

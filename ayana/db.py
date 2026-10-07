@@ -140,6 +140,14 @@ CREATE TABLE IF NOT EXISTS alert_episodes (
   receive_count INTEGER NOT NULL DEFAULT 1,
   labels_json TEXT NOT NULL DEFAULT '{}',
   annotations_json TEXT NOT NULL DEFAULT '{}',
+  source_state TEXT NOT NULL DEFAULT 'firing',
+  last_reconciled_at REAL,
+  silenced INTEGER NOT NULL DEFAULT 0,
+  inhibited INTEGER NOT NULL DEFAULT 0,
+  source_health TEXT NOT NULL DEFAULT 'ok',
+  problem_family TEXT NOT NULL DEFAULT '',
+  quarantine_reason TEXT NOT NULL DEFAULT '',
+  canonical_object TEXT NOT NULL DEFAULT '',
   UNIQUE(source_id, fingerprint, starts_at_norm)
 );
 
@@ -150,10 +158,15 @@ CREATE TABLE IF NOT EXISTS incidents (
   object_id TEXT NOT NULL DEFAULT '',
   severity TEXT NOT NULL DEFAULT 'warning',
   status TEXT NOT NULL DEFAULT 'open', -- open|resolved|closed
-  stage TEXT NOT NULL DEFAULT 'pending', -- pending|investigating|awaiting_approval|executing|verifying|watching|done
+  stage TEXT NOT NULL DEFAULT 'pending', -- pending|investigating|awaiting_approval|executing|verifying|watching|done|need_human
   need_human INTEGER NOT NULL DEFAULT 0,
   need_human_reason TEXT NOT NULL DEFAULT '',
   summary TEXT NOT NULL DEFAULT '',
+  generation INTEGER NOT NULL DEFAULT 1,
+  outcome TEXT NOT NULL DEFAULT '', -- recovered|unrecovered|unknown|closed_unverified|''
+  resolution_basis TEXT NOT NULL DEFAULT '',
+  closed_at REAL,
+  close_reason TEXT NOT NULL DEFAULT '',
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL,
   resolved_at REAL
@@ -162,10 +175,12 @@ CREATE TABLE IF NOT EXISTS incidents (
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY,
   incident_id TEXT NOT NULL DEFAULT '',
+  episode_id TEXT NOT NULL DEFAULT '',
   at REAL NOT NULL,
   type TEXT NOT NULL,
   title TEXT NOT NULL DEFAULT '',
-  payload_json TEXT NOT NULL DEFAULT '{}'
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  source_state TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS investigations (
@@ -200,17 +215,24 @@ CREATE TABLE IF NOT EXISTS actions (
   finished_at REAL,
   exec_account TEXT NOT NULL DEFAULT '',
   policy_snapshot_json TEXT NOT NULL DEFAULT '{}',
-  result_detail TEXT NOT NULL DEFAULT ''
+  result_detail TEXT NOT NULL DEFAULT '',
+  decision_channel TEXT NOT NULL DEFAULT '',
+  decision_reason TEXT NOT NULL DEFAULT '',
+  decided_at REAL,
+  decision_snapshot_json TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS verifications (
   id TEXT PRIMARY KEY,
   action_id TEXT NOT NULL DEFAULT '',
   incident_id TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'pending', -- pending|passed|failed|inconclusive
+  status TEXT NOT NULL DEFAULT 'pending', -- pending|passed|failed|inconclusive|unknown
   criteria_json TEXT NOT NULL DEFAULT '{}',
   evidence_json TEXT NOT NULL DEFAULT '[]',
   note TEXT NOT NULL DEFAULT '',
+  profile_id TEXT NOT NULL DEFAULT '',
+  generation INTEGER NOT NULL DEFAULT 1,
+  deadline_at REAL,
   started_at REAL NOT NULL,
   finished_at REAL
 );
@@ -258,6 +280,14 @@ CREATE TABLE IF NOT EXISTS object_knowledge (
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL,
   UNIQUE(asset_id, object_name)
+);
+
+CREATE TABLE IF NOT EXISTS global_stops (
+  key TEXT PRIMARY KEY,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  reason TEXT NOT NULL DEFAULT '',
+  actor TEXT NOT NULL DEFAULT '',
+  updated_at REAL NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_episodes_incident ON alert_episodes(incident_id);
@@ -322,6 +352,68 @@ class Database:
                 conn.execute(
                     "ALTER TABLE notification_outbox ADD COLUMN next_try_at REAL NOT NULL DEFAULT 0"
                 )
+            # P0-02 / P0-03: action 授权快照与预算占用
+            acols = [r[1] for r in conn.execute("PRAGMA table_info(actions)")]
+            for name, ddl in (
+                ("mode", "ALTER TABLE actions ADD COLUMN mode TEXT NOT NULL DEFAULT 'manual'"),
+                ("runbook_id", "ALTER TABLE actions ADD COLUMN runbook_id TEXT NOT NULL DEFAULT ''"),
+                ("runbook_rev", "ALTER TABLE actions ADD COLUMN runbook_rev TEXT NOT NULL DEFAULT ''"),
+                ("template_id", "ALTER TABLE actions ADD COLUMN template_id TEXT NOT NULL DEFAULT ''"),
+                ("object_ref", "ALTER TABLE actions ADD COLUMN object_ref TEXT NOT NULL DEFAULT ''"),
+                ("params_digest", "ALTER TABLE actions ADD COLUMN params_digest TEXT NOT NULL DEFAULT ''"),
+                ("approval_deadline", "ALTER TABLE actions ADD COLUMN approval_deadline REAL"),
+                ("budget_claimed_at", "ALTER TABLE actions ADD COLUMN budget_claimed_at REAL"),
+                ("precondition_json", "ALTER TABLE actions ADD COLUMN precondition_json TEXT NOT NULL DEFAULT '{}'"),
+                ("decision_channel", "ALTER TABLE actions ADD COLUMN decision_channel TEXT NOT NULL DEFAULT ''"),
+                ("decision_reason", "ALTER TABLE actions ADD COLUMN decision_reason TEXT NOT NULL DEFAULT ''"),
+                ("decided_at", "ALTER TABLE actions ADD COLUMN decided_at REAL"),
+                ("decision_snapshot_json", "ALTER TABLE actions ADD COLUMN decision_snapshot_json TEXT NOT NULL DEFAULT '{}'"),
+            ):
+                if acols and name not in acols:
+                    conn.execute(ddl)
+            # P1-03: alert episode source state / correlation / quarantine
+            ecols = [r[1] for r in conn.execute("PRAGMA table_info(alert_episodes)")]
+            for name, ddl in (
+                ("source_state", "ALTER TABLE alert_episodes ADD COLUMN source_state TEXT NOT NULL DEFAULT 'firing'"),
+                ("last_reconciled_at", "ALTER TABLE alert_episodes ADD COLUMN last_reconciled_at REAL"),
+                ("silenced", "ALTER TABLE alert_episodes ADD COLUMN silenced INTEGER NOT NULL DEFAULT 0"),
+                ("inhibited", "ALTER TABLE alert_episodes ADD COLUMN inhibited INTEGER NOT NULL DEFAULT 0"),
+                ("source_health", "ALTER TABLE alert_episodes ADD COLUMN source_health TEXT NOT NULL DEFAULT 'ok'"),
+                ("problem_family", "ALTER TABLE alert_episodes ADD COLUMN problem_family TEXT NOT NULL DEFAULT ''"),
+                ("quarantine_reason", "ALTER TABLE alert_episodes ADD COLUMN quarantine_reason TEXT NOT NULL DEFAULT ''"),
+                ("canonical_object", "ALTER TABLE alert_episodes ADD COLUMN canonical_object TEXT NOT NULL DEFAULT ''"),
+            ):
+                if ecols and name not in ecols:
+                    conn.execute(ddl)
+            evcols = [r[1] for r in conn.execute("PRAGMA table_info(events)")]
+            for name, ddl in (
+                ("episode_id", "ALTER TABLE events ADD COLUMN episode_id TEXT NOT NULL DEFAULT ''"),
+                ("source_state", "ALTER TABLE events ADD COLUMN source_state TEXT NOT NULL DEFAULT ''"),
+            ):
+                if evcols and name not in evcols:
+                    conn.execute(ddl)
+            icols = [r[1] for r in conn.execute("PRAGMA table_info(incidents)")]
+            for name, ddl in (
+                ("generation", "ALTER TABLE incidents ADD COLUMN generation INTEGER NOT NULL DEFAULT 1"),
+                ("outcome", "ALTER TABLE incidents ADD COLUMN outcome TEXT NOT NULL DEFAULT ''"),
+                ("resolution_basis", "ALTER TABLE incidents ADD COLUMN resolution_basis TEXT NOT NULL DEFAULT ''"),
+                ("closed_at", "ALTER TABLE incidents ADD COLUMN closed_at REAL"),
+                ("close_reason", "ALTER TABLE incidents ADD COLUMN close_reason TEXT NOT NULL DEFAULT ''"),
+            ):
+                if icols and name not in icols:
+                    conn.execute(ddl)
+            vcols = [r[1] for r in conn.execute("PRAGMA table_info(verifications)")]
+            for name, ddl in (
+                ("profile_id", "ALTER TABLE verifications ADD COLUMN profile_id TEXT NOT NULL DEFAULT ''"),
+                ("generation", "ALTER TABLE verifications ADD COLUMN generation INTEGER NOT NULL DEFAULT 1"),
+                ("deadline_at", "ALTER TABLE verifications ADD COLUMN deadline_at REAL"),
+            ):
+                if vcols and name not in vcols:
+                    conn.execute(ddl)
+            conn.execute(
+                "INSERT OR IGNORE INTO global_stops(key, enabled, reason, actor, updated_at)"
+                " VALUES('auto_dispatch', 0, '', 'system', 0)"
+            )
             conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
@@ -388,10 +480,22 @@ class Database:
         title: str = "",
         incident_id: str = "",
         payload: dict | None = None,
+        *,
+        episode_id: str = "",
+        source_state: str = "",
     ) -> None:
         self.execute(
-            "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
-            (incident_id, now(), type_, title, json.dumps(payload or {}, ensure_ascii=False)),
+            "INSERT INTO events(incident_id, episode_id, at, type, title, payload_json,"
+            " source_state) VALUES(?,?,?,?,?,?,?)",
+            (
+                incident_id,
+                episode_id,
+                now(),
+                type_,
+                title,
+                json.dumps(payload or {}, ensure_ascii=False),
+                source_state,
+            ),
         )
 
     def snapshot_config(self, kind: str, payload: dict, created_by: str = "") -> None:

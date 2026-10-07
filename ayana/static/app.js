@@ -397,45 +397,40 @@ async function refreshTab() {
 
 /* ---- 统一健康状态 ---- */
 function computeAssetHealth(asset, openIncs) {
+  // P0-06：优先使用后端 health 结论，不在此推断「正常」
+  const h = asset.health || {};
   const openCount = openIncs.filter((i) => i.asset_id === asset.id).length;
-  const hasProbe = (asset.objects || []).some((o) =>
-    o.kind === "probe" || o.external_probe || o.name.includes("probe")
-  );
-  // 用真实探测数据
-  const probe = asset.probe || {};
-  const hysteria = asset.hysteria_proxy || {};
-  let health = "正常", healthCls = "ok";
-  if (openCount > 0) {
-    health = `${openCount} 个异常`;
-    healthCls = "bad";
-  } else if (probe.state === "fail" || hysteria.state === "fail") {
-    health = "探测失败";
-    healthCls = "bad";
-  } else if (probe.state === "ok" || hysteria.state === "ok") {
-    health = "正常";
-    healthCls = "ok";
-  }
+  const map = {
+    healthy: { health: "正常", healthCls: "ok" },
+    unhealthy: { health: "异常", healthCls: "bad" },
+    degraded: { health: "降级", healthCls: "warn" },
+    stale: { health: "观测过期", healthCls: "warn" },
+    unknown: { health: "观测不全", healthCls: "warn" },
+  };
+  const m = map[h.state] || map.unknown;
   return {
     openCount,
-    hasProbe,
-    health,
-    healthCls,
-    coverage: hasProbe ? "已覆盖" : "无探测项",
-    coverageCls: hasProbe ? "ok" : "warn",
-    probeState: probe.state,
-    hysteriaState: hysteria.state,
-    hysteriaTargets: hysteria.targets || [],
+    hasProbe: (h.coverage || "").startsWith("required"),
+    health: h.label || m.health,
+    healthCls: m.healthCls,
+    coverage: h.coverage || "无探测项",
+    coverageCls: h.state === "healthy" ? "ok" : "warn",
+    probeState: h.state,
+    hysteriaState: "",
+    hysteriaTargets: [],
   };
 }
 
 function computeObjectStatus(obj, assetId, incByObj) {
+  // 无 required check / 无观测 → 未观测，不得「正常」
   const keys = [
     `${assetId}/${obj.id}`,
     `${assetId}/${obj.name}`,
     `${assetId}/${assetId}:${obj.kind}:${obj.name}`,
   ];
   const hit = keys.map((k) => incByObj[k]).find(Boolean);
-  return hit ? { label: "异常", cls: "bad", inc: hit } : { label: "正常", cls: "ok", inc: null };
+  if (hit) return { label: "异常", cls: "bad", inc: hit };
+  return { label: "未观测", cls: "warn", inc: null };
 }
 
 /** 标准对象行：登记对象 + 外部探测（google/youtube 等）统一成表格行 */
@@ -719,7 +714,6 @@ function loopOutcome(inc) {
   const vers = (inc.verifications || []).concat(
     ...actions.map((a) => a.verifications || [])
   );
-  // 去重
   const seen = new Set();
   const allVers = vers.filter((v) => {
     if (!v || seen.has(v.id)) return false;
@@ -728,19 +722,31 @@ function loopOutcome(inc) {
   });
   const lastVer = allVers[allVers.length - 1];
   const lastAct = actions[actions.length - 1];
-  let recovered = false;
+  // P0-04：outcome 来自服务端；closed ≠ recovered
+  const outcome = inc.outcome || "";
+  let recovered = outcome === "recovered";
   let recoverLabel = "处理中";
   let recoverCls = "warn";
-  if (inc.status === "resolved" || inc.status === "closed") {
+  if (inc.status === "closed") {
+    recovered = false;
+    recoverLabel = "已关闭（未证实恢复）";
+    recoverCls = "dim";
+  } else if (outcome === "recovered" || inc.status === "resolved") {
     recovered = true;
-    recoverLabel = inc.status === "closed" ? "已关闭" : "已恢复";
+    recoverLabel = "已恢复";
     recoverCls = "ok";
+  } else if (outcome === "closed_unverified") {
+    recoverLabel = "已关闭（未证实恢复）";
+    recoverCls = "dim";
   } else if (inc.need_human) {
     recoverLabel = "需人工";
     recoverCls = "bad";
-  } else if (lastVer && lastVer.status === "failed") {
-    recoverLabel = "验证未通过";
+  } else if (outcome === "unrecovered") {
+    recoverLabel = "未恢复";
     recoverCls = "bad";
+  } else if (outcome === "unknown") {
+    recoverLabel = "结论未知";
+    recoverCls = "warn";
   }
   return {
     problem: inc.title || "",
@@ -754,6 +760,8 @@ function loopOutcome(inc) {
     recovered,
     recoverLabel,
     recoverCls,
+    outcome,
+    generation: inc.generation || 1,
     needHuman: !!inc.need_human,
     needReason: inc.need_human_reason || "",
   };
@@ -850,13 +858,16 @@ async function openIncidentDetail(incId) {
   if (!d.ok) return;
   const inc = d.incident || {};
   const sum = d.summary || {};
+  const disp = d.disposition || {};
   const body = el("div");
 
   // 标题
   body.appendChild(el("h2", { text: sum.title || inc.title || "" }));
   body.appendChild(el("p", {
     class: "muted small",
-    text: `状态: ${sum.status_zh || ""} · 阶段: ${sum.stage_zh || ""}`,
+    text: `状态: ${sum.status_zh || ""} · 阶段: ${sum.stage_zh || ""}`
+      + ` · 发现 ${fmtTime(inc.created_at)}`
+      + (inc.resolved_at ? ` · 解决 ${fmtTime(inc.resolved_at)}` : ""),
   }));
 
   // 为什么需要人工
@@ -870,6 +881,73 @@ async function openIncidentDetail(incId) {
     body.appendChild(box);
   } else if (sum.suggestion) {
     body.appendChild(el("p", { class: "muted small", text: sum.suggestion }));
+  }
+
+  // 处置上下文（P1-01：证据 / 理由 / 权限 / 验证 / 批准拒绝）
+  if ((disp.proposals || []).length || disp.evidence_summary) {
+    body.appendChild(el("h3", { text: "处置上下文", style: "margin:16px 0 8px;font-size:14px" }));
+    if (disp.evidence_summary) {
+      const evBox = el("div", {
+        style: "background:rgba(120,160,255,.08);border-radius:8px;padding:10px;margin:8px 0",
+      });
+      evBox.appendChild(el("div", { text: "调查证据摘要", style: "font-weight:600;margin-bottom:4px" }));
+      evBox.appendChild(el("div", { class: "muted small", text: disp.evidence_summary }));
+      body.appendChild(evBox);
+    }
+    (disp.proposals || []).forEach((p) => {
+      const box = el("div", {
+        style: "border:1px solid var(--line);border-radius:8px;padding:12px;margin:10px 0",
+      });
+      box.appendChild(el("div", {
+        text: `${p.capability_zh || p.capability} · ${p.asset_id}/${p.object_id}`,
+        style: "font-weight:600",
+      }));
+      [
+        `理由: ${p.reason || "-"}`,
+        `runbook/template: ${p.runbook_id || p.template_id || "-"}${p.runbook_rev ? " rev " + p.runbook_rev : ""}`,
+        `权限结论: ${p.readable || p.decision || "-"}${p.decision_reason ? " · " + p.decision_reason : ""}`,
+        `验证目标: ${p.verification_target || "按 profile 独立判定"}`,
+        `模式: ${p.mode || "manual"} · 提案 ${p.action_id}`,
+        p.approval_deadline ? `批准期限: ${fmtTime(p.approval_deadline)}` : "",
+      ].filter(Boolean).forEach((t) => box.appendChild(el("div", { class: "muted small", text: t })));
+      box.appendChild(el("div", { class: "row-actions", style: "margin-top:10px" }, [
+        el("button", {
+          class: "btn", text: "批准并执行",
+          onclick: async () => {
+            const reason = prompt("批准原因（可空）:", "") || "";
+            await api(`/api/actions/${p.action_id}/approve`, {
+              method: "POST",
+              body: JSON.stringify({ execute: true, reason }),
+            });
+            $("modal").classList.add("hidden");
+            openIncidentDetail(incId);
+          },
+        }),
+        el("button", {
+          class: "btn danger", text: "拒绝",
+          onclick: async () => {
+            const reason = prompt("拒绝原因:", "") || "";
+            if (reason === null) return;
+            await api(`/api/actions/${p.action_id}/reject`, {
+              method: "POST",
+              body: JSON.stringify({ reason }),
+            });
+            $("modal").classList.add("hidden");
+            openIncidentDetail(incId);
+          },
+        }),
+      ]));
+      body.appendChild(box);
+    });
+    if (disp.policy) {
+      body.appendChild(el("div", {
+        class: "muted small",
+        text: `当前权限求值: ${disp.policy.readable || disp.policy.decision || ""}`
+          + (disp.policy.matched_rule ? ` · 命中规则 #${disp.policy.matched_rule.id}` : "")
+          + (disp.policy.reason ? ` · ${disp.policy.reason}` : ""),
+        style: "margin:6px 0",
+      }));
+    }
   }
 
   // 故障闭环：问题 → 处置 → 验证 → 恢复
@@ -1008,11 +1086,14 @@ const PERM_STATE_META = {
 };
 
 function permFlagsToState(p) {
-  if (!p || !p.allow) return "deny";
-  if (p.auto_allowed) return "auto";
-  if (p.require_approval) return "confirm";
-  // allow=1, 无需批准, 非 auto：按「自动执行」展示但不改写，直到用户主动切换
-  return "auto";
+  if (!p) return "deny";
+  // 优先使用服务端 effective decision，前端不重算优先级
+  if (p.decision === "forbidden") return "deny";
+  if (p.decision === "approval_required") return "confirm";
+  if (p.decision === "automatic") return "auto";
+  if (!p.allow) return "deny";
+  if (p.auto_allowed && !p.require_approval) return "auto";
+  return "confirm";
 }
 
 function permStateToFlags(state) {
@@ -1265,6 +1346,13 @@ async function renderPermissions() {
           class: "cap-name",
           text: PERM_CAP_LABEL[cap] || cap,
         }));
+        if (rule && rule.readable) {
+          row.appendChild(el("div", {
+            class: "muted small",
+            text: `服务端结论: ${rule.readable}${rule.decision ? " · " + rule.decision : ""}`,
+            style: "font-size:11px;opacity:.75",
+          }));
+        }
         row.appendChild(renderSeg(stateKey, async (next) => {
           const ok = await saveAgentPerm(a.id, objectId, cap, next);
           if (ok) {

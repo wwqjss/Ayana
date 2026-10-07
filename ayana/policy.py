@@ -145,6 +145,36 @@ class Policy:
                 ),
             )
 
+    def _match_rule(
+        self,
+        *,
+        subject_type: str,
+        subject_id: str,
+        capability: str,
+        asset_id: str = "",
+        object_id: str = "",
+    ) -> dict[str, Any] | None:
+        rows = self.db.query(
+            "SELECT * FROM permissions WHERE subject_type=? AND subject_id IN (?, '*')"
+            " AND capability IN (?, '*') AND asset_id IN (?, '*', '')"
+            " AND object_id IN (?, '*', '')",
+            (subject_type, subject_id, capability, asset_id, object_id),
+        )
+        best = None
+        for r in rows:
+            score = 0
+            if r["asset_id"] == asset_id and asset_id:
+                score += 2
+            if r["object_id"] == object_id and object_id:
+                score += 2
+            if r["capability"] == capability:
+                score += 3
+            if r["subject_id"] == subject_id:
+                score += 3
+            if best is None or score > best[0]:
+                best = (score, r)
+        return dict(best[1]) if best else None
+
     def check(
         self,
         *,
@@ -157,35 +187,22 @@ class Policy:
     ) -> dict[str, Any]:
         """默认拒绝。返回是否允许、是否需批准、命中的规则。"""
         cap = get_capability(capability)
-        rows = self.db.query(
-            "SELECT * FROM permissions WHERE subject_type=? AND subject_id IN (?, '*')"
-            " AND capability IN (?, '*') AND asset_id IN (?, '*', '')"
-            " AND object_id IN (?, '*', '')",
-            (subject_type, subject_id, capability, asset_id, object_id),
+        rule = self._match_rule(
+            subject_type=subject_type,
+            subject_id=subject_id,
+            capability=capability,
+            asset_id=asset_id,
+            object_id=object_id,
         )
-        best = None
-        for r in rows:
-            # 优先精确匹配
-            score = 0
-            if r["asset_id"] == asset_id and asset_id:
-                score += 2
-            if r["object_id"] == object_id and object_id:
-                score += 2
-            if r["capability"] == capability:
-                score += 3
-            if r["subject_id"] == subject_id:
-                score += 3
-            if best is None or score > best[0]:
-                best = (score, r)
-        if not best or not best[1]["allow"]:
+        if not rule or not rule["allow"]:
             return {
                 "allowed": False,
                 "reason": "denied_by_policy",
                 "require_approval": True,
                 "auto_allowed": False,
-                "rule": None,
+                "rule": rule,
+                "decision": "forbidden",
             }
-        rule = dict(best[1])
         require_approval = bool(rule["require_approval"])
         auto_allowed = bool(rule["auto_allowed"]) and cap.auto_allowed
         if auto and not auto_allowed:
@@ -195,6 +212,7 @@ class Policy:
                 "require_approval": True,
                 "auto_allowed": False,
                 "rule": rule,
+                "decision": "forbidden",
             }
         return {
             "allowed": True,
@@ -202,6 +220,102 @@ class Policy:
             "require_approval": require_approval and not auto,
             "auto_allowed": auto_allowed,
             "rule": rule,
+            "decision": self._three_state(
+                allow=True, require_approval=require_approval, auto_allowed=auto_allowed
+            ),
+        }
+
+    @staticmethod
+    def _three_state(*, allow: bool, require_approval: bool, auto_allowed: bool) -> str:
+        """forbidden / approval_required / automatic（安全优先）。
+
+        - allow=0 → forbidden
+        - allow=1 且 auto_allowed 且 不 require_approval → automatic
+        - 其余允许组合 → approval_required（含 auto+require_approval，必须等人）
+        """
+        if not allow:
+            return "forbidden"
+        if auto_allowed and not require_approval:
+            return "automatic"
+        return "approval_required"
+
+    def effective_decision(
+        self,
+        *,
+        subject_type: str,
+        subject_id: str,
+        capability: str,
+        asset_id: str = "",
+        object_id: str = "",
+        auto: bool = False,
+    ) -> dict[str, Any]:
+        """服务端权威三态 + reason / matched rule。前端不得自行求优先级。"""
+        cap = get_capability(capability)
+        is_write = cap.kind == "write"
+        rule = self._match_rule(
+            subject_type=subject_type,
+            subject_id=subject_id,
+            capability=capability,
+            asset_id=asset_id,
+            object_id=object_id,
+        )
+        if not rule or not rule["allow"]:
+            decision = "forbidden"
+            reason = "denied_by_policy"
+            require_approval = True
+            auto_allowed = False
+        else:
+            require_approval = bool(rule["require_approval"])
+            auto_allowed = bool(rule["auto_allowed"]) and cap.auto_allowed
+            decision = self._three_state(
+                allow=True, require_approval=require_approval, auto_allowed=auto_allowed
+            )
+            if auto and decision != "automatic":
+                decision = "forbidden"
+                reason = "auto_not_allowed"
+            else:
+                reason = "ok"
+        # 读能力：只表达 允许读取 / 禁止，不伪装成可批准写操作
+        if not is_write:
+            allowed = bool(rule and rule["allow"])
+            decision = "automatic" if allowed else "forbidden"
+            reason = "ok_read" if allowed else reason
+            require_approval = False
+            auto_allowed = allowed
+            readable = "允许读取" if allowed else "禁止"
+        else:
+            readable = {
+                "forbidden": "禁止",
+                "approval_required": "需要我确认",
+                "automatic": "自动执行",
+            }.get(decision, decision)
+        return {
+            "decision": decision,
+            "allowed": bool(rule and rule["allow"]),
+            "require_approval": require_approval,
+            "auto_allowed": auto_allowed,
+            "reason": reason,
+            "rule": rule,
+            "matched_rule": (
+                {
+                    "id": rule.get("id"),
+                    "subject_type": rule.get("subject_type"),
+                    "subject_id": rule.get("subject_id"),
+                    "asset_id": rule.get("asset_id"),
+                    "object_id": rule.get("object_id"),
+                    "capability": rule.get("capability"),
+                    "allow": bool(rule.get("allow")),
+                    "require_approval": bool(rule.get("require_approval")),
+                    "auto_allowed": bool(rule.get("auto_allowed")),
+                }
+                if rule
+                else None
+            ),
+            "kind": cap.kind,
+            "readable": readable,
+            "capability": capability,
+            "subject": f"{subject_type}:{subject_id}",
+            "target": f"{asset_id}/{object_id}",
         }
 
     def effective_summary(self) -> dict[str, Any]:

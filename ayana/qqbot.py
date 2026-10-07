@@ -25,7 +25,8 @@ HELP = """Ayana 命令
 /incident [id] 事件
 /investigate <asset> [object] 发起只读调查
 /actions 待批准操作
-/approve <action_id> 批准操作
+/approve <action_id> 批准并执行
+/reject <action_id> [原因] 拒绝操作
 /cancel <action_id> 取消操作
 """
 
@@ -127,7 +128,9 @@ class QQBot:
             if cmd == "/actions":
                 return self._actions_text()
             if cmd == "/approve":
-                return self._approve(args, actor_type, actor_id)
+                return await self._approve(args, actor_type, actor_id)
+            if cmd == "/reject":
+                return self._reject(args, actor_type, actor_id)
             if cmd == "/cancel":
                 return self._cancel(args, actor_type, actor_id)
         except Exception as e:
@@ -214,20 +217,52 @@ class QQBot:
             )
         return "\n".join(lines)
 
-    def _approve(self, args: list[str], actor_type: str, actor_id: str) -> str:
+    async def _approve(self, args: list[str], actor_type: str, actor_id: str) -> str:
         if not args:
             return "用法: /approve <action_id>"
         try:
-            res = self.actions.approve(args[0], approver_type=actor_type, approver_id=actor_id)
-            return f"已批准 {res['id']}，可执行"
+            # 与 Web 共用 approve_and_execute
+            res = await self.actions.approve_and_execute(
+                args[0],
+                actor_type=actor_type,
+                actor_id=actor_id,
+                channel="qq",
+                reason="qq_approve",
+            )
+            if res.get("already"):
+                return f"{args[0]} 已是 {res.get('state')}，未重复派发"
+            if res.get("executed"):
+                return f"已批准并执行 {res['id']} → {res.get('state')}"
+            return (
+                f"已批准 {res.get('id')}，但执行未完成: "
+                f"{res.get('error') or res.get('state')}"
+            )
         except ActionError as e:
             return f"批准失败: {e}"
+
+    def _reject(self, args: list[str], actor_type: str, actor_id: str) -> str:
+        if not args:
+            return "用法: /reject <action_id> [原因]"
+        reason = " ".join(args[1:]) if len(args) > 1 else ""
+        try:
+            res = self.actions.reject(
+                args[0],
+                actor_type=actor_type,
+                actor_id=actor_id,
+                channel="qq",
+                reason=reason,
+            )
+            return f"已拒绝 {res['id']}" + (f"（{reason}）" if reason else "")
+        except ActionError as e:
+            return f"拒绝失败: {e}"
 
     def _cancel(self, args: list[str], actor_type: str, actor_id: str) -> str:
         if not args:
             return "用法: /cancel <action_id>"
         try:
-            self.actions.cancel(args[0], actor_type=actor_type, actor_id=actor_id)
+            self.actions.cancel(
+                args[0], actor_type=actor_type, actor_id=actor_id, channel="qq"
+            )
             return f"已取消 {args[0]}"
         except ActionError as e:
             return f"取消失败: {e}"

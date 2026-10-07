@@ -64,6 +64,10 @@ class NTClient:
         """调用 astrbot-identity，返回账号与模式。"""
         return await self._run(alias, "astrbot-identity")
 
+    async def describe(self, alias: str) -> NTResult:
+        """受限只读 describe：host_id / account / mode / protocol_version。"""
+        return await self._run(alias, "astrbot-describe")
+
     async def probe(self, alias: str, cmd_tokens: list[str], timeout: float | None = None) -> NTResult:
         if not is_safe_alias(alias):
             raise NTError("blocked-alias", alias)
@@ -157,8 +161,15 @@ class IdentityGate:
     async def verify_account(self, asset_id: str, *, write: bool = False) -> dict[str, Any]:
         b = self.get(asset_id)
         alias = b.write_alias if write else b.read_alias
-        res = await self.nt.identity(alias)
-        info: dict[str, Any] = {"ok": False, "raw": res.clipped(500)}
+        info: dict[str, Any] = {"ok": False}
+        # 优先 describe；旧 identity 不得视为 host_id 已验收
+        res = await self.nt.describe(alias) if hasattr(self.nt, "describe") else NTResult(ok=False, output="")
+        source = "describe"
+        if not res.ok:
+            res = await self.nt.identity(alias)
+            source = "identity_legacy"
+        info["raw"] = res.clipped(500)
+        info["identity_source"] = source
         if not res.ok:
             info["error"] = "identity_call_failed"
             return info
@@ -168,18 +179,34 @@ class IdentityGate:
             info["error"] = "identity_parse_failed"
             return info
         mode = data.get("mode") or ""
+        remote_host_id = data.get("host_id") or data.get("hostid") or ""
         info.update(
             account=data.get("user", "") or "",
             mode=mode,
             uid=data.get("uid"),
+            remote_host_id=remote_host_id,
+            protocol_version=str(data.get("protocol_version") or data.get("proto") or ""),
         )
         want = "exec" if write else "probe"
         if mode != want:
             info["error"] = f"mode mismatch: {mode or 'missing'} != {want}"
             return info
-        # 写通道必须有已核实 host_id
-        if write and (not b.expected_host_id or not b.host_id_verified_at):
-            info["error"] = "host_id not registered/verified"
+        if write:
+            if not b.expected_host_id or not b.host_id_verified_at:
+                info["error"] = "host_id not registered/verified"
+                return info
+            if not remote_host_id:
+                info["error"] = "remote_host_id_missing"
+                return info
+            if remote_host_id != b.expected_host_id:
+                info["error"] = (
+                    f"host_id mismatch: remote={remote_host_id} expected={b.expected_host_id}"
+                )
+                return info
+        elif remote_host_id and b.expected_host_id and remote_host_id != b.expected_host_id:
+            info["error"] = (
+                f"host_id mismatch: remote={remote_host_id} expected={b.expected_host_id}"
+            )
             return info
         info["ok"] = True
         return info
