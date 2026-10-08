@@ -27,6 +27,11 @@ from .knowledge import KnowledgeBase
 from .llm import make_llm
 from .ntsafe import AssetBinding, IdentityGate, NTClient
 from .notify import Notifier
+from .notify_channels import ChannelStore
+from .monitor import HostMonitor
+from .wecom_aibot import WeComAibotManager
+from .wecom_bot import WeComBot
+from .messagelog import MessageLog
 from .onewbot import OneBotServer
 from .permission_change import PermissionChangeService
 from .policy import Policy
@@ -266,6 +271,16 @@ class App:
         self.notifier.set_default_target(
             f"user:{cfg['admin_qq']}" if cfg.get("admin_qq") else ""
         )
+        self.channel_store = ChannelStore(
+            self.db,
+            master_key=cfg.get("notify_channel_key") or cfg.get("ssh_credential_key") or "",
+        )
+        self.notifier.set_channel_store(self.channel_store)
+        self.host_monitor = HostMonitor(self.prom)
+        self.aibot_manager = WeComAibotManager()
+        self.channel_store.set_aibot_manager(self.aibot_manager)
+        self.mlog = MessageLog(self.db)
+        self.channel_store.set_mlog(self.mlog)
         self.llm = make_llm(cfg)
         self.investigation.llm = self.llm
         self.agent = AgentLoop(
@@ -310,6 +325,10 @@ class App:
             cred_store=self.creds,
             transport=self.transport,
             terminal=self.terminal,
+            channel_store=self.channel_store,
+            host_monitor=self.host_monitor,
+            aibot_manager=self.aibot_manager,
+            mlog=self.mlog,
         )
         self._stop = asyncio.Event()
         self._bg_tasks: list[asyncio.Task] = []
@@ -356,11 +375,23 @@ class App:
         self._bg_tasks.append(asyncio.create_task(self._bg_correlate()))
         self._bg_tasks.append(asyncio.create_task(self._bg_agent()))
 
-        # 推送通道
+        # 推送通道：QQ 走 OneBot；多渠道由 ChannelStore 路由
         async def _sender(target: str, body: str) -> bool:
             return await self.ob.send_to_target(target, body)
 
         self.notifier.set_sender(_sender)
+        self.channel_store.set_qq_sender(_sender)
+        self.wecom_bot = WeComBot(self.qq, self.aibot_manager, self.channel_store, self.mlog)
+        self.qq.mlog = self.mlog
+        self.aibot_manager._on_message = self.wecom_bot.on_channel_frame
+        try:
+            self.channel_store.ensure_default_qq(
+                f"user:{self.cfg['admin_qq']}" if self.cfg.get("admin_qq") else ""
+            )
+        except Exception:
+            log.exception("ensure_default_qq failed")
+        # 启动已启用的企微智能机器人长连接
+        self._bg_tasks.append(asyncio.create_task(self._bg_aibot()))
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -372,6 +403,10 @@ class App:
         log.info("shutting down")
         for t in self._bg_tasks:
             t.cancel()
+        try:
+            await self.aibot_manager.stop_all()
+        except Exception:
+            pass
         await ws_runner.cleanup()
         await http_runner.cleanup()
 
@@ -387,6 +422,32 @@ class App:
             except Exception:
                 log.exception("outbox flush failed")
             await asyncio.sleep(3)
+
+    async def _bg_aibot(self) -> None:
+        """维持企微智能机器人长连接（一渠道一连接）。"""
+        while not self._stop.is_set():
+            try:
+                for ch in self.channel_store.list_enabled():
+                    if ch.get("kind") != "wecom_aibot":
+                        continue
+                    try:
+                        raw = self.channel_store.reveal_for_send(ch["id"])
+                        sec = raw.get("secret") or {}
+                        cfg = raw.get("config") or {}
+                        bot_id = str(sec.get("bot_id") or "")
+                        secret = str(sec.get("secret") or "")
+                        if bot_id and secret:
+                            await self.aibot_manager.ensure(
+                                ch["id"],
+                                bot_id=bot_id,
+                                secret=secret,
+                                ws_url=str(cfg.get("ws_url") or ""),
+                            )
+                    except Exception:
+                        log.exception("aibot ensure failed for %s", ch.get("id"))
+            except Exception:
+                log.exception("aibot bg loop failed")
+            await asyncio.sleep(30)
 
     async def _bg_reconcile(self) -> None:
         while not self._stop.is_set():

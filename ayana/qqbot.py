@@ -78,33 +78,89 @@ class QQBot:
         self.notifier = notifier
         self.admin_qq = admin_qq
         self.version = version
+        self.mlog = None  # MessageLog | None
         self.ob.set_message_handler(self.on_event)
 
     async def on_event(self, event: dict) -> None:
         text = extract_text(event)
-        if not text.startswith("/"):
-            return
         message_type = event.get("message_type", "")
         user_id = str(event.get("user_id") or "")
         group_id = str(event.get("group_id") or "")
-        reply = await self.dispatch(text, user_id=user_id, group_id=group_id)
+        # 消息记录：入站（可观测，不改变命令行为）
+        log_id = ""
+        if text and self.mlog:
+            try:
+                log_id = self.mlog.record(
+                    direction="in",
+                    platform="qq",
+                    channel_kind="qq",
+                    channel_id="napcat",
+                    channel_name="NapCat",
+                    sender=user_id,
+                    target=group_id or user_id,
+                    body=text,
+                    state="received",
+                    detail={"message_type": message_type},
+                )
+            except Exception:
+                log.exception("message_log inbound failed")
+        if not text.startswith("/"):
+            if log_id and self.mlog:
+                try:
+                    self.mlog.update_state(log_id, state="ignored", detail={"reason": "not_command"})
+                except Exception:
+                    pass
+            return
+        try:
+            reply = await self.dispatch(text, user_id=user_id, group_id=group_id)
+            if log_id and self.mlog:
+                self.mlog.update_state(log_id, state="processed")
+        except Exception as e:
+            if log_id and self.mlog:
+                self.mlog.update_state(log_id, state="failed", error=str(e)[:200])
+            raise
         if not reply:
             return
         if message_type == "private":
             await self.ob.send_private(user_id, reply)
         elif message_type == "group":
             await self.ob.send_group(group_id, reply)
+        if self.mlog:
+            try:
+                self.mlog.record(
+                    direction="out",
+                    platform="qq",
+                    channel_kind="qq",
+                    channel_id="napcat",
+                    channel_name="NapCat",
+                    sender="ayana",
+                    target=group_id or user_id,
+                    body=reply,
+                    state="sent",
+                    reply_to=log_id or "",
+                    detail={"kind": "command_reply"},
+                )
+            except Exception:
+                log.exception("message_log reply failed")
 
     def _subject(self, user_id: str, group_id: str) -> tuple[str, str]:
         if group_id:
             return "qq_user", user_id
         return "qq_user", user_id
 
-    async def dispatch(self, text: str, *, user_id: str, group_id: str = "") -> str:
+    async def dispatch(
+        self,
+        text: str,
+        *,
+        user_id: str,
+        group_id: str = "",
+        actor_type: str = "qq_user",
+        channel: str = "qq",
+    ) -> str:
         parts = text.strip().split()
         cmd = parts[0].lower()
         args = parts[1:]
-        actor_type, actor_id = self._subject(user_id, group_id)
+        actor_type, actor_id = actor_type, user_id
 
         try:
             if cmd == "/ping":
@@ -128,13 +184,13 @@ class QQBot:
             if cmd == "/actions":
                 return self._actions_text()
             if cmd == "/approve":
-                return await self._approve(args, actor_type, actor_id)
+                return await self._approve(args, actor_type, actor_id, channel=channel)
             if cmd == "/reject":
-                return self._reject(args, actor_type, actor_id)
+                return self._reject(args, actor_type, actor_id, channel=channel)
             if cmd == "/cancel":
-                return self._cancel(args, actor_type, actor_id)
+                return self._cancel(args, actor_type, actor_id, channel=channel)
         except Exception as e:
-            log.exception("qq command failed")
+            log.exception("command failed")
             return f"错误: {e}"
         return ""
 
@@ -217,7 +273,7 @@ class QQBot:
             )
         return "\n".join(lines)
 
-    async def _approve(self, args: list[str], actor_type: str, actor_id: str) -> str:
+    async def _approve(self, args: list[str], actor_type: str, actor_id: str, channel: str = "qq") -> str:
         if not args:
             return "用法: /approve <action_id>"
         try:
@@ -226,8 +282,8 @@ class QQBot:
                 args[0],
                 actor_type=actor_type,
                 actor_id=actor_id,
-                channel="qq",
-                reason="qq_approve",
+                channel=channel,
+                reason=f"{channel}_approve",
             )
             if res.get("already"):
                 return f"{args[0]} 已是 {res.get('state')}，未重复派发"
@@ -240,7 +296,7 @@ class QQBot:
         except ActionError as e:
             return f"批准失败: {e}"
 
-    def _reject(self, args: list[str], actor_type: str, actor_id: str) -> str:
+    def _reject(self, args: list[str], actor_type: str, actor_id: str, channel: str = "qq") -> str:
         if not args:
             return "用法: /reject <action_id> [原因]"
         reason = " ".join(args[1:]) if len(args) > 1 else ""
@@ -249,19 +305,19 @@ class QQBot:
                 args[0],
                 actor_type=actor_type,
                 actor_id=actor_id,
-                channel="qq",
+                channel=channel,
                 reason=reason,
             )
             return f"已拒绝 {res['id']}" + (f"（{reason}）" if reason else "")
         except ActionError as e:
             return f"拒绝失败: {e}"
 
-    def _cancel(self, args: list[str], actor_type: str, actor_id: str) -> str:
+    def _cancel(self, args: list[str], actor_type: str, actor_id: str, channel: str = "qq") -> str:
         if not args:
             return "用法: /cancel <action_id>"
         try:
             self.actions.cancel(
-                args[0], actor_type=actor_type, actor_id=actor_id, channel="qq"
+                args[0], actor_type=actor_type, actor_id=actor_id, channel=channel
             )
             return f"已取消 {args[0]}"
         except ActionError as e:

@@ -10,3 +10,13 @@ ayana.out
 __pycache__/
 *.pyc
 uv.lock
+
+# 本地运行/验证产物（不入库）
+*.tar
+*.tar.gz
+ayana-start*.log
+ui-*.png
+ayana-verify.png
+.pw-verify/
+.playwright-cli/
+backups/

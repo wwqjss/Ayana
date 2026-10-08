@@ -302,7 +302,7 @@ function currentTabFromHash() {
   const h = (location.hash || "").replace(/^#/, "");
   const assetM = h.match(/^assets\/(.+)$/);
   if (assetM) return { tab: "overview", focus: assetM[1], assetView: true };
-  const m = h.match(/^(overview|incidents|connections|knowledge|permissions|audit)(?:\/(.+))?$/);
+  const m = h.match(/^(overview|incidents|monitor|messages|connections|notify|knowledge|permissions|audit)(?:\/(.+))?$/);
   return m ? { tab: m[1], focus: m[2] || "", assetView: false } : { tab: "overview", focus: "", assetView: false };
 }
 
@@ -317,7 +317,7 @@ function setTabHash(tab, focus, assetView) {
 }
 
 function activateTab(tab, focus, assetView) {
-  const valid = ["overview", "incidents", "connections", "knowledge", "permissions", "audit"];
+  const valid = ["overview", "incidents", "monitor", "messages", "connections", "notify", "knowledge", "permissions", "audit"];
   if (!valid.includes(tab)) tab = "overview";
   state.tab = tab;
   state.focus = focus || "";
@@ -390,7 +390,10 @@ async function refreshTab() {
   if (state.tab === "overview") await renderOverview();
   if (state.tab === "assets") await renderAssets();
   if (state.tab === "incidents") await renderIncidents();
+  if (state.tab === "monitor") await renderMonitor();
+  if (state.tab === "messages") await renderMessages();
   if (state.tab === "connections") await renderConnections();
+  if (state.tab === "notify") await renderNotify();
   if (state.tab === "knowledge") await renderKnowledge();
   if (state.tab === "permissions") await renderPermissions();
   if (state.tab === "audit") await renderAudit();
@@ -2454,6 +2457,872 @@ on("modal-close", "click", () => {
   $("modal").classList.add("hidden");
   setTabHash(state.tab, "");
   document.querySelectorAll(".modal-actions .btn-trust").forEach((b) => b.remove());
+});
+
+/* ---- 主机监控 ---- */
+const monitorState = {
+  host: "",
+  range: "1h",
+  hosts: [],
+  autoTimer: null,
+};
+
+function metricStateBadge(st) {
+  const map = {
+    ok: ["正常", "ok"],
+    warn: ["偏高", "warn"],
+    bad: ["异常", "bad"],
+    no_data: ["暂无数据", "dim"],
+    collect_error: ["采集失败", "bad"],
+  };
+  const [t, c] = map[st] || [st, "dim"];
+  return badge(t, c);
+}
+
+function fmtMetricVal(m) {
+  if (!m || m.value === null || m.value === undefined) return "—";
+  const v = m.value;
+  if (m.unit === "%") return v.toFixed(1);
+  if (m.unit === "B/s") {
+    const units = ["B/s", "KB/s", "MB/s", "GB/s"];
+    let x = Math.abs(v), i = 0;
+    while (x >= 1024 && i < units.length - 1) { x /= 1024; i++; }
+    return x.toFixed(i === 0 ? 0 : 1);
+  }
+  if (m.key && String(m.key).startsWith("load")) return v.toFixed(2);
+  return Number(v).toFixed(1);
+}
+
+function fmtMetricUnit(m) {
+  if (!m || m.value === null || m.value === undefined) return m && m.unit ? m.unit : "";
+  const v = m.value;
+  if (m.unit === "B/s") {
+    const units = ["B/s", "KB/s", "MB/s", "GB/s"];
+    let x = Math.abs(v), i = 0;
+    while (x >= 1024 && i < units.length - 1) { x /= 1024; i++; }
+    return units[i];
+  }
+  return m.unit || "";
+}
+
+function drawSpark(canvas, points, color) {
+  const ctx = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 200, h = canvas.clientHeight || 48;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  if (!points || points.length < 2) {
+    ctx.strokeStyle = "rgba(255,255,255,.12)";
+    ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
+    return;
+  }
+  const vs = points.map((p) => p.v);
+  let min = Math.min(...vs), max = Math.max(...vs);
+  if (max - min < 1e-9) { max = min + 1; }
+  const pad = 4;
+  const x0 = points[0].t, x1 = points[points.length - 1].t;
+  ctx.beginPath();
+  points.forEach((p, i) => {
+    const x = ((p.t - x0) / Math.max(x1 - x0, 1e-9)) * (w - 2) + 1;
+    const y = h - pad - ((p.v - min) / (max - min)) * (h - pad * 2);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.stroke();
+  // fill
+  ctx.lineTo(w - 1, h); ctx.lineTo(1, h); ctx.closePath();
+  ctx.fillStyle = color + "22"; ctx.fill();
+}
+
+function metricCard(m) {
+  const card = el("div", { class: "metric-card" });
+  const top = el("div", { class: "top" }, [
+    el("div", { class: "name", text: m.label || m.key }),
+    metricStateBadge(m.state),
+  ]);
+  card.appendChild(top);
+  const valWrap = el("div", { class: "val" });
+  valWrap.appendChild(document.createTextNode(fmtMetricVal(m)));
+  valWrap.appendChild(el("span", { class: "unit", text: " " + fmtMetricUnit(m) }));
+  card.appendChild(valWrap);
+  const canvas = el("canvas", {});
+  card.appendChild(canvas);
+  const color = m.state === "bad" ? "#f07178" : m.state === "warn" ? "#e5c07b" : "#6cb6ff";
+  setTimeout(() => drawSpark(canvas, m.points || [], color), 0);
+  return card;
+}
+
+async function renderMonitor() {
+  const body = $("monitor-body");
+  const strip = $("monitor-hosts-strip");
+  if (!body) return;
+  body.innerHTML = '<p class="muted small">加载中…</p>';
+  const hostsRes = await api("/api/monitor/hosts");
+  monitorState.hosts = (hostsRes.ok && hostsRes.hosts) || [];
+  // strip
+  strip.innerHTML = "";
+  monitorState.hosts.forEach((h) => {
+    const chip = el("div", {
+      class: "monitor-chip" + (h.asset_id === monitorState.host ? " active" : ""),
+      onclick: () => {
+        monitorState.host = h.asset_id;
+        const sel = $("monitor-host");
+        if (sel) sel.value = h.asset_id;
+        renderMonitor();
+      },
+    }, [
+      el("span", { class: "dot " + (h.state === "collect_error" ? "bad" : h.state), text: "" }),
+      el("span", { text: h.display_name || h.asset_id }),
+    ]);
+    strip.appendChild(chip);
+  });
+  fillSelect("monitor-host", monitorState.hosts.map((h) => ({
+    v: h.asset_id,
+    t: (h.display_name || h.asset_id) + " · " + (h.state === "ok" ? "正常" : h.state === "warn" ? "偏高" : h.state === "bad" ? "异常" : h.state === "collect_error" ? "采集失败" : "暂无数据"),
+  })));
+  if (!monitorState.host && monitorState.hosts.length) {
+    monitorState.host = monitorState.hosts[0].asset_id;
+  }
+  const sel = $("monitor-host");
+  if (sel) sel.value = monitorState.host || "";
+  if (!monitorState.host) {
+    body.innerHTML = '<p class="muted small">没有主机资产</p>';
+    return;
+  }
+  const res = await api(`/api/monitor/host/${encodeURIComponent(monitorState.host)}?range=${monitorState.range}`);
+  if (!res.ok) {
+    body.innerHTML = "";
+    body.appendChild(el("p", { class: "error", text: res.error || "加载失败" }));
+    return;
+  }
+  body.innerHTML = "";
+  const hist = res.history || {};
+  const ov = res.overview || {};
+  const bannerState = hist.state || ov.state;
+  if (bannerState === "collect_error") {
+    body.appendChild(el("div", { class: "banner warn", text: "采集失败：" + (hist.error || ov.error || "Prometheus 不可用") }));
+  } else if (bannerState === "no_data") {
+    body.appendChild(el("div", { class: "banner warn", text: "暂无数据：该主机可能未接入 Node Exporter，或标签 asset 未对齐。" }));
+  }
+  const metrics = hist.metrics || {};
+  const order = ["cpu", "memory", "swap", "disk", "load1", "load5", "load15", "disk_read", "disk_write", "net_rx", "net_tx"];
+  const grid = el("div", { class: "metric-grid" });
+  order.forEach((k) => {
+    const m = metrics[k];
+    if (m) grid.appendChild(metricCard(m));
+  });
+  body.appendChild(grid);
+  body.appendChild(el("p", {
+    class: "muted small",
+    text: `时间范围 ${monitorState.range} · 数据源 Prometheus / Node Exporter · 不在 Ayana 落时序`,
+  }));
+}
+
+function stopMonitorAuto() {
+  if (monitorState.autoTimer) {
+    clearInterval(monitorState.autoTimer);
+    monitorState.autoTimer = null;
+    const b = $("monitor-auto");
+    if (b) b.textContent = "自动 30s";
+  }
+}
+
+on("monitor-refresh", "click", () => renderMonitor());
+on("monitor-auto", "click", () => {
+  if (monitorState.autoTimer) { stopMonitorAuto(); return; }
+  monitorState.autoTimer = setInterval(() => {
+    if (state.tab === "monitor") renderMonitor();
+  }, 30000);
+  const b = $("monitor-auto");
+  if (b) b.textContent = "停止自动";
+});
+on("monitor-host", "change", (e) => {
+  monitorState.host = e.target.value;
+  renderMonitor();
+});
+on("monitor-range", "change", (e) => {
+  monitorState.range = e.target.value;
+  renderMonitor();
+});
+
+/* ---- 通知渠道 ---- */
+const notifyKindGuides = {};
+let notifyPlatforms = [];
+
+function renderNotifyGuide(kind) {
+  const root = $("notify-guide");
+  if (!root) return;
+  const g = notifyKindGuides[kind];
+  root.innerHTML = "";
+  if (!g) {
+    root.classList.add("hidden");
+    return;
+  }
+  root.classList.remove("hidden");
+  const head = el("h3", {}, [
+    el("span", { text: g.title || "" }),
+    el("span", { class: "guide-tag", text: "接入说明" }),
+  ]);
+  root.appendChild(head);
+  if (g.summary) root.appendChild(el("p", { class: "summary", text: g.summary }));
+  if (g.steps && g.steps.length) {
+    const ol = el("ol", {});
+    g.steps.forEach((s) => ol.appendChild(el("li", { text: s })));
+    root.appendChild(ol);
+  }
+  if (g.notes && g.notes.length) {
+    const notes = el("div", { class: "notes" }, [el("strong", { text: "注意" })]);
+    const ul = el("ul", {});
+    g.notes.forEach((n) => ul.appendChild(el("li", { text: n })));
+    notes.appendChild(ul);
+    root.appendChild(notes);
+  }
+  if (g.docs && g.docs.length) {
+    const docs = el("div", { class: "docs" });
+    docs.appendChild(document.createTextNode("官方文档："));
+    g.docs.forEach((d) => {
+      const a = el("a", { href: d.url, target: "_blank", rel: "noopener noreferrer", text: d.title || d.url });
+      docs.appendChild(a);
+    });
+    root.appendChild(docs);
+  }
+}
+
+async function loadNotifyKinds() {
+  if (Object.keys(notifyKindGuides).length && notifyPlatforms.length) return;
+  try {
+    const [kres, pres] = await Promise.all([
+      api("/api/notify/kinds"),
+      api("/api/notify/platforms"),
+    ]);
+    if (kres.ok && kres.kinds) {
+      kres.kinds.forEach((k) => { notifyKindGuides[k.kind] = k; });
+    }
+    if (pres.ok && pres.platforms) {
+      notifyPlatforms = pres.platforms;
+    }
+  } catch (_) { /* 指引加载失败不阻塞配置 */ }
+}
+
+function currentNotifyKind() {
+  return ($("notify-method") || {}).value || "qq";
+}
+
+function fillNotifyMethods() {
+  const pid = ($("notify-platform") || {}).value || "qq";
+  const plat = notifyPlatforms.find((p) => p.id === pid);
+  const methods = (plat && plat.methods) || [];
+  const sel = $("notify-method");
+  if (!sel) return;
+  sel.innerHTML = "";
+  methods.forEach((m) => {
+    const op = document.createElement("option");
+    op.value = m.kind;
+    op.textContent = m.label;
+    sel.appendChild(op);
+  });
+  if (methods.length) sel.value = methods[0].kind;
+}
+
+function toggleNotifyKind() {
+  const kind = currentNotifyKind();
+  const show = (id, on) => {
+    const n = $(id);
+    if (n) n.classList.toggle("hidden", !on);
+  };
+  show("notify-qq-wrap", kind === "qq");
+  show("notify-wecom-wrap", kind === "wecom");
+  show("notify-aibot-wrap", kind === "wecom_aibot");
+  show("notify-hook-wrap", kind === "webhook");
+  renderNotifyGuide(kind);
+}
+
+async function renderNotify() {
+  await loadNotifyKinds();
+  fillNotifyMethods();
+  toggleNotifyKind();
+  await loadNotifyChannels();
+  await loadNotifyOutbox();
+  await loadAibotStatus();
+}
+
+async function loadAibotStatus() {
+  try {
+    const res = await api("/api/notify/aibot/status");
+    if (res.ok) state.aibotStatus = res.status || {};
+  } catch (_) {
+    state.aibotStatus = {};
+  }
+}
+
+/** 已发现的推送目标：勾选保存 + 手动添加 */
+async function openAibotTargets(ch) {
+  const res = await api("/api/notify/aibot/targets?channel_id=" + encodeURIComponent(ch.id));
+  const discovered = (res.ok && res.targets) || [];
+  const selected = new Set((res.ok && res.selected) || ((ch.config && ch.config.targets) || []));
+  const wrap = el("div", {});
+  wrap.appendChild(el("p", {
+    class: "muted small",
+    text: "连接成功后，在企业微信群内 @机器人 发送一条消息，该群会出现在下面。勾选后点保存；也可手动补充 chatid/userid。",
+  }));
+  const list = el("div", { style: "max-height:280px;overflow:auto;margin:10px 0" });
+  const manual = el("input", {
+    placeholder: "手动添加：chatid 或 userid，逗号分隔",
+    style: "width:100%;margin:8px 0;padding:8px;border-radius:8px;border:1px solid var(--line);background:rgba(255,255,255,.04);color:var(--ink)",
+  });
+  const boxes = [];
+  function addRow(tid, label, checked) {
+    const row = el("label", {
+      style: "display:flex;align-items:center;gap:8px;padding:6px 4px;cursor:pointer",
+    });
+    const cb = el("input", { type: "checkbox" });
+    cb.checked = !!checked;
+    boxes.push({ tid, cb });
+    row.appendChild(cb);
+    row.appendChild(el("span", { text: label, style: "font-size:13px" }));
+    list.appendChild(row);
+  }
+  if (!discovered.length) {
+    list.appendChild(el("p", {
+      class: "muted small",
+      text: "暂未发现会话。请确认长连接已认证，并在群里 @机器人 发一条消息。",
+    }));
+  }
+  discovered.forEach((t) => {
+    const label = `[${t.kind_label || t.chattype || "?"}] ${t.target_id}` +
+      (t.userid && t.chattype === "group" ? ` · 最近 ${t.userid}` : "");
+    addRow(t.target_id, label, selected.has(t.target_id));
+  });
+  // 已保存但不在发现列表里的
+  selected.forEach((tid) => {
+    if (!discovered.some((t) => t.target_id === tid)) {
+      addRow(tid, `[已保存] ${tid}`, true);
+    }
+  });
+  wrap.appendChild(list);
+  wrap.appendChild(manual);
+  wrap.appendChild(el("p", {
+    class: "muted small",
+    id: "aibot-targets-msg",
+    text: `当前已选 ${selected.size} 个目标`,
+  }));
+  showModal("推送目标 · " + ch.name, [wrap]);
+  const actions = $("modal") && $("modal").querySelector(".modal-actions");
+  if (!actions) return;
+  actions.querySelectorAll(".btn-trust").forEach((b) => b.remove());
+  const saveBtn = el("button", { class: "btn primary btn-trust", text: "保存目标" });
+  saveBtn.addEventListener("click", async () => {
+    const picked = boxes.filter((x) => x.cb.checked).map((x) => x.tid);
+    const extra = (manual.value || "").split(/[\s,;，；]+/).filter(Boolean);
+    const all = [...new Set([...picked, ...extra])];
+    const r = await api("/api/notify/aibot/targets", {
+      method: "POST",
+      body: JSON.stringify({ id: ch.id, targets: all }),
+    });
+    const msg = document.getElementById("aibot-targets-msg");
+    if (msg) msg.textContent = r.ok ? `已保存 ${all.length} 个目标` : (r.error || "保存失败");
+    if (r.ok) {
+      loadNotifyChannels();
+      setTimeout(() => {
+        $("modal").classList.add("hidden");
+        setTabHash(state.tab, "");
+      }, 600);
+    }
+  });
+  actions.insertBefore(saveBtn, actions.firstChild);
+}
+
+async function loadNotifyChannels() {
+  const root = $("notify-list");
+  if (!root) return;
+  root.innerHTML = '<p class="muted small">加载中…</p>';
+  const res = await api("/api/notify/channels");
+  if (!res.ok) {
+    root.innerHTML = "";
+    root.appendChild(el("p", { class: "error", text: res.error || "加载失败" }));
+    return;
+  }
+  root.innerHTML = "";
+  const chans = res.channels || [];
+  if (!chans.length) {
+    root.appendChild(el("p", { class: "muted small", text: "还没有渠道。至少保留 QQ 或添加 Webhook。" }));
+    return;
+  }
+  chans.forEach((ch) => {
+    const row = el("div", { class: "notify-row" });
+    row.appendChild(el("button", {
+      class: "switch " + (ch.enabled ? "on" : ""),
+      title: ch.enabled ? "点击停用" : "点击启用",
+      onclick: async () => {
+        const r = await api("/api/notify/channels/enabled", {
+          method: "POST",
+          body: JSON.stringify({ id: ch.id, enabled: !ch.enabled }),
+        });
+        if (r.ok) loadNotifyChannels();
+        else alert(r.error || "操作失败");
+      },
+    }));
+    row.appendChild(el("div", { class: "name", text: ch.name }));
+    const metaBits = [ch.kind_label || ch.kind];
+    if (ch.kind === "qq" && ch.config && ch.config.target) metaBits.push(ch.config.target);
+    if (ch.kind === "wecom") {
+      const masked = (ch.config && (ch.config.webhook_masked || ch.config.url)) || "";
+      metaBits.push(masked || "（未配置 Webhook）");
+    }
+    if (ch.kind === "wecom_aibot") {
+      const c = ch.config || {};
+      metaBits.push(c.bot_id_masked || "BotID ****");
+      const tgts = c.targets || [];
+      metaBits.push(tgts.length ? "推送目标 " + tgts.length + " 个" : "推送目标未配置（可自动发现）");
+      const st = (state.aibotStatus || {})[ch.id];
+      if (st) {
+        metaBits.push(st.authenticated ? "长连接已认证" : (st.connected ? "已连接未认证" : "未连接 " + (st.state || "")));
+        if (st.error) metaBits.push("错误: " + st.error);
+      }
+    }
+    if (ch.kind === "webhook" && ch.config && ch.config.url) metaBits.push(ch.config.url);
+    if (ch.has_secret) metaBits.push("含加密凭据");
+    if (ch.last_test_at) {
+      metaBits.push(ch.last_test_ok ? "测试通过" : "测试失败: " + (ch.last_test_error || ""));
+    }
+    row.appendChild(el("div", { class: "meta", text: metaBits.join(" · ") }));
+    const ops = el("div", { class: "ops" });
+    ops.appendChild(el("button", {
+      class: "btn small",
+      text: "发送测试",
+      onclick: async () => {
+        const r = await api("/api/notify/channels/test", {
+          method: "POST",
+          body: JSON.stringify({ id: ch.id }),
+        });
+        const box = $("notify-msg");
+        if (r.ok && r.result) {
+          const res = r.result.results || [{ target: "", ok: r.result.ok, error: r.result.error }];
+          if (r.result.need_targets) {
+            if (box) box.textContent = r.result.error || "未配置推送目标";
+            openAibotTargets(ch);
+          } else {
+            const parts = res.map((x) => (x.ok ? "✓" : "✗") + (x.target || "默认") + (x.error ? " " + x.error : ""));
+            if (box) box.textContent = (r.result.ok ? "测试消息已发送 " : "测试未全部成功 ") + parts.join(" | ");
+          }
+        } else {
+          if (box) box.textContent = r.error || "测试失败";
+        }
+        loadNotifyChannels();
+      },
+    }));
+    if (ch.kind === "qq") {
+      ops.appendChild(el("button", {
+        class: "btn small",
+        text: "改目标",
+        onclick: () => {
+          const t = prompt("QQ 目标（user:123 / group:456）", (ch.config && ch.config.target) || "");
+          if (t === null) return;
+          api("/api/notify/channels/update", {
+            method: "POST",
+            body: JSON.stringify({ id: ch.id, config: { target: t.trim() } }),
+          }).then((r) => {
+            if (r.ok) loadNotifyChannels();
+            else alert(r.detail || r.error || "保存失败");
+          });
+        },
+      }));
+    }
+    if (ch.kind === "wecom") {
+      ops.appendChild(el("button", {
+        class: "btn small",
+        text: "改 Webhook",
+        onclick: () => {
+          const url = prompt(
+            "企业微信 Webhook 地址（完整 URL，含 key）\n留空取消；输入 - 清除现有地址",
+            ""
+          );
+          if (url === null || url === "") return;
+          const body = { id: ch.id, config: {} };
+          if (url === "-") body.clear_secret = true;
+          else body.config = { url: url.trim() };
+          api("/api/notify/channels/update", { method: "POST", body: JSON.stringify(body) })
+            .then((r) => {
+              if (r.ok) loadNotifyChannels();
+              else alert(r.detail || r.error || "保存失败");
+            });
+        },
+      }));
+      ops.appendChild(el("button", {
+        class: "btn small ghost",
+        text: "接入说明",
+        onclick: () => renderNotifyGuide("wecom"),
+      }));
+    }
+    if (ch.kind === "wecom_aibot") {
+      ops.appendChild(el("button", {
+        class: "btn small primary",
+        text: "推送目标",
+        onclick: () => openAibotTargets(ch),
+      }));
+      ops.appendChild(el("button", {
+        class: "btn small",
+        text: "接入说明",
+        onclick: () => renderNotifyGuide("wecom_aibot"),
+      }));
+    }
+    if (ch.kind === "webhook") {
+      ops.appendChild(el("button", {
+        class: "btn small",
+        text: "编辑",
+        onclick: () => {
+          const url = prompt("Webhook URL", (ch.config && ch.config.url) || "");
+          if (url === null) return;
+          const token = prompt("密钥 Token（留空则不修改；输入 - 清除）", "");
+          if (token === null) return;
+          const body = { id: ch.id, config: { url: url.trim() } };
+          if (token === "-") body.clear_secret = true;
+          else if (token.trim()) body.secret = { token: token.trim() };
+          api("/api/notify/channels/update", { method: "POST", body: JSON.stringify(body) })
+            .then((r) => {
+              if (r.ok) loadNotifyChannels();
+              else alert(r.detail || r.error || "保存失败");
+            });
+        },
+      }));
+    }
+    ops.appendChild(el("button", {
+      class: "btn small danger",
+      text: "删除",
+      onclick: async () => {
+        if (!confirm("删除渠道「" + ch.name + "」？")) return;
+        const r = await api("/api/notify/channels/delete", {
+          method: "POST",
+          body: JSON.stringify({ id: ch.id }),
+        });
+        if (r.ok) loadNotifyChannels();
+        else alert(r.error || "删除失败");
+      },
+    }));
+    row.appendChild(ops);
+    root.appendChild(row);
+  });
+}
+
+async function loadNotifyOutbox() {
+  const root = $("notify-outbox");
+  if (!root) return;
+  const st = ($("notify-outbox-state") || {}).value || "";
+  root.innerHTML = '<p class="muted small">加载中…</p>';
+  const res = await api("/api/notify/outbox?state=" + encodeURIComponent(st) + "&limit=50");
+  if (!res.ok) {
+    root.innerHTML = "";
+    root.appendChild(el("p", { class: "error", text: res.error || "加载失败" }));
+    return;
+  }
+  const rows = res.outbox || [];
+  root.innerHTML = "";
+  if (!rows.length) {
+    root.appendChild(el("p", { class: "muted small", text: "暂无记录" }));
+    return;
+  }
+  const table = el("table", {});
+  table.appendChild(el("tr", {}, [
+    el("th", { text: "时间" }),
+    el("th", { text: "渠道" }),
+    el("th", { text: "状态" }),
+    el("th", { text: "内容" }),
+    el("th", { text: "错误" }),
+    el("th", { text: "" }),
+  ]));
+  rows.forEach((r) => {
+    const stMap = { pending: ["待发送", "warn"], sent: ["已发送", "ok"], failed: ["失败", "bad"] };
+    const [stTxt, stCls] = stMap[r.state] || [r.state, "dim"];
+    const chLabel = r.channel_id ? (r.channel + (r.target ? " → " + r.target : "")) : (r.channel || "qq");
+    const tr = el("tr", {}, [
+      el("td", { class: "small muted", text: fmtTime(r.created_at) }),
+      el("td", { class: "small", text: chLabel }),
+      el("td", {}, [badge(stTxt, stCls)]),
+      el("td", { class: "small", text: String(r.body || "").slice(0, 80) }),
+      el("td", { class: "small muted", text: r.last_error || "" }),
+      el("td", {}, r.state === "failed" ? [el("button", {
+        class: "btn small",
+        text: "重试",
+        onclick: async () => {
+          const rr = await api("/api/notifications/retry", {
+            method: "POST",
+            body: JSON.stringify({ id: r.id }),
+          });
+          if (rr.ok) loadNotifyOutbox();
+        },
+      })] : []),
+    ]);
+    table.appendChild(tr);
+  });
+  root.appendChild(table);
+}
+
+on("notify-platform", "change", () => {
+  fillNotifyMethods();
+  toggleNotifyKind();
+});
+on("notify-method", "change", toggleNotifyKind);
+
+function notifyMsg(t) {
+  const box = $("notify-msg");
+  if (box) box.textContent = t || "";
+}
+
+async function notifyCreate(payload) {
+  const r = await api("/api/notify/channels", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  notifyMsg(r.ok ? "已添加，可点「发送测试」验证" : (r.detail || r.error || "添加失败"));
+  if (r.ok) {
+    ($("notify-name") || {}).value = "";
+    loadNotifyChannels();
+  }
+  return r;
+}
+
+on("notify-add-btn", "click", async () => {
+  const name = (($("notify-name") || {}).value || "").trim();
+  if (!name) return notifyMsg("请填写名称");
+  const target = (($("notify-qq-target") || {}).value || "").trim();
+  await notifyCreate({
+    name, kind: "qq", config: { target }, secret: {}, enabled: true,
+  });
+  ($("notify-qq-target") || {}).value = "";
+});
+
+on("notify-add-btn-wecom", "click", async () => {
+  const name = (($("notify-name") || {}).value || "").trim();
+  if (!name) return notifyMsg("请填写名称");
+  const url = (($("notify-wecom-url") || {}).value || "").trim();
+  if (!url) {
+    notifyMsg("请填写企业微信 Webhook 地址（见下方接入说明）");
+    renderNotifyGuide("wecom");
+    return;
+  }
+  await notifyCreate({
+    name, kind: "wecom",
+    config: { url }, secret: { webhook_url: url }, enabled: true,
+  });
+  ($("notify-wecom-url") || {}).value = "";
+});
+
+on("notify-add-btn-aibot", "click", async () => {
+  const name = (($("notify-name") || {}).value || "").trim();
+  if (!name) return notifyMsg("请填写名称");
+  const botId = (($("notify-aibot-botid") || {}).value || "").trim();
+  const secret = (($("notify-aibot-secret") || {}).value || "").trim();
+  const wsUrl = (($("notify-aibot-wsurl") || {}).value || "").trim();
+  const targetsRaw = (($("notify-aibot-targets") || {}).value || "").trim();
+  const targets = targetsRaw.split(/[\s,;，；]+/).filter(Boolean);
+  if (!botId || !secret) {
+    notifyMsg("请填写 Bot ID 与 Secret");
+    renderNotifyGuide("wecom_aibot");
+    return;
+  }
+  // 推送目标可为空：连接后从群消息自动发现
+  await notifyCreate({
+    name, kind: "wecom_aibot",
+    config: { bot_id: botId, targets, ws_url: wsUrl },
+    secret: { bot_id: botId, secret },
+    enabled: true,
+  });
+  ($("notify-aibot-botid") || {}).value = "";
+  ($("notify-aibot-secret") || {}).value = "";
+  ($("notify-aibot-targets") || {}).value = "";
+});
+
+on("notify-add-btn-hook", "click", async () => {
+  const name = (($("notify-name") || {}).value || "").trim();
+  if (!name) return notifyMsg("请填写名称");
+  const url = (($("notify-hook-url") || {}).value || "").trim();
+  if (!url) return notifyMsg("请填写 URL");
+  const secret = {};
+  const token = (($("notify-hook-token") || {}).value || "").trim();
+  if (token) secret.token = token;
+  const config = { url, method: "POST", content_type: "application/json" };
+  const hdr = (($("notify-hook-headers") || {}).value || "").trim();
+  if (hdr) {
+    try { config.headers = JSON.parse(hdr); }
+    catch (e) { return notifyMsg("自定义头不是合法 JSON"); }
+  }
+  await notifyCreate({ name, kind: "webhook", config, secret, enabled: true });
+  ($("notify-hook-url") || {}).value = "";
+  ($("notify-hook-token") || {}).value = "";
+  ($("notify-hook-headers") || {}).value = "";
+});
+on("notify-outbox-refresh", "click", () => loadNotifyOutbox());
+on("notify-outbox-state", "change", () => loadNotifyOutbox());
+on("notify-outbox-retry", "click", async () => {
+  const r = await api("/api/notifications/retry", { method: "POST", body: JSON.stringify({}) });
+  const msg = $("notify-msg");
+  if (msg) msg.textContent = r.ok ? `已重试 ${r.retried} 条` : (r.error || "重试失败");
+  loadNotifyOutbox();
+});
+
+/* ---- 消息记录 ---- */
+const msgState = { offset: 0, limit: 50, total: 0 };
+
+function msgDirBadge(d) {
+  return d === "in" ? badge("入站", "dim") : badge("出站", "ok");
+}
+
+function msgStateBadge(s) {
+  const map = {
+    received: ["已接收", "dim"],
+    processed: ["已处理", "ok"],
+    ignored: ["已忽略", "dim"],
+    failed: ["处理/发送失败", "bad"],
+    pending: ["待发送", "warn"],
+    sent: ["发送成功", "ok"],
+    unknown: ["结果未知", "warn"],
+  };
+  const [t, c] = map[s] || [s, "dim"];
+  return badge(t, c);
+}
+
+function msgLocalToTs(v) {
+  if (!v) return null;
+  const t = new Date(v).getTime();
+  return isNaN(t) ? null : t / 1000;
+}
+
+async function renderMessages() {
+  const root = $("msg-list");
+  if (!root) return;
+  root.innerHTML = '<p class="muted small">加载中…</p>';
+  const params = new URLSearchParams();
+  const platform = ($("msg-platform") || {}).value || "";
+  const direction = ($("msg-direction") || {}).value || "";
+  const st = ($("msg-state") || {}).value || "";
+  const q = (($("msg-q") || {}).value || "").trim();
+  const start = msgLocalToTs(($("msg-start") || {}).value);
+  const end = msgLocalToTs(($("msg-end") || {}).value);
+  if (platform) params.set("platform", platform);
+  if (direction) params.set("direction", direction);
+  if (st) params.set("state", st);
+  if (q) params.set("q", q);
+  if (start) params.set("start", String(start));
+  if (end) params.set("end", String(end));
+  params.set("limit", String(msgState.limit));
+  params.set("offset", String(msgState.offset));
+  const res = await api("/api/messages?" + params.toString());
+  if (!res.ok) {
+    root.innerHTML = "";
+    root.appendChild(el("p", { class: "error", text: res.error || "加载失败" }));
+    return;
+  }
+  msgState.total = res.total || 0;
+  const items = res.items || [];
+  root.innerHTML = "";
+  if (!items.length) {
+    root.appendChild(el("p", { class: "muted small", text: "没有符合条件的消息" }));
+  } else {
+    const table = el("table", {});
+    table.appendChild(el("tr", {}, [
+      el("th", { text: "时间" }),
+      el("th", { text: "平台" }),
+      el("th", { text: "渠道" }),
+      el("th", { text: "方向" }),
+      el("th", { text: "发送者" }),
+      el("th", { text: "目标" }),
+      el("th", { text: "内容" }),
+      el("th", { text: "状态" }),
+    ]));
+    items.forEach((m) => {
+      const tr = el("tr", {
+        style: "cursor:pointer",
+        onclick: () => openMessageDetail(m),
+      }, [
+        el("td", { class: "small muted", text: fmtTime(m.at) }),
+        el("td", { class: "small", text: m.platform || "-" }),
+        el("td", { class: "small", text: m.channel_name || m.channel_kind || m.channel_id || "-" }),
+        el("td", {}, [msgDirBadge(m.direction)]),
+        el("td", { class: "small", text: m.sender || "-" }),
+        el("td", { class: "small", text: m.target || "-" }),
+        el("td", { class: "small", text: String(m.body || "").slice(0, 60) + (String(m.body || "").length > 60 ? "…" : "") }),
+        el("td", {}, [msgStateBadge(m.state)]),
+      ]);
+      table.appendChild(tr);
+    });
+    root.appendChild(table);
+  }
+  const page = $("msg-page");
+  if (page) {
+    const from = msgState.total ? msgState.offset + 1 : 0;
+    const to = Math.min(msgState.offset + msgState.limit, msgState.total);
+    page.textContent = `${from}-${to} / ${msgState.total}`;
+  }
+}
+
+function openMessageDetail(m) {
+  const box = el("div", {});
+  const kv = (k, v) => el("p", {
+    class: "small",
+    style: "margin:4px 0",
+  }, [el("strong", { text: k + "： " }), document.createTextNode(String(v == null ? "" : v))]);
+  box.appendChild(kv("时间", fmtTime(m.at)));
+  box.appendChild(kv("平台", m.platform || "-"));
+  box.appendChild(kv("渠道", (m.channel_name || "") + (m.channel_id ? " (" + m.channel_id + ")" : "")));
+  box.appendChild(kv("方向", m.direction === "in" ? "入站" : "出站"));
+  box.appendChild(kv("发送者", m.sender || "-"));
+  box.appendChild(kv("接收目标", m.target || "-"));
+  box.appendChild(kv("状态", m.state || "-"));
+  if (m.error) box.appendChild(kv("失败原因", m.error));
+  if (m.direction === "in") {
+    box.appendChild(kv("是否回复", m.replied ? "是" : "否"));
+    if (m.reply_log_id) box.appendChild(kv("回复消息 ID", m.reply_log_id));
+  }
+  box.appendChild(el("pre", {
+    style: "margin-top:10px;padding:10px;background:rgba(255,255,255,.05);border-radius:8px;white-space:pre-wrap;word-break:break-all;max-height:240px;overflow:auto;font-size:12px",
+    text: m.body || "（空）",
+  }));
+  if (m.detail && Object.keys(m.detail).length) {
+    box.appendChild(el("p", {
+      class: "muted small",
+      style: "margin-top:8px",
+      text: "详情: " + JSON.stringify(m.detail),
+    }));
+  }
+  if (m.outbox_id) box.appendChild(kv("Outbox ID", m.outbox_id));
+  showModal("消息详情 · " + (m.id || "").slice(0, 16), [box]);
+  // 拉取关联回复
+  if (m.id) {
+    api("/api/messages/" + encodeURIComponent(m.id)).then((r) => {
+      if (!r.ok || !r.related || !r.related.length) return;
+      const rel = el("div", { style: "margin-top:12px" });
+      rel.appendChild(el("p", { class: "muted small", text: "关联回复：" }));
+      r.related.forEach((x) => {
+        rel.appendChild(el("p", {
+          class: "small",
+          style: "margin:4px 0;padding:6px 8px;background:rgba(255,255,255,.04);border-radius:6px",
+          text: `${fmtTime(x.at)} [${x.state}] ${String(x.body || "").slice(0, 120)}`,
+        }));
+      });
+      $("modal-body").appendChild(rel);
+    });
+  }
+}
+
+on("msg-search", "click", () => {
+  msgState.offset = 0;
+  renderMessages();
+});
+on("msg-prev", "click", () => {
+  msgState.offset = Math.max(0, msgState.offset - msgState.limit);
+  renderMessages();
+});
+on("msg-next", "click", () => {
+  if (msgState.offset + msgState.limit < msgState.total) {
+    msgState.offset += msgState.limit;
+    renderMessages();
+  }
+});
+on("msg-q", "keydown", (e) => {
+  if (e.key === "Enter") {
+    msgState.offset = 0;
+    renderMessages();
+  }
 });
 
 /* ---- init ---- */

@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 10
 
 
 class MigrationError(RuntimeError):
@@ -606,6 +606,78 @@ def _migrate_v7_host_key_line(conn: sqlite3.Connection) -> None:
     ])
 
 
+def _migrate_v8_notify_channels(conn: sqlite3.Connection) -> None:
+    """v8：多消息渠道 + outbox 按渠道独立状态。"""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS notify_channels ("
+        " id TEXT PRIMARY KEY,"
+        " name TEXT NOT NULL,"
+        " kind TEXT NOT NULL,"
+        " enabled INTEGER NOT NULL DEFAULT 1,"
+        " config_json TEXT NOT NULL DEFAULT '{}',"
+        " secret_enc BLOB NOT NULL DEFAULT X'',"
+        " created_at REAL NOT NULL,"
+        " updated_at REAL NOT NULL,"
+        " last_test_at REAL,"
+        " last_test_ok INTEGER,"
+        " last_test_error TEXT NOT NULL DEFAULT ''"
+        ")"
+    )
+    _add_columns(conn, "notification_outbox", [
+        ("channel_id", "ALTER TABLE notification_outbox ADD COLUMN channel_id TEXT NOT NULL DEFAULT ''"),
+    ])
+
+
+def _migrate_v9_aibot_seen_targets(conn: sqlite3.Connection) -> None:
+    """v9：企微智能机器人已发现推送目标（群 chatid / 单聊 userid）。"""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS aibot_seen_targets ("
+        " channel_id TEXT NOT NULL,"
+        " target_id TEXT NOT NULL,"
+        " chattype TEXT NOT NULL DEFAULT '',"
+        " userid TEXT NOT NULL DEFAULT '',"
+        " first_seen_at REAL NOT NULL,"
+        " last_seen_at REAL NOT NULL,"
+        " last_msgtype TEXT NOT NULL DEFAULT '',"
+        " PRIMARY KEY (channel_id, target_id)"
+        ")"
+    )
+
+
+def _migrate_v10_message_log(conn: sqlite3.Connection) -> None:
+    """v10：消息记录（入站 + 机器人回复等非 outbox 出站）。
+
+    通知 outbox 不复制，列表查询时与本表 UNION，避免重复写入。
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS message_log ("
+        " id TEXT PRIMARY KEY,"
+        " at REAL NOT NULL,"
+        " direction TEXT NOT NULL,"
+        " platform TEXT NOT NULL DEFAULT '',"
+        " channel_kind TEXT NOT NULL DEFAULT '',"
+        " channel_id TEXT NOT NULL DEFAULT '',"
+        " channel_name TEXT NOT NULL DEFAULT '',"
+        " sender TEXT NOT NULL DEFAULT '',"
+        " target TEXT NOT NULL DEFAULT '',"
+        " body TEXT NOT NULL DEFAULT '',"
+        " state TEXT NOT NULL DEFAULT '',"
+        " error TEXT NOT NULL DEFAULT '',"
+        " replied INTEGER NOT NULL DEFAULT 0,"
+        " reply_to TEXT NOT NULL DEFAULT '',"
+        " reply_log_id TEXT NOT NULL DEFAULT '',"
+        " detail_json TEXT NOT NULL DEFAULT '{}',"
+        " outbox_id TEXT NOT NULL DEFAULT ''"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_msglog_at ON message_log(at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_msglog_dir ON message_log(direction, at)"
+    )
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_v1_baseline,
     2: _migrate_v2_p0_p1_columns,
@@ -614,6 +686,9 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     5: _migrate_v5_action_decision_id,
     6: _migrate_v6_ssh_endpoints_credentials,
     7: _migrate_v7_host_key_line,
+    8: _migrate_v8_notify_channels,
+    9: _migrate_v9_aibot_seen_targets,
+    10: _migrate_v10_message_log,
 }
 
 _MIGRATION_NAMES = {
@@ -624,6 +699,9 @@ _MIGRATION_NAMES = {
     5: "action_decision_id",
     6: "ssh_endpoints_credentials",
     7: "host_key_line",
+    8: "notify_channels",
+    9: "aibot_seen_targets",
+    10: "message_log",
 }
 
 

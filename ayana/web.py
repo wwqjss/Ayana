@@ -51,6 +51,10 @@ class WebApp:
         cred_store=None,
         transport=None,
         terminal=None,
+        channel_store=None,
+        host_monitor=None,
+        aibot_manager=None,
+        mlog=None,
     ):
         self.db = db
         self.auth = auth
@@ -70,6 +74,10 @@ class WebApp:
         self.cred_store = cred_store
         self.transport = transport
         self.terminal = terminal
+        self.channel_store = channel_store
+        self.host_monitor = host_monitor
+        self.aibot_manager = aibot_manager
+        self.mlog = mlog
 
     def build(self) -> web.Application:
         app = web.Application(client_max_size=2_000_000)
@@ -153,6 +161,24 @@ class WebApp:
         app.router.add_get("/api/audit", self.api_audit)
         app.router.add_get("/api/notifications", self.api_notifications)
         app.router.add_post("/api/notifications/retry", self.api_notifications_retry)
+        # 多消息渠道
+        app.router.add_get("/api/notify/channels", self.api_notify_channels)
+        app.router.add_get("/api/notify/kinds", self.api_notify_kinds)
+        app.router.add_get("/api/notify/platforms", self.api_notify_platforms)
+        app.router.add_get("/api/notify/aibot/status", self.api_notify_aibot_status)
+        app.router.add_get("/api/notify/aibot/targets", self.api_notify_aibot_targets)
+        app.router.add_post("/api/notify/aibot/targets", self.api_notify_aibot_targets_save)
+        app.router.add_get("/api/messages", self.api_messages)
+        app.router.add_get("/api/messages/{mid}", self.api_message_detail)
+        app.router.add_post("/api/notify/channels", self.api_notify_channel_create)
+        app.router.add_post("/api/notify/channels/update", self.api_notify_channel_update)
+        app.router.add_post("/api/notify/channels/delete", self.api_notify_channel_delete)
+        app.router.add_post("/api/notify/channels/enabled", self.api_notify_channel_enabled)
+        app.router.add_post("/api/notify/channels/test", self.api_notify_channel_test)
+        app.router.add_get("/api/notify/outbox", self.api_notify_outbox)
+        # 主机资源监控
+        app.router.add_get("/api/monitor/hosts", self.api_monitor_hosts)
+        app.router.add_get("/api/monitor/host/{asset_id}", self.api_monitor_host)
         app.router.add_get("/api/runbook", self.api_runbook)
         app.router.add_post("/api/agent/auto", self.api_agent_auto_toggle)
         app.router.add_get("/api/agent/status", self.api_agent_status)
@@ -1419,6 +1445,284 @@ class WebApp:
         n = self.notifier.retry_failed(body.get("id", "")) if self.notifier else 0
         self.db.audit("web_user", sess["username"], "notifications_retry", detail={"count": n})
         return _json({"ok": True, "retried": n})
+
+    # ---- 多消息渠道 ----
+
+    def _channels(self):
+        if not self.channel_store:
+            raise web.HTTPNotFound(text="channel_store not configured")
+        return self.channel_store
+
+    async def api_notify_channels(self, request: web.Request) -> web.Response:
+        self._require_admin(request)
+        try:
+            channels = self._channels().list_meta()
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 500)
+        return _json({"ok": True, "channels": channels})
+
+    async def api_notify_kinds(self, request: web.Request) -> web.Response:
+        self._require_admin(request)
+        from .notify_channels import list_channel_kinds
+
+        return _json({"ok": True, "kinds": list_channel_kinds()})
+
+    async def api_notify_platforms(self, request: web.Request) -> web.Response:
+        self._require_admin(request)
+        from .notify_channels import list_platforms
+
+        return _json({"ok": True, "platforms": list_platforms()})
+
+    async def api_notify_aibot_status(self, request: web.Request) -> web.Response:
+        self._require_admin(request)
+        if not self.aibot_manager:
+            return _json({"ok": True, "status": {}})
+        return _json({"ok": True, "status": self.aibot_manager.status_all()})
+
+    async def api_notify_aibot_targets(self, request: web.Request) -> web.Response:
+        """已发现的推送目标（群 chatid / 单聊 userid）。"""
+        self._require_admin(request)
+        cid = request.rel_url.query.get("channel_id", "")
+        if not cid:
+            return _json({"ok": False, "error": "missing_channel_id"}, 400)
+        if not self.channel_store:
+            return _json({"ok": True, "targets": []})
+        meta = self.channel_store.get_meta(cid) or {}
+        cfg = meta.get("config") or {}
+        return _json(
+            {
+                "ok": True,
+                "targets": self.channel_store.list_seen_targets(cid),
+                "selected": list(cfg.get("targets") or []),
+            }
+        )
+
+    async def api_notify_aibot_targets_save(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        cid = str(body.get("id") or "")
+        if not cid:
+            return _json({"ok": False, "error": "missing_id"}, 400)
+        targets = body.get("targets") or []
+        if not isinstance(targets, list):
+            return _json({"ok": False, "error": "bad_targets"}, 400)
+        try:
+            ch = self._channels().set_targets(
+                cid, [str(t) for t in targets], actor=sess["username"]
+            )
+        except Exception as e:
+            return _json({"ok": False, "error": getattr(e, "code", str(e))}, 400)
+        return _json({"ok": True, "channel": ch})
+
+    # ---- 消息记录 ----
+
+    async def api_messages(self, request: web.Request) -> web.Response:
+        self._require_admin(request)
+        if not self.mlog:
+            return _json({"ok": True, "total": 0, "items": [], "limit": 50, "offset": 0})
+        q = request.rel_url.query
+
+        def _f(name: str) -> str:
+            return str(q.get(name) or "").strip()
+
+        def _t(name: str):
+            v = q.get(name)
+            if v is None or str(v).strip() == "":
+                return None
+            try:
+                return float(v)
+            except Exception:
+                return None
+
+        try:
+            limit = int(q.get("limit") or 50)
+            offset = int(q.get("offset") or 0)
+        except Exception:
+            limit, offset = 50, 0
+        res = self.mlog.list_messages(
+            platform=_f("platform"),
+            channel_kind=_f("channel_kind"),
+            channel_id=_f("channel_id"),
+            direction=_f("direction"),
+            state=_f("state"),
+            q=_f("q"),
+            start=_t("start"),
+            end=_t("end"),
+            limit=limit,
+            offset=offset,
+        )
+        return _json({"ok": True, **res})
+
+    async def api_message_detail(self, request: web.Request) -> web.Response:
+        self._require_admin(request)
+        if not self.mlog:
+            raise web.HTTPNotFound(text="mlog not configured")
+        mid = request.match_info["mid"]
+        item = self.mlog.get(mid)
+        if not item:
+            return _json({"ok": False, "error": "not_found"}, 404)
+        related = []
+        if item.get("reply_log_id"):
+            r = self.mlog.get(item["reply_log_id"])
+            if r:
+                related.append(r)
+        if item.get("direction") == "in":
+            rows = self.db.query(
+                "SELECT id FROM message_log WHERE reply_to=? ORDER BY at ASC LIMIT 5",
+                (item["id"],),
+            )
+            for r in rows:
+                if r["id"] != item.get("reply_log_id"):
+                    rr = self.mlog.get(r["id"])
+                    if rr:
+                        related.append(rr)
+        return _json({"ok": True, "message": item, "related": related})
+
+    async def api_notify_channel_create(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        try:
+            ch = self._channels().create(
+                name=body.get("name") or "",
+                kind=body.get("kind") or "",
+                config=body.get("config") or {},
+                secret=body.get("secret") or {},
+                enabled=bool(body.get("enabled", True)),
+                actor=sess["username"],
+            )
+        except Exception as e:
+            code = getattr(e, "code", "error")
+            return _json({"ok": False, "error": code, "detail": str(e)}, 400)
+        return _json({"ok": True, "channel": ch})
+
+    async def api_notify_channel_update(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        cid = str(body.get("id") or "")
+        if not cid:
+            return _json({"ok": False, "error": "missing_id"}, 400)
+        try:
+            ch = self._channels().update(
+                cid,
+                name=body.get("name"),
+                config=body.get("config"),
+                secret=body.get("secret"),
+                clear_secret=bool(body.get("clear_secret")),
+                enabled=body.get("enabled") if "enabled" in body else None,
+                actor=sess["username"],
+            )
+        except Exception as e:
+            code = getattr(e, "code", "error")
+            return _json({"ok": False, "error": code, "detail": str(e)}, 400)
+        return _json({"ok": True, "channel": ch})
+
+    async def api_notify_channel_delete(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        cid = str(body.get("id") or "")
+        if not cid:
+            return _json({"ok": False, "error": "missing_id"}, 400)
+        try:
+            self._channels().delete(cid, actor=sess["username"])
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True})
+
+    async def api_notify_channel_enabled(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        cid = str(body.get("id") or "")
+        if not cid:
+            return _json({"ok": False, "error": "missing_id"}, 400)
+        try:
+            ch = self._channels().set_enabled(
+                cid, bool(body.get("enabled")), actor=sess["username"]
+            )
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True, "channel": ch})
+
+    async def api_notify_channel_test(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        cid = str(body.get("id") or "")
+        if not cid:
+            return _json({"ok": False, "error": "missing_id"}, 400)
+        try:
+            res = await self._channels().test(cid, actor=sess["username"])
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True, "result": res})
+
+    async def api_notify_outbox(self, request: web.Request) -> web.Response:
+        self._require_admin(request)
+        state = request.rel_url.query.get("state", "")
+        limit = min(200, int(request.rel_url.query.get("limit", "50") or 50))
+        rows = (
+            self.notifier.outbox_summary(limit=limit, state=state)
+            if self.notifier
+            else []
+        )
+        failed = self.notifier.failed_summary() if self.notifier else []
+        return _json({"ok": True, "outbox": rows, "failed": failed})
+
+    # ---- 主机资源监控 ----
+
+    def _monitor(self):
+        if not self.host_monitor:
+            raise web.HTTPNotFound(text="host_monitor not configured")
+        return self.host_monitor
+
+    async def api_monitor_hosts(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        rows = self.db.query(
+            "SELECT id, display_name, prom_asset, enabled FROM assets ORDER BY id ASC"
+        )
+        assets = [dict(r) for r in rows]
+        try:
+            status = await self._monitor().hosts_status(assets)
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 502)
+        return _json({"ok": True, "hosts": status})
+
+    async def api_monitor_host(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        asset_id = request.match_info["asset_id"]
+        range_key = request.rel_url.query.get("range", "1h")
+        decision = self.policy.check(
+            subject_type="web_user",
+            subject_id=sess["username"],
+            capability="asset.summary",
+            asset_id=asset_id,
+            object_id="*",
+        )
+        if not decision["allowed"]:
+            return _json({"ok": False, "error": "denied"}, 403)
+        row = self.db.query_one(
+            "SELECT id, display_name, prom_asset FROM assets WHERE id=?", (asset_id,)
+        )
+        if not row:
+            return _json({"ok": False, "error": "not_found"}, 404)
+        prom_asset = row["prom_asset"] or asset_id
+        try:
+            overview = await self._monitor().host_overview(prom_asset)
+            history = await self._monitor().host_history(prom_asset, range_key)
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 502)
+        return _json(
+            {
+                "ok": True,
+                "asset": dict(row),
+                "overview": overview,
+                "history": history,
+            }
+        )
 
     # ---- SSH 资产 / 凭据（v0.4.1）----
 

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ayana</title>
-<link rel="stylesheet" href="/static/app.css?v=6">
+<link rel="stylesheet" href="/static/app.css?v=11">
 <link rel="stylesheet" href="/static/xterm/xterm.css">
 </head>
 <body>
@@ -29,7 +29,10 @@
       <nav>
         <button data-tab="overview" class="tab active">总览</button>
         <button data-tab="incidents" class="tab">事件</button>
+        <button data-tab="monitor" class="tab">监控</button>
+        <button data-tab="messages" class="tab">消息记录</button>
         <button data-tab="connections" class="tab">连接</button>
+        <button data-tab="notify" class="tab">通知</button>
         <button data-tab="knowledge" class="tab">知识</button>
         <button data-tab="permissions" class="tab">权限</button>
         <button data-tab="audit" class="tab">审计</button>
@@ -54,6 +57,91 @@
 
       <section id="tab-incidents" class="tab-panel hidden">
         <div id="incidents-list"></div>
+      </section>
+
+      <section id="tab-monitor" class="tab-panel hidden">
+        <div class="card">
+          <h2>主机资源</h2>
+          <p class="muted small">
+            数据来自 Prometheus（Node Exporter），不本地存时序。状态：
+            <span class="badge ok">正常</span>
+            <span class="badge warn">偏高</span>
+            <span class="badge bad">异常</span>
+            <span class="badge dim">暂无数据</span>
+            <span class="badge bad">采集失败</span>
+          </p>
+          <div class="form-row">
+            <label>主机 <select id="monitor-host"></select></label>
+            <label>时间范围
+              <select id="monitor-range">
+                <option value="15m">15 分钟</option>
+                <option value="1h" selected>1 小时</option>
+                <option value="6h">6 小时</option>
+                <option value="24h">24 小时</option>
+                <option value="7d">7 天</option>
+              </select>
+            </label>
+            <button class="btn primary" id="monitor-refresh" type="button">刷新</button>
+            <button class="btn" id="monitor-auto" type="button">自动 30s</button>
+          </div>
+          <div id="monitor-hosts-strip" class="monitor-strip"></div>
+        </div>
+        <div id="monitor-body"></div>
+      </section>
+
+      <section id="tab-messages" class="tab-panel hidden">
+        <div class="card">
+          <h2>消息记录</h2>
+          <p class="muted small">
+            统一查看各渠道入站与出站消息。出站通知复用 outbox，不重复存储；入站与机器人回复单独落库。
+            不记录敏感凭据；仅管理员可查看。
+          </p>
+          <div class="form-row" id="msg-filters">
+            <label>平台
+              <select id="msg-platform">
+                <option value="">全部</option>
+                <option value="qq">QQ</option>
+                <option value="wecom">企业微信</option>
+                <option value="webhook">Webhook</option>
+              </select>
+            </label>
+            <label>方向
+              <select id="msg-direction">
+                <option value="">全部</option>
+                <option value="in">入站</option>
+                <option value="out">出站</option>
+              </select>
+            </label>
+            <label>状态
+              <select id="msg-state">
+                <option value="">全部</option>
+                <option value="received">已接收</option>
+                <option value="processed">已处理</option>
+                <option value="ignored">已忽略</option>
+                <option value="pending">待发送</option>
+                <option value="sent">发送成功</option>
+                <option value="failed">发送失败</option>
+                <option value="unknown">结果未知</option>
+              </select>
+            </label>
+            <label>内容
+              <input id="msg-q" placeholder="搜索内容 / 发送者 / 目标">
+            </label>
+            <label>开始
+              <input id="msg-start" type="datetime-local">
+            </label>
+            <label>结束
+              <input id="msg-end" type="datetime-local">
+            </label>
+            <button class="btn primary" id="msg-search" type="button">查询</button>
+          </div>
+          <div id="msg-list"></div>
+          <div class="form-row" style="margin-top:10px">
+            <button class="btn" id="msg-prev" type="button">上一页</button>
+            <button class="btn" id="msg-next" type="button">下一页</button>
+            <span class="muted small" id="msg-page"></span>
+          </div>
+        </div>
       </section>
 
       <section id="tab-connections" class="tab-panel hidden">
@@ -136,6 +224,110 @@
             <button class="btn primary" id="ssh-test-btn" type="button">测试连接</button>
           </div>
           <pre id="ssh-test-out" class="muted small" style="white-space:pre-wrap;min-height:40px"></pre>
+        </div>
+      </section>
+
+      <section id="tab-notify" class="tab-panel hidden">
+        <div class="card">
+          <h2>通知渠道</h2>
+          <p class="muted small">
+            同一事件会并行发到所有已启用渠道；各渠道独立记录状态与失败原因，互不影响。
+            敏感凭据加密保存，界面不回显明文。配置顺序：消息平台 → 接入方式 → 填写配置。
+          </p>
+          <div class="form-row" id="notify-add-form">
+            <label>消息平台
+              <select id="notify-platform">
+                <option value="qq">QQ</option>
+                <option value="wecom" selected>企业微信</option>
+                <option value="webhook">通用 Webhook</option>
+              </select>
+            </label>
+            <label>接入方式
+              <select id="notify-method"></select>
+            </label>
+            <label>名称 <input id="notify-name" placeholder="例如 值班群 / 企微告警"></label>
+          </div>
+
+          <!-- QQ -->
+          <div class="form-row" id="notify-qq-wrap">
+            <label>目标
+              <input id="notify-qq-target" placeholder="user:123 或 group:456">
+            </label>
+            <button class="btn primary" id="notify-add-btn" type="button">添加渠道</button>
+          </div>
+
+          <!-- 企业微信 · 群机器人 Webhook -->
+          <div class="form-row hidden" id="notify-wecom-wrap">
+            <label style="flex:2">Webhook 地址
+              <input id="notify-wecom-url" type="password" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...">
+            </label>
+            <button class="btn primary" id="notify-add-btn-wecom" type="button">添加渠道</button>
+          </div>
+
+          <!-- 企业微信 · 智能机器人长连接 -->
+          <div class="hidden" id="notify-aibot-wrap">
+            <div class="form-row">
+              <label>Bot ID
+                <input id="notify-aibot-botid" type="password" placeholder="企微后台「API 模式 · 长连接」生成">
+              </label>
+              <label>Secret
+                <input id="notify-aibot-secret" type="password" placeholder="长连接专用 Secret">
+              </label>
+              <label style="flex:2">WebSocket 地址（可选）
+                <input id="notify-aibot-wsurl" placeholder="默认 wss://openws.work.weixin.qq.com；私有部署另填">
+              </label>
+            </div>
+            <div class="form-row" style="margin-top:8px">
+              <label style="flex:2">推送目标（可空，可多条，逗号/换行分隔）
+                <input id="notify-aibot-targets" placeholder="可先留空；连接后在群里 @机器人 即可自动发现，也可手动填 chatid/userid">
+              </label>
+              <button class="btn primary" id="notify-add-btn-aibot" type="button">添加渠道</button>
+            </div>
+            <p class="muted small" style="margin-top:6px">
+              提示：推送目标可为空保存。连接成功后，在企业微信群内 @机器人 发送一条消息，即可在渠道列表的「已发现的推送目标」中勾选该群。
+            </p>
+          </div>
+
+          <!-- 通用 Webhook -->
+          <div class="hidden" id="notify-hook-wrap">
+            <div class="form-row">
+              <label style="flex:2">URL
+                <input id="notify-hook-url" placeholder="https://example.com/hook">
+              </label>
+              <label>密钥 Token
+                <input id="notify-hook-token" type="password" placeholder="将作为 Bearer 发送（加密保存）">
+              </label>
+              <button class="btn primary" id="notify-add-btn-hook" type="button">添加渠道</button>
+            </div>
+            <div class="form-row" style="margin-top:8px">
+              <label>自定义头
+                <input id="notify-hook-headers" placeholder='JSON，如 {"X-From":"Ayana"}'>
+              </label>
+            </div>
+          </div>
+
+          <p class="muted small" id="notify-msg"></p>
+          <div id="notify-guide" class="notify-guide"></div>
+        </div>
+        <div class="card">
+          <h2>渠道列表</h2>
+          <div id="notify-list"></div>
+        </div>
+        <div class="card">
+          <h2>发送记录（outbox）</h2>
+          <div class="form-row">
+            <label>状态
+              <select id="notify-outbox-state">
+                <option value="">全部</option>
+                <option value="pending">待发送</option>
+                <option value="sent">已发送</option>
+                <option value="failed">失败</option>
+              </select>
+            </label>
+            <button class="btn" id="notify-outbox-refresh" type="button">刷新</button>
+            <button class="btn" id="notify-outbox-retry" type="button">重试失败</button>
+          </div>
+          <div id="notify-outbox"></div>
         </div>
       </section>
 
@@ -245,6 +437,6 @@
 <script src="/static/qrcode.js?v=9"></script>
 <script src="/static/xterm/xterm.js"></script>
 <script src="/static/xterm/xterm-addon-fit.js"></script>
-<script src="/static/app.js?v=18"></script>
+<script src="/static/app.js?v=23"></script>
 </body>
 </html>
