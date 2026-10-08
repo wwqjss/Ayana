@@ -197,7 +197,8 @@ class TestActions(unittest.TestCase):
         res = asyncio.run(run())
         self.assertEqual(res["state"], "success")
         self.assertEqual(self.nt.calls[0][0], "exec")
-        self.assertEqual(self.nt.calls[0][1], "nerv-exec")
+        # NT 别名已移除：transport 以 asset_id 调用
+        self.assertEqual(self.nt.calls[0][1], "nerv")
 
     def test_deny_without_permission(self):
         with self.assertRaises(ActionError):

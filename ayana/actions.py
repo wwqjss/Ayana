@@ -81,7 +81,8 @@ class ActionService:
         self.gate = gate
         self.policy = policy
         self.prom = prom
-        self.transport = transport
+        # 测试可传 Fake 作为 transport；生产为 SSH Router
+        self.transport = transport if transport is not None else nt
         self.action_ttl = action_ttl
         self.approval_ttl = approval_ttl
         self.verify_window = verify_window
@@ -89,11 +90,10 @@ class ActionService:
         self._exec_lock = asyncio.Lock()
 
     async def _write_channel(self, asset_id: str, tokens: list[str], timeout: float | None = None):
-        """写通道：优先 Transport（原生 SSH），否则 NT 别名。"""
+        """写通道：仅原生 SSH。NT 已移除。"""
         if self.transport is not None:
             return await self.transport.exec(asset_id, tokens, timeout=timeout)
-        binding = self.gate.get(asset_id)
-        return await self.nt.exec(binding.write_alias, tokens, timeout=timeout)
+        raise ActionError("ssh_required", "native SSH transport not configured")
 
     # ------------------------------------------------------------------
     # 提案

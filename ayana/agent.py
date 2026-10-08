@@ -523,7 +523,7 @@ class AgentLoop:
         # 调查证据是否全部运输失败（只看真实 transport 结果，不含 rejected gap）
         transport_evs = [
             e for e in (evidence or [])
-            if e.get("source") in ("nt_probe", "prometheus")
+            if e.get("source") in ("ssh_probe", "nt_probe", "prometheus")
             or e.get("classification") in ("observed", "transport_failure", "tool_failure")
         ]
         transport_ok = any(e.get("ok") for e in transport_evs) if transport_evs else None

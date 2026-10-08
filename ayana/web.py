@@ -1749,48 +1749,14 @@ class WebApp:
                           detail=result, channel="web")
             return _json(result)
 
-        # 2) 无 SSH 端点 → 测 NT 回退，并提示未配密码/密钥
-        result["channel"] = "nt"
+        # 2) 无 SSH 端点 → NT 已移除，明确提示配置 SSH
+        result["channel"] = "none"
+        result["ok"] = False
+        result["detail"] = "ssh_not_configured"
         result["hint"] = (
-            "未配置 SSH 端点（地址/密码或密钥），当前走 NT 通道。"
-            "若之后移除 NT，必须先配置密码或密钥才能远程执行。"
+            "未配置 SSH（需要地址 + 密码或密钥）。"
+            "NT 通道已移除，必须配置 SSH 后才能远程连接与执行。"
         )
-        nt = getattr(self.actions, "nt", None)
-        gate = getattr(self.actions, "gate", None)
-        try:
-            if nt is not None:
-                alias = None
-                if gate is not None:
-                    try:
-                        b = gate.get(asset_id)
-                        alias = b.write_alias if want_write else b.read_alias
-                    except Exception:
-                        alias = asset_id
-                res = await nt.probe(alias or asset_id, ["true"], timeout=8.0)
-                result["ok"] = bool(res.ok)
-                result["detail"] = "nt_ok" if res.ok else "nt_failed"
-                result["raw"] = {
-                    "ok": res.ok,
-                    "returncode": res.returncode,
-                    "timed_out": res.timed_out,
-                    "output": (res.output or "")[:300],
-                    "alias": alias,
-                }
-                if res.ok:
-                    result["hint"] = (
-                        "NT 通道连通。仍建议配置 SSH 密码/密钥，以便移除 NT 后继续可用。"
-                    )
-                else:
-                    result["hint"] = (
-                        f"NT 通道不通：{res.output or res.returncode}。"
-                        "请配置 SSH 密码或密钥，或检查 NT 别名/主机闸。"
-                    )
-            else:
-                result["detail"] = "nt_unavailable"
-                result["hint"] = "NT 通道不可用，且未配置 SSH。请配置 SSH 密码或密钥。"
-        except Exception as e:
-            result["detail"] = "nt_error"
-            result["hint"] = f"NT 测试异常：{e}。请配置 SSH 密码或密钥。"
         self.db.audit("web_user", sess["username"], "channel_test", asset_id=asset_id,
                       detail=result, channel="web")
         return _json(result)

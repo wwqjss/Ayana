@@ -266,7 +266,7 @@ class InvestigationService:
         self.gate = gate
         self.prom = prom
         self.policy = policy
-        self.transport = transport
+        self.transport = transport if transport is not None else nt
         self.knowledge = knowledge or KnowledgeBase(db)
         self.max_rounds = max(1, int(max_rounds))
         self.max_tool_calls = max(1, int(max_tool_calls))
@@ -276,8 +276,7 @@ class InvestigationService:
     async def _probe_channel(self, asset_id: str, tokens: list[str], timeout: float | None = None):
         if self.transport is not None:
             return await self.transport.probe(asset_id, tokens, timeout=timeout)
-        binding = self.gate.get(asset_id)
-        return await self.nt.probe(binding.read_alias, tokens, timeout=timeout)
+        raise RuntimeError("ssh_required: native SSH transport not configured")
 
     # ------------------------------------------------------------------
     # 一次性手动调查（Web / QQ）：仍走同一证据模型
@@ -733,7 +732,7 @@ class InvestigationService:
                 "capability": capability,
                 "asset_id": asset_id,
                 "object_id": object_id,
-                "source": "nt_probe",
+                "source": "ssh_probe",
                 "cmd": tokens,
                 "observed_at": now(),
                 "classification": classified["classification"],

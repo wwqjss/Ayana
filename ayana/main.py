@@ -33,7 +33,7 @@ from .policy import Policy
 from .prom import PromClient
 from .qqbot import QQBot
 from .credentials import CredentialStore
-from .transport import NTTransport, SSHAssetStore, SSHTransport
+from .transport import SSHAssetStore, SSHTransport
 from .terminal import TerminalService
 from .web import WebApp
 
@@ -203,33 +203,20 @@ class App:
         self.creds = CredentialStore(self.db, master_key=cfg.get("ssh_credential_key") or "")
         self.ssh_store = SSHAssetStore(self.db)
         self.ssh_transport = SSHTransport(self.ssh_store, self.creds)
-        self.nt_transport = NTTransport(self.nt, self.gate)
         self.terminal = TerminalService(self.db, self.ssh_store, self.creds)
-        # 确保人工终端权限（Agent 仍由 policy 硬拦）
-        try:
-            self.policy.upsert_permission(
-                subject_type="web_user", subject_id="*", capability="shell.interactive",
-                asset_id="*", object_id="*", allow=True, require_approval=False,
-                auto_allowed=False, actor="system",
-            )
-        except Exception:
-            pass
 
         class _Router:
-            """有 SSH 写/读端点则走原生 SSH，否则 NT。轻量，无插件框架。"""
+            """仅原生 SSH。NT 已移除。"""
 
-            def __init__(self, ssh, nt_t, store):
+            def __init__(self, ssh, store):
                 self._ssh = ssh
-                self._nt = nt_t
                 self._store = store
 
             def _use_ssh(self, asset_id: str, role: str) -> bool:
-                # role 是 read/write 通道名；也匹配自定义角色 kind
                 try:
                     ep = self._store.get_endpoint(asset_id, role)
                     if ep and ep.get("enabled"):
                         return True
-                    kind = self._store.role_kind(role) if role in ("read", "write") else role
                     for r in self._store.list_roles():
                         if (role in ("read", "write") and r.get("kind") == role) or r.get("name") == role:
                             ep = self._store.get_endpoint(asset_id, r["name"])
@@ -240,19 +227,24 @@ class App:
                 return False
 
             async def probe(self, asset_id, tokens, timeout=None):
-                if self._use_ssh(asset_id, "read"):
-                    return await self._ssh.probe(asset_id, tokens, timeout=timeout)
-                return await self._nt.probe(asset_id, tokens, timeout=timeout)
+                return await self._ssh.probe(asset_id, tokens, timeout=timeout)
 
             async def exec(self, asset_id, tokens, timeout=None):
-                if self._use_ssh(asset_id, "write"):
-                    return await self._ssh.exec(asset_id, tokens, timeout=timeout)
-                return await self._nt.exec(asset_id, tokens, timeout=timeout)
+                return await self._ssh.exec(asset_id, tokens, timeout=timeout)
 
             def _endpoint(self, asset_id, role):
                 return self._ssh._endpoint(asset_id, role)
 
-        self.transport = _Router(self.ssh_transport, self.nt_transport, self.ssh_store)
+        self.transport = _Router(self.ssh_transport, self.ssh_store)
+        # 确保人工终端权限（Agent 仍由 policy 硬拦）
+        try:
+            self.policy.upsert_permission(
+                subject_type="web_user", subject_id="*", capability="shell.interactive",
+                asset_id="*", object_id="*", allow=True, require_approval=False,
+                auto_allowed=False, actor="system",
+            )
+        except Exception:
+            pass
         self.investigation = InvestigationService(
             self.db, self.nt, self.gate, self.prom, self.policy,
             knowledge=self.knowledge,

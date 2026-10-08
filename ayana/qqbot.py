@@ -198,7 +198,7 @@ class QQBot:
         ev = res.get("evidence") or []
         lines = [f"调查 {res['id']} ({len(ev)} 条证据)"]
         for e in ev[:4]:
-            if e.get("source") == "nt_probe":
+            if e.get("source") in ("ssh_probe", "nt_probe"):
                 lines.append(f"$ {' '.join(e.get('cmd') or [])}")
                 out = (e.get("output") or "")[:200]
                 lines.append(out)

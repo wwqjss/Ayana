@@ -1505,7 +1505,7 @@ function credLabel(c) {
 }
 
 function hostStatusBadge(ep) {
-  if (!ep) return el("span", { class: "badge dim", text: "NT 通道" });
+  if (!ep) return el("span", { class: "badge dim", text: "未配置 SSH" });
   const trusted = !!ep.host_key_trusted_at && !!ep.host_key_sha256;
   return el("span", {
     class: "badge " + (trusted ? "ok" : "warn"),
@@ -1522,7 +1522,7 @@ async function testHostChannel(assetId, role) {
 }
 
 function showChannelResult(assetId, out, role) {
-  const ch = out.channel === "ssh" ? "原生 SSH" : out.channel === "nt" ? "NT 通道" : "无通道";
+  const ch = out.channel === "ssh" ? "原生 SSH" : "无通道";
   const kids = [];
 
   if (out.detail === "host_key_untrusted" && out.host_key_info) {
@@ -1668,10 +1668,7 @@ function showChannelResult(assetId, out, role) {
     endpoint_without_credential: "未配置密码或密钥",
     host_key_untrusted: "主机指纹尚未信任",
     host_key_changed: "主机密钥变更",
-    nt_ok: "NT 通道可用",
-    nt_failed: "NT 通道不可用",
-    nt_unavailable: "NT 通道不存在",
-    nt_error: "NT 测试异常",
+    ssh_not_configured: "未配置 SSH",
     none: "没有可用通道",
   };
   kids.push(el("p", {
@@ -1932,7 +1929,7 @@ async function renderConnections() {
       } else {
         body.appendChild(el("div", {
           class: "muted small",
-          text: "未配置 SSH（需要地址 + 密码或密钥）。当前可能走 NT 回退；若 NT 已移除则无法远程执行。点「测试」看 NT 是否连通。",
+          text: "未配置 SSH（需要地址 + 密码或密钥）。NT 已移除，必须配置 SSH 才能远程连接与执行。",
         }));
         body.appendChild(el("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, [
           el("button", {
@@ -1961,7 +1958,7 @@ async function renderConnections() {
             },
           }),
           el("button", {
-            class: "btn small", text: "测 NT 通道",
+            class: "btn small", text: "测试连接",
             onclick: () => testHostChannel(a.id, "write"),
           }),
         ]));

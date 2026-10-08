@@ -532,17 +532,4 @@ class SSHTransport:
         }
 
 
-class NTTransport:
-    """兼容旧 NT 通道。迁移完成后删除。"""
-
-    def __init__(self, nt: Any, gate: Any):
-        self.nt = nt
-        self.gate = gate
-
-    async def probe(self, asset_id: str, cmd_tokens: list[str], timeout: float | None = None) -> NTResult:
-        binding = self.gate.get(asset_id)
-        return await self.nt.probe(binding.read_alias, cmd_tokens, timeout=timeout)
-
-    async def exec(self, asset_id: str, cmd_tokens: list[str], timeout: float | None = None) -> NTResult:
-        binding = self.gate.get(asset_id)
-        return await self.nt.exec(binding.write_alias, cmd_tokens, timeout=timeout)
+# NT 实现已移除。仅保留原生 SSH（Transport）。
