@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 7
 
 
 class MigrationError(RuntimeError):
@@ -111,6 +111,36 @@ CREATE TABLE IF NOT EXISTS objects (
   auto_recover INTEGER NOT NULL DEFAULT 0,
   created_at REAL NOT NULL,
   UNIQUE(asset_id, kind, name)
+);
+
+-- SSH 凭据：密文入库；主密钥在 secrets（ssh_credential_key），与 DB 分离
+CREATE TABLE IF NOT EXISTS ssh_credentials (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL, -- password|private_key
+  secret_enc BLOB NOT NULL,
+  public_key TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  rotated_at REAL
+);
+
+-- SSH 连接端点：读/写账户分离；host_key_sha256 信任链
+CREATE TABLE IF NOT EXISTS ssh_endpoints (
+  id TEXT PRIMARY KEY,
+  asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  role TEXT NOT NULL, -- read|write
+  host TEXT NOT NULL,
+  port INTEGER NOT NULL DEFAULT 22,
+  username TEXT NOT NULL,
+  credential_id TEXT NOT NULL DEFAULT '',
+  host_key_sha256 TEXT NOT NULL DEFAULT '',
+  host_key_line TEXT NOT NULL DEFAULT '',
+  host_key_trusted_at REAL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  UNIQUE(asset_id, role)
 );
 
 CREATE TABLE IF NOT EXISTS permissions (
@@ -255,6 +285,7 @@ CREATE TABLE IF NOT EXISTS actions (
   decision_channel TEXT NOT NULL DEFAULT '',
   decision_reason TEXT NOT NULL DEFAULT '',
   decided_at REAL,
+  decision_id TEXT NOT NULL DEFAULT '',
   decision_snapshot_json TEXT NOT NULL DEFAULT '{}',
   adjudication TEXT NOT NULL DEFAULT '',
   adjudicated_at REAL,
@@ -306,6 +337,15 @@ CREATE TABLE IF NOT EXISTS work_items (
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL,
   UNIQUE(kind, identity)
+);
+
+-- Agent 权限上限（用户可配）：强制 ⊆ capabilities 源码目录；后端在 Policy 判定时执行
+CREATE TABLE IF NOT EXISTS agent_ceiling (
+  capability TEXT PRIMARY KEY,
+  allowed INTEGER NOT NULL DEFAULT 1,
+  allow_auto INTEGER NOT NULL DEFAULT 0,
+  updated_at REAL NOT NULL,
+  updated_by TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS permission_changes (
@@ -506,16 +546,84 @@ def _migrate_v3_recovery_columns(conn: sqlite3.Connection) -> None:
     ])
 
 
+def _migrate_v4_agent_ceiling(conn: sqlite3.Connection) -> None:
+    """v4：Agent 权限上限（用户可配，强制 ⊆ 源码能力目录）。"""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS agent_ceiling ("
+        " capability TEXT PRIMARY KEY,"
+        " allowed INTEGER NOT NULL DEFAULT 1,"
+        " allow_auto INTEGER NOT NULL DEFAULT 0,"
+        " updated_at REAL NOT NULL,"
+        " updated_by TEXT NOT NULL DEFAULT ''"
+        ")"
+    )
+
+
+def _migrate_v5_action_decision_id(conn: sqlite3.Connection) -> None:
+    """v5：审批关联 —— actions.decision_id，与审计/PermissionChange 同语义。"""
+    _add_columns(conn, "actions", [
+        ("decision_id", "ALTER TABLE actions ADD COLUMN decision_id TEXT NOT NULL DEFAULT ''"),
+    ])
+
+
+def _migrate_v6_ssh_endpoints_credentials(conn: sqlite3.Connection) -> None:
+    """v6：原生 SSH 资产端点与加密凭据。"""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS ssh_credentials ("
+        " id TEXT PRIMARY KEY,"
+        " name TEXT NOT NULL DEFAULT '',"
+        " kind TEXT NOT NULL,"
+        " secret_enc BLOB NOT NULL,"
+        " public_key TEXT NOT NULL DEFAULT '',"
+        " created_at REAL NOT NULL,"
+        " updated_at REAL NOT NULL,"
+        " rotated_at REAL"
+        ")"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS ssh_endpoints ("
+        " id TEXT PRIMARY KEY,"
+        " asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,"
+        " role TEXT NOT NULL,"
+        " host TEXT NOT NULL,"
+        " port INTEGER NOT NULL DEFAULT 22,"
+        " username TEXT NOT NULL,"
+        " credential_id TEXT NOT NULL DEFAULT '',"
+        " host_key_sha256 TEXT NOT NULL DEFAULT '',"
+        " host_key_trusted_at REAL,"
+        " enabled INTEGER NOT NULL DEFAULT 1,"
+        " created_at REAL NOT NULL,"
+        " updated_at REAL NOT NULL,"
+        " UNIQUE(asset_id, role)"
+        ")"
+    )
+
+
+def _migrate_v7_host_key_line(conn: sqlite3.Connection) -> None:
+    """v7：保存 host 公钥原文，连接时写入 known_hosts。"""
+    _add_columns(conn, "ssh_endpoints", [
+        ("host_key_line", "ALTER TABLE ssh_endpoints ADD COLUMN host_key_line TEXT NOT NULL DEFAULT ''"),
+    ])
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_v1_baseline,
     2: _migrate_v2_p0_p1_columns,
     3: _migrate_v3_recovery_columns,
+    4: _migrate_v4_agent_ceiling,
+    5: _migrate_v5_action_decision_id,
+    6: _migrate_v6_ssh_endpoints_credentials,
+    7: _migrate_v7_host_key_line,
 }
 
 _MIGRATION_NAMES = {
     1: "baseline_columns",
     2: "p0_p1_columns",
     3: "recovery_and_work_items",
+    4: "agent_ceiling",
+    5: "action_decision_id",
+    6: "ssh_endpoints_credentials",
+    7: "host_key_line",
 }
 
 

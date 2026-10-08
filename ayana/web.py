@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import logging
@@ -46,6 +47,10 @@ class WebApp:
         notifier=None,
         agent=None,
         permission_changes=None,
+        ssh_store=None,
+        cred_store=None,
+        transport=None,
+        terminal=None,
     ):
         self.db = db
         self.auth = auth
@@ -61,6 +66,10 @@ class WebApp:
         self.notifier = notifier
         self.agent = agent
         self.permission_changes = permission_changes
+        self.ssh_store = ssh_store
+        self.cred_store = cred_store
+        self.transport = transport
+        self.terminal = terminal
 
     def build(self) -> web.Application:
         app = web.Application(client_max_size=2_000_000)
@@ -92,6 +101,9 @@ class WebApp:
         app.router.add_get("/api/overview", self.api_overview)
         app.router.add_get("/api/assets", self.api_assets)
         app.router.add_get("/api/assets/{asset_id}", self.api_asset_detail)
+        app.router.add_post("/api/assets", self.api_asset_create)
+        app.router.add_post("/api/assets/{asset_id}/update", self.api_asset_update)
+        app.router.add_delete("/api/assets/{asset_id}", self.api_asset_delete)
         app.router.add_post("/api/assets/{asset_id}/investigate", self.api_investigate)
         app.router.add_get("/api/incidents", self.api_incidents)
         app.router.add_get("/api/incidents/{inc_id}", self.api_incident_detail)
@@ -108,6 +120,30 @@ class WebApp:
         app.router.add_get("/api/permissions", self.api_permissions)
         app.router.add_post("/api/permissions", self.api_permission_upsert)
         app.router.add_post("/api/permissions/delete", self.api_permission_delete)
+        app.router.add_post("/api/permissions/preview", self.api_permission_preview)
+        app.router.add_get("/api/permissions/history", self.api_permission_history)
+        app.router.add_get("/api/agent-ceiling", self.api_agent_ceiling_list)
+        app.router.add_post("/api/agent-ceiling", self.api_agent_ceiling_set)
+        # SSH 资产 / 凭据
+        app.router.add_get("/api/ssh/endpoints", self.api_ssh_endpoints)
+        app.router.add_post("/api/ssh/endpoints", self.api_ssh_endpoint_upsert)
+        app.router.add_post("/api/ssh/endpoints/trust", self.api_ssh_trust_host_key)
+        app.router.add_delete("/api/ssh/endpoints", self.api_ssh_endpoint_delete)
+        app.router.add_get("/api/ssh/roles", self.api_ssh_roles)
+        app.router.add_post("/api/ssh/roles", self.api_ssh_role_add)
+        app.router.add_get("/api/ssh/credentials", self.api_ssh_credentials)
+        app.router.add_post("/api/ssh/credentials", self.api_ssh_credential_create)
+        app.router.add_post("/api/ssh/credentials/generate", self.api_ssh_credential_generate)
+        app.router.add_post("/api/ssh/credentials/rotate", self.api_ssh_credential_rotate)
+        app.router.add_post("/api/ssh/credentials/deploy-pubkey", self.api_ssh_deploy_pubkey)
+        app.router.add_delete("/api/ssh/credentials", self.api_ssh_credential_delete)
+        app.router.add_post("/api/ssh/test", self.api_ssh_test)
+        app.router.add_post("/api/assets/{asset_id}/test", self.api_asset_channel_test)
+        app.router.add_post("/api/ssh/switch-to-key", self.api_ssh_switch_to_key)
+        app.router.add_post("/api/ssh/hostkey/fetch", self.api_ssh_hostkey_fetch)
+        # 人工 Web 终端（仅登录管理员；Agent 不注册）
+        app.router.add_get("/api/terminal/check", self.api_terminal_check)
+        app.router.add_get("/ws/terminal", self.ws_terminal)
         app.router.add_get("/api/permission-changes", self.api_permission_changes)
         app.router.add_post("/api/permission-changes", self.api_permission_change_propose)
         app.router.add_get("/api/permission-changes/{cid}", self.api_permission_change_present)
@@ -401,39 +437,63 @@ class WebApp:
         self._require_auth(request)
         from .health import REQUIRED_CHECKS, asset_health
 
+        # 短缓存：避免前端连点/轮询把 Prom 探测打满（Windows 连接拒绝约 2s/次）
+        now_ts = time.time()
+        cache = getattr(self, "_overview_cache", None)
+        if cache and (now_ts - cache["at"]) < 5.0:
+            return _json(cache["data"])
+
         assets_raw = self.db.query("SELECT * FROM assets ORDER BY id")
-        assets = []
         open_inc = self.incidents.list_incidents(status="open", limit=50)
         open_by_asset = {}
         for i in open_inc:
             aid = i.get("asset_id") or ""
             open_by_asset[aid] = open_by_asset.get(aid, 0) + 1
+
+        async def _fetch_metric(asset_id: str, metric: str):
+            try:
+                if metric == "hysteria_proxy_up":
+                    hy = await self.prom.query("hysteria_proxy_up")
+                    return metric, hy.get("result") or []
+                if metric == "probe_success":
+                    return metric, await self.prom.probe_success_since(
+                        asset_id, "", start=now() - 300
+                    )
+            except Exception:
+                return metric, []
+            return metric, []
+
+        # 先并行收集各资产需要的指标，再组装
+        tasks = []
+        for a in assets_raw:
+            req = REQUIRED_CHECKS.get(a["id"], [])
+            metrics = {c.get("metric") for c in req if c.get("metric")}
+            for metric in metrics:
+                tasks.append(_fetch_metric(a["id"], metric))
+        results = await asyncio.gather(*tasks) if tasks else []
+        # (asset_id, metric) 顺序与 tasks 构建顺序一致
+        idx = 0
+        metric_map: dict[str, dict[str, list]] = {}
+        for a in assets_raw:
+            req = REQUIRED_CHECKS.get(a["id"], [])
+            metrics = {c.get("metric") for c in req if c.get("metric")}
+            metric_map[a["id"]] = {}
+            for metric in metrics:
+                _m, samples = results[idx]
+                metric_map[a["id"]][metric] = samples
+                idx += 1
+
+        assets = []
         for a in assets_raw:
             d = dict(a)
             d["objects"] = [
                 dict(o)
                 for o in self.db.query("SELECT * FROM objects WHERE asset_id=?", (a["id"],))
             ]
-            samples_by_metric = {}
-            req = REQUIRED_CHECKS.get(a["id"], [])
-            metrics = {c.get("metric") for c in req if c.get("metric")}
-            for metric in metrics:
-                try:
-                    if metric == "hysteria_proxy_up":
-                        hy = await self.prom.query("hysteria_proxy_up")
-                        samples_by_metric[metric] = hy.get("result") or []
-                    elif metric == "probe_success":
-                        samples_by_metric[metric] = await self.prom.probe_success_since(
-                            a["id"], "", start=now() - 300
-                        )
-                    else:
-                        samples_by_metric[metric] = []
-                except Exception:
-                    samples_by_metric[metric] = []
             health = asset_health(
                 asset_id=a["id"],
                 objects=d["objects"],
-                samples_by_metric=samples_by_metric,
+                samples_by_metric=metric_map.get(a["id"], {}),
                 open_incidents=open_by_asset.get(a["id"], 0),
             )
             d["health"] = health
@@ -449,22 +509,22 @@ class WebApp:
             sources["prometheus_targets"] = len(targets)
             sources["prometheus_unhealthy"] = sum(1 for t in targets if t.get("health") != "up")
         except Exception as e:
-            sources["prometheus_error"] = str(e)
+            sources["prometheus_error"] = str(e)[:200]
         quiet = not need and not open_inc and not pending_actions and not unknown_actions
-        return _json(
-            {
-                "ok": True,
-                "version": self.version,
-                "assets": assets,
-                "open_incidents": open_inc,
-                "need_human": need,
-                "recent_actions": actions,
-                "pending_actions": len(pending_actions),
-                "unknown_actions": len(unknown_actions),
-                "sources": sources,
-                "quiet": quiet,
-            }
-        )
+        data = {
+            "ok": True,
+            "version": self.version,
+            "assets": assets,
+            "open_incidents": open_inc,
+            "need_human": need,
+            "recent_actions": actions,
+            "pending_actions": len(pending_actions),
+            "unknown_actions": len(unknown_actions),
+            "sources": sources,
+            "quiet": quiet,
+        }
+        self._overview_cache = {"at": time.time(), "data": data}
+        return _json(data)
 
     async def api_assets(self, request: web.Request) -> web.Response:
         self._require_auth(request)
@@ -476,8 +536,186 @@ class WebApp:
                 dict(o)
                 for o in self.db.query("SELECT * FROM objects WHERE asset_id=?", (r["id"],))
             ]
+            # 附带 SSH 端点（主机连接信息）
+            if self.ssh_store:
+                try:
+                    d["ssh_endpoints"] = self.ssh_store.list_endpoints(r["id"])
+                except Exception:
+                    d["ssh_endpoints"] = []
             out.append(d)
         return _json({"ok": True, "assets": out})
+
+    def _asset_payload(self, body: dict) -> dict:
+        aid = str(body.get("id") or "").strip()
+        if not aid or not aid.replace("_", "").replace("-", "").isalnum() or len(aid) > 32:
+            raise ValueError("bad_asset_id")
+        host = str(body.get("host") or "").strip()
+        port = int(body.get("port") or 22)
+        user = str(body.get("username") or "").strip() or "root"
+        if not host:
+            raise ValueError("host_required")
+        return {
+            "id": aid.lower(),
+            "display_name": str(body.get("display_name") or aid).strip(),
+            "host": host,
+            "port": port,
+            "username": user,
+            "role": str(body.get("role") or "write").strip(),
+            "credential_id": body.get("credential_id") or "",
+            "prom_asset": str(body.get("prom_asset") or aid).strip(),
+            "notes": str(body.get("notes") or "").strip(),
+        }
+
+    async def api_asset_create(self, request: web.Request) -> web.Response:
+        """添加主机：创建资产 + 可选 SSH 端点（一表完成）。"""
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        try:
+            p = self._asset_payload(body)
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        existing = self.db.query_one("SELECT id FROM assets WHERE id=?", (p["id"],))
+        if existing:
+            return _json({"ok": False, "error": "asset_exists"}, 409)
+        t = now()
+        # NT 别名约定：asset / asset-exec（兼容旧通道）
+        read_alias = p["id"]
+        write_alias = f"{p['id']}-exec"
+        with self.db.tx() as conn:
+            conn.execute(
+                "INSERT INTO assets(id, display_name, read_alias, write_alias, expected_host_id,"
+                " prom_asset, enabled, notes, created_at, updated_at)"
+                " VALUES(?,?,?,?,? ,?,1,?,?,?)",
+                (
+                    p["id"], p["display_name"], read_alias, write_alias, "",
+                    p["prom_asset"], p["notes"], t, t,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, detail_json, channel)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (
+                    t, "web_user", sess["username"], "asset_created", p["id"],
+                    __import__("json").dumps(
+                        {"host": p["host"], "port": p["port"], "username": p["username"]},
+                        ensure_ascii=False,
+                    ),
+                    "web",
+                ),
+            )
+        ssh_ep = None
+        cred_id = p.get("credential_id") or ""
+        # 添加主机时可直接输入密码 / 私钥 → 自动建凭据
+        secret = str(body.get("password") or body.get("private_key") or "").strip()
+        if secret and not cred_id:
+            try:
+                kind = "private_key" if "BEGIN" in secret else "password"
+                meta = self._cred_store().create(
+                    name=f"{p['id']}-{p.get('role') or 'write'}",
+                    kind=kind,
+                    secret=secret,
+                    actor=sess["username"],
+                )
+                cred_id = meta["id"]
+            except Exception as e:
+                return _json({"ok": False, "error": f"credential: {e}"}, 400)
+        if self.ssh_store and p.get("host"):
+            try:
+                ssh_ep = self.ssh_store.upsert_endpoint(
+                    asset_id=p["id"],
+                    role=p["role"] or "write",
+                    host=p["host"],
+                    port=p["port"],
+                    username=p["username"],
+                    credential_id=cred_id,
+                    actor=sess["username"],
+                )
+            except Exception as e:
+                return _json({"ok": True, "asset_id": p["id"], "ssh_error": str(e)})
+        return _json({"ok": True, "asset_id": p["id"], "ssh_endpoint": ssh_ep, "credential_id": cred_id})
+
+    async def api_asset_update(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        aid = request.match_info["asset_id"]
+        body = await request.json()
+        row = self.db.query_one("SELECT * FROM assets WHERE id=?", (aid,))
+        if not row:
+            return _json({"ok": False, "error": "not_found"}, 404)
+        t = now()
+        display = str(body.get("display_name") or row["display_name"]).strip()
+        notes = str(body.get("notes") or row["notes"]).strip()
+        enabled = row["enabled"]
+        if "enabled" in body:
+            enabled = 1 if body.get("enabled") else 0
+        self.db.execute(
+            "UPDATE assets SET display_name=?, notes=?, enabled=?, updated_at=? WHERE id=?",
+            (display, notes, enabled, t, aid),
+        )
+        ssh_ep = None
+        cred_id = body.get("credential_id") or ""
+        secret = str(body.get("password") or body.get("private_key") or "").strip()
+        if secret and self.cred_store:
+            try:
+                kind = "private_key" if "BEGIN" in secret else "password"
+                meta = self._cred_store().create(
+                    name=f"{aid}-{body.get('role') or 'write'}",
+                    kind=kind,
+                    secret=secret,
+                    actor=sess["username"],
+                )
+                cred_id = meta["id"]
+            except Exception as e:
+                return _json({"ok": False, "error": f"credential: {e}"}, 400)
+        if self.ssh_store and body.get("host"):
+            try:
+                ssh_ep = self.ssh_store.upsert_endpoint(
+                    asset_id=aid,
+                    role=(body.get("role") or "write"),
+                    host=str(body["host"]).strip(),
+                    port=int(body.get("port") or 22),
+                    username=str(body.get("username") or "root").strip(),
+                    credential_id=cred_id,
+                    actor=sess["username"],
+                )
+            except Exception as e:
+                return _json({"ok": False, "error": f"ssh: {e}"}, 400)
+        self.db.audit(
+            "web_user", sess["username"], "asset_updated",
+            asset_id=aid, detail={"display_name": display, "enabled": enabled}, channel="web",
+        )
+        return _json({"ok": True, "asset_id": aid, "ssh_endpoint": ssh_ep, "credential_id": cred_id})
+
+    async def api_asset_delete(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        aid = request.match_info["asset_id"]
+        row = self.db.query_one("SELECT * FROM assets WHERE id=?", (aid,))
+        if not row:
+            return _json({"ok": False, "error": "not_found"}, 404)
+        # 有未完结操作时拒绝删除
+        busy = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM actions WHERE asset_id=?"
+            " AND state IN ('proposed','approved','dispatched','unknown')",
+            (aid,),
+        )
+        if busy and busy["n"] > 0:
+            return _json({"ok": False, "error": "asset_busy", "open_actions": int(busy["n"])}, 409)
+        with self.db.tx() as conn:
+            conn.execute("DELETE FROM ssh_endpoints WHERE asset_id=?", (aid,))
+            conn.execute("DELETE FROM objects WHERE asset_id=?", (aid,))
+            conn.execute("DELETE FROM assets WHERE id=?", (aid,))
+            conn.execute(
+                "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, detail_json, channel)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (
+                    now(), "web_user", sess["username"], "asset_deleted", aid,
+                    __import__("json").dumps({"display_name": row["display_name"]}, ensure_ascii=False),
+                    "web",
+                ),
+            )
+        return _json({"ok": True})
 
     async def api_asset_detail(self, request: web.Request) -> web.Response:
         self._require_auth(request)
@@ -793,6 +1031,26 @@ class WebApp:
             return _json({"ok": False, "error": str(e)}, 400)
         return _json({"ok": True, **res})
 
+    def _sensitive_totp(self, sess: dict, body: dict) -> dict[str, Any] | None:
+        """敏感操作二次确认：已启用 TOTP 的用户必须提供有效验证码。
+
+        验证码不落日志、不进事件正文。未启用 TOTP 的用户不强制（与登录一致）。
+        """
+        username = sess["username"]
+        code = str(body.get("totp") or body.get("totp_code") or "").strip()
+        if not self.auth.totp_enabled(username):
+            return None
+        if not code:
+            self.db.audit(
+                "web_user", username, "sensitive_totp_required", detail={"missing": True}
+            )
+            return {"ok": False, "error": "totp_required"}
+        if not self.auth.verify_totp(username, code):
+            self.db.audit("web_user", username, "sensitive_totp_failed")
+            return {"ok": False, "error": "totp_invalid"}
+        self.db.audit("web_user", username, "sensitive_totp_ok")
+        return None
+
     async def api_action_approve(self, request: web.Request) -> web.Response:
         sess = self._require_auth(request)
         self._check_csrf(request, sess)
@@ -801,6 +1059,9 @@ class WebApp:
             body = await request.json()
         except Exception:
             body = {}
+        mfa_err = self._sensitive_totp(sess, body)
+        if mfa_err:
+            return _json(mfa_err, 401)
         execute = bool(body.get("execute", True))
         reason = body.get("reason", "") or ""
         try:
@@ -863,6 +1124,14 @@ class WebApp:
     async def api_action_execute(self, request: web.Request) -> web.Response:
         sess = self._require_auth(request)
         self._check_csrf(request, sess)
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        mfa_err = self._sensitive_totp(sess, body)
+        if mfa_err:
+            return _json(mfa_err, 401)
         try:
             res = await self.actions.execute(
                 request.match_info["aid"],
@@ -930,6 +1199,30 @@ class WebApp:
             return _json({"ok": False, "error": str(e)}, 400)
         return _json(res)
 
+    async def api_permission_preview(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        body = await request.json()
+        try:
+            data = self.policy.preview(
+                subject_type=body["subject_type"],
+                subject_id=body["subject_id"],
+                capability=body["capability"],
+                asset_id=body.get("asset_id") or "",
+                object_id=body.get("object_id") or "",
+                auto=bool(body.get("auto", False)),
+            )
+        except (PolicyDeny, KeyError) as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True, "preview": data})
+
+    async def api_permission_history(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        limit = min(200, int(request.rel_url.query.get("limit", "50")))
+        return _json({
+            "ok": True,
+            "history": self.policy.list_config_history(limit=limit),
+        })
+
     async def api_permission_delete(self, request: web.Request) -> web.Response:
         sess = self._require_admin(request)
         self._check_csrf(request, sess)
@@ -939,6 +1232,28 @@ class WebApp:
         except (PolicyDeny, KeyError, ValueError) as e:
             return _json({"ok": False, "error": str(e)}, 400)
         return _json({"ok": True})
+
+    # ---- Agent ceiling（用户可配上限，后端强制 ⊆ 源码能力目录）----
+
+    async def api_agent_ceiling_list(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        return _json({"ok": True, "agent_ceiling": self.policy.agent_ceiling.list()})
+
+    async def api_agent_ceiling_set(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        try:
+            eff = self.policy.agent_ceiling.set(
+                body["capability"],
+                allowed=bool(body.get("allowed", True)),
+                allow_auto=bool(body.get("allow_auto", False)),
+                actor=sess["username"],
+            )
+        except Exception as e:
+            # 含 ObjectBindingError：能力不在源码目录 → 400，不得发明
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True, "agent_ceiling": eff})
 
     # ---- Permission Change（0.4：TOTP 只签一笔）----
 
@@ -1104,6 +1419,794 @@ class WebApp:
         n = self.notifier.retry_failed(body.get("id", "")) if self.notifier else 0
         self.db.audit("web_user", sess["username"], "notifications_retry", detail={"count": n})
         return _json({"ok": True, "retried": n})
+
+    # ---- SSH 资产 / 凭据（v0.4.1）----
+
+    def _ssh_store(self):
+        if not self.ssh_store:
+            raise web.HTTPNotFound(text="ssh_store not configured")
+        return self.ssh_store
+
+    def _cred_store(self):
+        if not self.cred_store:
+            raise web.HTTPNotFound(text="cred_store not configured")
+        return self.cred_store
+
+    async def api_ssh_roles(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        return _json({"ok": True, "roles": self._ssh_store().list_roles()})
+
+    async def api_ssh_role_add(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        try:
+            role = self._ssh_store().add_role(
+                name=body["name"],
+                kind=body.get("kind") or "read",
+                label=body.get("label") or "",
+                actor=sess["username"],
+            )
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True, "role": role})
+
+    async def api_ssh_endpoints(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        asset_id = request.rel_url.query.get("asset_id", "")
+        return _json({"ok": True, "endpoints": self._ssh_store().list_endpoints(asset_id)})
+
+    async def api_ssh_endpoint_upsert(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        try:
+            ep = self._ssh_store().upsert_endpoint(
+                asset_id=body["asset_id"],
+                role=body.get("role") or "read",
+                host=body["host"],
+                port=int(body.get("port") or 22),
+                username=body["username"],
+                credential_id=body.get("credential_id") or "",
+                actor=sess["username"],
+            )
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True, "endpoint": ep})
+
+    async def api_ssh_hostkey_fetch(self, request: web.Request) -> web.Response:
+        """自动获取主机指纹（ssh-keyscan），供「信任并连接」弹窗展示。"""
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        try:
+            from .transport import fetch_host_key
+            res = await fetch_host_key(
+                str(body.get("host") or "").strip(),
+                int(body.get("port") or 22),
+            )
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)[:200]}, 400)
+        return _json(res)
+
+    async def api_ssh_trust_host_key(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        try:
+            ep = self._ssh_store().trust_host_key(
+                body["asset_id"],
+                body.get("role") or "read",
+                body["host_key_sha256"],
+                actor=sess["username"],
+                key_line=body.get("host_key_line") or "",
+            )
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True, "endpoint": ep})
+
+    async def api_ssh_endpoint_delete(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        try:
+            self._ssh_store().delete_endpoint(
+                body["asset_id"], body.get("role") or "read", actor=sess["username"]
+            )
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True})
+
+    async def api_ssh_credentials(self, request: web.Request) -> web.Response:
+        self._require_admin(request)
+        # 只返回元数据，永不返回明文
+        return _json({"ok": True, "credentials": self._cred_store().list_meta()})
+
+    async def api_ssh_credential_create(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        try:
+            meta = self._cred_store().create(
+                name=body.get("name") or "",
+                kind=body["kind"],
+                secret=body["secret"],
+                public_key=body.get("public_key") or "",
+                actor=sess["username"],
+            )
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True, "credential": meta})
+
+    async def api_ssh_credential_delete(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        try:
+            self._cred_store().delete(body["id"], actor=sess["username"])
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True})
+
+    async def api_ssh_credential_generate(self, request: web.Request) -> web.Response:
+        from .credentials import generate_and_store_keypair
+
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        try:
+            meta = generate_and_store_keypair(
+                self._cred_store(), name=body.get("name") or "ayana", actor=sess["username"]
+            )
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True, "credential": meta})
+
+    async def api_ssh_credential_rotate(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        try:
+            meta = self._cred_store().rotate(
+                body["id"],
+                secret=body["secret"],
+                public_key=body.get("public_key") or "",
+                actor=sess["username"],
+            )
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True, "credential": meta})
+
+    async def api_ssh_deploy_pubkey(self, request: web.Request) -> web.Response:
+        from .credentials import deploy_public_key
+
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        try:
+            res = await deploy_public_key(
+                host=body["host"],
+                port=int(body.get("port") or 22),
+                username=body["username"],
+                public_key=body["public_key"],
+                credential_id=body["credential_id"],
+                store=self._cred_store(),
+            )
+            self.db.audit(
+                "web_user",
+                sess["username"],
+                "ssh_pubkey_deployed",
+                detail={"ok": res.get("ok"), "host": body.get("host")},
+            )
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True, **res})
+
+    async def api_asset_channel_test(self, request: web.Request) -> web.Response:
+        """测当前实际使用的通道：SSH 或 NT，并明确通/不通与原因。"""
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        asset_id = request.match_info["asset_id"]
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        role = str(body.get("role") or "write")
+        want_write = role not in ("read",)
+
+        eps = []
+        if self.ssh_store:
+            try:
+                eps = [e for e in self.ssh_store.list_endpoints(asset_id) if e.get("enabled")]
+            except Exception:
+                eps = []
+        ssh_ep = None
+        for e in eps:
+            if want_write and e.get("role") not in ("read",):
+                ssh_ep = e
+                break
+            if not want_write:
+                ssh_ep = e
+                break
+        if not ssh_ep and eps:
+            ssh_ep = eps[0]
+
+        has_credential = bool(ssh_ep and ssh_ep.get("credential_id"))
+        auth_method = "none"
+        if ssh_ep and ssh_ep.get("credential_id") and self.cred_store:
+            try:
+                cm = self.cred_store.get_meta(ssh_ep["credential_id"])
+                auth_method = "key" if (cm or {}).get("kind") == "private_key" else "password"
+            except Exception:
+                auth_method = "unknown"
+        result: dict[str, Any] = {
+            "asset_id": asset_id,
+            "channel": "none",
+            "ok": False,
+            "ssh_configured": bool(ssh_ep),
+            "has_credential": has_credential,
+            "auth_method": auth_method,
+            "host_key_trusted": bool(ssh_ep and ssh_ep.get("host_key_trusted_at") and ssh_ep.get("host_key_sha256")),
+            "detail": "",
+            "hint": "",
+        }
+
+        # 1) 有 SSH 端点 → 测 SSH
+        if ssh_ep:
+            result["channel"] = "ssh"
+            if not has_credential:
+                result["detail"] = "endpoint_without_credential"
+                result["hint"] = "已配置 SSH 地址，但未配置密码或密钥。请配置密码登录后再改用密钥。"
+                self.db.audit("web_user", sess["username"], "channel_test", asset_id=asset_id,
+                              detail=result, channel="web")
+                return _json(result)
+
+            # 自动取当前主机指纹，供信任/变更判断与弹窗
+            from .transport import fetch_host_key
+            scanned = await fetch_host_key(ssh_ep.get("host") or "", int(ssh_ep.get("port") or 22))
+            result["host_key_scan"] = {
+                k: scanned.get(k) for k in ("ok", "fingerprint", "key_type", "key_line", "error")
+            } if scanned else {}
+            stored_fp = ssh_ep.get("host_key_sha256") or ""
+            stored_line = ssh_ep.get("host_key_line") or ""
+
+            if stored_fp and scanned.get("ok") and scanned.get("fingerprint") and scanned["fingerprint"] != stored_fp:
+                result["detail"] = "host_key_changed"
+                result["ok"] = False
+                result["hint"] = (
+                    "主机密钥已变更！为安全起见已阻止连接，不会自动覆盖。"
+                    "请确认服务器是否重装/换机；确认无误后可在界面上重新信任新指纹。"
+                )
+                result["host_key_info"] = {
+                    "host": ssh_ep.get("host"),
+                    "port": ssh_ep.get("port"),
+                    "stored_fingerprint": stored_fp,
+                    "current_fingerprint": scanned.get("fingerprint"),
+                    "changed": True,
+                }
+                self.db.audit("web_user", sess["username"], "channel_test", asset_id=asset_id,
+                              detail=result, channel="web")
+                return _json(result)
+
+            if not result["host_key_trusted"]:
+                result["detail"] = "host_key_untrusted"
+                result["ok"] = False
+                if scanned.get("ok"):
+                    result["hint"] = "首次连接该主机，需要你确认主机指纹后才能继续。"
+                    result["host_key_info"] = {
+                        "host": ssh_ep.get("host"),
+                        "port": ssh_ep.get("port"),
+                        "fingerprint": scanned.get("fingerprint"),
+                        "key_type": scanned.get("key_type"),
+                        "key_line": scanned.get("key_line"),
+                        "changed": False,
+                    }
+                else:
+                    result["hint"] = f"无法获取主机指纹：{scanned.get('error') or 'keyscan_failed'}。请检查地址/端口是否可达。"
+                self.db.audit("web_user", sess["username"], "channel_test", asset_id=asset_id,
+                              detail=result, channel="web")
+                return _json(result)
+
+            # 有信任且指纹未变 → 真连接：执行 hostname / whoami / uname -s
+            try:
+                from .terminal import run_cmd_probe
+
+                cm = self.cred_store.get_meta(ssh_ep.get("credential_id") or "") if self.cred_store else None
+                cred_kind = (cm or {}).get("kind") or "password"
+                secret = self.cred_store.reveal_secret(ssh_ep["credential_id"]) if (self.cred_store and ssh_ep.get("credential_id")) else ""
+                probe = await run_cmd_probe(
+                    host=ssh_ep.get("host") or "",
+                    port=int(ssh_ep.get("port") or 22),
+                    username=ssh_ep.get("username") or "",
+                    cred_kind=cred_kind,
+                    secret=secret,
+                    host_key_line=ssh_ep.get("host_key_line") or "",
+                    cmds=["hostname", "whoami", "uname -s"],
+                )
+                secret = ""
+                result["ok"] = bool(probe.get("ok"))
+                result["probe_cmds"] = probe.get("results") or []
+                if probe.get("ok"):
+                    outs = {r["cmd"]: r.get("stdout") for r in probe.get("results") or []}
+                    result["detail"] = "ssh_ok"
+                    result["hint"] = (
+                        f"连接正常：{outs.get('hostname') or ''} · "
+                        f"{outs.get('whoami') or ''} · {outs.get('uname -s') or ''}"
+                    )
+                else:
+                    result["detail"] = "ssh_failed"
+                    result["hint"] = f"SSH 连接或命令失败：{probe.get('error') or ''}"
+                    result["raw_error"] = probe.get("error") or ""
+                    for r in probe.get("results") or []:
+                        if not r.get("ok"):
+                            result["hint"] = f"命令失败：{r.get('cmd')} → {r.get('stderr') or r.get('stdout') or r.get('returncode')}"
+                            break
+            except Exception as e:
+                result["detail"] = "ssh_error"
+                result["hint"] = f"SSH 测试异常：{e}"
+            self.db.audit("web_user", sess["username"], "channel_test", asset_id=asset_id,
+                          detail=result, channel="web")
+            return _json(result)
+
+        # 2) 无 SSH 端点 → 测 NT 回退，并提示未配密码/密钥
+        result["channel"] = "nt"
+        result["hint"] = (
+            "未配置 SSH 端点（地址/密码或密钥），当前走 NT 通道。"
+            "若之后移除 NT，必须先配置密码或密钥才能远程执行。"
+        )
+        nt = getattr(self.actions, "nt", None)
+        gate = getattr(self.actions, "gate", None)
+        try:
+            if nt is not None:
+                alias = None
+                if gate is not None:
+                    try:
+                        b = gate.get(asset_id)
+                        alias = b.write_alias if want_write else b.read_alias
+                    except Exception:
+                        alias = asset_id
+                res = await nt.probe(alias or asset_id, ["true"], timeout=8.0)
+                result["ok"] = bool(res.ok)
+                result["detail"] = "nt_ok" if res.ok else "nt_failed"
+                result["raw"] = {
+                    "ok": res.ok,
+                    "returncode": res.returncode,
+                    "timed_out": res.timed_out,
+                    "output": (res.output or "")[:300],
+                    "alias": alias,
+                }
+                if res.ok:
+                    result["hint"] = (
+                        "NT 通道连通。仍建议配置 SSH 密码/密钥，以便移除 NT 后继续可用。"
+                    )
+                else:
+                    result["hint"] = (
+                        f"NT 通道不通：{res.output or res.returncode}。"
+                        "请配置 SSH 密码或密钥，或检查 NT 别名/主机闸。"
+                    )
+            else:
+                result["detail"] = "nt_unavailable"
+                result["hint"] = "NT 通道不可用，且未配置 SSH。请配置 SSH 密码或密钥。"
+        except Exception as e:
+            result["detail"] = "nt_error"
+            result["hint"] = f"NT 测试异常：{e}。请配置 SSH 密码或密钥。"
+        self.db.audit("web_user", sess["username"], "channel_test", asset_id=asset_id,
+                      detail=result, channel="web")
+        return _json(result)
+
+    async def api_ssh_switch_to_key(self, request: web.Request) -> web.Response:
+        """密码登录 → 生成密钥 → 部署公钥 → 切换密钥认证 →（可选）删除密码。"""
+        from .credentials import deploy_public_key, generate_and_store_keypair
+
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        asset_id = str(body.get("asset_id") or "").strip()
+        role = str(body.get("role") or "write")
+        delete_password = bool(body.get("delete_password", True))
+        if not asset_id:
+            return _json({"ok": False, "error": "asset_id_required"}, 400)
+
+        steps: list[str] = []
+        try:
+            eps = self._ssh_store().list_endpoints(asset_id)
+        except Exception as e:
+            return _json({"ok": False, "error": f"endpoints: {e}"}, 400)
+        ep = next((e for e in eps if e.get("role") == role and e.get("enabled")), None)
+        if not ep and eps:
+            ep = next((e for e in eps if e.get("enabled")), None)
+        if not ep:
+            return _json({
+                "ok": False,
+                "error": "no_ssh_endpoint",
+                "hint": "请先「配置 SSH 连接」填地址和密码，再切换密钥。",
+            }, 400)
+
+        cred_id = ep.get("credential_id") or ""
+        if not cred_id:
+            return _json({
+                "ok": False,
+                "error": "no_credential",
+                "hint": "当前主机没有绑定密码/密钥。请先配置密码登录。",
+            }, 400)
+        meta = self.cred_store.get_meta(cred_id)
+        kind = (meta or {}).get("kind") or ""
+        if kind == "private_key":
+            return _json({
+                "ok": True,
+                "already_key": True,
+                "credential_id": cred_id,
+                "hint": "已经在用密钥认证，无需切换。",
+            })
+        steps.append(f"use_password_credential:{cred_id[:10]}")
+
+        # 1) 生成密钥对并入库
+        try:
+            key_meta = generate_and_store_keypair(
+                self.cred_store,
+                name=f"{asset_id}-key",
+                actor=sess["username"],
+            )
+        except Exception as e:
+            return _json({"ok": False, "error": f"keygen: {e}", "steps": steps}, 500)
+        steps.append(f"generated_key:{key_meta['id'][:10]}")
+
+        # 2) 用现有密码把公钥装到目标机
+        try:
+            dep = await deploy_public_key(
+                host=ep["host"],
+                port=int(ep.get("port") or 22),
+                username=ep["username"],
+                public_key=key_meta.get("public_key") or "",
+                credential_id=cred_id,
+                store=self.cred_store,
+                host_key_line=(ep.get("host_key_line") or "") if "host_key_line" in ep.keys() else "",
+            )
+        except Exception as e:
+            return _json({
+                "ok": False,
+                "error": f"deploy_pubkey: {e}",
+                "steps": steps,
+                "hint": "部署公钥失败，请确认密码正确且用户可写 ~/.ssh/authorized_keys。",
+            }, 500)
+        steps.append(f"deployed_pubkey:ok={dep.get('ok')}")
+        if not dep.get("ok"):
+            return _json({
+                "ok": False,
+                "error": "deploy_pubkey_failed",
+                "deploy": dep,
+                "steps": steps,
+                "hint": "公钥未装上，仍保留密码认证。错误见 deploy.output。",
+            }, 400)
+
+        # 3) 先用新密钥验证，通过后才切换端点（避免半路改掉认证）
+        verify = {"ok": False}
+        try:
+            from .transport import SSHTransport
+            # 临时把密钥绑到端点上做验证，失败则回滚 credential_id
+            old_cred = ep.get("credential_id") or ""
+            self.ssh_store.upsert_endpoint(
+                asset_id=ep["asset_id"],
+                role=ep["role"],
+                host=ep["host"],
+                port=int(ep.get("port") or 22),
+                username=ep["username"],
+                credential_id=key_meta["id"],
+                actor=sess["username"],
+            )
+            try:
+                tr = SSHTransport(self._ssh_store(), self._cred_store())
+                verify = await tr.test_connection(ep["asset_id"], "write")
+            except Exception as e:
+                verify = {"ok": False, "error": str(e)[:300]}
+            if not verify.get("ok"):
+                # 回滚：仍用原密码凭据
+                self.ssh_store.upsert_endpoint(
+                    asset_id=ep["asset_id"],
+                    role=ep["role"],
+                    host=ep["host"],
+                    port=int(ep.get("port") or 22),
+                    username=ep["username"],
+                    credential_id=old_cred,
+                    actor=sess["username"],
+                )
+                steps.append(f"key_verify:ok=False;rolled_back_to_password")
+                return _json({
+                    "ok": False,
+                    "error": "key_verify_failed",
+                    "verify": verify,
+                    "steps": steps,
+                    "rolled_back": True,
+                    "hint": (
+                        "密钥验证未通过，已回退为密码认证，未改动登录方式。"
+                        "请检查服务器 authorized_keys 或重试。"
+                    ),
+                })
+            steps.append("key_verify:ok=True")
+            steps.append("switched_to_key_confirmed")
+        except Exception as e:
+            verify = {"ok": False, "error": str(e)[:300]}
+            steps.append(f"key_verify_error:{str(e)[:120]}")
+            return _json({
+                "ok": False,
+                "error": "key_verify_error",
+                "verify": verify,
+                "steps": steps,
+                "rolled_back": True,
+                "hint": f"密钥验证异常，已保持密码认证：{e}",
+            })
+
+        # 4) 验证通过后再问是否删密码（取消则保留密码，但登录已用密钥）
+        deleted = False
+        if delete_password:
+            try:
+                self._cred_store().delete(cred_id, actor=sess["username"])
+                deleted = True
+                steps.append(f"deleted_password:{cred_id[:10]}")
+            except Exception as e:
+                steps.append(f"delete_password_failed:{e}")
+        else:
+            steps.append("password_kept")
+
+        self.db.audit(
+            "web_user", sess["username"], "ssh_switch_to_key",
+            asset_id=asset_id,
+            detail={
+                "ok": bool(verify.get("ok")),
+                "deleted_password": deleted,
+                "key_credential_id": key_meta["id"],
+                "steps": steps,
+            },
+            channel="web",
+        )
+        return _json({
+            "ok": True,
+            "already_key": False,
+            "credential_id": key_meta["id"],
+            "public_key": key_meta.get("public_key") or "",
+            "verify": verify,
+            "deleted_password": deleted,
+            "auth_method": "key",
+            "steps": steps,
+            "hint": (
+                "已切换为密钥登录，密码已删除。" if deleted
+                else "已切换为密钥登录（密码仍保留，可稍后在凭据库删除）。"
+            ),
+        })
+
+    # ---- 人工 Web 终端（Agent 不可达）----
+
+    def _terminal_ok(self, sess: dict) -> dict | None:
+        """需登录 + shell.interactive。返回错误 dict 或 None。"""
+        if not sess:
+            return {"ok": False, "error": "unauthorized"}
+        decision = self.policy.check(
+            subject_type="web_user",
+            subject_id=sess["username"],
+            capability="shell.interactive",
+            asset_id="*",
+            object_id="*",
+        )
+        if not decision.get("allowed"):
+            return {"ok": False, "error": "permission_denied", "hint": "需要 shell.interactive 权限"}
+        return None
+
+    async def api_terminal_check(self, request: web.Request) -> web.Response:
+        """打开终端前检查：权限、SSH 配置、host key。不建会话。"""
+        sess = self._session(request)
+        err = self._terminal_ok(sess)
+        if err:
+            return _json(err, 403)
+        asset_id = request.rel_url.query.get("asset_id", "")
+        if not asset_id:
+            return _json({"ok": False, "error": "asset_id_required"}, 400)
+        if not self.terminal:
+            return _json({"ok": False, "error": "terminal_unavailable"}, 503)
+
+        eps = self.ssh_store.list_endpoints(asset_id) if self.ssh_store else []
+        ep = next((e for e in eps if e.get("enabled")), None)
+        if not ep:
+            return _json({
+                "ok": False,
+                "can_open": False,
+                "detail": "no_ssh_endpoint",
+                "hint": "未配置 SSH，请先在连接页配置地址与密码/密钥。",
+            })
+        if not ep.get("credential_id"):
+            return _json({
+                "ok": False,
+                "can_open": False,
+                "detail": "no_credential",
+                "hint": "未配置密码或密钥，无法打开终端。",
+            })
+
+        from .transport import fetch_host_key
+
+        scanned = await fetch_host_key(ep.get("host") or "", int(ep.get("port") or 22))
+        stored_fp = ep.get("host_key_sha256") or ""
+        trusted = bool(stored_fp and ep.get("host_key_trusted_at"))
+        auth_method = "none"
+        try:
+            cm = self.cred_store.get_meta(ep["credential_id"]) if self.cred_store else None
+            auth_method = "key" if (cm or {}).get("kind") == "private_key" else "password"
+        except Exception:
+            pass
+
+        base = {
+            "asset_id": asset_id,
+            "host": ep.get("host"),
+            "port": ep.get("port"),
+            "remote_user": ep.get("username"),
+            "auth_method": auth_method,
+            "host_key_trusted": trusted,
+        }
+        if trusted and scanned.get("ok") and scanned.get("fingerprint") != stored_fp:
+            return _json({
+                **base,
+                "ok": False,
+                "can_open": False,
+                "detail": "host_key_changed",
+                "hint": "主机密钥已变更，已阻止连接。请确认服务器身份后重新信任。",
+                "host_key_info": {
+                    "host": ep.get("host"),
+                    "port": ep.get("port"),
+                    "stored_fingerprint": stored_fp,
+                    "current_fingerprint": scanned.get("fingerprint"),
+                    "changed": True,
+                },
+            })
+        if not trusted:
+            info = {
+                "host": ep.get("host"),
+                "port": ep.get("port"),
+                "fingerprint": scanned.get("fingerprint") if scanned.get("ok") else "",
+                "key_type": scanned.get("key_type") if scanned.get("ok") else "",
+                "key_line": scanned.get("key_line") if scanned.get("ok") else "",
+                "changed": False,
+            }
+            return _json({
+                **base,
+                "ok": False,
+                "can_open": False,
+                "detail": "host_key_untrusted",
+                "hint": "首次连接，需要确认主机指纹后才能打开终端。",
+                "host_key_info": info,
+            })
+        return _json({
+            **base,
+            "ok": True,
+            "can_open": True,
+            "detail": "ready",
+            "hint": "可以打开终端。",
+            "sessions": self.terminal.stats() if self.terminal else {},
+        })
+
+    async def ws_terminal(self, request: web.Request) -> web.WebSocketResponse:
+        """WebSocket 交互终端。仅人工 Web 会话；Agent 无此入口。"""
+        ws = web.WebSocketResponse(heartbeat=30)
+        await ws.prepare(request)
+        sess = self._session(request)
+        err = self._terminal_ok(sess)
+        if err:
+            await ws.send_json({"type": "error", "error": err.get("error"), "hint": err.get("hint")})
+            await ws.close(code=4403, message=b"forbidden")
+            return ws
+        if not self.terminal:
+            await ws.send_json({"type": "error", "error": "terminal_unavailable"})
+            await ws.close(code=1011)
+            return ws
+
+        asset_id = request.rel_url.query.get("asset_id", "")
+        cols = int(request.rel_url.query.get("cols") or 80)
+        rows = int(request.rel_url.query.get("rows") or 24)
+        username = sess["username"]
+
+        tsess = None
+        try:
+            tsess, info = await self.terminal.create(
+                asset_id=asset_id,
+                role=request.rel_url.query.get("role") or "write",
+                username=username,
+                cols=cols,
+                rows=rows,
+            )
+            await ws.send_json({"type": "ready", **info})
+        except Exception as e:
+            code = getattr(e, "code", "error")
+            detail = getattr(e, "detail", "") or str(e)
+            hint = "连接失败"
+            host_key_info = None
+            if code == "host_key_untrusted":
+                hint = "首次连接，需要确认主机指纹"
+                try:
+                    host_key_info = json.loads(detail) if detail.startswith("{") else None
+                except Exception:
+                    host_key_info = None
+            elif code == "host_key_changed":
+                hint = "主机密钥已变更，已阻止连接"
+                try:
+                    host_key_info = json.loads(detail) if detail.startswith("{") else None
+                except Exception:
+                    host_key_info = None
+            elif code == "no_credential":
+                hint = "未配置密码或密钥"
+            elif code == "no_ssh_endpoint":
+                hint = "未配置 SSH 连接"
+            elif code == "too_many_sessions":
+                hint = "终端会话过多，请关闭其他终端后重试"
+            await ws.send_json({
+                "type": "error",
+                "error": code,
+                "hint": hint,
+                "detail": detail[:300] if code not in ("host_key_untrusted", "host_key_changed") else "",
+                "host_key_info": host_key_info,
+            })
+            await ws.close(code=1011)
+            return ws
+
+        sid = tsess.session_id
+
+        async def pump_out():
+            loop = asyncio.get_event_loop()
+            while not ws.closed and tsess.alive():
+                data = await loop.run_in_executor(None, tsess.read)
+                if data:
+                    try:
+                        await ws.send_bytes(data)
+                    except Exception:
+                        break
+                else:
+                    await asyncio.sleep(0.05)
+            if not ws.closed:
+                reason = tsess.close_reason or "ssh_closed"
+                await ws.send_json({"type": "closed", "reason": reason})
+
+        out_task = asyncio.create_task(pump_out())
+        try:
+            async for msg in ws:
+                if msg.type == web.WSMsgType.BINARY:
+                    try:
+                        tsess.write(msg.data)
+                    except Exception as e:
+                        await ws.send_json({"type": "error", "error": "write_failed", "hint": str(e)[:120]})
+                        break
+                elif msg.type == web.WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                    except Exception:
+                        continue
+                    typ = data.get("type")
+                    if typ == "resize":
+                        tsess.resize(int(data.get("cols") or 80), int(data.get("rows") or 24))
+                    elif typ == "close":
+                        break
+                elif msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
+                    break
+        finally:
+            out_task.cancel()
+            self.terminal.close(sid, username=username, reason="user_or_disconnect")
+        return ws
+
+    async def api_ssh_test(self, request: web.Request) -> web.Response:
+        from .transport import SSHTransport
+
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        try:
+            tr = SSHTransport(self._ssh_store(), self._cred_store())
+            res = await tr.test_connection(body["asset_id"], body.get("role") or "read")
+            self.db.audit(
+                "web_user",
+                sess["username"],
+                "ssh_test",
+                asset_id=body.get("asset_id") or "",
+                detail={"ok": res.get("ok"), "role": body.get("role") or "read"},
+            )
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True, **res})
 
     async def api_runbook(self, request: web.Request) -> web.Response:
         self._require_auth(request)

@@ -377,6 +377,26 @@ class AgentLoop:
                 (inc["asset_id"], inc.get("object_id") or "", inc.get("object_id") or ""),
             )
             obj_id = (obj["id"] if obj else inc.get("object_id") or "")
+            # 硬约束：对象上存在结果不明的写操作 → 绝不自动重放
+            stuck = self.db.query_one(
+                "SELECT id FROM actions WHERE asset_id=? AND object_id=?"
+                " AND state IN ('unknown','dispatched') LIMIT 1",
+                (inc["asset_id"], obj_id or inc.get("object_id") or ""),
+            )
+            if stuck:
+                self._escalate(
+                    inc_id, f"no_replay_unknown:{stuck['id']}", None
+                )
+                result["steps"].append(
+                    {
+                        "step": "auto_dispatch",
+                        "ok": False,
+                        "error": "no_replay_unknown",
+                        "blocking_action_id": stuck["id"],
+                    }
+                )
+                result["action"] = "escalated_no_replay"
+                return result
             prop = self.actions.propose(
                 asset_id=inc["asset_id"],
                 object_id=obj_id or inc.get("object_id") or "",

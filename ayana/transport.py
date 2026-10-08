@@ -1,0 +1,548 @@
+"""轻量 Transport：只保留 NT 与原生 SSH 两种实现。
+
+迁移完成后删除 NT 实现。不为 Node/K8s 预留插件框架。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import json
+import os
+import shlex
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Protocol
+
+from .db import Database, new_id, now
+from .ntsafe import NTError, NTResult
+
+
+class TransportError(Exception):
+    def __init__(self, code: str, detail: str = ""):
+        self.code = code
+        self.detail = detail
+        super().__init__(f"{code}: {detail}" if detail else code)
+
+
+def compute_host_key_fingerprint(key_line: str) -> tuple[str, str]:
+    """从 ssh-keyscan 行算出 SHA256 指纹（与 ssh-keygen -lf 一致）。"""
+    parts = (key_line or "").strip().split()
+    if len(parts) < 2:
+        raise TransportError("bad_host_key_line")
+    key_type = parts[-2] if len(parts) >= 3 else parts[0]
+    # 形式: [host] type base64 | type base64
+    b64 = parts[-1]
+    try:
+        blob = base64.b64decode(b64)
+    except Exception as e:
+        raise TransportError("bad_host_key_b64", str(e)) from e
+    digest = hashlib.sha256(blob).digest()
+    fp = "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+    return fp, key_type
+
+
+async def fetch_host_key(host: str, port: int = 22, *, timeout: float = 8.0) -> dict[str, Any]:
+    """用 ssh-keyscan 获取主机公钥（不登录）。失败返回 ok=False。"""
+    if not host:
+        raise TransportError("host_required")
+    proc = await asyncio.create_subprocess_exec(
+        "ssh-keyscan",
+        "-T", str(max(2, int(timeout))),
+        "-p", str(int(port or 22)),
+        "-t", "ed25519,rsa,ecdsa",
+        host,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout + 2)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return {"ok": False, "error": "keyscan_timeout"}
+    out = (out_b or b"").decode("utf-8", errors="replace")
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip() and not ln.startswith("#")]
+    if not lines:
+        return {
+            "ok": False,
+            "error": "keyscan_empty",
+            "stderr": (err_b or b"").decode("utf-8", errors="replace")[:300],
+        }
+    # 优先 ed25519
+    chosen = None
+    for ln in lines:
+        if "ssh-ed25519" in ln:
+            chosen = ln
+            break
+    if not chosen:
+        chosen = lines[0]
+    try:
+        fp, key_type = compute_host_key_fingerprint(chosen)
+    except TransportError as e:
+        return {"ok": False, "error": e.code, "detail": e.detail}
+    # known_hosts 需要 [host]:port 或 host 前缀
+    host_field = host
+    if int(port or 22) != 22:
+        host_field = f"[{host}]:{int(port)}"
+    key_body = chosen.split(None, 1)[1] if len(chosen.split(None, 1)) > 1 else chosen
+    # 若 keyscan 行已含 host 前缀则只取 type+key
+    parts = chosen.split()
+    if len(parts) >= 3:
+        key_type = parts[-2]
+        key_body = f"{parts[-2]} {parts[-1]}"
+    else:
+        key_body = chosen
+    known_line = f"{host_field} {key_body}"
+    return {
+        "ok": True,
+        "host": host,
+        "port": int(port or 22),
+        "fingerprint": fp,
+        "key_type": key_type,
+        "key_line": known_line,
+        "raw_line": chosen,
+    }
+
+
+class Transport(Protocol):
+    async def probe(self, asset_id: str, cmd_tokens: list[str], timeout: float | None = None) -> NTResult: ...
+
+    async def exec(self, asset_id: str, cmd_tokens: list[str], timeout: float | None = None) -> NTResult: ...
+
+
+@dataclass
+class SSHEndpoint:
+    id: str
+    asset_id: str
+    role: str  # read|write
+    host: str
+    port: int
+    username: str
+    credential_id: str
+    host_key_sha256: str
+    host_key_trusted_at: float | None
+    host_key_line: str = ""
+    enabled: bool = True
+
+
+class SSHAssetStore:
+    """SSH 端点登记与 host key 信任。角色可自定义，kind 决定读/写通道。"""
+
+    DEFAULT_ROLES = [
+        {"name": "write", "kind": "write", "label": "可执行"},
+        {"name": "read", "kind": "read", "label": "只读"},
+    ]
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def list_roles(self) -> list[dict[str, Any]]:
+        row = self.db.query_one("SELECT value FROM meta WHERE key='ssh_roles'")
+        if not row:
+            return list(self.DEFAULT_ROLES)
+        try:
+            data = json.loads(row["value"])
+            return data if isinstance(data, list) else list(self.DEFAULT_ROLES)
+        except Exception:
+            return list(self.DEFAULT_ROLES)
+
+    def add_role(self, *, name: str, kind: str, label: str = "", actor: str = "web") -> dict[str, Any]:
+        name = (name or "").strip()
+        if not name or not name.replace("_", "-").replace(".", "").isalnum() or len(name) > 32:
+            raise TransportError("bad_role_name", name)
+        if kind not in ("read", "write"):
+            raise TransportError("bad_role_kind", kind)
+        roles = self.list_roles()
+        if any(r.get("name") == name for r in roles):
+            raise TransportError("role_exists", name)
+        item = {"name": name, "kind": kind, "label": label or name}
+        roles.append(item)
+        with self.db.tx() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('ssh_roles', ?)",
+                (json.dumps(roles, ensure_ascii=False),),
+            )
+            conn.execute(
+                "INSERT INTO audit_log(at, actor_type, actor_id, entry, detail_json, channel)"
+                " VALUES(?,?,?,?,?,?)",
+                (
+                    now(),
+                    "web_user",
+                    actor,
+                    "ssh_role_added",
+                    json.dumps(item, ensure_ascii=False),
+                    "web",
+                ),
+            )
+        return item
+
+    def role_kind(self, role: str) -> str:
+        """角色名 → 读/写通道。未知角色按 write 收紧前先拒绝。"""
+        for r in self.list_roles():
+            if r.get("name") == role:
+                return r.get("kind") or "read"
+        if role in ("read", "write"):
+            return role
+        raise TransportError("unknown_role", role)
+
+    def upsert_endpoint(
+        self,
+        *,
+        asset_id: str,
+        role: str,
+        host: str,
+        port: int = 22,
+        username: str,
+        credential_id: str = "",
+        actor: str = "web",
+    ) -> dict[str, Any]:
+        if not host or not username:
+            raise TransportError("bad_endpoint", "host/username required")
+        # 允许自定义角色名；校验 kind
+        self.role_kind(role)
+        t = now()
+        eid = new_id("ssh")
+        with self.db.tx() as conn:
+            conn.execute(
+                "INSERT INTO ssh_endpoints(id, asset_id, role, host, port, username,"
+                " credential_id, enabled, created_at, updated_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(asset_id, role) DO UPDATE SET"
+                " host=excluded.host, port=excluded.port, username=excluded.username,"
+                " credential_id=excluded.credential_id, updated_at=excluded.updated_at",
+                (eid, asset_id, role, host, int(port), username, credential_id or "", 1, t, t),
+            )
+            conn.execute(
+                "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, detail_json, channel)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (
+                    t,
+                    "web_user",
+                    actor,
+                    "ssh_endpoint_upsert",
+                    asset_id,
+                    json.dumps(
+                        {
+                            "role": role,
+                            "host": host,
+                            "port": int(port),
+                            "username": username,
+                            "credential_id": credential_id or "",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "web",
+                ),
+            )
+        return self.get_endpoint(asset_id, role) or {}
+
+    def get_endpoint(self, asset_id: str, role: str) -> dict[str, Any] | None:
+        row = self.db.query_one(
+            "SELECT * FROM ssh_endpoints WHERE asset_id=? AND role=?",
+            (asset_id, role),
+        )
+        return dict(row) if row else None
+
+    def list_endpoints(self, asset_id: str = "") -> list[dict[str, Any]]:
+        if asset_id:
+            rows = self.db.query(
+                "SELECT * FROM ssh_endpoints WHERE asset_id=? ORDER BY role", (asset_id,)
+            )
+        else:
+            rows = self.db.query("SELECT * FROM ssh_endpoints ORDER BY asset_id, role")
+        return [dict(r) for r in rows]
+
+    def trust_host_key(
+        self, asset_id: str, role: str, sha256_fp: str, actor: str = "web", *,
+        key_line: str = "",
+    ) -> dict[str, Any]:
+        """管理员核实后登记 host key。指纹变更需再次确认，不自动覆盖。"""
+        if not sha256_fp:
+            raise TransportError("bad_fingerprint")
+        t = now()
+        row = self.get_endpoint(asset_id, role)
+        if not row:
+            raise TransportError("endpoint_missing", f"{asset_id}/{role}")
+        prev = row.get("host_key_sha256") or ""
+        with self.db.tx() as conn:
+            conn.execute(
+                "UPDATE ssh_endpoints SET host_key_sha256=?, host_key_line=?, host_key_trusted_at=?, updated_at=?"
+                " WHERE asset_id=? AND role=?",
+                (sha256_fp, key_line or (row.get("host_key_line") or ""), t, t, asset_id, role),
+            )
+            conn.execute(
+                "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, detail_json, channel)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (
+                    t,
+                    "web_user",
+                    actor,
+                    "ssh_host_key_trusted" if not prev else "ssh_host_key_changed",
+                    asset_id,
+                    __import__("json").dumps(
+                        {
+                            "role": role,
+                            "previous": prev,
+                            "current": sha256_fp,
+                            "changed": bool(prev and prev != sha256_fp),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "web",
+                ),
+            )
+        return self.get_endpoint(asset_id, role) or {}
+
+    def delete_endpoint(self, asset_id: str, role: str, actor: str = "web") -> None:
+        with self.db.tx() as conn:
+            conn.execute(
+                "DELETE FROM ssh_endpoints WHERE asset_id=? AND role=?", (asset_id, role)
+            )
+            conn.execute(
+                "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, detail_json, channel)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (
+                    now(),
+                    "web_user",
+                    actor,
+                    "ssh_endpoint_deleted",
+                    asset_id,
+                    __import__("json").dumps({"role": role}, ensure_ascii=False),
+                    "web",
+                ),
+            )
+
+
+class SSHTransport:
+    """原生 SSH：Ayana → ssh → 目标服务器。命令 tokens 由 capabilities 约束。"""
+
+    def __init__(
+        self,
+        store: SSHAssetStore,
+        cred_store: Any,
+        *,
+        ssh_binary: str = "ssh",
+        default_timeout: float = 12.0,
+    ):
+        self.store = store
+        self.cred_store = cred_store
+        self.ssh_binary = ssh_binary
+        self.default_timeout = default_timeout
+
+    def _endpoint(self, asset_id: str, role: str) -> SSHEndpoint:
+        row = self.store.get_endpoint(asset_id, role)
+        if not row or not row.get("enabled"):
+            raise TransportError("endpoint_missing", f"{asset_id}/{role}")
+        return SSHEndpoint(
+            id=row["id"],
+            asset_id=row["asset_id"],
+            role=row["role"],
+            host=row["host"],
+            port=int(row["port"] or 22),
+            username=row["username"],
+            credential_id=row["credential_id"] or "",
+            host_key_sha256=row["host_key_sha256"] or "",
+            host_key_trusted_at=row["host_key_trusted_at"],
+            host_key_line=(row["host_key_line"] or "") if "host_key_line" in row.keys() else "",
+            enabled=bool(row["enabled"]),
+        )
+
+    def _endpoint_for_channel(self, asset_id: str, kind: str) -> SSHEndpoint:
+        """按读/写通道找端点：优先精确角色名，再按角色 kind 匹配。"""
+        if kind == "write":
+            row = self.store.get_endpoint(asset_id, "write")
+            if row and row.get("enabled"):
+                return self._endpoint(asset_id, "write")
+            for r in self.store.list_roles():
+                if r.get("kind") == "write":
+                    row = self.store.get_endpoint(asset_id, r["name"])
+                    if row and row.get("enabled"):
+                        return self._endpoint(asset_id, r["name"])
+            raise TransportError("endpoint_missing", f"{asset_id}/write")
+        row = self.store.get_endpoint(asset_id, "read")
+        if row and row.get("enabled"):
+            return self._endpoint(asset_id, "read")
+        for r in self.store.list_roles():
+            if r.get("kind") == "read":
+                row = self.store.get_endpoint(asset_id, r["name"])
+                if row and row.get("enabled"):
+                    return self._endpoint(asset_id, r["name"])
+        raise TransportError("endpoint_missing", f"{asset_id}/read")
+
+    async def probe(self, asset_id: str, cmd_tokens: list[str], timeout: float | None = None) -> NTResult:
+        return await self._run(asset_id, "read", cmd_tokens, timeout)
+
+    async def exec(self, asset_id: str, cmd_tokens: list[str], timeout: float | None = None) -> NTResult:
+        return await self._run(asset_id, "write", cmd_tokens, timeout)
+
+    async def _run(
+        self, asset_id: str, kind: str, cmd_tokens: list[str], timeout: float | None = None
+    ) -> NTResult:
+        if not cmd_tokens or not all(isinstance(t, str) and t for t in cmd_tokens):
+            raise TransportError("bad_tokens")
+        for t in cmd_tokens:
+            if any(ch in t for ch in " \t\n;|&$`"):
+                raise TransportError("unsafe_token", t)
+        ep = self._endpoint_for_channel(asset_id, "write" if kind == "write" else "read")
+        # 首次未信任：不要求用户手工粘贴；由上层 fetch_host_key + 信任后再连
+        if not ep.host_key_sha256 or not ep.host_key_trusted_at:
+            raise TransportError("host_key_untrusted", f"{asset_id}/{ep.role}")
+        # 已信任：核对当前指纹，变更则阻断，不自动覆盖
+        current = await fetch_host_key(ep.host, ep.port, timeout=5.0)
+        if current.get("ok"):
+            if current.get("fingerprint") != ep.host_key_sha256:
+                raise TransportError(
+                    "host_key_changed",
+                    json.dumps(
+                        {
+                            "stored": ep.host_key_sha256,
+                            "current": current.get("fingerprint"),
+                            "host": ep.host,
+                            "port": ep.port,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+        known_line = ep.host_key_line or ""
+
+        remote = shlex.join(cmd_tokens)
+        t = max(3.0, float(timeout or self.default_timeout))
+        workdir = tempfile.mkdtemp(prefix="ayana-ssh-")
+        try:
+            env = os.environ.copy()
+            askpass = None
+            identity = None
+            secret = ""
+            auth_mode = "none"
+            cred_kind = ""
+            if ep.credential_id and self.cred_store is not None:
+                meta = self.cred_store.get_meta(ep.credential_id)
+                cred_kind = (meta or {}).get("kind") or ""
+                secret = self.cred_store.reveal_secret(ep.credential_id)
+                if cred_kind == "private_key":
+                    auth_mode = "key"
+                    identity = Path(workdir) / "id_key"
+                    identity.write_text(secret, encoding="utf-8")
+                    os.chmod(identity, 0o600)
+                else:
+                    auth_mode = "password"
+                    askpass = Path(workdir) / "askpass.sh"
+                    # 不把密码写入 argv；经 askpass 脚本供 ssh 读取
+                    askpass.write_text(
+                        "#!/bin/sh\nprintf '%s' \"$AYANA_SSH_PASSWORD\"\n",
+                        encoding="utf-8",
+                    )
+                    os.chmod(askpass, 0o700)
+                    env["AYANA_SSH_PASSWORD"] = secret
+                    env["SSH_ASKPASS"] = str(askpass)
+                    # 无 TTY 时也强制走 ASKPASS，否则 BatchMode/无终端会跳过密码
+                    env["SSH_ASKPASS_REQUIRE"] = "force"
+                    env["DISPLAY"] = env.get("DISPLAY") or "ayana:0"
+
+            # host key：strict + 已信任的公钥写入临时 known_hosts
+            known_hosts = Path(workdir) / "known_hosts"
+            if known_line:
+                known_hosts.write_text(known_line + "\n", encoding="utf-8")
+            else:
+                # 兼容旧数据：无 key_line 时无法 strict 通过，明确报错
+                raise TransportError("host_key_line_missing", f"{asset_id}/{ep.role}")
+
+            # 密码认证不能开 BatchMode（会跳过 password）；密钥认证用 BatchMode
+            argv = [
+                self.ssh_binary,
+                "-o", "StrictHostKeyChecking=yes",
+                "-o", f"UserKnownHostsFile={known_hosts}",
+                "-o", f"ConnectTimeout={max(2, int(t) - 1)}",
+                "-o", "NumberOfPasswordPrompts=1",
+                "-p", str(ep.port),
+            ]
+            if auth_mode == "password":
+                argv += [
+                    "-o", "PreferredAuthentications=password,keyboard-interactive",
+                    "-o", "PubkeyAuthentication=no",
+                    "-o", "PasswordAuthentication=yes",
+                ]
+            elif auth_mode == "key":
+                argv += [
+                    "-o", "BatchMode=yes",
+                    "-o", "PreferredAuthentications=publickey",
+                    "-o", "IdentitiesOnly=yes",
+                    "-o", "PasswordAuthentication=no",
+                ]
+            else:
+                argv += ["-o", "BatchMode=yes"]
+            if identity:
+                argv += ["-i", str(identity)]
+            argv += [f"{ep.username}@{ep.host}", remote]
+
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            try:
+                out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=t)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                    await asyncio.wait_for(proc.wait(), timeout=2)
+                except Exception:
+                    pass
+                return NTResult(ok=False, output="timeout", timed_out=True, returncode=-1)
+            out = (out_b or b"").decode("utf-8", errors="replace")
+            err = (err_b or b"").decode("utf-8", errors="replace")
+            text = out if proc.returncode == 0 else (err or out or f"exit={proc.returncode}")
+            return NTResult(
+                ok=proc.returncode == 0,
+                output=text,
+                returncode=proc.returncode,
+                mode="exec" if kind == "write" else "probe",
+                account=ep.username,
+            )
+        finally:
+            # 凭据与临时文件立即清理
+            try:
+                import shutil
+
+                shutil.rmtree(workdir, ignore_errors=True)
+            except Exception:
+                pass
+            secret = ""
+
+    async def test_connection(self, asset_id: str, role: str = "read") -> dict[str, Any]:
+        kind = "write" if role == "write" else "read"
+        try:
+            self.store.role_kind(role) if role not in ("read", "write") else None
+            kind = self.store.role_kind(role) if role not in ("read", "write") else role
+        except Exception:
+            pass
+        res = await self._run(asset_id, "write" if kind == "write" else "read", ["true"], timeout=8.0)
+        return {
+            "ok": res.ok,
+            "output": res.output[:500],
+            "returncode": res.returncode,
+            "timed_out": res.timed_out,
+        }
+
+
+class NTTransport:
+    """兼容旧 NT 通道。迁移完成后删除。"""
+
+    def __init__(self, nt: Any, gate: Any):
+        self.nt = nt
+        self.gate = gate
+
+    async def probe(self, asset_id: str, cmd_tokens: list[str], timeout: float | None = None) -> NTResult:
+        binding = self.gate.get(asset_id)
+        return await self.nt.probe(binding.read_alias, cmd_tokens, timeout=timeout)
+
+    async def exec(self, asset_id: str, cmd_tokens: list[str], timeout: float | None = None) -> NTResult:
+        binding = self.gate.get(asset_id)
+        return await self.nt.exec(binding.write_alias, cmd_tokens, timeout=timeout)

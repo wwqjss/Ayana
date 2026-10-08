@@ -237,6 +237,18 @@ _reg(
     )
 )
 
+_reg(
+    Capability(
+        name="shell.interactive",
+        kind="write",
+        object_kinds=("*",),
+        risk="shell",
+        description="人工 Web SSH 交互终端（不授予 Agent）",
+        write_tokens=None,
+        auto_allowed=False,
+    )
+)
+
 
 def get_capability(name: str) -> Capability:
     c = CAPABILITIES.get(name)

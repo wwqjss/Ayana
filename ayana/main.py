@@ -32,6 +32,9 @@ from .permission_change import PermissionChangeService
 from .policy import Policy
 from .prom import PromClient
 from .qqbot import QQBot
+from .credentials import CredentialStore
+from .transport import NTTransport, SSHAssetStore, SSHTransport
+from .terminal import TerminalService
 from .web import WebApp
 
 log = logging.getLogger("ayana")
@@ -156,6 +159,11 @@ def seed_assets(db: Database) -> None:
             asset_id="*", object_id="*", allow=True, require_approval=False,
             auto_allowed=True, actor="system",
         )
+    # 人工 Web 终端：仅 web 用户；Agent 不可（policy 层硬拦）
+    policy.upsert_permission(
+        subject_type="web_user", subject_id="*", capability="shell.interactive",
+        asset_id="*", object_id="*", allow=True, require_approval=False, auto_allowed=False, actor="system",
+    )
 
 
 def load_bindings(db: Database) -> list[AssetBinding]:
@@ -191,9 +199,64 @@ class App:
         self.knowledge = KnowledgeBase(self.db)
         self.prom = PromClient(cfg.get("prometheus_url", "http://127.0.0.1:9090"))
         self.incidents = IncidentService(self.db)
+        # SSH：凭据加密 + 端点；有端点用原生 SSH，否则回落 NT（迁移期）
+        self.creds = CredentialStore(self.db, master_key=cfg.get("ssh_credential_key") or "")
+        self.ssh_store = SSHAssetStore(self.db)
+        self.ssh_transport = SSHTransport(self.ssh_store, self.creds)
+        self.nt_transport = NTTransport(self.nt, self.gate)
+        self.terminal = TerminalService(self.db, self.ssh_store, self.creds)
+        # 确保人工终端权限（Agent 仍由 policy 硬拦）
+        try:
+            self.policy.upsert_permission(
+                subject_type="web_user", subject_id="*", capability="shell.interactive",
+                asset_id="*", object_id="*", allow=True, require_approval=False,
+                auto_allowed=False, actor="system",
+            )
+        except Exception:
+            pass
+
+        class _Router:
+            """有 SSH 写/读端点则走原生 SSH，否则 NT。轻量，无插件框架。"""
+
+            def __init__(self, ssh, nt_t, store):
+                self._ssh = ssh
+                self._nt = nt_t
+                self._store = store
+
+            def _use_ssh(self, asset_id: str, role: str) -> bool:
+                # role 是 read/write 通道名；也匹配自定义角色 kind
+                try:
+                    ep = self._store.get_endpoint(asset_id, role)
+                    if ep and ep.get("enabled"):
+                        return True
+                    kind = self._store.role_kind(role) if role in ("read", "write") else role
+                    for r in self._store.list_roles():
+                        if (role in ("read", "write") and r.get("kind") == role) or r.get("name") == role:
+                            ep = self._store.get_endpoint(asset_id, r["name"])
+                            if ep and ep.get("enabled"):
+                                return True
+                except Exception:
+                    return False
+                return False
+
+            async def probe(self, asset_id, tokens, timeout=None):
+                if self._use_ssh(asset_id, "read"):
+                    return await self._ssh.probe(asset_id, tokens, timeout=timeout)
+                return await self._nt.probe(asset_id, tokens, timeout=timeout)
+
+            async def exec(self, asset_id, tokens, timeout=None):
+                if self._use_ssh(asset_id, "write"):
+                    return await self._ssh.exec(asset_id, tokens, timeout=timeout)
+                return await self._nt.exec(asset_id, tokens, timeout=timeout)
+
+            def _endpoint(self, asset_id, role):
+                return self._ssh._endpoint(asset_id, role)
+
+        self.transport = _Router(self.ssh_transport, self.nt_transport, self.ssh_store)
         self.investigation = InvestigationService(
             self.db, self.nt, self.gate, self.prom, self.policy,
             knowledge=self.knowledge,
+            transport=self.transport,
         )
         self.actions = ActionService(
             self.db,
@@ -201,6 +264,7 @@ class App:
             self.gate,
             self.policy,
             self.prom,
+            transport=self.transport,
             action_ttl=int(cfg.get("action_ttl_sec", 1800)),
             verify_window=int(cfg.get("verify_window_sec", 90)),
             verify_timeout=int(cfg.get("verify_timeout_sec", 300)),
@@ -250,6 +314,10 @@ class App:
             notifier=self.notifier,
             agent=self.agent,
             permission_changes=self.permission_changes,
+            ssh_store=self.ssh_store,
+            cred_store=self.creds,
+            transport=self.transport,
+            terminal=self.terminal,
         )
         self._stop = asyncio.Event()
         self._bg_tasks: list[asyncio.Task] = []

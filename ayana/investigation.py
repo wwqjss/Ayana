@@ -255,6 +255,7 @@ class InvestigationService:
         policy: Policy,
         knowledge: KnowledgeBase | None = None,
         *,
+        transport: Any | None = None,
         max_rounds: int = MAX_ROUNDS,
         max_tool_calls: int = MAX_TOOL_CALLS,
         deadline_sec: float = DEFAULT_DEADLINE_SEC,
@@ -265,11 +266,18 @@ class InvestigationService:
         self.gate = gate
         self.prom = prom
         self.policy = policy
+        self.transport = transport
         self.knowledge = knowledge or KnowledgeBase(db)
         self.max_rounds = max(1, int(max_rounds))
         self.max_tool_calls = max(1, int(max_tool_calls))
         self.deadline_sec = float(deadline_sec)
         self.llm = llm
+
+    async def _probe_channel(self, asset_id: str, tokens: list[str], timeout: float | None = None):
+        if self.transport is not None:
+            return await self.transport.probe(asset_id, tokens, timeout=timeout)
+        binding = self.gate.get(asset_id)
+        return await self.nt.probe(binding.read_alias, tokens, timeout=timeout)
 
     # ------------------------------------------------------------------
     # 一次性手动调查（Web / QQ）：仍走同一证据模型
@@ -714,7 +722,7 @@ class InvestigationService:
             return out
 
         for tokens in plans:
-            res: NTResult = await self.nt.probe(binding.read_alias, tokens, timeout=10.0)
+            res: NTResult = await self._probe_channel(asset_id, tokens, timeout=10.0)
             classified = classify_evidence(capability, tokens, res)
             transport = dict(classified.get("transport") or {})
             transport["identity"] = binding.read_alias

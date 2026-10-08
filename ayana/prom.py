@@ -19,10 +19,28 @@ class PromClient:
     def __init__(self, base_url: str, timeout: float = 8.0):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        # 失败熔断：连续失败后短路，避免 overview 等路径被慢连接拖死
+        self._fail_streak = 0
+        self._open_until = 0.0
+
+    def _circuit_open(self) -> bool:
+        return time.time() < self._open_until
+
+    def _note_fail(self) -> None:
+        self._fail_streak += 1
+        if self._fail_streak >= 2:
+            # 30s 内不再连 Prom，立刻返回错误
+            self._open_until = time.time() + 30.0
+
+    def _note_ok(self) -> None:
+        self._fail_streak = 0
+        self._open_until = 0.0
 
     async def _get(self, path: str, params: dict | None = None) -> dict[str, Any]:
         import aiohttp
 
+        if self._circuit_open():
+            raise PromError("circuit_open: prometheus unavailable")
         url = f"{self.base_url}{path}"
         try:
             async with aiohttp.ClientSession(
@@ -31,9 +49,12 @@ class PromClient:
                 async with session.get(url, params=params) as resp:
                     text = await resp.text()
                     if resp.status != 200:
+                        self._note_fail()
                         raise PromError(f"http {resp.status}: {text[:200]}")
+                    self._note_ok()
                     return json.loads(text)
         except aiohttp.ClientError as e:
+            self._note_fail()
             raise PromError(str(e)) from e
 
     async def query(self, expr: str) -> dict[str, Any]:

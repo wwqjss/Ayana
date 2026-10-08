@@ -49,6 +49,17 @@ UNKNOWN_HINTS = (
     "killed",
 )
 
+# 全局硬约束：结果不明的写操作不得自动重放（v0.4.0 1a 起断言）
+# unknown / dispatched / 已终结态一律禁止再次派发
+WRITE_NO_REPLAY_STATES = frozenset(
+    {"unknown", "dispatched", "success", "failure", "cancelled", "expired", "rejected"}
+)
+
+
+def write_may_dispatch(state: str) -> bool:
+    """仅 approved 可进入派发；其余（含 unknown）一律不可。"""
+    return state == "approved"
+
 
 class ActionService:
     def __init__(
@@ -59,6 +70,7 @@ class ActionService:
         policy: Policy,
         prom: PromClient,
         *,
+        transport: Any | None = None,
         action_ttl: int = 1800,
         approval_ttl: int = 900,
         verify_window: int = 90,
@@ -69,11 +81,19 @@ class ActionService:
         self.gate = gate
         self.policy = policy
         self.prom = prom
+        self.transport = transport
         self.action_ttl = action_ttl
         self.approval_ttl = approval_ttl
         self.verify_window = verify_window
         self.verify_timeout = verify_timeout
         self._exec_lock = asyncio.Lock()
+
+    async def _write_channel(self, asset_id: str, tokens: list[str], timeout: float | None = None):
+        """写通道：优先 Transport（原生 SSH），否则 NT 别名。"""
+        if self.transport is not None:
+            return await self.transport.exec(asset_id, tokens, timeout=timeout)
+        binding = self.gate.get(asset_id)
+        return await self.nt.exec(binding.write_alias, tokens, timeout=timeout)
 
     # ------------------------------------------------------------------
     # 提案
@@ -207,7 +227,7 @@ class ActionService:
             )
             conn.execute(
                 "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, object_id,"
-                " action_id, detail_json) VALUES(?,?,?,?,?,?,?,?)",
+                " action_id, detail_json, incident_id, channel) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
                     now(),
                     proposer_type,
@@ -225,9 +245,12 @@ class ActionService:
                             "runbook_rev": runbook_rev,
                             "template_id": template_id,
                             "params_digest": params_digest,
+                            "tokens": tokens,
                         },
                         ensure_ascii=False,
                     ),
+                    incident_id or "",
+                    "system" if mode == "auto" else "web",
                 ),
             )
         return {
@@ -313,16 +336,20 @@ class ActionService:
                     "reason": decision.get("reason", ""),
                     "decision": decision.get("decision"),
                     "channel": channel,
+                    "capability": row.get("capability") or "",
                 },
+                incident_id=row.get("incident_id") or "",
+                channel=channel,
             )
             raise ActionError("approve_denied", decision.get("reason", "forbidden"))
 
         t = now()
+        decision_id = new_id("dec")
         with self.db.tx() as conn:
             cur = conn.execute(
                 "UPDATE actions SET state='approved', approver_type=?, approver_id=?,"
                 " approved_at=?, decision_channel=?, decision_reason=?, decided_at=?,"
-                " decision_snapshot_json=?"
+                " decision_id=?, decision_snapshot_json=?"
                 " WHERE id=? AND state='proposed'",
                 (
                     approver_type,
@@ -331,6 +358,7 @@ class ActionService:
                     channel,
                     reason,
                     t,
+                    decision_id,
                     json.dumps(decision, ensure_ascii=False, default=str),
                     action_id,
                 ),
@@ -346,9 +374,15 @@ class ActionService:
                     "idempotent": True,
                     "already": True,
                 }
+            payload_json = row.get("params_json") or "{}"
+            try:
+                tokens = (json.loads(payload_json) or {}).get("tokens") or []
+            except Exception:
+                tokens = []
             conn.execute(
                 "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, object_id,"
-                " action_id, detail_json) VALUES(?,?,?,?,?,?,?,?)",
+                " action_id, detail_json, decision_id, incident_id, channel)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     t,
                     approver_type,
@@ -361,6 +395,8 @@ class ActionService:
                         {
                             "channel": channel,
                             "reason": reason,
+                            "capability": row.get("capability") or "",
+                            "tokens": tokens,
                             "decision": decision.get("decision"),
                             "matched_rule": decision.get("matched_rule"),
                             "policy_snapshot": {
@@ -372,6 +408,9 @@ class ActionService:
                         },
                         ensure_ascii=False,
                     ),
+                    decision_id,
+                    row.get("incident_id") or "",
+                    channel,
                 ),
             )
             conn.execute(
@@ -388,12 +427,19 @@ class ActionService:
                             "channel": channel,
                             "reason": reason,
                             "decision": decision.get("decision"),
+                            "decision_id": decision_id,
                         },
                         ensure_ascii=False,
                     ),
                 ),
             )
-        return {"id": action_id, "state": "approved", "idempotent": False, "decision": decision.get("decision")}
+        return {
+            "id": action_id,
+            "state": "approved",
+            "idempotent": False,
+            "decision": decision.get("decision"),
+            "decision_id": decision_id,
+        }
 
     def reject(
         self,
@@ -412,10 +458,11 @@ class ActionService:
         if state != "proposed":
             raise ActionError("bad_state", state)
         t = now()
+        decision_id = new_id("dec")
         with self.db.tx() as conn:
             cur = conn.execute(
                 "UPDATE actions SET state='cancelled', finished_at=?, result_detail=?,"
-                " decision_channel=?, decision_reason=?, decided_at=?"
+                " decision_channel=?, decision_reason=?, decided_at=?, decision_id=?"
                 " WHERE id=? AND state='proposed'",
                 (
                     t,
@@ -423,6 +470,7 @@ class ActionService:
                     channel,
                     reason,
                     t,
+                    decision_id,
                     action_id,
                 ),
             )
@@ -438,7 +486,8 @@ class ActionService:
                 }
             conn.execute(
                 "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, object_id,"
-                " action_id, detail_json) VALUES(?,?,?,?,?,?,?,?)",
+                " action_id, detail_json, decision_id, incident_id, channel)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     t,
                     actor_type,
@@ -447,7 +496,17 @@ class ActionService:
                     row["asset_id"],
                     row["object_id"],
                     action_id,
-                    json.dumps({"channel": channel, "reason": reason}, ensure_ascii=False),
+                    json.dumps(
+                        {
+                            "channel": channel,
+                            "reason": reason,
+                            "capability": row.get("capability") or "",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    decision_id,
+                    row.get("incident_id") or "",
+                    channel,
                 ),
             )
             conn.execute(
@@ -463,12 +522,13 @@ class ActionService:
                             "actor": f"{actor_type}:{actor_id}",
                             "channel": channel,
                             "reason": reason,
+                            "decision_id": decision_id,
                         },
                         ensure_ascii=False,
                     ),
                 ),
             )
-        return {"id": action_id, "state": "cancelled", "idempotent": False}
+        return {"id": action_id, "state": "cancelled", "idempotent": False, "decision_id": decision_id}
 
     async def approve_and_execute(
         self,
@@ -541,26 +601,39 @@ class ActionService:
                 asset_id=row["asset_id"],
                 object_id=row["object_id"],
                 action_id=action_id,
-                detail={"reason": "not_owner"},
+                detail={"reason": "not_owner", "capability": row.get("capability") or ""},
+                incident_id=row.get("incident_id") or "",
+                channel=channel,
             )
             raise ActionError("cancel_denied", "not_owner")
         t = now()
         with self.db.tx() as conn:
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE actions SET state='cancelled', finished_at=?, result_detail=?,"
-                " decision_channel=?, decision_reason=?, decided_at=? WHERE id=?",
-                (t, f"cancelled:{reason or ''}", channel, reason, t, action_id),
+                " decision_channel=?, decision_reason=?, decided_at=?, decision_id=? WHERE id=?",
+                (t, f"cancelled:{reason or ''}", channel, reason, t, new_id("dec"), action_id),
             )
             conn.execute(
-                "INSERT INTO audit_log(at, actor_type, actor_id, entry, action_id, detail_json)"
-                " VALUES(?,?,?,?,?,?)",
+                "INSERT INTO audit_log(at, actor_type, actor_id, entry, action_id, asset_id, object_id,"
+                " detail_json, incident_id, channel) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
                     t,
                     actor_type,
                     actor_id,
                     "action_cancelled",
                     action_id,
-                    json.dumps({"channel": channel, "reason": reason}, ensure_ascii=False),
+                    row["asset_id"],
+                    row["object_id"],
+                    json.dumps(
+                        {
+                            "channel": channel,
+                            "reason": reason,
+                            "capability": row.get("capability") or "",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    row.get("incident_id") or "",
+                    channel,
                 ),
             )
             conn.execute(
@@ -682,32 +755,61 @@ class ActionService:
         is_admin: bool = False,
     ) -> dict[str, Any]:
         row = self._get(action_id)
-        if row["state"] != "approved":
+        # 硬约束：结果不明 / 已派发 / 已终结的写操作不得重放
+        if row["state"] == "unknown":
+            raise ActionError("no_replay_unknown", action_id)
+        if row["state"] in WRITE_NO_REPLAY_STATES:
+            raise ActionError("no_replay", row["state"])
+        if not write_may_dispatch(row["state"]):
             raise ActionError("bad_state", row["state"])
 
         # 记录核验时使用的绑定快照，领取事务里逐项比对
-        binding = self.gate.get(row["asset_id"])
-        snap = {
-            "read_alias": binding.read_alias,
-            "write_alias": binding.write_alias,
-            "expected_host_id": binding.expected_host_id,
-            "asset_id": binding.asset_id,
-        }
+        # SSH 路径：以 host_key 信任为准；NT 路径：保留 alias/host_id 绑定
+        ssh_ep = None
+        if self.transport is not None and hasattr(self.transport, "_endpoint"):
+            try:
+                ssh_ep = self.transport._endpoint(row["asset_id"], "write")
+            except Exception:
+                ssh_ep = None
+        if ssh_ep is not None:
+            if not ssh_ep.host_key_sha256 or not ssh_ep.host_key_trusted_at:
+                raise ActionError("identity_gate", "host_key not trusted")
+            snap = {
+                "read_alias": "",
+                "write_alias": "",
+                "expected_host_id": ssh_ep.host_key_sha256,
+                "asset_id": ssh_ep.asset_id,
+            }
+            ident = {
+                "ok": True,
+                "mode": "exec",
+                "account": ssh_ep.username,
+                "host_key": ssh_ep.host_key_sha256,
+            }
+        else:
+            binding = self.gate.get(row["asset_id"])
+            snap = {
+                "read_alias": binding.read_alias,
+                "write_alias": binding.write_alias,
+                "expected_host_id": binding.expected_host_id,
+                "asset_id": binding.asset_id,
+            }
 
-        # 身份核验（网络等待）——之后必须在短事务内重查，不得再等网络
-        try:
-            ident = await self.gate.verify_account(row["asset_id"], write=True)
-        except NTError as e:
-            raise ActionError("identity_gate", str(e)) from e
+            # 身份核验（网络等待）——之后必须在短事务内重查，不得再等网络
+            try:
+                ident = await self.gate.verify_account(row["asset_id"], write=True)
+            except NTError as e:
+                raise ActionError("identity_gate", str(e)) from e
         if not ident.get("ok"):
             raise ActionError("identity_gate", ident.get("error") or "verify_account failed")
         if ident.get("mode") != "exec":
             raise ActionError("identity_gate", f"mode={ident.get('mode')}")
-        if binding.host_id_verified_at is None or not binding.expected_host_id:
-            raise ActionError("identity_gate", "host_id not registered/verified")
+        if ssh_ep is None:
+            if binding.host_id_verified_at is None or not binding.expected_host_id:
+                raise ActionError("identity_gate", "host_id not registered/verified")
 
         # ---- 短事务：重查授权/期限/对象/占用/资产绑定 + 领取 ----
-        dispatcher = binding.write_alias
+        dispatcher = ssh_ep.username if ssh_ep is not None else binding.write_alias
         reject: tuple[str, str] | None = None
         tokens: list[str] = []
         with self.db.tx() as conn:
@@ -723,6 +825,16 @@ class ActionService:
             ).fetchone()
             if not asset_row or not asset_row["enabled"]:
                 reject = ("asset_disabled", "asset missing or disabled")
+            elif ssh_ep is not None:
+                # SSH：host key 信任快照比对
+                ep_now = conn.execute(
+                    "SELECT * FROM ssh_endpoints WHERE asset_id=? AND role='write'",
+                    (fresh["asset_id"],),
+                ).fetchone()
+                if not ep_now or not ep_now["host_key_trusted_at"]:
+                    reject = ("identity_gate", "host_key not trusted")
+                elif (ep_now["host_key_sha256"] or "") != (snap.get("expected_host_id") or ""):
+                    reject = ("binding_changed", "ssh host key changed during identity wait")
             elif not asset_row["host_id_verified_at"] or not asset_row["expected_host_id"]:
                 reject = ("identity_gate", "host_id not registered/verified")
             elif (
@@ -866,21 +978,36 @@ class ActionService:
 
             if reject is not None:
                 code, detail = reject
+                fresh_d = dict(fresh)
+                _dec = fresh_d.get("decision_id") or ""
+                _aud = (
+                    now(),
+                    actor_type,
+                    actor_id,
+                    "action_dispatch_denied",
+                    fresh_d["asset_id"],
+                    fresh_d["object_id"],
+                    action_id,
+                    json.dumps(
+                        {
+                            "code": code,
+                            "detail": detail,
+                            "capability": fresh_d.get("capability") or "",
+                            "tokens": tokens,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    _dec,
+                    fresh_d.get("incident_id") or "",
+                    "system",
+                )
                 # 客观原因终止提案；调用者无权仅拒绝本次请求
                 if code in ("dispatcher_denied",):
                     conn.execute(
                         "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, object_id,"
-                        " action_id, detail_json) VALUES(?,?,?,?,?,?,?,?)",
-                        (
-                            now(),
-                            actor_type,
-                            actor_id,
-                            "action_dispatch_denied",
-                            fresh["asset_id"],
-                            fresh["object_id"],
-                            action_id,
-                            json.dumps({"code": code, "detail": detail}, ensure_ascii=False),
-                        ),
+                        " action_id, detail_json, decision_id, incident_id, channel)"
+                        " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        _aud,
                     )
                 else:
                     conn.execute(
@@ -890,17 +1017,9 @@ class ActionService:
                     )
                     conn.execute(
                         "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, object_id,"
-                        " action_id, detail_json) VALUES(?,?,?,?,?,?,?,?)",
-                        (
-                            now(),
-                            actor_type,
-                            actor_id,
-                            "action_dispatch_denied",
-                            fresh["asset_id"],
-                            fresh["object_id"],
-                            action_id,
-                            json.dumps({"code": code, "detail": detail}, ensure_ascii=False),
-                        ),
+                        " action_id, detail_json, decision_id, incident_id, channel)"
+                        " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        _aud,
                     )
             else:
                 cur = conn.execute(
@@ -935,7 +1054,7 @@ class ActionService:
             raise ActionError(code, detail)
 
         # 网络：真正执行
-        res = await self.nt.exec(dispatcher, tokens, timeout=15.0)
+        res = await self._write_channel(row["asset_id"], tokens, timeout=15.0)
         state, detail = classify_exec_result(res)
 
         # ---- 同事务提交：结果 + 审计 + 验证义务/人工 + 事件 ----
@@ -943,6 +1062,13 @@ class ActionService:
         vid = ""
         if state == "success":
             vid = new_id("ver")
+        decision_id = (row.get("decision_id") or "") if isinstance(row, dict) else ""
+        payload_now = {}
+        try:
+            payload_now = json.loads(row.get("params_json") or "{}") if isinstance(row, dict) else {}
+        except Exception:
+            payload_now = {}
+        exec_tokens = list(tokens or payload_now.get("tokens") or [])
         with self.db.tx() as conn:
             conn.execute(
                 "UPDATE actions SET state=?, finished_at=?, result_detail=? WHERE id=?",
@@ -950,7 +1076,8 @@ class ActionService:
             )
             conn.execute(
                 "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, object_id,"
-                " action_id, detail_json) VALUES(?,?,?,?,?,?,?,?)",
+                " action_id, detail_json, decision_id, incident_id, channel)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     finished_at,
                     actor_type,
@@ -965,9 +1092,16 @@ class ActionService:
                             "timed_out": res.timed_out,
                             "nt_account": dispatcher,
                             "actor": f"{actor_type}:{actor_id}",
+                            "capability": row.get("capability") or "",
+                            "tokens": exec_tokens,
+                            "params_digest": row.get("params_digest") or "",
+                            "result_detail": detail[:500],
                         },
                         ensure_ascii=False,
                     ),
+                    decision_id or "",
+                    row.get("incident_id") or "",
+                    "system",
                 ),
             )
             conn.execute(

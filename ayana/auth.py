@@ -311,6 +311,12 @@ class AuthService:
         self.db.execute("DELETE FROM meta WHERE key=?", (f"totp_pending:{user_id}",))
         self.db.execute("DELETE FROM web_sessions WHERE user_id=?", (user_id,))
 
+    def totp_enabled(self, username: str) -> bool:
+        row = self.db.query_one(
+            "SELECT totp_enabled, totp_secret FROM users WHERE username=?", (username,)
+        )
+        return bool(row and row["totp_enabled"] and row["totp_secret"])
+
     def verify_totp(self, username: str, code: str) -> bool:
         """验证某用户的 TOTP。调用方不得把 code 传给 LLM/日志。"""
         row = self.db.query_one(

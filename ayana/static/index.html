@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ayana</title>
 <link rel="stylesheet" href="/static/app.css?v=6">
+<link rel="stylesheet" href="/static/xterm/xterm.css">
 </head>
 <body>
 <div id="app">
@@ -28,6 +29,7 @@
       <nav>
         <button data-tab="overview" class="tab active">总览</button>
         <button data-tab="incidents" class="tab">事件</button>
+        <button data-tab="connections" class="tab">连接</button>
         <button data-tab="knowledge" class="tab">知识</button>
         <button data-tab="permissions" class="tab">权限</button>
         <button data-tab="audit" class="tab">审计</button>
@@ -52,6 +54,89 @@
 
       <section id="tab-incidents" class="tab-panel hidden">
         <div id="incidents-list"></div>
+      </section>
+
+      <section id="tab-connections" class="tab-panel hidden">
+        <div class="card">
+          <h2>添加主机</h2>
+          <p class="muted small">
+            主机 = 资产。填写连接信息即可新增；可选绑定凭据。保存后自动登记 SSH 端点，无需再单独选资产。
+          </p>
+          <div class="form-row" id="host-add-form">
+            <label>主机 ID <input id="host-id" placeholder="例如 yomi / web-01"></label>
+            <label>名称 <input id="host-name" placeholder="显示名"></label>
+            <label>地址 <input id="host-addr" placeholder="IP / 域名"></label>
+            <label>端口 <input id="host-port" type="number" value="22" style="width:80px"></label>
+            <label>用户 <input id="host-user" placeholder="root"></label>
+            <label>角色
+              <select id="host-role"></select>
+            </label>
+            <button class="btn small" id="role-add-btn" type="button">+ 角色</button>
+            <label>认证
+              <select id="host-auth">
+                <option value="password">密码</option>
+                <option value="key">私钥</option>
+                <option value="cred">已有凭据</option>
+                <option value="none">暂不配置</option>
+              </select>
+            </label>
+            <label id="host-auth-password-wrap">密码 <input id="host-password" type="password" placeholder="SSH 密码"></label>
+            <label id="host-auth-key-wrap" class="hidden" style="flex:2">私钥 <input id="host-private-key" placeholder="粘贴 PEM 私钥"></label>
+            <label id="host-auth-cred-wrap" class="hidden">凭据 <select id="host-cred"><option value="">（无）</option></select></label>
+            <button class="btn primary" id="host-add-btn" type="button">添加主机</button>
+          </div>
+          <div id="role-add-form" class="form-row hidden" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--line)">
+            <label>角色名 <input id="role-name" placeholder="例如 deploy / monitor"></label>
+            <label>显示名 <input id="role-label" placeholder="例如 发布账号"></label>
+            <label>权限
+              <select id="role-kind">
+                <option value="write">可执行（exec）</option>
+                <option value="read">只读（query）</option>
+              </select>
+            </label>
+            <button class="btn primary" id="role-save-btn" type="button">保存角色</button>
+            <button class="btn" id="role-cancel-btn" type="button">取消</button>
+          </div>
+          <p class="muted small" id="host-add-msg"></p>
+        </div>
+
+        <div class="card">
+          <h2>主机列表</h2>
+          <div id="host-list"></div>
+        </div>
+
+        <div class="card">
+          <h2>凭据库</h2>
+          <p class="muted small">密码或私钥加密入库；可生成密钥对并部署公钥。列表不显示明文。</p>
+          <div class="form-row">
+            <label>名称 <input id="ssh-cred-name" placeholder="yomi-root"></label>
+            <label>类型
+              <select id="ssh-cred-kind">
+                <option value="password">password 密码</option>
+                <option value="private_key">private_key 私钥</option>
+              </select>
+            </label>
+            <label style="flex:2">密钥/密码 <input id="ssh-cred-secret" placeholder="密码或粘贴私钥 PEM" type="password"></label>
+            <button class="btn" id="ssh-cred-save" type="button">导入凭据</button>
+            <button class="btn" id="ssh-cred-gen" type="button">生成密钥对</button>
+          </div>
+          <div id="ssh-creds"></div>
+        </div>
+
+        <div class="card">
+          <h2>连接测试</h2>
+          <div class="form-row">
+            <label>主机 <select id="ssh-test-asset"></select></label>
+            <label>角色
+              <select id="ssh-test-role">
+                <option value="read">read</option>
+                <option value="write">write</option>
+              </select>
+            </label>
+            <button class="btn primary" id="ssh-test-btn" type="button">测试连接</button>
+          </div>
+          <pre id="ssh-test-out" class="muted small" style="white-space:pre-wrap;min-height:40px"></pre>
+        </div>
       </section>
 
       <section id="tab-knowledge" class="tab-panel hidden">
@@ -98,6 +183,9 @@
             <span><span class="dot" style="background:var(--ok)"></span>Ayana 可以自动执行</span>
           </div>
           <div id="perm-agent"></div>
+          <h3 style="margin:18px 0 8px;font-size:14px">Agent 权限上限（ceiling）</h3>
+          <p class="muted small">后端强制：Agent（auto_rule / llm）不能超过此处上限，也不能超过源码能力目录。</p>
+          <div id="agent-ceiling"></div>
         </div>
         <details class="perm-adv card">
           <summary>高级权限（QQ / Web 用户等细规则）</summary>
@@ -140,7 +228,23 @@
   </div>
 </div>
 
-<script src="/static/qrcode.js?v=6"></script>
-<script src="/static/app.js?v=6"></script>
+<div id="term-modal" class="modal hidden">
+  <div class="modal-card" style="width:min(960px,96vw);max-width:96vw;height:min(640px,90vh);display:flex;flex-direction:column">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+      <h3 id="term-title" style="flex:1;margin:0">终端</h3>
+      <span id="term-status" class="badge dim">未连接</span>
+      <button class="btn small" id="term-reconnect">重连</button>
+      <button class="btn small danger" id="term-disconnect">断开</button>
+      <button class="btn small" id="term-close">关闭</button>
+    </div>
+    <div id="term-host-label" class="muted small" style="margin-bottom:6px"></div>
+    <div id="term-container" style="flex:1;min-height:280px;background:#0c0c0c;border-radius:8px;overflow:hidden;padding:4px"></div>
+  </div>
+</div>
+
+<script src="/static/qrcode.js?v=9"></script>
+<script src="/static/xterm/xterm.js"></script>
+<script src="/static/xterm/xterm-addon-fit.js"></script>
+<script src="/static/app.js?v=17"></script>
 </body>
 </html>
