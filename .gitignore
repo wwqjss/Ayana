@@ -1,5 +1,6 @@
 # 秘密与运行时
 secrets.json
+config.json
 ayana.db
 ayana.db-wal
 ayana.db-shm

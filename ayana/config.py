@@ -1,6 +1,7 @@
 """配置与秘密加载。
 
-公开配置进 config.json（可入库）；秘密进 secrets.json 或环境变量（不入库）。
+config.json 不入库（.gitignore 已挡，含 self_id/admin_qq 等个人信息）。
+参考 config.example.json 做模板；秘密进 secrets.json 或环境变量（不入库）。
 """
 
 from __future__ import annotations
