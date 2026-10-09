@@ -17,7 +17,7 @@ from .capabilities import assert_within_ceiling, get_capability, list_capabiliti
 from .db import Database, now
 
 # 主体
-SUBJECT_TYPES = ("web_user", "qq_user", "qq_group", "auto_rule", "llm", "system")
+SUBJECT_TYPES = ("web_user", "qq_user", "qq_group", "wecom_user", "auto_rule", "llm", "system")
 
 # 受 agent ceiling 约束的主体（无人在环决策面）
 AGENT_SUBJECT_TYPES = ("auto_rule", "llm")
@@ -453,15 +453,28 @@ class Policy:
                 "decision": "forbidden",
                 "agent_ceiling": ceil,
             }
+        # S08: 不因 auto=True 隐藏 require_approval；派发门须看到真实审批要求
+        decision = self._three_state(
+            allow=True, require_approval=require_approval, auto_allowed=auto_allowed
+        )
+        # auto 模式下若仍需审批，拒绝自动派发
+        if auto and decision != "automatic":
+            return {
+                "allowed": False,
+                "reason": "approval_required",
+                "require_approval": require_approval,
+                "auto_allowed": auto_allowed,
+                "rule": rule,
+                "decision": decision,
+                "agent_ceiling": ceil,
+            }
         return {
             "allowed": True,
             "reason": "ok",
-            "require_approval": require_approval and not auto,
+            "require_approval": require_approval,
             "auto_allowed": auto_allowed,
             "rule": rule,
-            "decision": self._three_state(
-                allow=True, require_approval=require_approval, auto_allowed=auto_allowed
-            ),
+            "decision": decision,
             "agent_ceiling": ceil,
         }
 

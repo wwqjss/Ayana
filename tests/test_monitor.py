@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ayana.monitor import HostMonitor, _state_from_value, RANGES
+from ayana.monitor import HostMonitor, _state_from_value, _swap_state_and_value, RANGES
 from ayana.prom import PromError
 
 
@@ -38,6 +38,34 @@ class TestMonitor(unittest.TestCase):
         self.assertEqual(_state_from_value("cpu", 96), "bad")
         self.assertEqual(_state_from_value("memory", None), "no_data")
         self.assertEqual(_state_from_value("load1", 99), "ok")
+
+    def test_swap_not_enabled(self):
+        """Swap 总量为 0 → 未启用，不计算使用率、不标异常。"""
+        state, val = _swap_state_and_value(0.0, None)
+        self.assertEqual(state, "not_enabled")
+        self.assertIsNone(val)
+        state, val = _swap_state_and_value(0.0, 100.0)
+        self.assertEqual(state, "not_enabled")
+        self.assertIsNone(val)
+
+    def test_swap_enabled_ok(self):
+        """Swap 已启用且使用率低 → 正常。"""
+        state, val = _swap_state_and_value(2147483648.0, 10.0)
+        self.assertEqual(state, "ok")
+        self.assertEqual(val, 10.0)
+
+    def test_swap_enabled_warn(self):
+        state, val = _swap_state_and_value(2147483648.0, 60.0)
+        self.assertEqual(state, "warn")
+
+    def test_swap_enabled_bad(self):
+        state, val = _swap_state_and_value(2147483648.0, 90.0)
+        self.assertEqual(state, "bad")
+
+    def test_swap_no_data(self):
+        """Swap 总量未知 → 暂无数据。"""
+        state, val = _swap_state_and_value(None, None)
+        self.assertEqual(state, "no_data")
 
     def test_ranges_present(self):
         for k in ("15m", "1h", "6h", "24h", "7d"):
@@ -94,6 +122,66 @@ class TestMonitor(unittest.TestCase):
             self.assertEqual(res["metrics"]["cpu"]["value"], 25.5)
             self.assertEqual(res["metrics"]["cpu"]["state"], "ok")
             self.assertEqual(res["metrics"]["memory"]["value"], 40.0)
+
+        import asyncio
+
+        asyncio.run(run())
+
+    def test_overview_swap_not_enabled(self):
+        """KANATA 场景：Swap 总量为 0 → 未启用，不显示 100% 异常。"""
+
+        async def run():
+            prom = FakeProm()
+            mon = HostMonitor(prom)
+
+            async def query(expr):
+                if "SwapTotal" in expr:
+                    return {"result": [{"metric": {"asset": "kanata"}, "value": 0.0}]}
+                if "SwapFree" in expr:
+                    return {"result": [{"metric": {"asset": "kanata"}, "value": 0.0}]}
+                if "cpu_seconds_total" in expr:
+                    return {"result": [{"metric": {"asset": "kanata"}, "value": 25.0}]}
+                if "MemAvailable" in expr:
+                    return {"result": [{"metric": {"asset": "kanata"}, "value": 40.0}]}
+                return {"result": []}
+
+            prom.query = query
+            res = await mon.host_overview("kanata")
+            swap = res["metrics"]["swap"]
+            self.assertEqual(swap["state"], "not_enabled")
+            self.assertIsNone(swap["value"])
+            # 整体状态不应因 Swap 未启用而异常
+            self.assertNotEqual(res["state"], "bad")
+            self.assertNotEqual(res["state"], "warn")
+
+        import asyncio
+
+        asyncio.run(run())
+
+    def test_overview_swap_enabled(self):
+        """已启用 Swap 主机：正常使用率计算。"""
+
+        async def run():
+            prom = FakeProm()
+            mon = HostMonitor(prom)
+
+            async def query(expr):
+                if "SwapTotal" in expr and "SwapFree" not in expr:
+                    return {"result": [{"metric": {"asset": "nerv"}, "value": 2147483648.0}]}
+                if "SwapFree" in expr:
+                    # swap 使用率表达式：100 * (1 - free/total) ≈ 10%
+                    return {"result": [{"metric": {"asset": "nerv"}, "value": 10.0}]}
+                if "cpu_seconds_total" in expr:
+                    return {"result": [{"metric": {"asset": "nerv"}, "value": 10.0}]}
+                if "MemAvailable" in expr:
+                    return {"result": [{"metric": {"asset": "nerv"}, "value": 50.0}]}
+                return {"result": []}
+
+            prom.query = query
+            res = await mon.host_overview("nerv")
+            swap = res["metrics"]["swap"]
+            self.assertEqual(swap["state"], "ok")
+            self.assertAlmostEqual(swap["value"], 10.0, places=1)
 
         import asyncio
 

@@ -354,7 +354,11 @@ async function boot() {
   if (!me.ok) { showLogin(); return; }
   state.user = me.user;
   state.csrf = me.csrf_token || state.csrf;
-  state.version = "v0.2.0";
+  // 版本取服务端 health，不硬编码
+  try {
+    const h = await fetch("/health").then(r => r.json());
+    state.version = "v" + (h.version || "unknown");
+  } catch { state.version = "v?"; }
   await loadMeta();
   showMain();
 }
@@ -2472,6 +2476,7 @@ function metricStateBadge(st) {
     ok: ["正常", "ok"],
     warn: ["偏高", "warn"],
     bad: ["异常", "bad"],
+    not_enabled: ["未启用", "dim"],
     no_data: ["暂无数据", "dim"],
     collect_error: ["采集失败", "bad"],
   };
@@ -2481,6 +2486,7 @@ function metricStateBadge(st) {
 
 function fmtMetricVal(m) {
   if (!m || m.value === null || m.value === undefined) return "—";
+  if (m.state === "not_enabled") return "—";
   const v = m.value;
   if (m.unit === "%") return v.toFixed(1);
   if (m.unit === "B/s") {
@@ -2494,6 +2500,7 @@ function fmtMetricVal(m) {
 }
 
 function fmtMetricUnit(m) {
+  if (!m || m.state === "not_enabled") return "";
   if (!m || m.value === null || m.value === undefined) return m && m.unit ? m.unit : "";
   const v = m.value;
   if (m.unit === "B/s") {
@@ -2545,6 +2552,9 @@ function metricCard(m) {
   valWrap.appendChild(document.createTextNode(fmtMetricVal(m)));
   valWrap.appendChild(el("span", { class: "unit", text: " " + fmtMetricUnit(m) }));
   card.appendChild(valWrap);
+  if (m.state === "not_enabled") {
+    return card;
+  }
   const canvas = el("canvas", {});
   card.appendChild(canvas);
   const color = m.state === "bad" ? "#f07178" : m.state === "warn" ? "#e5c07b" : "#6cb6ff";

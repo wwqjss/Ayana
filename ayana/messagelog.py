@@ -83,8 +83,14 @@ class MessageLog:
         return mid
 
     def update_state(self, log_id: str, *, state: str = "", error: str = "", **extra: Any) -> None:
-        sets = ["state=?", "error=?"]
-        params: list[Any] = [state, (error or "")[:300]]
+        sets = []
+        params: list[Any] = []
+        if state:
+            sets.append("state=?")
+            params.append(state)
+        if error:
+            sets.append("error=?")
+            params.append((error or "")[:300])
         if "replied" in extra:
             sets.append("replied=?")
             params.append(1 if extra["replied"] else 0)
@@ -94,6 +100,8 @@ class MessageLog:
         if "detail" in extra:
             sets.append("detail_json=?")
             params.append(json.dumps(extra["detail"] or {}, ensure_ascii=False))
+        if not sets:
+            return
         params.append(log_id)
         self.db.execute(f"UPDATE message_log SET {', '.join(sets)} WHERE id=?", tuple(params))
 

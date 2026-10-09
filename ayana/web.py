@@ -552,11 +552,36 @@ class WebApp:
         self._overview_cache = {"at": time.time(), "data": data}
         return _json(data)
 
+    def _visible_asset_ids(self, sess: dict) -> set[str]:
+        """S10: 返回调用者有 asset.summary 权限的资产 ID 集合。admin 见全部。"""
+        if not sess:
+            return set()
+        username = sess.get("username") or ""
+        if username == "admin":
+            return {r["id"] for r in self.db.query("SELECT id FROM assets")}
+        rows = self.db.query("SELECT id FROM assets")
+        out = set()
+        for r in rows:
+            decision = self.policy.check(
+                subject_type="web_user",
+                subject_id=username,
+                capability="asset.summary",
+                asset_id=r["id"],
+                object_id="*",
+            )
+            if decision.get("allowed"):
+                out.add(r["id"])
+        return out
+
     async def api_assets(self, request: web.Request) -> web.Response:
-        self._require_auth(request)
+        sess = self._require_auth(request)
+        visible = self._visible_asset_ids(sess)
         rows = self.db.query("SELECT * FROM assets ORDER BY id")
         out = []
         for r in rows:
+            # S10: 只返回调用者有权看到的资产
+            if r["id"] not in visible:
+                continue
             d = dict(r)
             d["objects"] = [
                 dict(o)
@@ -792,9 +817,13 @@ class WebApp:
         return _json(res)
 
     async def api_incidents(self, request: web.Request) -> web.Response:
-        self._require_auth(request)
+        sess = self._require_auth(request)
         status = request.rel_url.query.get("status", "")
-        return _json({"ok": True, "incidents": self.incidents.list_incidents(status=status)})
+        visible = self._visible_asset_ids(sess)
+        all_incs = self.incidents.list_incidents(status=status)
+        # S10: 只返回调用者有权资产关联的事件
+        filtered = [i for i in all_incs if i.get("asset_id") in visible] if visible else []
+        return _json({"ok": True, "incidents": filtered})
 
     async def api_loops(self, request: web.Request) -> web.Response:
         """故障闭环：Incident 关联 Investigation / Action / Verification。"""
@@ -1023,12 +1052,16 @@ class WebApp:
         return _json({"ok": True, "outcome": res.get("outcome")})
 
     async def api_actions(self, request: web.Request) -> web.Response:
-        self._require_auth(request)
+        sess = self._require_auth(request)
         q = request.rel_url.query
         manual_only = q.get("manual", "") in ("1", "true", "yes")
+        visible = self._visible_asset_ids(sess)
+        all_actions = self.actions.list_actions(manual_only=manual_only)
+        # S10: 只返回调用者有权资产关联的操作
+        filtered = [a for a in all_actions if a.get("asset_id") in visible] if visible else []
         return _json({
             "ok": True,
-            "actions": self.actions.list_actions(manual_only=manual_only),
+            "actions": filtered,
         })
 
     async def api_action_detail(self, request: web.Request) -> web.Response:
@@ -1628,6 +1661,12 @@ class WebApp:
             return _json({"ok": False, "error": "missing_id"}, 400)
         try:
             self._channels().delete(cid, actor=sess["username"])
+            # S06: 删除渠道立即停止客户端
+            if self.aibot_manager:
+                try:
+                    await self.aibot_manager.stop(cid)
+                except Exception:
+                    pass
         except Exception as e:
             return _json({"ok": False, "error": str(e)}, 400)
         return _json({"ok": True})
@@ -1643,6 +1682,12 @@ class WebApp:
             ch = self._channels().set_enabled(
                 cid, bool(body.get("enabled")), actor=sess["username"]
             )
+            # S06: 停用渠道立即停止客户端，不等下轮扫描
+            if not body.get("enabled") and self.aibot_manager:
+                try:
+                    await self.aibot_manager.stop(cid)
+                except Exception:
+                    pass
         except Exception as e:
             return _json({"ok": False, "error": str(e)}, 400)
         return _json({"ok": True, "channel": ch})
@@ -2247,15 +2292,21 @@ class WebApp:
 
     # ---- 人工 Web 终端（Agent 不可达）----
 
-    def _terminal_ok(self, sess: dict) -> dict | None:
-        """需登录 + shell.interactive。返回错误 dict 或 None。"""
+    def _terminal_ok(self, sess: dict, asset_id: str = "") -> dict | None:
+        """需登录 + shell.interactive（按目标资产核权）。S02/S03: 不再用通配资产授权。"""
         if not sess:
             return {"ok": False, "error": "unauthorized"}
+        username = sess.get("username") or ""
+        # 仅 admin 可开人工终端（S02: 取消 web_user:* 通配恢复）
+        if username != "admin":
+            return {"ok": False, "error": "permission_denied", "hint": "需要管理员权限"}
+        # 若指定资产，核对对该资产的 shell.interactive；未指定时仅允许已有全局 admin 规则
+        check_asset = asset_id or "*"
         decision = self.policy.check(
             subject_type="web_user",
-            subject_id=sess["username"],
+            subject_id=username,
             capability="shell.interactive",
-            asset_id="*",
+            asset_id=check_asset,
             object_id="*",
         )
         if not decision.get("allowed"):
@@ -2265,10 +2316,10 @@ class WebApp:
     async def api_terminal_check(self, request: web.Request) -> web.Response:
         """打开终端前检查：权限、SSH 配置、host key。不建会话。"""
         sess = self._session(request)
-        err = self._terminal_ok(sess)
+        asset_id = request.rel_url.query.get("asset_id", "")
+        err = self._terminal_ok(sess, asset_id)
         if err:
             return _json(err, 403)
-        asset_id = request.rel_url.query.get("asset_id", "")
         if not asset_id:
             return _json({"ok": False, "error": "asset_id_required"}, 400)
         if not self.terminal:
@@ -2354,10 +2405,18 @@ class WebApp:
 
     async def ws_terminal(self, request: web.Request) -> web.WebSocketResponse:
         """WebSocket 交互终端。仅人工 Web 会话；Agent 无此入口。"""
+        # S03: Upgrade 前校验 Origin；非法来源直接 HTTP 拒绝，不升级
+        origin = request.headers.get("Origin", "")
+        host_hdr = request.headers.get("Host", "")
+        if origin and host_hdr:
+            allowed = {f"http://{host_hdr}", f"https://{host_hdr}"}
+            if origin.rstrip("/") not in allowed:
+                return web.Response(status=403, text="origin rejected")
         ws = web.WebSocketResponse(heartbeat=30)
         await ws.prepare(request)
         sess = self._session(request)
-        err = self._terminal_ok(sess)
+        asset_id = request.rel_url.query.get("asset_id", "")
+        err = self._terminal_ok(sess, asset_id)
         if err:
             await ws.send_json({"type": "error", "error": err.get("error"), "hint": err.get("hint")})
             await ws.close(code=4403, message=b"forbidden")
@@ -2428,13 +2487,26 @@ class WebApp:
                         break
                 else:
                     await asyncio.sleep(0.05)
+            # S03: 超时/SSH 断开时强制关闭 WebSocket，不只发 closed 消息
             if not ws.closed:
-                reason = tsess.close_reason or "ssh_closed"
-                await ws.send_json({"type": "closed", "reason": reason})
+                reason = tsess.close_reason or ("timeout" if not tsess.alive() else "ssh_closed")
+                try:
+                    await ws.send_json({"type": "closed", "reason": reason})
+                except Exception:
+                    pass
+                try:
+                    await ws.close(code=1000, message=b"session ended")
+                except Exception:
+                    pass
 
         out_task = asyncio.create_task(pump_out())
         try:
             async for msg in ws:
+                # S03: 输入期间复查会话有效性（注销/改密/撤权后拒绝）
+                cur = self._session(request)
+                if not cur or cur.get("username") != username:
+                    await ws.send_json({"type": "error", "error": "session_revoked", "hint": "登录已失效"})
+                    break
                 if msg.type == web.WSMsgType.BINARY:
                     try:
                         tsess.write(msg.data)

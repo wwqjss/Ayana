@@ -178,14 +178,18 @@ class TerminalSession:
                 pass
 
     def write(self, data: bytes) -> None:
+        # S03: 仅在真实用户输入时刷新 idle；写入前复核存活（超时/撤销即拒绝）
+        if not self.alive():
+            self.close("timeout_or_revoked")
+            raise TerminalError("session_closed", "timeout or revoked")
         self.touch()
         if not self._chan or self._chan.closed:
             raise TerminalError("session_closed")
         self._chan.sendall(data)
 
     def read(self, bufsize: int = 8192) -> bytes:
-        self.touch()
-        if not self._chan:
+        # S03: 轮询读不刷新 idle，避免空闲会话永不超时
+        if not self._chan or self.closed:
             return b""
         try:
             if self._chan.recv_ready():

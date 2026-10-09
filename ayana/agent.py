@@ -47,6 +47,15 @@ class AgentLoop:
 
     def set_auto_enabled(self, enabled: bool) -> None:
         self.auto_enabled = enabled
+        # S22: 持久化到 meta，重启后不回退到配置默认值
+        try:
+            self.db.execute(
+                "INSERT INTO meta(key, value) VALUES('agent_auto_enabled', ?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("1" if enabled else "0",),
+            )
+        except Exception:
+            pass
         self.db.audit("system", "agent", f"auto_remediation_{'on' if enabled else 'off'}")
 
     async def handle_incident(self, inc_id: str) -> dict[str, Any]:

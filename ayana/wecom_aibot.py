@@ -46,6 +46,9 @@ class WeComAibotError(Exception):
 class WeComAibotClient:
     """单机器人长连接。线程不安全，只在事件循环里用。"""
 
+    # S05: 业务处理与接收循环解耦；并发上限防止无限建任务
+    MAX_HANDLER_TASKS = 4
+
     def __init__(
         self,
         *,
@@ -67,6 +70,7 @@ class WeComAibotClient:
         self._hb_task: asyncio.Task | None = None
         self._run_task: asyncio.Task | None = None
         self._pending: dict[str, asyncio.Future] = {}
+        self._handler_tasks: set[asyncio.Task] = set()  # S05: 业务小任务集合
         self._stopped = False
         self._authenticated = False
         self._missed_pong = 0
@@ -119,6 +123,11 @@ class WeComAibotClient:
             if not fut.done():
                 fut.set_exception(WeComAibotError("closed", "connection stopping"))
         self._pending.clear()
+        # S05: 取消业务处理任务
+        for t in list(self._handler_tasks):
+            if not t.done():
+                t.cancel()
+        self._handler_tasks.clear()
         for t in (self._hb_task, self._recv_task, self._run_task):
             if t and not t.done():
                 t.cancel()
@@ -276,6 +285,7 @@ class WeComAibotClient:
         req_id = str((frame.get("headers") or {}).get("req_id") or "")
         cmd = str(frame.get("cmd") or "")
         errcode = frame.get("errcode")
+        log.info("aibot frame cmd=%s req_id=%s errcode=%s", cmd, req_id, errcode)
 
         # 认证回执
         if req_id.startswith("aibot_subscribe") or cmd == "aibot_subscribe":
@@ -311,13 +321,28 @@ class WeComAibotClient:
 
         # 消息 / 事件推送
         if cmd in ("aibot_msg_callback", "aibot_event_callback"):
+            log.info("aibot dispatching to _on_message=%s", self._on_message is not None)
             if self._on_message:
-                try:
-                    res = self._on_message(frame)
-                    if asyncio.iscoroutine(res):
-                        await res
-                except Exception:
-                    log.exception("wecom aibot on_message failed")
+                # S05: 业务处理改后台任务，不在接收循环里 await，避免 ACK 死锁
+                if len(self._handler_tasks) >= self.MAX_HANDLER_TASKS:
+                    log.warning("wecom aibot handler tasks full, dropping message")
+                    return
+                task = asyncio.create_task(
+                    self._run_handler(frame), name=f"wecom-handler-{cmd}"
+                )
+                self._handler_tasks.add(task)
+                task.add_done_callback(self._handler_tasks.discard)
+
+    async def _run_handler(self, frame: dict) -> None:
+        """S05: 后台执行业务 handler，异常不影响接收循环。"""
+        try:
+            res = self._on_message(frame)
+            if asyncio.iscoroutine(res):
+                await res
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("wecom aibot on_message failed")
 
     # ---- send ----
 

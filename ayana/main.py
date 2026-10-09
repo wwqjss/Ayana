@@ -16,9 +16,11 @@ from aiohttp import web
 from . import VERSION
 from .actions import ActionService
 from .agent import AgentLoop
+from .agent_query import AgentQueryService
 from .alertmanager import AlertIngest
 from .auth import AuthService
 from .config import load_config
+from .controlled import ControlledExecutor
 from .db import Database, now
 from .incidents import IncidentService
 from .investigation import InvestigationService
@@ -164,9 +166,9 @@ def seed_assets(db: Database) -> None:
             asset_id="*", object_id="*", allow=True, require_approval=False,
             auto_allowed=True, actor="system",
         )
-    # 人工 Web 终端：仅 web 用户；Agent 不可（policy 层硬拦）
+    # 人工 Web 终端：仅 admin；Agent 不可（policy 层硬拦）。S02: 不再通配给所有 web 用户
     policy.upsert_permission(
-        subject_type="web_user", subject_id="*", capability="shell.interactive",
+        subject_type="web_user", subject_id="admin", capability="shell.interactive",
         asset_id="*", object_id="*", allow=True, require_approval=False, auto_allowed=False, actor="system",
     )
 
@@ -190,6 +192,9 @@ class App:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.db = Database(cfg["db_path"])
+        import os
+        log.info("db path resolved to: %s (base_dir=%s) cwd=%s abs=%s",
+                 self.db.path, cfg.get("base_dir", ""), os.getcwd(), os.path.abspath(self.db.path))
         seed_assets(self.db)
         self.auth = AuthService(
             self.db,
@@ -197,6 +202,7 @@ class App:
             session_ttl=int(cfg.get("web_session_ttl_sec", 43200)),
             max_failed=int(cfg.get("web_max_failed_logins", 8)),
             lockout=int(cfg.get("web_lockout_sec", 900)),
+            totp_key=cfg.get("totp_encrypt_key") or "",
         )
         self.policy = Policy(self.db)
         self.nt = NTClient(privilege_mode="restricted_dispatcher")
@@ -241,15 +247,7 @@ class App:
                 return self._ssh._endpoint(asset_id, role)
 
         self.transport = _Router(self.ssh_transport, self.ssh_store)
-        # 确保人工终端权限（Agent 仍由 policy 硬拦）
-        try:
-            self.policy.upsert_permission(
-                subject_type="web_user", subject_id="*", capability="shell.interactive",
-                asset_id="*", object_id="*", allow=True, require_approval=False,
-                auto_allowed=False, actor="system",
-            )
-        except Exception:
-            pass
+        # S02: 不再在每次启动时恢复通配 shell.interactive；权限由 seed_assets 仅建 admin 规则
         self.investigation = InvestigationService(
             self.db, self.nt, self.gate, self.prom, self.policy,
             knowledge=self.knowledge,
@@ -283,10 +281,16 @@ class App:
         self.channel_store.set_mlog(self.mlog)
         self.llm = make_llm(cfg)
         self.investigation.llm = self.llm
+        # S22: 优先读持久化 auto 开关，回退配置默认值
+        _auto_row = self.db.query_one("SELECT value FROM meta WHERE key='agent_auto_enabled'")
+        _auto_persisted = _auto_row["value"] if _auto_row else None
         self.agent = AgentLoop(
             self.db, self.investigation, self.actions, self.policy,
             self.llm, self.notifier,
-            auto_enabled=bool(cfg.get("auto_remediation_enabled", False)),
+            auto_enabled=(
+                _auto_persisted == "1" if _auto_persisted is not None
+                else bool(cfg.get("auto_remediation_enabled", False))
+            ),
             knowledge=self.knowledge,
         )
         self.ob = OneBotServer(cfg["onewbot_token"], int(cfg.get("self_id") or 0))
@@ -301,6 +305,13 @@ class App:
             admin_qq=str(cfg.get("admin_qq") or ""),
             version=VERSION,
         )
+        # 统一消息入口：Agent 查询 + 受控命令
+        self.agent_query = AgentQueryService(self.host_monitor, self.db)
+        self.controlled = ControlledExecutor(
+            self.db, self.transport, self.policy, self.actions
+        )
+        self.qq.agent_query = self.agent_query
+        self.qq.controlled = self.controlled
         self.permission_changes = PermissionChangeService(
             self.db,
             self.policy,
@@ -427,9 +438,14 @@ class App:
         """维持企微智能机器人长连接（一渠道一连接）。"""
         while not self._stop.is_set():
             try:
-                for ch in self.channel_store.list_enabled():
+                chans = self.channel_store.list_enabled()
+                enabled_aibot_ids = set()
+                log.info("bg_aibot scanning %d channels", len(chans))
+                for ch in chans:
                     if ch.get("kind") != "wecom_aibot":
                         continue
+                    log.info("bg_aibot found wecom_aibot channel %s", ch.get("id"))
+                    enabled_aibot_ids.add(ch["id"])
                     try:
                         raw = self.channel_store.reveal_for_send(ch["id"])
                         sec = raw.get("secret") or {}
@@ -445,6 +461,14 @@ class App:
                             )
                     except Exception:
                         log.exception("aibot ensure failed for %s", ch.get("id"))
+                # S06: 停用/删除的渠道立即断开，不能当安全停止
+                for cid in list(self.aibot_manager._clients.keys()):
+                    if cid not in enabled_aibot_ids:
+                        log.info("bg_aibot stopping disabled channel %s", cid)
+                        try:
+                            await self.aibot_manager.stop(cid)
+                        except Exception:
+                            log.exception("aibot stop failed for %s", cid)
             except Exception:
                 log.exception("aibot bg loop failed")
             await asyncio.sleep(30)

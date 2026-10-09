@@ -1,4 +1,7 @@
-"""本地认证：密码（PBKDF2）+ TOTP 2FA + 恢复码 + Web 会话。"""
+"""本地认证：密码（PBKDF2）+ TOTP 2FA + 恢复码 + Web 会话。
+
+S11: TOTP 秘密使用 AES-GCM 加密存储（totp_encrypt_key），明文只在验证瞬间进内存。
+"""
 
 from __future__ import annotations
 
@@ -14,10 +17,51 @@ from typing import Any
 
 from .db import Database, now, new_id
 
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+except ImportError:  # pragma: no cover
+    AESGCM = None  # type: ignore
+
 PBKDF2_ITERATIONS = 200_000
 TOTP_DIGITS = 6
 TOTP_PERIOD = 30
 TOTP_WINDOW = 1  # 允许前后 1 个时间步
+
+# S11: 版本化前缀，区分加密/明文存量
+_TOTP_ENC_PREFIX = "enc:v1:"
+
+
+def _totp_derive_key(master: str) -> bytes:
+    if not master:
+        return b""
+    return hashlib.sha256(master.encode("utf-8")).digest()
+
+
+def encrypt_totp_secret(master: str, plaintext: str) -> str:
+    """S11: 加密 TOTP secret。无密钥时降级明文（兼容旧数据），但标 prefix 不加。"""
+    if not master or AESGCM is None or not plaintext:
+        return plaintext
+    key = _totp_derive_key(master)
+    nonce = os.urandom(12)
+    ct = AESGCM(key).encrypt(nonce, plaintext.encode("utf-8"), None)
+    return _TOTP_ENC_PREFIX + base64.b64encode(nonce + ct).decode("ascii")
+
+
+def decrypt_totp_secret(master: str, stored: str) -> str:
+    """S11: 解密 TOTP secret。兼容旧明文（无 prefix 直接返回）。"""
+    if not stored:
+        return ""
+    if not stored.startswith(_TOTP_ENC_PREFIX):
+        return stored  # 旧明文数据
+    if not master or AESGCM is None:
+        return ""
+    try:
+        raw = base64.b64decode(stored[len(_TOTP_ENC_PREFIX):])
+        nonce, ct = raw[:12], raw[12:]
+        key = _totp_derive_key(master)
+        return AESGCM(key).decrypt(nonce, ct, None).decode("utf-8")
+    except Exception:
+        return ""
 
 
 def hash_password(password: str, pepper: str, *, iterations: int = PBKDF2_ITERATIONS) -> str:
@@ -109,12 +153,13 @@ class AuthError(Exception):
 
 
 class AuthService:
-    def __init__(self, db: Database, pepper: str, session_ttl: int, max_failed: int, lockout: int):
+    def __init__(self, db: Database, pepper: str, session_ttl: int, max_failed: int, lockout: int, totp_key: str = ""):
         self.db = db
         self.pepper = pepper
         self.session_ttl = session_ttl
         self.max_failed = max_failed
         self.lockout = lockout
+        self._totp_key = totp_key  # S11: TOTP 加密密钥
 
     def ensure_bootstrap_admin(self, username: str) -> str | None:
         """若无用户则创建管理员，返回临时密码；否则 None。"""
@@ -164,7 +209,7 @@ class AuthService:
                 ok = True
             elif recovery_code:
                 ok = self._use_recovery_code(user_id, recovery_code)
-            elif totp_code and totp_verify(row["totp_secret"], totp_code):
+            elif totp_code and totp_verify(decrypt_totp_secret(self._totp_key, row["totp_secret"]), totp_code):
                 ok = True
 
         self.db.execute(
@@ -191,7 +236,8 @@ class AuthService:
         return True
 
     def _issue_session(self, user_id: int, ip: str = "", ua: str = "") -> dict[str, Any]:
-        sid = new_id("sess")
+        # S23: 会话 token 使用高熵随机值（≥128bit），不用短 UUID
+        sid = "sess_" + pysecrets.token_urlsafe(32)
         csrf = pysecrets.token_urlsafe(24)
         t = now()
         self.db.execute(
@@ -245,14 +291,15 @@ class AuthService:
         if row["totp_enabled"]:
             if not password or not verify_password(password, row["password_hash"], self.pepper):
                 raise AuthError("reauth_required", "更换 2FA 需要当前密码")
-            if not totp_code or not totp_verify(row["totp_secret"], totp_code):
+            if not totp_code or not totp_verify(decrypt_totp_secret(self._totp_key, row["totp_secret"]), totp_code):
                 raise AuthError("reauth_required", "更换 2FA 需要当前动态码")
         secret = generate_totp_secret()
-        # 待确认 secret 与正式 secret 分离：不覆盖、不禁用
+        # S11: 待确认 secret 加密存储
+        enc_secret = encrypt_totp_secret(self._totp_key, secret)
         self.db.execute(
             "INSERT INTO meta(key, value) VALUES(?, ?)"
             " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (f"totp_pending:{user_id}", secret),
+            (f"totp_pending:{user_id}", enc_secret),
         )
         username = row["username"]
         return {"secret": secret, "otpauth": otpauth_uri(username, secret)}
@@ -270,7 +317,11 @@ class AuthService:
         )
         if not pending or not pending["value"]:
             raise AuthError("no_secret", "尚未初始化 TOTP")
-        if not totp_verify(pending["value"], code):
+        # S11: 解密 pending secret 再验证
+        pending_secret = decrypt_totp_secret(self._totp_key, pending["value"])
+        if not pending_secret:
+            raise AuthError("no_secret", "TOTP secret 解密失败")
+        if not totp_verify(pending_secret, code):
             raise AuthError("invalid_code", "动态验证码错误")
         if row["totp_enabled"] and password:
             # 更换流程需再次确认密码（setup 已验过，这里做一次最终确认）
@@ -287,7 +338,7 @@ class AuthService:
                 )
             conn.execute(
                 "UPDATE users SET totp_secret=?, totp_enabled=1, updated_at=? WHERE id=?",
-                (pending["value"], now(), user_id),
+                (encrypt_totp_secret(self._totp_key, pending_secret), now(), user_id),
             )
             conn.execute("DELETE FROM meta WHERE key=?", (f"totp_pending:{user_id}",))
             # 更换认证因素：撤销该用户其它会话（保留当前由调用方决定）
@@ -301,7 +352,7 @@ class AuthService:
         if not password or not verify_password(password, row["password_hash"], self.pepper):
             raise AuthError("reauth_required", "需要当前密码")
         if row["totp_enabled"]:
-            if not totp_code or not totp_verify(row["totp_secret"], totp_code):
+            if not totp_code or not totp_verify(decrypt_totp_secret(self._totp_key, row["totp_secret"]), totp_code):
                 raise AuthError("reauth_required", "需要当前动态码")
         self.db.execute(
             "UPDATE users SET totp_enabled=0, totp_secret='', updated_at=? WHERE id=?",
@@ -324,7 +375,11 @@ class AuthService:
         )
         if not row or not row["totp_enabled"] or not row["totp_secret"]:
             return False
-        return totp_verify(row["totp_secret"], (code or "").strip())
+        # S11: 解密后验证
+        secret = decrypt_totp_secret(self._totp_key, row["totp_secret"])
+        if not secret:
+            return False
+        return totp_verify(secret, (code or "").strip())
 
     def cleanup(self) -> None:
         self.db.execute("DELETE FROM web_sessions WHERE expires_at<?", (now(),))

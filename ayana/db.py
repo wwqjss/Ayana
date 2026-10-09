@@ -825,14 +825,22 @@ class Database:
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
+        """短事务。S16: 嵌套 tx 只在最外层提交/回滚，内层共享同一事务。"""
         conn = self._connect()
         with self._write_lock:
+            # 事务深度：用线程局部变量追踪（sqlite3.Connection 不允许自定义属性）
+            depth = getattr(self, "_tx_depth", 0)
+            self._tx_depth = depth + 1
             try:
                 yield conn
-                conn.commit()
+                if depth == 0:
+                    conn.commit()
             except Exception:
-                conn.rollback()
+                if depth == 0:
+                    conn.rollback()
                 raise
+            finally:
+                self._tx_depth = depth
 
     def execute(self, sql: str, params: tuple | dict = ()) -> sqlite3.Cursor:
         conn = self._connect()

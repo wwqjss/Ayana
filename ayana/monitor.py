@@ -2,6 +2,7 @@
 
 状态：
 - ok / warn / bad  有数据且阈值判定
+- not_enabled      功能未启用（如 Swap 总量为 0）
 - no_data          查询成功但无样本
 - collect_error    Prometheus 不可达 / 查询失败
 """
@@ -44,11 +45,28 @@ def _state_from_value(metric: str, value: float | None) -> str:
     return "ok"
 
 
+def _swap_state_and_value(
+    swap_total: float | None, swap_used: float | None
+) -> tuple[str, float | None]:
+    """Swap 状态：总量为 0 → 未启用；否则按使用率阈值判定。"""
+    if swap_total is None:
+        return "no_data", None
+    if swap_total <= 0:
+        return "not_enabled", None
+    if swap_used is None:
+        return "no_data", None
+    return _state_from_value("swap", swap_used), swap_used
+
+
 def _agg_max(samples: list[dict]) -> float | None:
     vals = [s.get("value") for s in samples if s.get("value") is not None]
     if not vals:
         return None
-    return max(float(v) for v in vals)
+    nums = [float(v) for v in vals]
+    nums = [n for n in nums if n == n]  # drop NaN
+    if not nums:
+        return None
+    return max(nums)
 
 
 def _agg_sum_latest(samples: list[dict]) -> float | None:
@@ -62,7 +80,11 @@ def _agg_sum_latest(samples: list[dict]) -> float | None:
     vals = [s.get("value") for s in by_series.values() if s.get("value") is not None]
     if not vals:
         return None
-    return sum(float(v) for v in vals)
+    nums = [float(v) for v in vals]
+    nums = [n for n in nums if n == n]
+    if not nums:
+        return None
+    return sum(nums)
 
 
 def json_key(metric: dict) -> str:
@@ -90,9 +112,10 @@ class HostMonitor:
         return {
             "cpu": f'100 - (avg(rate(node_cpu_seconds_total{{{sel},mode="idle"}}[2m])) * 100)',
             "memory": f'100 * (1 - (node_memory_MemAvailable_bytes{{{sel}}} / node_memory_MemTotal_bytes{{{sel}}}))',
+            "swap_total": f'node_memory_SwapTotal_bytes{{{sel}}}',
             "swap": (
                 f'100 * (1 - (node_memory_SwapFree_bytes{{{sel}}} /'
-                f' clamp_min(node_memory_SwapTotal_bytes{{{sel}}}, 1)))'
+                f' node_memory_SwapTotal_bytes{{{sel}}}))'
             ),
             "disk": (
                 f'100 * (1 - (node_filesystem_avail_bytes{{{sel},fstype!~"tmpfs|overlay|squashfs|ramfs"}} /'
@@ -150,7 +173,7 @@ class HostMonitor:
         points = [
             {"t": s.get("sample_at"), "v": s.get("value")}
             for s in sorted(series, key=lambda x: x.get("sample_at") or 0)
-            if s.get("sample_at") is not None
+            if s.get("sample_at") is not None and s.get("value") is not None and s.get("value") == s.get("value")
         ]
         return {
             "key": name,
@@ -160,6 +183,37 @@ class HostMonitor:
             "state": state,
             "points": points,
             "updated_at": time.time(),
+        }
+
+    def _swap_metric_block(
+        self,
+        *,
+        total_samples: list[dict],
+        used_samples: list[dict],
+        series: list[dict],
+    ) -> dict[str, Any]:
+        """Swap 专用：总量为 0 → 未启用，不计算使用率、不标异常。"""
+        swap_total = _agg_max(total_samples)
+        swap_used = _agg_max(used_samples)
+        state, value = _swap_state_and_value(swap_total, swap_used)
+        points = []
+        if state != "not_enabled":
+            points = [
+                {"t": s.get("sample_at"), "v": s.get("value")}
+                for s in sorted(series, key=lambda x: x.get("sample_at") or 0)
+                if s.get("sample_at") is not None
+                and s.get("value") is not None
+                and s.get("value") == s.get("value")
+            ]
+        return {
+            "key": "swap",
+            "label": "Swap 使用率",
+            "unit": "%",
+            "value": value,
+            "state": state,
+            "points": points,
+            "updated_at": time.time(),
+            "total": swap_total,
         }
 
     async def host_overview(self, asset_id: str) -> dict[str, Any]:
@@ -175,6 +229,7 @@ class HostMonitor:
         try:
             cpu = await self._query_instant(exprs["cpu"])
             mem = await self._query_instant(exprs["memory"])
+            swap_total = await self._query_instant(exprs["swap_total"])
             swap = await self._query_instant(exprs["swap"])
             disk = await self._query_instant(exprs["disk"])
             load = await self._query_instant(exprs["load1"])
@@ -194,10 +249,13 @@ class HostMonitor:
                 st = "ok" if cur is not None else "no_data"
             return {"key": key, "label": label, "unit": unit, "value": cur, "state": st}
 
+        swap_blk = self._swap_metric_block(
+            total_samples=swap_total, used_samples=swap, series=[]
+        )
         metrics = {
             "cpu": blk("cpu", cpu, "%", "CPU 使用率"),
             "memory": blk("memory", mem, "%", "内存使用率"),
-            "swap": blk("swap", swap, "%", "Swap 使用率"),
+            "swap": swap_blk,
             "disk": blk("disk", disk, "%", "磁盘使用率(最大)"),
             "load1": blk("load1", load, "", "负载 1m", thresh_key=None),
             "load5": blk("load5", load5, "", "负载 5m", thresh_key=None),
@@ -210,15 +268,23 @@ class HostMonitor:
             result["state"] = "collect_error"
             result["error"] = "node_exporter_down"
         else:
-            # 汇总最差状态
-            order = {"ok": 0, "no_data": 1, "warn": 2, "bad": 3, "collect_error": 4}
-            worst = max(
-                (m["state"] for m in metrics.values()),
-                key=lambda s: order.get(s, 0),
-                default="ok",
-            )
-            result["state"] = worst if worst != "no_data" else "ok"
-            if all(m["value"] is None for m in metrics.values()):
+            # 汇总最差状态（not_enabled 不参与告警）
+            order = {"ok": 0, "not_enabled": 0, "partial_no_data": 1, "no_data": 1, "warn": 2, "bad": 3, "collect_error": 4}
+            states = [m["state"] for m in metrics.values() if m["state"] != "not_enabled"]
+            has_data = any(m["value"] is not None for m in metrics.values())
+            no_data_count = sum(1 for s in states if s == "no_data")
+            if no_data_count and has_data:
+                # S20: 部分缺测 → partial_no_data，不改成 ok
+                worst_partial = max(
+                    (s for s in states if s != "no_data"),
+                    key=lambda s: order.get(s, 0),
+                    default="ok",
+                )
+                result["state"] = worst_partial if order.get(worst_partial, 0) > 1 else "partial_no_data"
+            else:
+                worst = max(states, key=lambda s: order.get(s, 0), default="ok")
+                result["state"] = worst
+            if all(m["value"] is None and m["state"] != "not_enabled" for m in metrics.values()):
                 result["state"] = "no_data"
         result["metrics"] = metrics
         return result
@@ -253,7 +319,16 @@ class HostMonitor:
         }
         metrics: dict[str, Any] = {}
         collect_err = ""
+        swap_total_samples: list[dict] = []
+        swap_used_series: list[dict] = []
+        swap_used_instant: list[dict] = []
         for key, expr in exprs.items():
+            if key == "swap_total":
+                try:
+                    swap_total_samples = await self._query_instant(expr)
+                except PromError as e:
+                    collect_err = str(e)[:200]
+                continue
             unit, label = labels.get(key, ("", key))
             try:
                 series = await self._query_series(expr, start=start, end=end, step=step)
@@ -271,6 +346,10 @@ class HostMonitor:
                     "error": collect_err,
                 }
                 continue
+            if key == "swap":
+                swap_used_series = series
+                swap_used_instant = instant
+                continue
             if key.startswith(("disk_read", "disk_write", "net_")):
                 cur = _agg_sum_latest(instant)
             else:
@@ -284,11 +363,11 @@ class HostMonitor:
             for s in series:
                 t = float(s.get("sample_at") or 0)
                 v = s.get("value")
-                if v is None:
+                if v is None or v != v:
                     continue
-                if key.startswith(("disk_read", "disk_write", "net_", "disk")) or key in ("cpu", "memory", "swap"):
+                if key.startswith(("disk_read", "disk_write", "net_", "disk")) or key in ("cpu", "memory"):
                     # 多序列：同刻求和（disk 取 max）
-                    if key == "disk" or key in ("cpu", "memory", "swap"):
+                    if key == "disk" or key in ("cpu", "memory"):
                         prev = by_t.get(t)
                         by_t[t] = max(prev, float(v)) if prev is not None else float(v)
                     else:
@@ -305,14 +384,21 @@ class HostMonitor:
                 "state": st,
                 "points": points,
             }
+        # Swap 专用块：总量为 0 → 未启用
+        swap_blk = self._swap_metric_block(
+            total_samples=swap_total_samples,
+            used_samples=swap_used_instant,
+            series=swap_used_series,
+        )
+        metrics["swap"] = swap_blk
         out["metrics"] = metrics
         if collect_err and all(m.get("state") == "collect_error" for m in metrics.values()):
             out["state"] = "collect_error"
             out["error"] = collect_err
-        elif all(m.get("value") is None for m in metrics.values()):
+        elif all(m.get("value") is None and m.get("state") != "not_enabled" for m in metrics.values()):
             out["state"] = "no_data"
         else:
-            order = {"ok": 0, "no_data": 1, "warn": 2, "bad": 3, "collect_error": 4}
+            order = {"ok": 0, "not_enabled": 0, "no_data": 1, "warn": 2, "bad": 3, "collect_error": 4}
             out["state"] = max(
                 (m.get("state") for m in metrics.values()),
                 key=lambda s: order.get(s, 0),

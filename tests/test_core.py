@@ -92,11 +92,27 @@ class TestPolicy(unittest.TestCase):
         )
         self.assertTrue(d["allowed"])
         self.assertTrue(d["require_approval"])
+        # S08: require_approval=True 时即使 auto_allowed=True，也不允许自动派发
         d2 = self.policy.check(
             subject_type="web_user", subject_id="admin", capability="service.restart",
             asset_id="nerv", object_id="o1", auto=True,
         )
-        self.assertTrue(d2["allowed"])
+        self.assertFalse(d2["allowed"])
+        self.assertEqual(d2.get("reason"), "approval_required")
+
+    def test_auto_allowed_without_approval(self):
+        """auto_allowed=True 且 require_approval=False → 可自动派发。"""
+        self.policy.upsert_permission(
+            subject_type="web_user", subject_id="admin", capability="service.restart",
+            asset_id="nerv", object_id="o1", allow=True, require_approval=False, auto_allowed=True,
+            actor="t",
+        )
+        d = self.policy.check(
+            subject_type="web_user", subject_id="admin", capability="service.restart",
+            asset_id="nerv", object_id="o1", auto=True,
+        )
+        self.assertTrue(d["allowed"])
+        self.assertEqual(d.get("decision"), "automatic")
 
     def test_auto_denied_when_not_allowed(self):
         self.policy.upsert_permission(

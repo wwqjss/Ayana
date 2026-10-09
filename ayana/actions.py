@@ -651,10 +651,10 @@ class ActionService:
             )
 
     def expire_stale_proposals(self) -> int:
-        """TTL / approval_deadline 到期的 proposed → expired。"""
+        """TTL / approval_deadline 到期的 proposed/approved → expired。S14: 同步事件 need_human。"""
         t = now()
         rows = self.db.query(
-            "SELECT id, incident_id FROM actions WHERE state='proposed'"
+            "SELECT id, incident_id FROM actions WHERE state IN ('proposed','approved')"
             " AND (approval_deadline IS NOT NULL AND ? > approval_deadline"
             "      OR ? - created_at > ?)",
             (t, t, float(self.action_ttl)),
@@ -664,7 +664,7 @@ class ActionService:
             with self.db.tx() as conn:
                 cur = conn.execute(
                     "UPDATE actions SET state='expired', finished_at=?,"
-                    " result_detail='approval_expired' WHERE id=? AND state='proposed'",
+                    " result_detail='approval_expired' WHERE id=? AND state IN ('proposed','approved')",
                     (t, r["id"]),
                 )
                 if cur.rowcount:
@@ -686,6 +686,13 @@ class ActionService:
                             json.dumps({"action_id": r["id"]}, ensure_ascii=False),
                         ),
                     )
+                    # S14: 到期同步事件为需人工
+                    if r["incident_id"]:
+                        conn.execute(
+                            "UPDATE incidents SET need_human=1, need_human_reason=?,"
+                            " stage='need_human' WHERE id=? AND status='open'",
+                            (f"approval_expired:{r['id']}", r["incident_id"]),
+                        )
         return n
 
     def cancel_pending_for_incident(self, incident_id: str, reason: str = "incident_recovered") -> int:
@@ -1053,9 +1060,15 @@ class ActionService:
             code, detail = reject
             raise ActionError(code, detail)
 
-        # 网络：真正执行
-        res = await self._write_channel(row["asset_id"], tokens, timeout=15.0)
-        state, detail = classify_exec_result(res)
+        # 网络：真正执行。S14: Transport 异常须收敛，不能卡在 dispatched
+        try:
+            res = await self._write_channel(row["asset_id"], tokens, timeout=15.0)
+            state, detail = classify_exec_result(res)
+        except Exception as e:
+            # 未发出/异常：收敛为 unknown + 需人工，释放对象锁
+            log.exception("action write_channel failed")
+            state, detail = "unknown", f"exec_exception:{str(e)[:120]}"
+            res = None
 
         # ---- 同事务提交：结果 + 审计 + 验证义务/人工 + 事件 ----
         finished_at = now()
@@ -1088,8 +1101,8 @@ class ActionService:
                     action_id,
                     json.dumps(
                         {
-                            "returncode": res.returncode,
-                            "timed_out": res.timed_out,
+                            "returncode": res.returncode if res else -1,
+                            "timed_out": res.timed_out if res else False,
                             "nt_account": dispatcher,
                             "actor": f"{actor_type}:{actor_id}",
                             "capability": row.get("capability") or "",
@@ -1629,7 +1642,9 @@ class ActionService:
             return {"id": action_id, "state": "unknown", "adjudication": "still_unknown"}
 
         # executed / not_executed：结束 unknown 占用，但不改写原始 result_detail
+        # S15: executed 核清 ≠ 业务成功；须先建验证义务再释放
         release_state = "success" if outcome == "executed" else "cancelled"
+        vid = new_id("ver") if outcome == "executed" else ""
         with self.db.tx() as conn:
             conn.execute(
                 "UPDATE actions SET adjudication=?, adjudicated_at=?, adjudication_reason=?,"
@@ -1637,6 +1652,23 @@ class ActionService:
                 " WHERE id=? AND state='unknown'",
                 (outcome, t, reason or outcome, release_state, t, action_id),
             )
+            # S15: executed 核清时建立验证义务，不直接当 success 释放
+            if vid and outcome == "executed":
+                criteria = {
+                    "checks": ["service_status", "stability"],
+                    "asset_id": row["asset_id"],
+                    "object_id": row["object_id"],
+                    "incident_id": row.get("incident_id") or "",
+                    "baseline_finished_at": t,
+                    "source": "adjudicated_unknown",
+                }
+                conn.execute(
+                    "INSERT INTO verifications(id, action_id, incident_id, status,"
+                    " criteria_json, started_at, profile_id, generation, deadline_at)"
+                    " VALUES(?,?,?,?,?,?,?,?,?)",
+                    (vid, action_id, row.get("incident_id") or "", "pending",
+                     json.dumps(criteria, ensure_ascii=False), t, "", 0, t + 180.0),
+                )
             conn.execute(
                 "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, object_id,"
                 " action_id, detail_json, incident_id, channel) VALUES(?,?,?,?,?,?,?,?,?,?)",

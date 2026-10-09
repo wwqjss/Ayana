@@ -10,6 +10,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -19,6 +20,22 @@ from typing import Any, Protocol
 
 from .db import Database, new_id, now
 from .ntsafe import NTError, NTResult
+
+# S01: 严格校验 SSH username/host，拒绝选项形态与元字符注入
+_USERNAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,31}$")
+_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:\-_]{0,252}$")
+
+
+def validate_ssh_identity(username: str, host: str) -> None:
+    """拒绝可被 OpenSSH 解析为选项或带 shell 元字符的 username/host。"""
+    if not username or not _USERNAME_RE.match(username) or username.startswith("-"):
+        raise TransportError("bad_username", "invalid username syntax")
+    if not host or not _HOST_RE.match(host) or host.startswith("-"):
+        raise TransportError("bad_host", "invalid host syntax")
+    if "@" in username or "@" in host:
+        raise TransportError("bad_identity", "unexpected @ in identity")
+    if ":" in username:
+        raise TransportError("bad_username", "unexpected : in username")
 
 
 class TransportError(Exception):
@@ -49,6 +66,9 @@ async def fetch_host_key(host: str, port: int = 22, *, timeout: float = 8.0) -> 
     """用 ssh-keyscan 获取主机公钥（不登录）。失败返回 ok=False。"""
     if not host:
         raise TransportError("host_required")
+    # S01: host 也须合法，防止 ssh-keyscan 参数注入
+    if not _HOST_RE.match(host) or host.startswith("-"):
+        raise TransportError("bad_host", "invalid host syntax")
     proc = await asyncio.create_subprocess_exec(
         "ssh-keyscan",
         "-T", str(max(2, int(timeout))),
@@ -204,6 +224,10 @@ class SSHAssetStore:
     ) -> dict[str, Any]:
         if not host or not username:
             raise TransportError("bad_endpoint", "host/username required")
+        # S01: 严格校验 username/host，防止 SSH 参数注入
+        validate_ssh_identity(username, host)
+        if not (1 <= int(port) <= 65535):
+            raise TransportError("bad_port", "port out of range")
         # 允许自定义角色名；校验 kind
         self.role_kind(role)
         t = now()
@@ -479,7 +503,9 @@ class SSHTransport:
                 argv += ["-o", "BatchMode=yes"]
             if identity:
                 argv += ["-i", str(identity)]
-            argv += [f"{ep.username}@{ep.host}", remote]
+            # S01: 用 -l 分隔用户与目的地，拒绝选项形态注入
+            validate_ssh_identity(ep.username, ep.host)
+            argv += ["-l", ep.username, "--", ep.host, remote]
 
             proc = await asyncio.create_subprocess_exec(
                 *argv,
