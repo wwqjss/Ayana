@@ -370,7 +370,7 @@ async def _llm_intent(
     for attempt in range(2):
         try:
             resp = await llm.chat_raw(
-                messages, max_tokens=800, json_mode=(attempt == 0), temperature=0.2
+                messages, max_tokens=1600, json_mode=(attempt == 0), temperature=0.2
             )
         except Exception as e:
             err = f"chat_exception:{e}"
@@ -393,43 +393,85 @@ async def _llm_intent(
 
 
 def _extract_json_object(raw: str) -> dict[str, Any] | None:
-    """从模型输出提取 JSON：容错代码块、尾逗号、单引号、未闭合。"""
+    """从模型输出提取 JSON：容错代码块、尾逗号、单引号、截断括号。"""
     if not raw:
         return None
     s = raw.strip()
     s = re.sub(r"^```(?:json)?\s*", "", s)
     s = re.sub(r"\s*```$", "", s)
     m = re.search(r"\{[\s\S]*\}", s)
-    if not m:
+    blob = m.group(0) if m else (s if s.startswith("{") else "")
+    if not blob:
         return None
-    blob = m.group(0)
-    for attempt in (blob, re.sub(r",\s*([}\]])", r"\1", blob), blob.replace("'", '"')):
+    candidates = [
+        blob,
+        re.sub(r",\s*([}\]])", r"\1", blob),
+        blob.replace("'", '"'),
+    ]
+    # 截断修复：按括号栈补齐缺失的 }"/ 项
+    repaired = _repair_truncated_json(blob)
+    if repaired:
+        candidates.append(repaired)
+        candidates.append(re.sub(r",\s*([}\]])", r"\1", repaired))
+    for attempt in candidates:
         try:
             data = json.loads(attempt)
             if isinstance(data, dict):
                 return data
         except Exception:
             continue
-    # 尽力截到最后一层括号
-    depth = 0
-    end = 0
-    for i, ch in enumerate(blob):
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                end = i + 1
-                break
-    if end > 2:
-        frag = blob[:end]
-        try:
-            data = json.loads(re.sub(r",\s*([}\]])", r"\1", frag))
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
     return None
+
+
+def _repair_truncated_json(blob: str) -> str | None:
+    """尽力闭合因 max_tokens 截断的 JSON。"""
+    if not blob or not blob.startswith("{"):
+        return None
+    out = []
+    stack: list[str] = []
+    in_str = False
+    esc = False
+    for ch in blob:
+        out.append(ch)
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            stack.append("}")
+        elif ch == "[":
+            stack.append("]")
+        elif ch in "}]":
+            if stack and stack[-1] == ch:
+                stack.pop()
+    tail = "".join(out)
+    # 未闭合字符串
+    if in_str:
+        tail += '"'
+    # 去掉尾部悬挂逗号 / 半个字段
+    tail = re.sub(r",\s*$", "", tail)
+    # 若最后像 "key" 或 "key": 无值，截掉
+    tail = re.sub(r',?\s*"[^"]*"?\s*:?\s*$', "", tail)
+    tail = re.sub(r",\s*$", "", tail)
+    for closer in reversed(stack):
+        tail += closer
+    try:
+        data = json.loads(tail)
+        return tail if isinstance(data, dict) else None
+    except Exception:
+        # 再试去尾逗号
+        try:
+            t2 = re.sub(r",\s*([}\]])", r"\1", tail)
+            data = json.loads(t2)
+            return t2 if isinstance(data, dict) else None
+        except Exception:
+            return None
 
 
 def build_check_summary(fields: dict[str, Any]) -> str:
