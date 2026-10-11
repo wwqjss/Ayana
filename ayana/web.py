@@ -197,6 +197,30 @@ class WebApp:
         app.router.add_get("/api/checks", self.api_checks_list)
         app.router.add_post("/api/checks", self.api_checks_create)
         app.router.add_post("/api/assist/configure", self.api_assist_configure)
+        app.router.add_post("/api/checks/update", self.api_checks_update)
+        app.router.add_post("/api/checks/delete", self.api_checks_delete)
+        app.router.add_post("/api/checks/run", self.api_checks_run)
+        app.router.add_get("/api/checks/activity", self.api_checks_activity)
+        app.router.add_get("/api/promconfig/overview", self.api_promconfig_overview)
+        app.router.add_get("/api/promconfig/config", self.api_promconfig_config)
+        app.router.add_get("/api/promconfig/targets", self.api_promconfig_targets)
+        app.router.add_post("/api/promconfig/targets", self.api_promconfig_target_add)
+        app.router.add_post("/api/promconfig/targets/update", self.api_promconfig_target_update)
+        app.router.add_post("/api/promconfig/targets/delete", self.api_promconfig_target_delete)
+        app.router.add_get("/api/promconfig/rules", self.api_promconfig_rules)
+        app.router.add_get("/api/promconfig/rules/templates", self.api_promconfig_rule_templates)
+        app.router.add_post("/api/promconfig/rules/template", self.api_promconfig_rule_apply_template)
+        app.router.add_post("/api/promconfig/rules/update", self.api_promconfig_rule_update)
+        app.router.add_get("/api/promconfig/node-exporter", self.api_promconfig_node_status)
+        app.router.add_post("/api/promconfig/node-exporter", self.api_promconfig_node_control)
+        app.router.add_post("/api/promconfig/node-exporter/register", self.api_promconfig_node_register)
+        app.router.add_post("/api/promconfig/node-exporter/adopt", self.api_promconfig_node_adopt)
+        app.router.add_post("/api/promconfig/node-exporter/detect", self.api_promconfig_node_detect)
+        app.router.add_post("/api/promconfig/node-exporter/install", self.api_promconfig_node_install)
+        app.router.add_post("/api/promconfig/validate", self.api_promconfig_validate)
+        app.router.add_post("/api/promconfig/rollback", self.api_promconfig_rollback)
+        app.router.add_post("/hooks/alertmanager", self.hook_alertmanager)
+        return app
 
     async def api_assist_configure(self, request: web.Request) -> web.Response:
         """自然语言 → 填表意图。只读查询 + 字段草稿；不保存。"""
@@ -212,7 +236,6 @@ class WebApp:
         if domain not in ("checks", "permissions"):
             return _json({"ok": False, "error": "bad_domain"}, 400)
 
-        # 只读上下文：资产 / 能力 / 现有检查名
         assets = [r["id"] for r in self.db.query("SELECT id FROM assets ORDER BY id")]
         caps: list[str] = []
         try:
@@ -239,7 +262,6 @@ class WebApp:
             capabilities=caps,
             existing_names=names,
         )
-        # 审计：只记录意图，不记录完整自由文本（可截断）
         try:
             self.db.audit(
                 "web_user",
@@ -250,30 +272,6 @@ class WebApp:
         except Exception:
             pass
         return _json(res)
-        app.router.add_post("/api/checks/update", self.api_checks_update)
-        app.router.add_post("/api/checks/delete", self.api_checks_delete)
-        app.router.add_post("/api/checks/run", self.api_checks_run)
-        app.router.add_get("/api/checks/activity", self.api_checks_activity)
-        app.router.add_get("/api/promconfig/overview", self.api_promconfig_overview)
-        app.router.add_get("/api/promconfig/config", self.api_promconfig_config)
-        app.router.add_get("/api/promconfig/targets", self.api_promconfig_targets)
-        app.router.add_post("/api/promconfig/targets", self.api_promconfig_target_add)
-        app.router.add_post("/api/promconfig/targets/update", self.api_promconfig_target_update)
-        app.router.add_post("/api/promconfig/targets/delete", self.api_promconfig_target_delete)
-        app.router.add_get("/api/promconfig/rules", self.api_promconfig_rules)
-        app.router.add_get("/api/promconfig/rules/templates", self.api_promconfig_rule_templates)
-        app.router.add_post("/api/promconfig/rules/template", self.api_promconfig_rule_apply_template)
-        app.router.add_post("/api/promconfig/rules/update", self.api_promconfig_rule_update)
-        app.router.add_get("/api/promconfig/node-exporter", self.api_promconfig_node_status)
-        app.router.add_post("/api/promconfig/node-exporter", self.api_promconfig_node_control)
-        app.router.add_post("/api/promconfig/node-exporter/register", self.api_promconfig_node_register)
-        app.router.add_post("/api/promconfig/node-exporter/adopt", self.api_promconfig_node_adopt)
-        app.router.add_post("/api/promconfig/node-exporter/detect", self.api_promconfig_node_detect)
-        app.router.add_post("/api/promconfig/node-exporter/install", self.api_promconfig_node_install)
-        app.router.add_post("/api/promconfig/validate", self.api_promconfig_validate)
-        app.router.add_post("/api/promconfig/rollback", self.api_promconfig_rollback)
-        app.router.add_post("/hooks/alertmanager", self.hook_alertmanager)
-        return app
 
     # ---- auth helpers ----
 
