@@ -103,9 +103,9 @@ class HostMonitor:
         self.prom = prom
 
     def _asset_sel(self, asset_id: str) -> str:
-        # Prometheus scrape 标签 asset=与 Ayana 资产 id/prom_asset 对齐
-        esc = asset_id.replace('"', "")
-        return f'asset="{esc}"'
+        # 标签大小写不敏感：romi / ROMI / Romi 视为同一资产
+        esc = asset_id.replace('"', "").replace("\\", "")
+        return f'asset=~"(?i)^{esc}$"'
 
     def _history_exprs(self, asset_id: str) -> dict[str, str]:
         sel = self._asset_sel(asset_id)

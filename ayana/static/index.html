@@ -1,442 +1,1002 @@
 <!DOCTYPE html>
+
 <html lang="zh-CN">
+
 <head>
+
 <meta charset="utf-8">
+
 <meta name="viewport" content="width=device-width, initial-scale=1">
+
 <title>Ayana</title>
-<link rel="stylesheet" href="/static/app.css?v=11">
+
+<link rel="stylesheet" href="/static/app.css?v=13">
+
 <link rel="stylesheet" href="/static/xterm/xterm.css">
+
 </head>
+
 <body>
+
 <div id="app">
+
   <div id="login-view" class="login-wrap hidden">
+
     <form id="login-form" class="card login-card">
+
       <h1>Ayana</h1>
+
       <p class="muted">运维控制台</p>
+
       <label>用户名 <input name="username" autocomplete="username" required></label>
+
       <label>密码 <input name="password" type="password" autocomplete="current-password" required></label>
+
       <label id="totp-field">TOTP <input name="totp" inputmode="numeric" maxlength="6" placeholder="6 位动态码"></label>
+
       <label id="recovery-field" class="hidden">恢复码 <input name="recovery_code" placeholder="XXXX-XXXX-XXXX"></label>
+
       <button type="submit" class="btn primary">登录</button>
+
       <p class="error" id="login-error"></p>
+
       <p class="muted small"><a href="#" id="use-recovery">使用恢复码</a></p>
+
     </form>
+
   </div>
 
+
+
   <div id="main-view" class="hidden">
+
     <header class="topbar">
+
       <div class="brand">Ayana <span class="ver" id="ver"></span></div>
+
       <nav>
+
         <button data-tab="overview" class="tab active">总览</button>
+
         <button data-tab="incidents" class="tab">事件</button>
-        <button data-tab="monitor" class="tab">监控</button>
+
+        <button data-tab="checks" class="tab">检查</button>
+        <button data-tab="monitor" class="tab">资源</button>
+        <button data-tab="promconfig" class="tab">高级·Prom</button>
+
         <button data-tab="messages" class="tab">消息记录</button>
+
         <button data-tab="connections" class="tab">连接</button>
+
         <button data-tab="notify" class="tab">通知</button>
+
         <button data-tab="knowledge" class="tab">知识</button>
+
         <button data-tab="permissions" class="tab">权限</button>
+
         <button data-tab="audit" class="tab">审计</button>
+
       </nav>
+
       <div class="user-box">
+
         <span id="username"></span>
+
         <button id="totp-btn" class="btn ghost small">2FA</button>
+
         <button id="logout-btn" class="btn ghost small">退出</button>
+
       </div>
+
     </header>
 
+
+
     <main>
+
       <section id="tab-overview" class="tab-panel">
+
         <div class="banner ok hidden" id="quiet-banner">没有需要你处理的事情</div>
+
         <div class="banner warn hidden" id="human-banner">需要人工介入</div>
+
         <div class="grid" id="overview-grid"></div>
+
       </section>
+
+
 
       <section id="tab-assets" class="tab-panel hidden">
+
         <div id="assets-list"></div>
+
       </section>
+
+
 
       <section id="tab-incidents" class="tab-panel hidden">
+
         <div id="incidents-list"></div>
+
       </section>
 
+
+
       <section id="tab-monitor" class="tab-panel hidden">
+
         <div class="card">
+
           <h2>主机资源</h2>
+
           <p class="muted small">
+
             数据来自 Prometheus（Node Exporter），不本地存时序。状态：
+
             <span class="badge ok">正常</span>
+
             <span class="badge warn">偏高</span>
+
             <span class="badge bad">异常</span>
+
             <span class="badge dim">暂无数据</span>
+
             <span class="badge bad">采集失败</span>
+
           </p>
+
           <div class="form-row">
+
             <label>主机 <select id="monitor-host"></select></label>
+
             <label>时间范围
+
               <select id="monitor-range">
+
                 <option value="15m">15 分钟</option>
+
                 <option value="1h" selected>1 小时</option>
+
                 <option value="6h">6 小时</option>
+
                 <option value="24h">24 小时</option>
+
                 <option value="7d">7 天</option>
+
+              </select>
+
+            </label>
+
+            <button class="btn primary" id="monitor-refresh" type="button">刷新</button>
+
+            <button class="btn" id="monitor-auto" type="button">自动 30s</button>
+
+          </div>
+
+          <div id="monitor-hosts-strip" class="monitor-strip"></div>
+
+          <div class="form-row" id="monitor-install-row">
+            <button class="btn primary" id="monitor-detect" type="button">一键接入监控（分步）</button>
+            <span class="muted small">自动判断 Docker / 二进制，推荐安装方式</span>
+          </div>
+          <div id="monitor-install-box"></div>
+        </div>
+
+        <div id="monitor-body"></div>
+
+      </section>
+
+
+
+      
+      <section id="tab-checks" class="tab-panel hidden">
+        <div class="card">
+          <h2>业务检查</h2>
+          <p class="muted small">盯端口、服务、自定义命令。不依赖 Prometheus；连续失败会告警。</p>
+          <div class="form-row">
+            <label>主机 <select id="chk-asset"></select></label>
+            <label>类型
+              <select id="chk-kind">
+                <option value="port">端口监听</option>
+                <option value="service">服务启动</option>
+                <option value="command">自定义命令</option>
               </select>
             </label>
-            <button class="btn primary" id="monitor-refresh" type="button">刷新</button>
-            <button class="btn" id="monitor-auto" type="button">自动 30s</button>
+            <label>名称 <input id="chk-name" placeholder="如 harbor-http"></label>
           </div>
-          <div id="monitor-hosts-strip" class="monitor-strip"></div>
+          <div class="form-row" id="chk-params-port">
+            <label>端口 <input id="chk-port" type="number" placeholder="8080"></label>
+            <label>协议
+              <select id="chk-proto"><option value="tcp">tcp</option><option value="udp">udp</option></select>
+            </label>
+          </div>
+          <div class="form-row hidden" id="chk-params-service">
+            <label>服务名 <input id="chk-unit" placeholder="nginx"></label>
+          </div>
+          <div class="form-row hidden" id="chk-params-command">
+            <label>命令(空格分隔) <input id="chk-cmd" placeholder="curl -f http://127.0.0.1:8080/health" style="min-width:320px"></label>
+            <label>期望
+              <select id="chk-expect">
+                <option value="exit0">退出码 0</option>
+                <option value="contains">输出包含</option>
+                <option value="not_contains">输出不含</option>
+              </select>
+            </label>
+            <label>匹配串 <input id="chk-expect-val" placeholder="ok"></label>
+          </div>
+          <div class="form-row">
+            <label>间隔秒 <input id="chk-interval" type="number" value="60"></label>
+            <label>连续失败 <input id="chk-threshold" type="number" value="2"></label>
+            <label>级别
+              <select id="chk-severity">
+                <option value="warning">warning</option>
+                <option value="critical">critical</option>
+                <option value="info">info</option>
+              </select>
+            </label>
+            <button class="btn primary" id="chk-add" type="button">添加检查</button>
+            <button class="btn" id="chk-refresh" type="button">刷新</button>
+          </div>
+          <div id="chk-list"></div>
         </div>
-        <div id="monitor-body"></div>
+        <div class="card">
+          <h2>动态</h2>
+          <div id="chk-activity"></div>
+        </div>
+      </section>
+
+      <section id="tab-promconfig" class="tab-panel hidden">
+        <div class="card">
+          <div class="form-row" style="margin-top:0;justify-content:space-between">
+            <div>
+              <h2 style="margin:0">Prometheus</h2>
+              <p class="muted small" id="promconfig-status" style="margin:4px 0 0">加载中...</p>
+            </div>
+            <div>
+              <button class="btn" id="promconfig-refresh" type="button">刷新</button>
+              <button class="btn" id="promconfig-validate" type="button">应用变更</button>
+            </div>
+          </div>
+          <details class="pc-adv">
+            <summary>高级：校验 / 回滚 / 原文</summary>
+            <div class="form-row">
+              <button class="btn" id="promconfig-rollback" type="button">回滚最近备份</button>
+            </div>
+            <pre id="promconfig-raw" class="code-block"></pre>
+          </details>
+        </div>
+
+        <div class="card">
+          <h2>正在监控</h2>
+          <div class="form-row">
+            <input id="pc-target-addr" placeholder="地址，如 10.0.0.5:9100" style="min-width:220px">
+            <input id="pc-target-asset" placeholder="资产，如 nerv">
+            <button class="btn primary" id="pc-target-add" type="button">添加</button>
+          </div>
+          <div id="promconfig-targets"></div>
+        </div>
+
+        <div class="card">
+          <h2>告警开关</h2>
+          <div id="promconfig-templates"></div>
+          <details class="pc-adv" style="margin-top:8px">
+            <summary>已启用规则（<span id="pc-rules-count">0</span>）</summary>
+            <div id="promconfig-rules"></div>
+          </details>
+        </div>
+
+        <div class="card">
+          <h2>主机接入监控</h2>
+          <p class="muted small">给还没有采集器的主机：检查 → 装 Node Exporter → 自动注册。</p>
+          <div class="form-row">
+            <select id="pc-ne-asset"></select>
+            <input id="pc-ne-register" placeholder="采集地址(自动)" style="min-width:220px">
+            <button class="btn primary" id="pc-ne-register-btn" type="button">一键接入</button>
+            <button class="btn" id="pc-ne-check" type="button">状态</button>
+            <button class="btn" id="pc-ne-stop" type="button">停止</button>
+          </div>
+          <div id="promconfig-ne"></div>
+        </div>
       </section>
 
       <section id="tab-messages" class="tab-panel hidden">
+
         <div class="card">
+
           <h2>消息记录</h2>
+
           <p class="muted small">
+
             统一查看各渠道入站与出站消息。出站通知复用 outbox，不重复存储；入站与机器人回复单独落库。
+
             不记录敏感凭据；仅管理员可查看。
+
           </p>
+
           <div class="form-row" id="msg-filters">
+
             <label>平台
+
               <select id="msg-platform">
+
                 <option value="">全部</option>
+
                 <option value="qq">QQ</option>
+
                 <option value="wecom">企业微信</option>
+
                 <option value="webhook">Webhook</option>
+
               </select>
+
             </label>
+
             <label>方向
+
               <select id="msg-direction">
+
                 <option value="">全部</option>
+
                 <option value="in">入站</option>
+
                 <option value="out">出站</option>
+
               </select>
+
             </label>
+
             <label>状态
+
               <select id="msg-state">
+
                 <option value="">全部</option>
+
                 <option value="received">已接收</option>
+
                 <option value="processed">已处理</option>
+
                 <option value="ignored">已忽略</option>
+
                 <option value="pending">待发送</option>
+
                 <option value="sent">发送成功</option>
+
                 <option value="failed">发送失败</option>
+
                 <option value="unknown">结果未知</option>
+
               </select>
+
             </label>
+
             <label>内容
+
               <input id="msg-q" placeholder="搜索内容 / 发送者 / 目标">
+
             </label>
+
             <label>开始
+
               <input id="msg-start" type="datetime-local">
+
             </label>
+
             <label>结束
+
               <input id="msg-end" type="datetime-local">
+
             </label>
+
             <button class="btn primary" id="msg-search" type="button">查询</button>
+
           </div>
+
           <div id="msg-list"></div>
+
           <div class="form-row" style="margin-top:10px">
+
             <button class="btn" id="msg-prev" type="button">上一页</button>
+
             <button class="btn" id="msg-next" type="button">下一页</button>
+
             <span class="muted small" id="msg-page"></span>
+
           </div>
+
         </div>
+
       </section>
+
+
 
       <section id="tab-connections" class="tab-panel hidden">
+
         <div class="card">
+
           <h2>添加主机</h2>
+
           <p class="muted small">
+
             主机 = 资产。填写连接信息即可新增；可选绑定凭据。保存后自动登记 SSH 端点，无需再单独选资产。
+
           </p>
+
           <div class="form-row" id="host-add-form">
+
             <label>主机 ID <input id="host-id" placeholder="例如 yomi / web-01"></label>
+
             <label>名称 <input id="host-name" placeholder="显示名"></label>
+
             <label>地址 <input id="host-addr" placeholder="IP / 域名"></label>
+
             <label>端口 <input id="host-port" type="number" value="22" style="width:80px"></label>
+
             <label>用户 <input id="host-user" placeholder="root"></label>
+
             <label>角色
+
               <select id="host-role"></select>
+
             </label>
+
             <button class="btn small" id="role-add-btn" type="button">+ 角色</button>
+
             <label>认证
+
               <select id="host-auth">
+
                 <option value="password">密码</option>
+
                 <option value="key">私钥</option>
+
                 <option value="cred">已有凭据</option>
+
                 <option value="none">暂不配置</option>
+
               </select>
+
             </label>
+
             <label id="host-auth-password-wrap">密码 <input id="host-password" type="password" placeholder="SSH 密码"></label>
+
             <label id="host-auth-key-wrap" class="hidden" style="flex:2">私钥 <input id="host-private-key" placeholder="粘贴 PEM 私钥"></label>
+
             <label id="host-auth-cred-wrap" class="hidden">凭据 <select id="host-cred"><option value="">（无）</option></select></label>
+
             <button class="btn primary" id="host-add-btn" type="button">添加主机</button>
+
           </div>
+
           <div id="role-add-form" class="form-row hidden" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--line)">
+
             <label>角色名 <input id="role-name" placeholder="例如 deploy / monitor"></label>
+
             <label>显示名 <input id="role-label" placeholder="例如 发布账号"></label>
+
             <label>权限
+
               <select id="role-kind">
+
                 <option value="write">可执行（exec）</option>
+
                 <option value="read">只读（query）</option>
+
               </select>
+
             </label>
+
             <button class="btn primary" id="role-save-btn" type="button">保存角色</button>
+
             <button class="btn" id="role-cancel-btn" type="button">取消</button>
+
           </div>
+
           <p class="muted small" id="host-add-msg"></p>
+
         </div>
 
+
+
         <div class="card">
+
           <h2>主机列表</h2>
+
           <div id="host-list"></div>
+
         </div>
 
+
+
         <div class="card">
+
           <h2>凭据库</h2>
+
           <p class="muted small">密码或私钥加密入库；可生成密钥对并部署公钥。列表不显示明文。</p>
+
           <div class="form-row">
+
             <label>名称 <input id="ssh-cred-name" placeholder="yomi-root"></label>
+
             <label>类型
+
               <select id="ssh-cred-kind">
+
                 <option value="password">password 密码</option>
+
                 <option value="private_key">private_key 私钥</option>
+
               </select>
+
             </label>
+
             <label style="flex:2">密钥/密码 <input id="ssh-cred-secret" placeholder="密码或粘贴私钥 PEM" type="password"></label>
+
             <button class="btn" id="ssh-cred-save" type="button">导入凭据</button>
+
             <button class="btn" id="ssh-cred-gen" type="button">生成密钥对</button>
+
           </div>
+
           <div id="ssh-creds"></div>
+
         </div>
 
+
+
         <div class="card">
+
           <h2>连接测试</h2>
+
           <div class="form-row">
+
             <label>主机 <select id="ssh-test-asset"></select></label>
+
             <label>角色
+
               <select id="ssh-test-role">
+
                 <option value="read">read</option>
+
                 <option value="write">write</option>
+
               </select>
+
             </label>
+
             <button class="btn primary" id="ssh-test-btn" type="button">测试连接</button>
+
           </div>
+
           <pre id="ssh-test-out" class="muted small" style="white-space:pre-wrap;min-height:40px"></pre>
+
         </div>
+
       </section>
+
+
 
       <section id="tab-notify" class="tab-panel hidden">
+
         <div class="card">
+
           <h2>通知渠道</h2>
+
           <p class="muted small">
+
             同一事件会并行发到所有已启用渠道；各渠道独立记录状态与失败原因，互不影响。
+
             敏感凭据加密保存，界面不回显明文。配置顺序：消息平台 → 接入方式 → 填写配置。
+
           </p>
+
           <div class="form-row" id="notify-add-form">
+
             <label>消息平台
+
               <select id="notify-platform">
+
                 <option value="qq">QQ</option>
+
                 <option value="wecom" selected>企业微信</option>
+
                 <option value="webhook">通用 Webhook</option>
+
               </select>
+
             </label>
+
             <label>接入方式
+
               <select id="notify-method"></select>
+
             </label>
+
             <label>名称 <input id="notify-name" placeholder="例如 值班群 / 企微告警"></label>
+
           </div>
+
+
 
           <!-- QQ -->
+
           <div class="form-row" id="notify-qq-wrap">
+
             <label>目标
+
               <input id="notify-qq-target" placeholder="user:123 或 group:456">
+
             </label>
+
             <button class="btn primary" id="notify-add-btn" type="button">添加渠道</button>
+
           </div>
+
+
 
           <!-- 企业微信 · 群机器人 Webhook -->
+
           <div class="form-row hidden" id="notify-wecom-wrap">
+
             <label style="flex:2">Webhook 地址
+
               <input id="notify-wecom-url" type="password" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...">
+
             </label>
+
             <button class="btn primary" id="notify-add-btn-wecom" type="button">添加渠道</button>
+
           </div>
+
+
 
           <!-- 企业微信 · 智能机器人长连接 -->
+
           <div class="hidden" id="notify-aibot-wrap">
+
             <div class="form-row">
+
               <label>Bot ID
+
                 <input id="notify-aibot-botid" type="password" placeholder="企微后台「API 模式 · 长连接」生成">
+
               </label>
+
               <label>Secret
+
                 <input id="notify-aibot-secret" type="password" placeholder="长连接专用 Secret">
+
               </label>
+
               <label style="flex:2">WebSocket 地址（可选）
+
                 <input id="notify-aibot-wsurl" placeholder="默认 wss://openws.work.weixin.qq.com；私有部署另填">
+
               </label>
+
             </div>
+
             <div class="form-row" style="margin-top:8px">
+
               <label style="flex:2">推送目标（可空，可多条，逗号/换行分隔）
+
                 <input id="notify-aibot-targets" placeholder="可先留空；连接后在群里 @机器人 即可自动发现，也可手动填 chatid/userid">
+
               </label>
+
               <button class="btn primary" id="notify-add-btn-aibot" type="button">添加渠道</button>
+
             </div>
+
             <p class="muted small" style="margin-top:6px">
+
               提示：推送目标可为空保存。连接成功后，在企业微信群内 @机器人 发送一条消息，即可在渠道列表的「已发现的推送目标」中勾选该群。
+
             </p>
+
           </div>
+
+
 
           <!-- 通用 Webhook -->
+
           <div class="hidden" id="notify-hook-wrap">
+
             <div class="form-row">
+
               <label style="flex:2">URL
+
                 <input id="notify-hook-url" placeholder="https://example.com/hook">
+
               </label>
+
               <label>密钥 Token
+
                 <input id="notify-hook-token" type="password" placeholder="将作为 Bearer 发送（加密保存）">
+
               </label>
+
               <button class="btn primary" id="notify-add-btn-hook" type="button">添加渠道</button>
+
             </div>
+
             <div class="form-row" style="margin-top:8px">
+
               <label>自定义头
+
                 <input id="notify-hook-headers" placeholder='JSON，如 {"X-From":"Ayana"}'>
+
               </label>
+
             </div>
+
           </div>
+
+
 
           <p class="muted small" id="notify-msg"></p>
+
           <div id="notify-guide" class="notify-guide"></div>
+
         </div>
+
         <div class="card">
+
           <h2>渠道列表</h2>
+
           <div id="notify-list"></div>
+
         </div>
+
         <div class="card">
+
           <h2>发送记录（outbox）</h2>
+
           <div class="form-row">
+
             <label>状态
+
               <select id="notify-outbox-state">
+
                 <option value="">全部</option>
+
                 <option value="pending">待发送</option>
+
                 <option value="sent">已发送</option>
+
                 <option value="failed">失败</option>
+
               </select>
+
             </label>
+
             <button class="btn" id="notify-outbox-refresh" type="button">刷新</button>
+
             <button class="btn" id="notify-outbox-retry" type="button">重试失败</button>
+
           </div>
+
           <div id="notify-outbox"></div>
+
         </div>
+
       </section>
+
+
 
       <section id="tab-knowledge" class="tab-panel hidden">
+
         <div class="card">
+
           <h2>运维知识库</h2>
+
           <p class="muted small">一个知识主题 = 一个 Markdown。供 Agent 调查与人工查阅；不授予执行权。</p>
+
           <div class="form-row" id="kb-filters">
+
             <label>搜索 <input id="kb-q" placeholder="标题 / 标签 / 正文…"></label>
+
             <label>类型
+
               <select id="kb-type">
+
                 <option value="">全部</option>
+
                 <option value="system">system 系统/链路</option>
+
                 <option value="issue">issue 典型故障</option>
+
                 <option value="procedure">procedure 方法</option>
+
               </select>
+
             </label>
+
             <label>状态
+
               <select id="kb-status">
+
                 <option value="">全部</option>
+
                 <option value="active">active 有效</option>
+
                 <option value="deprecated">deprecated 废弃</option>
+
                 <option value="historical">historical 历史</option>
+
               </select>
+
             </label>
+
             <button class="btn primary" id="kb-search" type="button">搜索</button>
+
           </div>
+
         </div>
+
         <div id="knowledge-list"></div>
+
       </section>
+
+
 
       <section id="tab-permissions" class="tab-panel hidden">
+
         <div class="card">
+
           <h2>谁能做什么</h2>
+
           <p class="muted small">
+
             按「资产 / 对象」选择处置方式。默认管理 Ayana Agent 自动处置；
+
             QQ / Web 个人授权见下方「高级权限」。
+
           </p>
+
           <p class="muted small">
+
             主机侧 commands.json / forced-command / sudoers 仍是最终安全上限，此处不能扩大。
+
           </p>
+
           <div class="perm-legend">
+
             <span><span class="dot" style="background:var(--bad)"></span>禁止</span>
+
             <span><span class="dot" style="background:var(--warn)"></span>需要我确认</span>
+
             <span><span class="dot" style="background:var(--ok)"></span>Ayana 可以自动执行</span>
+
           </div>
+
           <div id="perm-agent"></div>
+
           <h3 style="margin:18px 0 8px;font-size:14px">Agent 权限上限（ceiling）</h3>
+
           <p class="muted small">后端强制：Agent（auto_rule / llm）不能超过此处上限，也不能超过源码能力目录。</p>
+
           <div id="agent-ceiling"></div>
+
         </div>
+
         <details class="perm-adv card">
+
           <summary>高级权限（QQ / Web 用户等细规则）</summary>
+
           <div class="form-row">
+
             <label>主体类型
+
               <select id="perm-subject-type">
+
                 <option value="web_user">web_user</option>
+
                 <option value="qq_user">qq_user</option>
+
                 <option value="qq_group">qq_group</option>
+
                 <option value="auto_rule">auto_rule</option>
+
               </select>
+
             </label>
+
             <label>主体 ID <input id="perm-subject-id" placeholder="用户名 / QQ 号"></label>
+
             <label>能力 <select id="perm-cap"></select></label>
+
             <label>资产 <select id="perm-asset"></select></label>
+
             <label>对象 <input id="perm-object" value="*" ></label>
+
             <label class="chk"><input type="checkbox" id="perm-allow" checked> 允许</label>
+
             <label class="chk"><input type="checkbox" id="perm-approval" checked> 需批准</label>
+
             <label class="chk"><input type="checkbox" id="perm-auto"> 允许自动</label>
+
             <button class="btn primary" id="perm-save">保存</button>
+
           </div>
+
           <div id="perm-list"></div>
+
         </details>
+
       </section>
+
+
 
       <section id="tab-audit" class="tab-panel hidden">
+
         <div id="audit-list"></div>
+
       </section>
+
     </main>
+
   </div>
+
 </div>
+
+
 
 <div id="modal" class="modal hidden">
+
   <div class="modal-card">
+
     <h3 id="modal-title"></h3>
+
     <div id="modal-body"></div>
+
     <div class="modal-actions">
+
       <button class="btn" id="modal-close">关闭</button>
+
     </div>
+
   </div>
+
 </div>
+
+
 
 <div id="term-modal" class="modal hidden">
+
   <div class="modal-card" style="width:min(960px,96vw);max-width:96vw;height:min(640px,90vh);display:flex;flex-direction:column">
+
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+
       <h3 id="term-title" style="flex:1;margin:0">终端</h3>
+
       <span id="term-status" class="badge dim">未连接</span>
+
       <button class="btn small" id="term-reconnect">重连</button>
+
       <button class="btn small danger" id="term-disconnect">断开</button>
+
       <button class="btn small" id="term-close">关闭</button>
+
     </div>
+
     <div id="term-host-label" class="muted small" style="margin-bottom:6px"></div>
+
     <div id="term-container" style="flex:1;min-height:280px;background:#0c0c0c;border-radius:8px;overflow:hidden;padding:4px"></div>
+
   </div>
+
 </div>
 
+
+
 <script src="/static/qrcode.js?v=9"></script>
+
 <script src="/static/xterm/xterm.js"></script>
+
 <script src="/static/xterm/xterm-addon-fit.js"></script>
-<script src="/static/app.js?v=23"></script>
+
+<script src="/static/app.js?v=37"></script>
+
 </body>
+
 </html>
+

@@ -38,6 +38,8 @@ from .onewbot import OneBotServer
 from .permission_change import PermissionChangeService
 from .policy import Policy
 from .prom import PromClient
+from .promconfig import build_prom_config_service
+from .checks import CheckService
 from .qqbot import QQBot
 from .credentials import CredentialStore
 from .transport import SSHAssetStore, SSHTransport
@@ -54,6 +56,7 @@ DEFAULT_ASSETS = [
         "write_alias": "nerv-exec",
         "expected_host_id": "NERV",
         "prom_asset": "nerv",
+        "host": "203.0.113.10",
         "objects": [
             {"kind": "service", "name": "frps", "unit": "frps", "auto_recover": 1},
             {"kind": "service", "name": "nginx", "unit": "nginx"},
@@ -69,6 +72,7 @@ DEFAULT_ASSETS = [
         "write_alias": "kanata-exec",
         "expected_host_id": "KANATA",
         "prom_asset": "kanata",
+        "host": "192.0.2.10",
         "objects": [
             {"kind": "container", "name": "harbor-core", "container": "harbor-core"},
             {"kind": "container", "name": "nginx", "container": "nginx"},
@@ -82,6 +86,7 @@ DEFAULT_ASSETS = [
         "write_alias": "sora-exec",
         "expected_host_id": "sora",
         "prom_asset": "sora",
+        "host": "",
         "objects": [
             {"kind": "service", "name": "hysteria-server", "unit": "hysteria-server"},
             {"kind": "port", "name": "hy2-443", "port": 443, "protocol": "udp"},
@@ -118,8 +123,8 @@ def seed_assets(db: Database) -> None:
     for a in DEFAULT_ASSETS:
         db.execute(
             "INSERT INTO assets(id, display_name, read_alias, write_alias, expected_host_id,"
-            " prom_asset, enabled, notes, created_at, updated_at)"
-            " VALUES(?,?,?,?,?,?,1,'',?,?)",
+            " prom_asset, host, enabled, notes, created_at, updated_at)"
+            " VALUES(?,?,?,?,?,?,?,1,'',?,?)",
             (
                 a["id"],
                 a["display_name"],
@@ -127,6 +132,7 @@ def seed_assets(db: Database) -> None:
                 a["write_alias"],
                 a["expected_host_id"],
                 a["prom_asset"],
+                a.get("host") or "",
                 t,
                 t,
             ),
@@ -171,6 +177,39 @@ def seed_assets(db: Database) -> None:
         subject_type="web_user", subject_id="admin", capability="shell.interactive",
         asset_id="*", object_id="*", allow=True, require_approval=False, auto_allowed=False, actor="system",
     )
+    for cap in ("checks.read", "checks.write"):
+        row = db.query_one(
+            "SELECT id FROM permissions WHERE subject_type='web_user' AND subject_id='admin'"
+            " AND capability=? AND asset_id='*' AND object_id='*'",
+            (cap,),
+        )
+        if not row:
+            policy.upsert_permission(
+                subject_type="web_user", subject_id="admin", capability=cap,
+                asset_id="*", object_id="*", allow=True, require_approval=False,
+                auto_allowed=False, actor="system",
+            )
+
+
+def ensure_promconfig_admin_perms(db: Database) -> None:
+    """已有库升级：仅为缺失的 admin 权限插入种子，不覆盖已有决定。"""
+    from .policy import Policy
+
+    policy = Policy(db)
+    for cap in ("promconfig.read", "promconfig.write", "node_exporter.status", "node_exporter.manage"):
+        row = db.query_one(
+            "SELECT id, allow, require_approval FROM permissions"
+            " WHERE subject_type='web_user' AND subject_id='admin' AND capability=?"
+            " AND asset_id='*' AND object_id='*'",
+            (cap,),
+        )
+        if row:
+            continue
+        policy.upsert_permission(
+            subject_type="web_user", subject_id="admin", capability=cap,
+            asset_id="*", object_id="*", allow=True, require_approval=False,
+            auto_allowed=False, actor="system",
+        )
 
 
 def load_bindings(db: Database) -> list[AssetBinding]:
@@ -243,6 +282,12 @@ class App:
             async def exec(self, asset_id, tokens, timeout=None):
                 return await self._ssh.exec(asset_id, tokens, timeout=timeout)
 
+            async def send_file(self, asset_id, local_path, remote_path, *, timeout=60.0):
+                """推文件（安装二进制等）。委托 SSHTransport。"""
+                return await self._ssh.send_file(
+                    asset_id, local_path, remote_path, timeout=timeout
+                )
+
             def _endpoint(self, asset_id, role):
                 return self._ssh._endpoint(asset_id, role)
 
@@ -275,6 +320,16 @@ class App:
         )
         self.notifier.set_channel_store(self.channel_store)
         self.host_monitor = HostMonitor(self.prom)
+        try:
+            self.promconfig = build_prom_config_service(
+                self.db, cfg, prom=self.prom, transport=self.ssh_transport
+            )
+        except Exception as e:
+            log.warning("promconfig disabled: %s", e)
+            self.promconfig = None
+        self.checks = CheckService(self.db, self._checks_transport())
+        self.checks.notifier = self.notifier
+        self.checks.incidents = self.incidents
         self.aibot_manager = WeComAibotManager()
         self.channel_store.set_aibot_manager(self.aibot_manager)
         self.mlog = MessageLog(self.db)
@@ -340,9 +395,71 @@ class App:
             host_monitor=self.host_monitor,
             aibot_manager=self.aibot_manager,
             mlog=self.mlog,
+            promconfig=self.promconfig,
+            checks=self.checks,
         )
         self._stop = asyncio.Event()
         self._bg_tasks: list[asyncio.Task] = []
+
+    def _checks_transport(self):
+        """检查通道：有 SSH 端点用 SSH；本机登记资产用 LocalExec；失败不跨主机回退。"""
+        from .promconfig import LocalExecTransport
+        from .ntsafe import NTResult
+
+        ssh = self.ssh_transport
+        local = LocalExecTransport()
+        local_assets = set()
+        try:
+            pc = self.cfg.get("prometheus_config") or {}
+            if isinstance(pc, dict):
+                local_assets = {str(x) for x in (pc.get("local_assets") or []) if str(x).strip()}
+        except Exception:
+            pass
+        store = getattr(ssh, "store", None) if ssh is not None else None
+
+        class _T:
+            async def probe(self, asset_id, tokens, timeout=None):
+                ep = None
+                if store is not None:
+                    try:
+                        ep = store.get_endpoint(asset_id, "read") or store.get_endpoint(asset_id, "write")
+                    except Exception:
+                        ep = None
+                if ep and ssh is not None:
+                    return await ssh.probe(asset_id, tokens, timeout=timeout)
+                if asset_id in local_assets:
+                    return await local.probe(asset_id, tokens, timeout=timeout)
+                return NTResult(ok=False, output="endpoint_missing: " + str(asset_id), returncode=255)
+
+            async def exec(self, asset_id, tokens, timeout=None):
+                ep = None
+                if store is not None:
+                    try:
+                        ep = store.get_endpoint(asset_id, "write")
+                    except Exception:
+                        ep = None
+                if ep and ssh is not None:
+                    return await ssh.exec(asset_id, tokens, timeout=timeout)
+                if asset_id in local_assets:
+                    return await local.exec(asset_id, tokens, timeout=timeout)
+                return NTResult(ok=False, output="endpoint_missing: " + str(asset_id), returncode=255)
+
+            async def send_file(self, asset_id, local_path, remote_path, *, timeout=60.0):
+                ep = None
+                if store is not None:
+                    try:
+                        ep = store.get_endpoint(asset_id, "write")
+                    except Exception:
+                        ep = None
+                if ep and ssh is not None and hasattr(ssh, "send_file"):
+                    return await ssh.send_file(asset_id, local_path, remote_path, timeout=timeout)
+                if asset_id in local_assets:
+                    return await local.send_file(asset_id, local_path, remote_path, timeout=timeout)
+                from .ntsafe import NTResult as _R
+
+                return _R(ok=False, output="endpoint_missing: " + str(asset_id), returncode=255)
+
+        return _T()
 
     async def start(self) -> None:
         # 启动安全检查
@@ -359,6 +476,10 @@ class App:
         admin = self.auth.ensure_bootstrap_admin("admin")
         if admin:
             log.warning("BOOTSTRAP admin password (rotate after first login): %s", admin)
+        try:
+            ensure_promconfig_admin_perms(self.db)
+        except Exception as e:
+            log.warning("ensure promconfig admin perms failed: %s", e)
 
         ws_app = web.Application()
         ws_app.router.add_get(self.cfg.get("ws_path", "/ws"), self.ob.handle_ws)
@@ -402,7 +523,7 @@ class App:
         except Exception:
             log.exception("ensure_default_qq failed")
         # 启动已启用的企微智能机器人长连接
-        self._bg_tasks.append(asyncio.create_task(self._bg_aibot()))
+        self._bg_tasks.append(asyncio.create_task(self._bg_checks()))
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -420,6 +541,18 @@ class App:
             pass
         await ws_runner.cleanup()
         await http_runner.cleanup()
+
+    async def _bg_checks(self) -> None:
+        """业务检查调度：轻量默认，不依赖 Prometheus。"""
+        while not self._stop.is_set():
+            try:
+                await self.checks.run_due()
+            except Exception as e:
+                log.warning("checks tick failed: %s", e)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                pass
 
     async def _bg_outbox(self) -> None:
         while not self._stop.is_set():

@@ -302,7 +302,7 @@ function currentTabFromHash() {
   const h = (location.hash || "").replace(/^#/, "");
   const assetM = h.match(/^assets\/(.+)$/);
   if (assetM) return { tab: "overview", focus: assetM[1], assetView: true };
-  const m = h.match(/^(overview|incidents|monitor|messages|connections|notify|knowledge|permissions|audit)(?:\/(.+))?$/);
+  const m = h.match(/^(overview|incidents|monitor|checks|promconfig|messages|connections|notify|knowledge|permissions|audit)(?:\/(.+))?$/);
   return m ? { tab: m[1], focus: m[2] || "", assetView: false } : { tab: "overview", focus: "", assetView: false };
 }
 
@@ -317,7 +317,7 @@ function setTabHash(tab, focus, assetView) {
 }
 
 function activateTab(tab, focus, assetView) {
-  const valid = ["overview", "incidents", "monitor", "messages", "connections", "notify", "knowledge", "permissions", "audit"];
+  const valid = ["overview", "incidents", "monitor", "checks", "promconfig", "messages", "connections", "notify", "knowledge", "permissions", "audit"];
   if (!valid.includes(tab)) tab = "overview";
   state.tab = tab;
   state.focus = focus || "";
@@ -395,6 +395,8 @@ async function refreshTab() {
   if (state.tab === "assets") await renderAssets();
   if (state.tab === "incidents") await renderIncidents();
   if (state.tab === "monitor") await renderMonitor();
+  if (state.tab === "checks") await renderChecks();
+  if (state.tab === "promconfig") await renderPromConfig();
   if (state.tab === "messages") await renderMessages();
   if (state.tab === "connections") await renderConnections();
   if (state.tab === "notify") await renderNotify();
@@ -1821,7 +1823,7 @@ async function renderConnections() {
             },
           }),
           el("button", {
-            class: "btn small primary", text: "改用密钥登录",
+            class: "btn small primary", text: (writeEp.host_key_trusted_at && writeEp.host_key_sha256) ? "改用密钥登录" : "信任并更换密钥",
             onclick: async () => {
               const go = confirm(
                 "将改用密钥登录：\n1. 生成密钥对\n2. 用当前密码部署公钥\n3. 验证密钥登录\n\n确定切换？\n（点「取消」不做任何改动）"
@@ -1844,6 +1846,7 @@ async function renderConnections() {
                   asset_id: writeEp.asset_id,
                   role: writeEp.role,
                   delete_password: false,
+                  trust_host_key: true,
                 }),
               });
               const kids = [];
@@ -1908,27 +1911,26 @@ async function renderConnections() {
           }),
           el("button", {
             class: "btn small", text: "改连接信息",
-            onclick: async () => {
-              const host = prompt("地址:", writeEp.host);
-              if (host === null) return;
-              const user = prompt("用户:", writeEp.username);
-              if (user === null) return;
-              const port = prompt("端口:", String(writeEp.port || 22));
-              const auth = prompt("认证: password / key / none", "password");
-              let secret = "";
-              if (auth === "password") secret = prompt("SSH 密码（留空则不改凭据）:") || "";
-              else if (auth === "key") secret = prompt("粘贴私钥 PEM（留空则不改凭据）:") || "";
-              const r = await api(`/api/assets/${a.id}/update`, {
-                method: "POST",
-                body: JSON.stringify({
-                  host, username: user, port: Number(port || 22),
+            onclick: () => {
+              sshFormModal("改连接信息 · " + a.id, [
+                { name: "host", label: "地址 (IP/域名)", value: writeEp.host, required: true },
+                { name: "username", label: "用户", value: writeEp.username || "root", required: true },
+                { name: "port", label: "端口", value: String(writeEp.port || 22), type: "number" },
+                { name: "password", label: "新密码（留空=不改凭据）", type: "password", help: "填了会更新原密码凭据，不是新建一条" },
+                { name: "private_key", label: "新私钥 PEM（留空=不改）", type: "textarea" },
+                { name: "clear_credential", label: "清空凭据（填 yes 才清空）", placeholder: "yes / 空" },
+              ], async (d) => {
+                const body = {
+                  host: d.host,
+                  username: d.username,
+                  port: Number(d.port || 22),
                   role: writeEp.role,
-                  password: auth === "password" ? secret : "",
-                  private_key: auth === "key" ? secret : "",
-                }),
+                  password: d.password || "",
+                  private_key: d.private_key || "",
+                  clear_credential: d.clear_credential.toLowerCase() === "yes",
+                };
+                return api(`/api/assets/${a.id}/update`, { method: "POST", body: JSON.stringify(body) });
               });
-              showModal("更新连接", [el("pre", { text: JSON.stringify(r.ok ? { ok: true, ssh_endpoint: r.ssh_endpoint, credential_id: r.credential_id } : r, null, 2) })]);
-              renderConnections();
             },
           }),
         ]);
@@ -1936,32 +1938,31 @@ async function renderConnections() {
       } else {
         body.appendChild(el("div", {
           class: "muted small",
-          text: "未配置 SSH（需要地址 + 密码或密钥）。NT 已移除，必须配置 SSH 才能远程连接与执行。",
+          text: "未配置 SSH（需要地址 + 密码或密钥）。需配置 SSH 才能远程连接与执行。",
         }));
         body.appendChild(el("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, [
           el("button", {
             class: "btn small primary", text: "配置 SSH（填密码/密钥）",
-            onclick: async () => {
-              const host = prompt("地址 (IP/域名):", "");
-              if (!host) return;
-              const user = prompt("用户:", "root");
-              const port = prompt("端口:", "22");
-              const password = prompt("SSH 密码（可留空，下面可改用私钥）:", "");
-              let private_key = "";
-              if (!password) {
-                private_key = prompt("粘贴私钥 PEM（也可留空后去凭据库添加）:", "") || "";
-              }
-              const r = await api(`/api/assets/${a.id}/update`, {
-                method: "POST",
-                body: JSON.stringify({
-                  host, username: user || "root", port: Number(port || 22),
-                  role: "write",
-                  password: password || "",
-                  private_key: private_key || "",
-                }),
+            onclick: () => {
+              sshFormModal("配置 SSH · " + a.id, [
+                { name: "host", label: "地址 (IP/域名)", required: true, placeholder: "192.0.2.10" },
+                { name: "username", label: "用户", value: "root", required: true },
+                { name: "port", label: "端口", value: "22", type: "number" },
+                { name: "password", label: "SSH 密码（与私钥二选一）", type: "password" },
+                { name: "private_key", label: "私钥 PEM（密码留空时用）", type: "textarea" },
+              ], async (d) => {
+                return api(`/api/assets/${a.id}/update`, {
+                  method: "POST",
+                  body: JSON.stringify({
+                    host: d.host,
+                    username: d.username || "root",
+                    port: Number(d.port || 22),
+                    role: "write",
+                    password: d.password || "",
+                    private_key: d.private_key || "",
+                  }),
+                });
               });
-              showModal("配置 SSH", [el("pre", { text: JSON.stringify(r, null, 2) })]);
-              renderConnections();
             },
           }),
           el("button", {
@@ -2450,6 +2451,211 @@ on("term-reconnect", "click", () => {
 });
 
 /* ---- modal ---- */
+
+function sshFormModal(title, fields, onSubmit) {
+  // fields: [{name,label,type,value,placeholder,required,help}]
+  const wrap = el("div", {});
+  const inputs = {};
+  fields.forEach((f) => {
+    const id = "sf_" + f.name;
+    const input =
+      f.type === "password"
+        ? el("input", { id, type: "password", placeholder: f.placeholder || "", autocomplete: "new-password" })
+        : f.type === "textarea"
+          ? el("textarea", { id, placeholder: f.placeholder || "", rows: 4 })
+          : el("input", {
+              id,
+              type: f.type || "text",
+              placeholder: f.placeholder || "",
+              value: f.value == null ? "" : String(f.value),
+            });
+    if (f.value != null && f.type !== "password" && f.type !== "textarea") input.value = String(f.value);
+    inputs[f.name] = input;
+    const lab = el("label", { style: "display:block;margin:8px 0 4px;font-size:12px;color:var(--dim)" }, [
+      document.createTextNode(f.label + (f.required ? " *" : "")),
+    ]);
+    wrap.appendChild(lab);
+    wrap.appendChild(input);
+    if (f.help) {
+      wrap.appendChild(el("div", { class: "muted small", style: "margin:2px 0 6px", text: f.help }));
+    }
+  });
+  const err = el("p", { class: "error small", style: "margin-top:8px" });
+  const okBtn = el("button", {
+    class: "btn primary",
+    text: "确定",
+    onclick: async () => {
+      err.textContent = "";
+      const data = {};
+      for (const k of Object.keys(inputs)) {
+        data[k] = (inputs[k].value || "").trim();
+      }
+      okBtn.disabled = true;
+      try {
+        const r = await onSubmit(data);
+        if (r && r.ok === false) {
+          err.textContent = (r.error || "失败") + (r.detail ? ": " + r.detail : "");
+          okBtn.disabled = false;
+          return;
+        }
+        closeModal();
+        renderConnections();
+      } catch (e) {
+        err.textContent = String(e);
+        okBtn.disabled = false;
+      }
+    },
+  });
+  const cancelBtn = el("button", { class: "btn ghost", text: "取消", onclick: () => closeModal() });
+  wrap.appendChild(el("div", { style: "margin-top:14px;display:flex;gap:8px" }, [okBtn, cancelBtn]));
+  wrap.appendChild(err);
+  showModal(title, [wrap]);
+}
+
+function closeModal() { const m = document.getElementById("modal"); if (m) m.classList.add("hidden"); }
+
+
+const pcProgressByHost = {};
+const pcRunningByHost = {};
+
+function pcProgressRender(box, steps) {
+  // steps: [{key, label, status: pending|running|ok|fail|skip, detail}]
+  box.innerHTML = "";
+  const bar = el("div", {
+    style: "height:8px;border-radius:6px;background:rgba(255,255,255,.08);margin:8px 0 12px;overflow:hidden",
+  });
+  const done = steps.filter((s) => s.status === "ok" || s.status === "skip").length;
+  const total = Math.max(steps.length, 1);
+  const pct = Math.round((done / total) * 100);
+  bar.appendChild(el("div", {
+    style: `height:100%;width:${pct}%;background:linear-gradient(90deg,#3d86e0,#3dd68c);transition:width .35s`,
+  }));
+  box.appendChild(bar);
+  steps.forEach((s) => {
+    const icon =
+      s.status === "ok" ? "✓" :
+      s.status === "fail" ? "✗" :
+      s.status === "running" ? "…" :
+      s.status === "skip" ? "−" : "·";
+    const color =
+      s.status === "ok" ? "var(--ok)" :
+      s.status === "fail" ? "var(--bad)" :
+      s.status === "running" ? "var(--warn)" : "var(--dim)";
+    const row = el("div", {
+      style: "display:flex;gap:10px;align-items:flex-start;padding:4px 0;font-size:13px",
+    }, [
+      el("span", { style: `width:18px;color:${color};font-weight:700`, text: icon }),
+      el("div", {}, [
+        el("div", { style: `color:${s.status === "pending" ? "var(--dim)" : "var(--ink)"}`, text: s.label }),
+        s.detail ? el("div", { class: "muted small", style: "margin-top:2px", text: s.detail }) : null,
+      ].filter(Boolean)),
+    ]);
+    box.appendChild(row);
+  });
+}
+
+async function pcRunAdoptFlow(asset) {
+  const box = $("monitor-install-box");
+  if (!box) return;
+  pcRunningByHost[asset] = true;
+  box.dataset.running = "1";
+  const steps = [
+    { key: "detect", label: "1. 检测主机（Docker / 二进制 / 9100）", status: "pending" },
+    { key: "install", label: "2. 安装 / 启动采集器", status: "pending" },
+    { key: "register", label: "3. 注册到 Prometheus", status: "pending" },
+    { key: "verify", label: "4. 验证是否采到指标", status: "pending" },
+  ];
+  const render = () => { pcProgressByHost[asset] = steps.map((s) => Object.assign({}, s)); pcProgressRender(box, steps); };
+  render();
+
+  // 1 detect
+  steps[0].status = "running";
+  render();
+  const det = await api("/api/promconfig/node-exporter/detect", {
+    method: "POST",
+    body: JSON.stringify({ asset_id: asset }),
+  });
+  if (!det.ok) {
+    steps[0].status = "fail";
+    steps[0].detail = String(det.error || "检测失败");
+    render();
+    return;
+  }
+  steps[0].status = "ok";
+  steps[0].detail =
+    "Docker=" + (det.docker ? "有" : "无") +
+    " · 二进制=" + (det.binary || "无") +
+    " · 9100=" + (det.port_9100 ? "在听" : "无") +
+    " · 推荐=" + (det.recommend || "-");
+  render();
+
+  // 2 install（已运行则跳过）
+  if (det.running || (det.port_9100 && det.binary)) {
+    steps[1].status = "skip";
+    steps[1].detail = "已在运行，跳过安装";
+    render();
+  } else if (det.recommend === "docker" || det.recommend === "binary") {
+    steps[1].status = "running";
+    steps[1].detail = det.recommend === "docker" ? "正在用 Docker 启动…" : "正在分发二进制并写 systemd…";
+    render();
+    const ir = await api("/api/promconfig/node-exporter/install", {
+      method: "POST",
+      body: JSON.stringify({ asset_id: asset, method: det.recommend }),
+    });
+    if (!ir.ok) {
+      steps[1].status = "fail";
+      steps[1].detail = String((ir.error || "") + " " + (ir.detail || ""));
+      render();
+      return;
+    }
+    steps[1].status = "ok";
+    steps[1].detail = (ir.steps || []).map((s) => s.step).join(" → ") || "安装完成";
+    render();
+  } else {
+    steps[1].status = "fail";
+    steps[1].detail = "无法安装：无 Docker 且无二进制/安装包";
+    render();
+    return;
+  }
+
+  // 3 register
+  steps[2].status = "running";
+  steps[2].detail = "写入 file_sd 并热重载…";
+  render();
+  const ar = await api("/api/promconfig/node-exporter/adopt", {
+    method: "POST",
+    body: JSON.stringify({ asset_id: asset }),
+  });
+  if (!ar.ok && ar.error !== "no_metrics") {
+    steps[2].status = "fail";
+    steps[2].detail = String(ar.hint || ar.error || "注册失败");
+    render();
+    return;
+  }
+  steps[2].status = "ok";
+  steps[2].detail = "地址 " + (ar.address || "-");
+  render();
+
+  // 4 verify
+  steps[3].status = "running";
+  steps[3].detail = "查询 up 指标…";
+  render();
+  const sc = ar.scrape || {};
+  if (ar.ok && sc.has_metrics) {
+    steps[3].status = "ok";
+    steps[3].detail = "指标正常";
+  } else {
+    steps[3].status = "fail";
+    steps[3].detail =
+      (sc.hint || ar.hint || "未采到指标") +
+      (sc.error ? " · " + sc.error : "");
+  }
+  render();
+  pcRunningByHost[asset] = false;
+  if (box) box.dataset.running = "0";
+  if (typeof renderMonitor === "function") renderMonitor();
+}
+
 function showModal(title, children) {
   $("modal-title").textContent = title;
   const body = $("modal-body");
@@ -2566,6 +2772,18 @@ async function renderMonitor() {
   const body = $("monitor-body");
   const strip = $("monitor-hosts-strip");
   if (!body) return;
+  // 切主机/重绘时清掉检测结果，避免旧主机按钮串台
+  const ibox = $("monitor-install-box");
+  if (ibox) {
+    const host = monitorState.host || "";
+    ibox.dataset.hostKey = host;
+    // 恢复该主机自己的进度，不丢别人的
+    if (pcProgressByHost[host] && pcProgressByHost[host].length) {
+      pcProgressRender(ibox, pcProgressByHost[host]);
+    } else if (!pcRunningByHost[host]) {
+      ibox.innerHTML = "";
+    }
+  }
   body.innerHTML = '<p class="muted small">加载中…</p>';
   const hostsRes = await api("/api/monitor/hosts");
   monitorState.hosts = (hostsRes.ok && hostsRes.hosts) || [];
@@ -3333,6 +3551,527 @@ on("msg-q", "keydown", (e) => {
     msgState.offset = 0;
     renderMessages();
   }
+});
+
+/* ---- Prometheus 配置管理 ---- */
+const pcState = { overview: null, config: null, targets: null, rules: null };
+
+function pcBadge(text, cls) {
+  return el("span", { class: "badge " + (cls || "dim"), text: String(text || "") });
+}
+
+function pcSetStatus(msg, cls) {
+  const n = $("promconfig-status");
+  if (!n) return;
+  n.textContent = msg || "";
+  n.className = "muted small" + (cls ? " " + cls : "");
+}
+
+async function renderPromConfig() {
+  pcSetStatus("加载中…");
+  const [ov, cfg, tg, rules] = await Promise.all([
+    api("/api/promconfig/overview").catch((e) => ({ ok: false, error: String(e) })),
+    api("/api/promconfig/config").catch((e) => ({ ok: false, error: String(e) })),
+    api("/api/promconfig/targets").catch((e) => ({ ok: false, error: String(e) })),
+    api("/api/promconfig/rules").catch((e) => ({ ok: false, error: String(e) })),
+  ]);
+  pcState.overview = ov;
+  pcState.config = cfg;
+  pcState.targets = tg;
+  pcState.rules = rules;
+
+  const raw = $("promconfig-raw");
+  if (raw) raw.textContent = (cfg && cfg.raw) || (cfg && cfg.error ? String(cfg.error) : "（无配置）");
+
+  renderPcTargets();
+  renderPcRules();
+  await renderPcNodeExporter();
+  const live = (ov && ov.live) || {};
+  const msg = ov && ov.ok
+    ? `目标 ${live.targets_total || 0} · 正常 ${live.targets_up || 0}` + (live.targets_down ? ` · 异常 ${live.targets_down}` : "")
+    : "加载失败";
+  pcSetStatus(msg, ov && ov.ok ? "" : "error");
+}
+
+function pcAddr(x) {
+  if (x == null) return "-";
+  if (typeof x === "string") return x;
+  if (typeof x === "object") {
+    if (x.address) return pcAddr(x.address);
+    // YAML 误解析成 map 的 host:port / url：拼回可读形式
+    const keys = Object.keys(x);
+    if (keys.length === 1) {
+      const k = keys[0];
+      const v = x[k];
+      if (/^https?$/.test(k) && typeof v === "string") return k + ":" + v;
+      return k + ":" + v;
+    }
+    return keys.map((k) => k + "=" + x[k]).join(",");
+  }
+  return String(x);
+}
+
+function pcShortErr(s) {
+  if (!s) return "";
+  return String(s).replace(/^Get\s+"/, "").replace(/":.*/, "").slice(0, 48);
+}
+
+function renderPcTargets() {
+  const box = $("promconfig-targets");
+  if (!box) return;
+  box.innerHTML = "";
+  const t = pcState.targets;
+  if (!t || !t.ok) {
+    box.appendChild(el("p", { class: "error", text: "加载失败: " + ((t && t.error) || "") }));
+    return;
+  }
+  const liveKey = new Map();
+  (t.live_targets || []).forEach((lt) => {
+    const addr =
+      (lt.labels && (lt.labels.instance || lt.labels.address)) ||
+      (lt.scrapeUrl || "").replace(/^https?:\/\//, "").replace(/\/metrics$/, "");
+    liveKey.set(pcAddr(addr), lt);
+  });
+  const rows = [];
+  (t.file_sd_targets || []).forEach((row) => rows.push({ ...row, managed: true, via: "托管" }));
+  (t.config_targets || []).forEach((row) => {
+    if (row.via === "file_sd_configs") return;
+    rows.push({ ...row, managed: false, via: row.job || "配置" });
+  });
+  if (!rows.length) {
+    box.appendChild(el("p", { class: "muted small", text: "暂无目标。填地址点「添加」。" }));
+    return;
+  }
+  rows.forEach((row) => {
+    const addr = pcAddr(row.address);
+    const lt = liveKey.get(addr);
+    const up = lt && lt.health === "up";
+    const name = (row.labels && (row.labels.name || row.labels.asset || row.labels.service)) || row.via || "";
+    const line = el("div", {
+      style: "display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)",
+    }, [
+      el("span", { class: "badge " + (up ? "ok" : lt ? "bad" : "dim"), text: up ? "正常" : lt ? "异常" : "—" }),
+      el("strong", { class: "small", text: addr }),
+      el("span", { class: "muted small", text: name }),
+      el("span", { class: "muted small", style: "margin-left:auto", text: lt ? pcShortErr(lt.lastError) : "" }),
+    ]);
+    if (row.managed) {
+      line.appendChild(el("button", {
+        class: "btn ghost small",
+        text: "移除",
+        onclick: async () => {
+          if (!confirm("移除 " + addr + "？")) return;
+          const r = await api("/api/promconfig/targets/delete", {
+            method: "POST",
+            body: JSON.stringify({ address: addr, file: row.file }),
+          });
+          if (!r.ok) alert("失败: " + (r.error || r.detail || ""));
+          renderPromConfig();
+        },
+      }));
+    } else {
+      line.appendChild(el("span", { class: "muted small", text: "配置内" }));
+    }
+    box.appendChild(line);
+  });
+}
+
+function renderPcRules() {
+  const box = $("promconfig-rules");
+  const tplBox = $("promconfig-templates");
+  if (!box || !tplBox) return;
+  box.innerHTML = "";
+  tplBox.innerHTML = "";
+  const r = pcState.rules;
+  if (!r || !r.ok) {
+    box.appendChild(el("p", { class: "error", text: "加载失败: " + ((r && r.error) || "") }));
+    return;
+  }
+  // 模板：一行一条，开关 + 阈值
+  const thrHint = {
+    cpu_high: "80",
+    mem_high: "85",
+    disk_high: "85",
+    load_high: "2",
+    host_down: "",
+  };
+  (r.templates || []).forEach((tp) => {
+    const needThr = tp.id !== "host_down";
+    const thr = el("input", {
+      placeholder: thrHint[tp.id] || "阈值",
+      style: "width:72px",
+      title: needThr ? "不填用默认" : "无需阈值",
+    });
+    if (!needThr) thr.classList.add("hidden");
+    const on = el("button", {
+      class: "btn primary small",
+      text: "启用",
+      onclick: async () => {
+        const body = { template_id: tp.id, enabled: true };
+        if (needThr && thr.value) body.threshold = Number(thr.value);
+        const res = await api("/api/promconfig/rules/template", { method: "POST", body: JSON.stringify(body) });
+        if (!res.ok) alert("失败: " + (res.error || res.detail || ""));
+        renderPromConfig();
+      },
+    });
+    const off = el("button", {
+      class: "btn ghost small",
+      text: "停用",
+      onclick: async () => {
+        await api("/api/promconfig/rules/template", {
+          method: "POST",
+          body: JSON.stringify({ template_id: tp.id, enabled: false }),
+        });
+        renderPromConfig();
+      },
+    });
+    tplBox.appendChild(el("div", {
+      style: "display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)",
+    }, [
+      el("div", { style: "min-width:140px" }, [
+        el("strong", { class: "small", text: tp.name }),
+      ]),
+      el("span", { class: "muted small", style: "flex:1", text: tp.description }),
+      el("span", {
+        class: "badge " + (tp.default_severity === "critical" ? "bad" : "dim"),
+        text: tp.default_severity,
+      }),
+      thr,
+      on,
+      off,
+    ]));
+  });
+
+  // 已启用规则（折叠里）：中文化常见名
+  const zhName = {
+    NodeHostDown: "主机离线",
+    NodeCpuHigh: "CPU 过高",
+    NodeMemoryHigh: "内存过高",
+    NodeDiskHigh: "磁盘过高",
+    NodeLoadHigh: "负载过高",
+    TargetDown: "探测失败",
+    PrometheusJobMissing: "采集丢失",
+    PrometheusNotConnectedToAlertmanager: "未连 Alertmanager",
+    DiskUsageHigh: "磁盘过高",
+    MemoryLow: "内存不足",
+  };
+  let n = 0;
+  (r.files || []).forEach((f) => {
+    (f.groups || []).forEach((g) => {
+      (g.rules || []).forEach((rule) => {
+        n++;
+        const sev = (rule.labels && rule.labels.severity) || "";
+        const label = zhName[rule.alert] || rule.alert || rule.record || "-";
+        const line = el("div", {
+          style: "display:flex;align-items:center;gap:10px;padding:8px 0",
+        }, [
+          pcBadge(sev || "on", sev === "critical" ? "bad" : sev === "warning" ? "warn" : "ok"),
+          el("strong", { class: "small", text: label }),
+          el("span", { class: "muted small", text: rule.alert || "" }),
+          el("span", { class: "muted small", style: "margin-left:auto", text: rule.for ? "持续 " + rule.for : "" }),
+        ]);
+        if (f.managed_by && rule.simple_editable) {
+          line.appendChild(el("button", {
+            class: "btn ghost small",
+            text: "停用",
+            onclick: async () => {
+              await api("/api/promconfig/rules/update", {
+                method: "POST",
+                body: JSON.stringify({ file_path: f.path, alert: rule.alert, enabled: false }),
+              });
+              renderPromConfig();
+            },
+          }));
+        }
+        box.appendChild(line);
+      });
+    });
+  });
+  const cnt = $("pc-rules-count");
+  if (cnt) cnt.textContent = String(n);
+}
+
+function pcFillRegisterAddr() {
+  const sel = $("pc-ne-asset");
+  const inp = $("pc-ne-register");
+  if (!sel || !inp) return;
+  const a = (state.assets || []).find((x) => x.id === sel.value);
+  const host = (a && (a.monitor_host || a.host)) || "";
+  // 换主机就覆盖地址，避免沿用上一台的 IP
+  const addressHost = host.includes(":") && !host.startsWith("[") ? "[" + host + "]" : host;
+  inp.value = host ? addressHost + ":9100" : "";
+}
+
+on("pc-ne-asset", "change", pcFillRegisterAddr);
+
+async function renderPcNodeExporter() {
+  const box = $("promconfig-ne");
+  const sel = $("pc-ne-asset");
+  if (!box) return;
+  if (sel && state.assets) {
+    fillSelect("pc-ne-asset", state.assets.map((a) => ({
+      v: a.id,
+      t: a.id + (a.monitor_host ? " · " + a.monitor_host : ""),
+    })));
+    pcFillRegisterAddr();
+  }
+  box.innerHTML = "";
+}
+
+on("promconfig-refresh", "click", () => renderPromConfig());
+on("promconfig-validate", "click", async () => {
+  if (!confirm("执行 promtool 校验并热重载 Prometheus？")) return;
+  pcSetStatus("校验中…");
+  const r = await api("/api/promconfig/validate", { method: "POST", body: "{}" });
+  if (r.ok) {
+    pcSetStatus("校验通过并已热重载");
+    alert("校验通过，已热重载");
+  } else {
+    pcSetStatus("校验/重载失败", "error");
+    alert("失败: " + (r.error || "") + " " + JSON.stringify(r.detail || r));
+  }
+  renderPromConfig();
+});
+on("promconfig-rollback", "click", async () => {
+  const path = prompt("要回滚的配置路径（如 prometheus.yml / file_sd/ayana-nodes.json / rules/ayana-node-alerts.yml）");
+  if (!path) return;
+  const r = await api("/api/promconfig/rollback", {
+    method: "POST",
+    body: JSON.stringify({ path }),
+  });
+  if (!r.ok) alert("回滚失败: " + (r.error || r.detail || ""));
+  else alert("已回滚 " + path);
+  renderPromConfig();
+});
+on("pc-target-add", "click", async () => {
+  const address = ($("pc-target-addr") || {}).value || "";
+  const asset = ($("pc-target-asset") || {}).value || "";
+  const labels = {};
+  if (asset) labels.asset = asset;
+  const r = await api("/api/promconfig/targets", {
+    method: "POST",
+    body: JSON.stringify({ address, labels }),
+  });
+  if (!r.ok) alert("添加失败: " + (r.error || r.detail || ""));
+  const a = $("pc-target-addr");
+  if (a) a.value = "";
+  renderPromConfig();
+});
+on("pc-ne-check", "click", async () => {
+  const asset = ($("pc-ne-asset") || {}).value;
+  const r = await api("/api/promconfig/node-exporter?asset_id=" + encodeURIComponent(asset || ""));
+  const box = $("promconfig-ne");
+  if (!box) return;
+  if (!r.ok) {
+    box.innerHTML = "";
+    box.appendChild(el("p", { class: "error", text: String(r.error || "检查失败") }));
+    return;
+  }
+  const s = r.status || {};
+  box.innerHTML = "";
+  box.appendChild(el("p", {
+    class: "small",
+    text: `安装=${s.installed ? "是" : "否"} · 运行=${s.active ? "是" : "否"} · 9100监听=${s.port_9100 ? "是" : "否"} · ${s.load_state || ""}`,
+  }));
+  if (s.error_active || s.error_port) {
+    box.appendChild(el("p", { class: "muted small", text: (s.error_active || "") + " " + (s.error_port || "") }));
+  }
+});
+async function pcNodeAction(action) {
+  const asset = ($("pc-ne-asset") || {}).value;
+  if (action === "stop" && !confirm("停止 " + asset + " 的采集器？")) return;
+  const r = await api("/api/promconfig/node-exporter", {
+    method: "POST",
+    body: JSON.stringify({ asset_id: asset, action, listen_address: "127.0.0.1:9100" }),
+  });
+  const box = $("promconfig-ne");
+  if (!box) return;
+  box.innerHTML = "";
+  if (!r.ok) {
+    box.appendChild(el("p", { class: "error", text: String((r.error || "") + " " + (r.detail || "")) }));
+    return;
+  }
+  const s = r.status || r;
+  box.appendChild(el("p", {
+    class: "small",
+    text: `${asset}: ${s.active || s.running ? "运行中" : "未运行"}${s.mode ? " · " + s.mode : ""}`,
+  }));
+}
+on("pc-ne-start", "click", () => pcNodeAction("start"));
+on("pc-ne-stop", "click", () => pcNodeAction("stop"));
+on("pc-ne-register-btn", "click", async () => {
+  const asset = ($("pc-ne-asset") || {}).value;
+  const address = (($("pc-ne-register") || {}).value || "").trim();
+  const box = $("promconfig-ne");
+  if (box) box.innerHTML = '<p class="muted small">接入中，可能需要 1-2 分钟…</p>';
+  const r = await api("/api/promconfig/node-exporter/adopt", {
+    method: "POST",
+    body: JSON.stringify({ asset_id: asset, address }),
+  });
+  if (!r.ok) {
+    if (box) {
+      box.innerHTML = "";
+      box.appendChild(el("p", { class: "error", text: String((r.error || "") + " " + (r.detail || "")) }));
+    }
+    return;
+  }
+  if (box) {
+    box.innerHTML = "";
+    box.appendChild(el("p", {
+      class: "small",
+      style: "color:var(--ok)",
+      text: "已接入 " + r.asset_id + " → " + r.address,
+    }));
+    (r.steps || []).forEach((s) => {
+      box.appendChild(el("p", {
+        class: "muted small",
+        text: "· " + s.step + ": " + (s.ok ? "成功" : "失败"),
+      }));
+    });
+  }
+  renderPromConfig();
+});
+
+/* ---- 业务检查 ---- */
+async function renderChecks() {
+  fillSelect("chk-asset", (state.assets || []).map((a) => ({ v: a.id, t: a.id + " / " + a.display_name })));
+  const list = $("chk-list");
+  const act = $("chk-activity");
+  if (!list) return;
+  list.innerHTML = '<p class="muted small">加载中…</p>';
+  const [cRes, aRes] = await Promise.all([
+    api("/api/checks").catch(() => ({ ok: false })),
+    api("/api/checks/activity").catch(() => ({ ok: false })),
+  ]);
+  list.innerHTML = "";
+  if (!cRes.ok) {
+    list.appendChild(el("p", { class: "error", text: "加载失败: " + (cRes.error || "") }));
+    return;
+  }
+  const rows = cRes.checks || [];
+  if (!rows.length) {
+    list.appendChild(el("p", { class: "muted small", text: "还没有检查。选主机和类型，点「添加检查」。" }));
+  } else {
+    const table = el("table", { class: "table" });
+    table.appendChild(el("tr", {}, [
+      el("th", { text: "主机" }),
+      el("th", { text: "名称" }),
+      el("th", { text: "类型" }),
+      el("th", { text: "状态" }),
+      el("th", { text: "最近" }),
+      el("th", { text: "操作" }),
+    ]));
+    rows.forEach((c) => {
+      const st = c.last_state === "ok" ? "ok" : c.last_state === "fail" ? "bad" : "dim";
+      table.appendChild(el("tr", {}, [
+        el("td", { class: "small", text: c.asset_id }),
+        el("td", { class: "small", text: c.name }),
+        el("td", { class: "small", text: c.kind + (c.kind === "port" ? " :" + (c.params.port || "") : c.kind === "service" ? " " + (c.params.unit || "") : "") }),
+        el("td", {}, [pcBadge(c.enabled ? c.last_state : "停用", st)]),
+        el("td", { class: "small", text: c.last_detail || (c.last_at ? fmtTime(c.last_at) : "—") }),
+        el("td", {}, [
+          el("button", {
+            class: "btn ghost small",
+            text: "立即测",
+            onclick: async () => {
+              const r = await api("/api/checks/run", { method: "POST", body: JSON.stringify({ id: c.id }) });
+              if (!r.ok) alert("失败: " + (r.error || r.detail || ""));
+              renderChecks();
+            },
+          }),
+          el("button", {
+            class: "btn ghost small",
+            text: c.enabled ? "停用" : "启用",
+            onclick: async () => {
+              await api("/api/checks/update", {
+                method: "POST",
+                body: JSON.stringify({ id: c.id, enabled: !c.enabled }),
+              });
+              renderChecks();
+            },
+          }),
+          el("button", {
+            class: "btn ghost small",
+            text: "删除",
+            onclick: async () => {
+              if (!confirm("删除检查 " + c.name + "？")) return;
+              await api("/api/checks/delete", { method: "POST", body: JSON.stringify({ id: c.id }) });
+              renderChecks();
+            },
+          }),
+        ]),
+      ]));
+    });
+    list.appendChild(table);
+  }
+  if (act) {
+    act.innerHTML = "";
+    const items = (aRes && aRes.activity) || [];
+    if (!items.length) act.appendChild(el("p", { class: "muted small", text: "暂无动态" }));
+    items.slice(0, 20).forEach((x) => {
+      act.appendChild(el("p", {
+        class: "small",
+        style: "margin:4px 0",
+        text: `${fmtTime(x.at)} [${x.state}] ${x.asset_id}/${x.name}: ${x.detail || ""}`,
+      }));
+    });
+  }
+}
+
+function chkKindChanged() {
+  const k = ($("chk-kind") || {}).value;
+  const p = $("chk-params-port"), s = $("chk-params-service"), c = $("chk-params-command");
+  if (p) p.classList.toggle("hidden", k !== "port");
+  if (s) s.classList.toggle("hidden", k !== "service");
+  if (c) c.classList.toggle("hidden", k !== "command");
+}
+on("chk-kind", "change", chkKindChanged);
+on("chk-refresh", "click", () => renderChecks());
+
+on("monitor-detect", "click", () => {
+  const asset = monitorState.host || (($("monitor-host") || {}).value || "");
+  if (!asset) {
+    const box = $("monitor-install-box");
+    if (box) box.innerHTML = '<p class="muted small">先选一台主机</p>';
+    return;
+  }
+  pcRunAdoptFlow(asset);
+});
+
+on("chk-add", "click", async () => {
+  const kind = ($("chk-kind") || {}).value;
+  const body = {
+    asset_id: ($("chk-asset") || {}).value,
+    kind,
+    name: ($("chk-name") || {}).value,
+    interval_sec: Number(($("chk-interval") || {}).value || 60),
+    fail_threshold: Number(($("chk-threshold") || {}).value || 2),
+    severity: ($("chk-severity") || {}).value,
+    params: {},
+    expect: {},
+  };
+  if (kind === "port") {
+    body.params = {
+      port: Number(($("chk-port") || {}).value),
+      protocol: ($("chk-proto") || {}).value || "tcp",
+    };
+    if (!body.name) body.name = "port-" + body.params.port;
+  } else if (kind === "service") {
+    body.params = { unit: ($("chk-unit") || {}).value };
+    if (!body.name) body.name = body.params.unit;
+  } else {
+    const raw = ($("chk-cmd") || {}).value || "";
+    body.params = { argv: raw.trim().split(/\s+/).filter(Boolean) };
+    const ev = ($("chk-expect") || {}).value;
+    const evv = ($("chk-expect-val") || {}).value;
+    if (ev === "contains") body.expect = { output_contains: evv };
+    else if (ev === "not_contains") body.expect = { output_not_contains: evv };
+    else body.expect = { exit_code: 0 };
+    if (!body.name) body.name = "cmd";
+  }
+  const r = await api("/api/checks", { method: "POST", body: JSON.stringify(body) });
+  if (!r.ok) alert("添加失败: " + (r.error || r.detail || ""));
+  renderChecks();
 });
 
 /* ---- init ---- */

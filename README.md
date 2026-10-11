@@ -209,8 +209,10 @@ google + youtube 同时命中 `hysteria2-chain.md` → 共同依赖优先调查�
 | 读 | `service.status` / `service.logs` | 服务状态 / 日志 |
 | 读 | `port.listen` / `disk.usage` / `memory.available` / `load.current` | 端口、磁盘、内存、负载 |
 | 读 | `probe.status` | 外部探测（经 Prometheus） |
+| 读 | `promconfig.read` / `node_exporter.status` | Prometheus 配置 / Node Exporter 状态 |
 | 写 | `service.restart` / `start` / `stop` | systemd（start/stop 偏人工） |
 | 写 | `container.restart` | docker restart（登记容器） |
+| 写 | `promconfig.write` / `node_exporter.manage` | Prometheus 配置管理 / Node Exporter 运维 |
 
 写命令由对象绑定生成（如 `systemctl restart frps`），不可注入。
 
@@ -236,6 +238,42 @@ google + youtube 同时命中 `hysteria2-chain.md` → 共同依赖优先调查�
 - Prometheus / Alertmanager / Blackbox（配置项 `prometheus_url` · `alertmanager_url`）
 - `POST /hooks/alertmanager`（Bearer `webhook_token`）
 - 验证依赖 `probe_success` 等指标的 range 查询
+
+### Prometheus 配置管理（v0.6.1）
+
+Web 导航 **Prometheus**：可视化管理已有配置，尽量少手写 YAML/JSON。
+
+| 能力 | 说明 |
+|------|------|
+| 读现有配置 | `prometheus.yml` / 抓取任务 / 目标 / 告警规则；兼容手写，原文保留 |
+| 目标管理 | 新增/编辑/删除；优先 `file_sd_configs`（`file_sd/ayana-nodes.json`）；静态配置只读 |
+| 告警模板 | CPU / 内存 / 磁盘 / 负载 / 主机离线；勾选启用、改阈值/for/级别 |
+| 规则编辑 | Ayana 托管规则可结构化编辑；复杂/外部规则只读，不破坏原文 |
+| Node Exporter | 从资产选主机：检查/安装/启动/停止/注册目标；默认 `127.0.0.1:9100`，禁公网监听 |
+| 安全应用 | 备份 → `promtool check` → 原子写入 → `/-/reload`；失败回滚；全程审计 |
+
+配置（`config.json` → `prometheus_config`）：
+
+```json
+"prometheus_config": {
+  "local_dir": "prometheus",
+  "ssh_asset_id": "",
+  "remote_base": "/etc/prometheus",
+  "promtool": "promtool",
+  "reload_url": ""
+}
+```
+
+- `ssh_asset_id` 为空：读写本地 `base_dir/prometheus/`（或 `local_dir`）
+- 非空：经该资产 SSH 读写 `remote_base`（路径沙箱，禁止 `..`/绝对路径逃逸）
+- 能力：`promconfig.read` / `promconfig.write` / `node_exporter.status` / `node_exporter.manage`（admin 默认授予）
+
+约束：
+
+- 无法无损写回的配置**拒绝修改**，只展示原文
+- 不覆盖未知字段、注释、复杂规则
+- 安装不下载公网二进制；要求主机已有 `/usr/local/bin/node_exporter`
+- 写操作走 admin + Policy + CSRF + 审计；Agent 不自动写 Prometheus 配置
 
 ---
 
@@ -266,6 +304,7 @@ OneBot v11 反向 WS（`ws_host`/`ws_port`/`ws_path`，NapCat 侧连入）。
 |------|------|
 | 总览 | 紧凑统计 + 资产可折叠条（对象表、探测） |
 | 事件 | 列表 / 详情（人话摘要、关联操作、时间线）、手动关闭 |
+| Prometheus | 配置/目标/告警规则/Node Exporter 可视化管理 |
 | 操作 | 列表（完成时间）、批准/取消/执行/验证，与事件互链 |
 | 权限 | admin 改策略 |
 | 审计 | 关键词 + 时间范围 |
@@ -340,7 +379,7 @@ python -m unittest discover -s tests -v
 
 ## 版本与许可
 
-- 版本：`ayana.__version__`（当前 **0.2.0**）
+- 版本：`ayana.__version__`（当前 **0.6.1**）
 - 仓库：私有部署使用；主机安全配置不在本仓库
 
 **已验收参考**：NERV `frps` 闭环（重启 + 双新鲜采样验证）；白屏问题（前端 `ZH_CAP`）已修复并上线。

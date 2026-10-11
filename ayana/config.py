@@ -34,6 +34,17 @@ DEFAULTS: dict[str, Any] = {
     "verify_timeout_sec": 300,
     "action_ttl_sec": 1800,
     "auto_remediation_enabled": False,
+    # Prometheus 配置管理（可选）：ssh_asset_id 为空则用本地目录
+    "prometheus_config": {
+        "local_dir": "prometheus",
+        "ssh_asset_id": "",
+        "remote_base": "/etc/prometheus",
+        "promtool": "promtool",
+        "reload_url": "",
+        "config_path_prefix": "/etc/prometheus/",
+        "local_assets": [],
+        "require_promtool": True,
+    },
 }
 
 # 秘密键：优先环境变量 AYANA_<KEY>，其次 secrets.json

@@ -249,6 +249,80 @@ _reg(
     )
 )
 
+# ---- Prometheus 配置管理（v0.6.x）----
+# 写路径走 PromConfigService 固定命令，不经自由 write_tokens；此处仅登记能力供 Policy 使用。
+
+_reg(
+    Capability(
+        name="promconfig.read",
+        kind="read",
+        object_kinds=("*",),
+        risk="read",
+        description="读取 Prometheus 配置、抓取目标与告警规则",
+        probe_tokens=lambda o: [],
+    )
+)
+
+_reg(
+    Capability(
+        name="promconfig.write",
+        kind="write",
+        object_kinds=("*",),
+        risk="write",
+        description="修改 Prometheus 配置/目标/规则（备份+promtool+热重载）",
+        write_tokens=None,
+        auto_allowed=False,
+    )
+)
+
+_reg(
+    Capability(
+        name="node_exporter.status",
+        kind="read",
+        object_kinds=("*",),
+        risk="read",
+        description="检查 Node Exporter 安装/运行/9100 监听",
+        probe_tokens=lambda o: [],
+    )
+)
+
+_reg(
+    Capability(
+        name="node_exporter.manage",
+        kind="write",
+        object_kinds=("*",),
+        risk="write",
+        description="安装/启动/停止 Node Exporter（固定模板，默认 127.0.0.1:9100）",
+        write_tokens=None,
+        auto_allowed=False,
+    )
+)
+
+# ---- 业务检查（轻量默认，不依赖 Prometheus）----
+
+_reg(
+    Capability(
+        name="checks.read",
+        kind="read",
+        object_kinds=("*",),
+        risk="read",
+        description="查看业务检查与最近结果",
+        probe_tokens=lambda o: [],
+    )
+)
+
+_reg(
+    Capability(
+        name="checks.write",
+        kind="write",
+        object_kinds=("*",),
+        risk="write",
+        description="增删改业务检查（端口/服务/固定命令）",
+        write_tokens=None,
+        auto_allowed=False,
+    )
+)
+
 
 def get_capability(name: str) -> Capability:
     c = CAPABILITIES.get(name)

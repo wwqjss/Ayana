@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 12
 
 
 class MigrationError(RuntimeError):
@@ -678,6 +678,60 @@ def _migrate_v10_message_log(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v11_checks(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS checks ("
+        " id TEXT PRIMARY KEY,"
+        " asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,"
+        " name TEXT NOT NULL DEFAULT '',"
+        " kind TEXT NOT NULL,"
+        " params_json TEXT NOT NULL DEFAULT '{}',"
+        " expect_json TEXT NOT NULL DEFAULT '{}',"
+        " interval_sec INTEGER NOT NULL DEFAULT 60,"
+        " fail_threshold INTEGER NOT NULL DEFAULT 2,"
+        " severity TEXT NOT NULL DEFAULT 'warning',"
+        " enabled INTEGER NOT NULL DEFAULT 1,"
+        " last_state TEXT NOT NULL DEFAULT 'unknown',"
+        " last_ok INTEGER NOT NULL DEFAULT 0,"
+        " last_at REAL NOT NULL DEFAULT 0,"
+        " last_detail TEXT NOT NULL DEFAULT '',"
+        " fail_streak INTEGER NOT NULL DEFAULT 0,"
+        " created_at REAL NOT NULL,"
+        " updated_at REAL NOT NULL,"
+        " UNIQUE(asset_id, kind, name)"
+        ")"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS check_results ("
+        " id INTEGER PRIMARY KEY,"
+        " check_id TEXT NOT NULL,"
+        " at REAL NOT NULL,"
+        " ok INTEGER NOT NULL,"
+        " state TEXT NOT NULL,"
+        " detail TEXT NOT NULL DEFAULT ''"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_check_results ON check_results(check_id, at)"
+    )
+
+
+def _migrate_v12_asset_host(conn: sqlite3.Connection) -> None:
+    """资产主 IP/主机名：用于自动填监控地址。"""
+    try:
+        conn.execute("ALTER TABLE assets ADD COLUMN host TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+    # 从 SSH 端点回填（无端点则保持空串）
+    conn.execute(
+        "UPDATE assets SET host=COALESCE("
+        " (SELECT host FROM ssh_endpoints"
+        "  WHERE ssh_endpoints.asset_id=assets.id AND ssh_endpoints.enabled=1"
+        "  ORDER BY CASE role WHEN 'write' THEN 0 ELSE 1 END LIMIT 1), '')"
+        " WHERE host='' OR host IS NULL"
+    )
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_v1_baseline,
     2: _migrate_v2_p0_p1_columns,
@@ -689,6 +743,8 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     8: _migrate_v8_notify_channels,
     9: _migrate_v9_aibot_seen_targets,
     10: _migrate_v10_message_log,
+    11: _migrate_v11_checks,
+    12: _migrate_v12_asset_host,
 }
 
 _MIGRATION_NAMES = {
@@ -702,6 +758,8 @@ _MIGRATION_NAMES = {
     8: "notify_channels",
     9: "aibot_seen_targets",
     10: "message_log",
+    11: "checks",
+    12: "asset_host",
 }
 
 

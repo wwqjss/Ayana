@@ -55,6 +55,8 @@ class WebApp:
         host_monitor=None,
         aibot_manager=None,
         mlog=None,
+        promconfig=None,
+        checks=None,
     ):
         self.db = db
         self.auth = auth
@@ -78,6 +80,8 @@ class WebApp:
         self.host_monitor = host_monitor
         self.aibot_manager = aibot_manager
         self.mlog = mlog
+        self.promconfig = promconfig
+        self.checks = checks
 
     def build(self) -> web.Application:
         app = web.Application(client_max_size=2_000_000)
@@ -184,6 +188,30 @@ class WebApp:
         app.router.add_get("/api/agent/status", self.api_agent_status)
         app.router.add_get("/api/capabilities", self.api_capabilities)
         app.router.add_get("/api/prom/probe", self.api_prom_probe)
+        app.router.add_get("/api/checks", self.api_checks_list)
+        app.router.add_post("/api/checks", self.api_checks_create)
+        app.router.add_post("/api/checks/update", self.api_checks_update)
+        app.router.add_post("/api/checks/delete", self.api_checks_delete)
+        app.router.add_post("/api/checks/run", self.api_checks_run)
+        app.router.add_get("/api/checks/activity", self.api_checks_activity)
+        app.router.add_get("/api/promconfig/overview", self.api_promconfig_overview)
+        app.router.add_get("/api/promconfig/config", self.api_promconfig_config)
+        app.router.add_get("/api/promconfig/targets", self.api_promconfig_targets)
+        app.router.add_post("/api/promconfig/targets", self.api_promconfig_target_add)
+        app.router.add_post("/api/promconfig/targets/update", self.api_promconfig_target_update)
+        app.router.add_post("/api/promconfig/targets/delete", self.api_promconfig_target_delete)
+        app.router.add_get("/api/promconfig/rules", self.api_promconfig_rules)
+        app.router.add_get("/api/promconfig/rules/templates", self.api_promconfig_rule_templates)
+        app.router.add_post("/api/promconfig/rules/template", self.api_promconfig_rule_apply_template)
+        app.router.add_post("/api/promconfig/rules/update", self.api_promconfig_rule_update)
+        app.router.add_get("/api/promconfig/node-exporter", self.api_promconfig_node_status)
+        app.router.add_post("/api/promconfig/node-exporter", self.api_promconfig_node_control)
+        app.router.add_post("/api/promconfig/node-exporter/register", self.api_promconfig_node_register)
+        app.router.add_post("/api/promconfig/node-exporter/adopt", self.api_promconfig_node_adopt)
+        app.router.add_post("/api/promconfig/node-exporter/detect", self.api_promconfig_node_detect)
+        app.router.add_post("/api/promconfig/node-exporter/install", self.api_promconfig_node_install)
+        app.router.add_post("/api/promconfig/validate", self.api_promconfig_validate)
+        app.router.add_post("/api/promconfig/rollback", self.api_promconfig_rollback)
         app.router.add_post("/hooks/alertmanager", self.hook_alertmanager)
         return app
 
@@ -573,6 +601,31 @@ class WebApp:
                 out.add(r["id"])
         return out
 
+    def _asset_monitor_host(self, asset: dict, endpoints: list[dict] | None = None) -> str:
+        """Resolve the monitoring host from current asset/connection configuration."""
+        for key in ("monitor_host", "host"):
+            host = str(asset.get(key) or "").strip()
+            if host:
+                return host
+        store = self.ssh_store or self._ssh_store()
+        if endpoints is None:
+            endpoints = store.list_endpoints(asset["id"]) if store else []
+        preference = {"write": 0, "read": 1}
+        candidates = []
+        for ep in endpoints:
+            if not ep.get("enabled") or not str(ep.get("host") or "").strip():
+                continue
+            priority = preference.get(ep.get("role"))
+            if priority is None and store:
+                try:
+                    priority = {"write": 2, "read": 3}.get(store.role_kind(ep.get("role")))
+                except Exception:
+                    continue
+            if priority is not None:
+                candidates.append((priority, ep))
+        candidates.sort(key=lambda item: item[0])
+        return str(candidates[0][1]["host"]).strip() if candidates else ""
+
     async def api_assets(self, request: web.Request) -> web.Response:
         sess = self._require_auth(request)
         visible = self._visible_asset_ids(sess)
@@ -588,11 +641,18 @@ class WebApp:
                 for o in self.db.query("SELECT * FROM objects WHERE asset_id=?", (r["id"],))
             ]
             # 附带 SSH 端点（主机连接信息）
-            if self.ssh_store:
+            eps = []
+            store = self.ssh_store or self._ssh_store()
+            if store:
                 try:
-                    d["ssh_endpoints"] = self.ssh_store.list_endpoints(r["id"])
+                    eps = store.list_endpoints(r["id"])
                 except Exception:
-                    d["ssh_endpoints"] = []
+                    eps = []
+            d["ssh_endpoints"] = eps
+            # 自动主地址：assets.host 优先，否则 SSH 端点 host
+            host = self._asset_monitor_host(d, eps)
+            d["host"] = host
+            d["monitor_host"] = host
             out.append(d)
         return _json({"ok": True, "assets": out})
 
@@ -636,11 +696,11 @@ class WebApp:
         with self.db.tx() as conn:
             conn.execute(
                 "INSERT INTO assets(id, display_name, read_alias, write_alias, expected_host_id,"
-                " prom_asset, enabled, notes, created_at, updated_at)"
-                " VALUES(?,?,?,?,? ,?,1,?,?,?)",
+                " prom_asset, host, enabled, notes, created_at, updated_at)"
+                " VALUES(?,?,?,?,? ,?,?,1,?,?,?)",
                 (
                     p["id"], p["display_name"], read_alias, write_alias, "",
-                    p["prom_asset"], p["notes"], t, t,
+                    p["prom_asset"], p["host"], p["notes"], t, t,
                 ),
             )
             conn.execute(
@@ -705,25 +765,47 @@ class WebApp:
             (display, notes, enabled, t, aid),
         )
         ssh_ep = None
-        cred_id = body.get("credential_id") or ""
+        role = str(body.get("role") or "write")
+        # 凭据策略：空=保留原凭据；clear_credential=显式清空；新密文=rotate 或 create
+        clear_cred = bool(body.get("clear_credential"))
         secret = str(body.get("password") or body.get("private_key") or "").strip()
-        if secret and self.cred_store:
+        existing_ep = None
+        if self.ssh_store:
+            try:
+                existing_ep = self.ssh_store.get_endpoint(aid, role) or (
+                    self.ssh_store.list_endpoints(aid) or [None]
+                )[0]
+            except Exception:
+                existing_ep = None
+        cred_id = body.get("credential_id")
+        if cred_id is None:
+            cred_id = (existing_ep or {}).get("credential_id") or ""
+        cred_id = str(cred_id or "").strip()
+        if clear_cred:
+            cred_id = ""
+        elif secret and self.cred_store:
             try:
                 kind = "private_key" if "BEGIN" in secret else "password"
-                meta = self._cred_store().create(
-                    name=f"{aid}-{body.get('role') or 'write'}",
-                    kind=kind,
-                    secret=secret,
-                    actor=sess["username"],
-                )
-                cred_id = meta["id"]
+                # 同端点已有凭据 → rotate，避免孤儿
+                if cred_id:
+                    meta = self._cred_store().rotate(
+                        cred_id, secret=secret, actor=sess["username"]
+                    )
+                else:
+                    meta = self._cred_store().create(
+                        name=f"{aid}-{role}",
+                        kind=kind,
+                        secret=secret,
+                        actor=sess["username"],
+                    )
+                    cred_id = meta["id"]
             except Exception as e:
                 return _json({"ok": False, "error": f"credential: {e}"}, 400)
         if self.ssh_store and body.get("host"):
             try:
                 ssh_ep = self.ssh_store.upsert_endpoint(
                     asset_id=aid,
-                    role=(body.get("role") or "write"),
+                    role=role,
                     host=str(body["host"]).strip(),
                     port=int(body.get("port") or 22),
                     username=str(body.get("username") or "root").strip(),
@@ -734,7 +816,14 @@ class WebApp:
                 return _json({"ok": False, "error": f"ssh: {e}"}, 400)
         self.db.audit(
             "web_user", sess["username"], "asset_updated",
-            asset_id=aid, detail={"display_name": display, "enabled": enabled}, channel="web",
+            asset_id=aid,
+            detail={
+                "display_name": display,
+                "enabled": enabled,
+                "credential_cleared": clear_cred,
+                "credential_rotated": bool(secret and not clear_cred),
+            },
+            channel="web",
         )
         return _json({"ok": True, "asset_id": aid, "ssh_endpoint": ssh_ep, "credential_id": cred_id})
 
@@ -2098,13 +2187,13 @@ class WebApp:
                           detail=result, channel="web")
             return _json(result)
 
-        # 2) 无 SSH 端点 → NT 已移除，明确提示配置 SSH
+        # 2) 无 SSH 端点 → 提示配置 SSH
         result["channel"] = "none"
         result["ok"] = False
         result["detail"] = "ssh_not_configured"
         result["hint"] = (
             "未配置 SSH（需要地址 + 密码或密钥）。"
-            "NT 通道已移除，必须配置 SSH 后才能远程连接与执行。"
+            "需配置 SSH 后才能远程连接与执行。"
         )
         self.db.audit("web_user", sess["username"], "channel_test", asset_id=asset_id,
                       detail=result, channel="web")
@@ -2120,6 +2209,8 @@ class WebApp:
         asset_id = str(body.get("asset_id") or "").strip()
         role = str(body.get("role") or "write")
         delete_password = bool(body.get("delete_password", True))
+        # 明确「信任并更换」：未信任也可一步完成；未勾选则仍拒绝（安全边界）
+        trust_and_rotate = bool(body.get("trust_host_key", False))
         if not asset_id:
             return _json({"ok": False, "error": "asset_id_required"}, 400)
 
@@ -2154,6 +2245,46 @@ class WebApp:
                 "credential_id": cred_id,
                 "hint": "已经在用密钥认证，无需切换。",
             })
+
+        # host key：未信任且用户未点「信任并更换」→ 拒绝
+        trusted = bool(ep.get("host_key_trusted_at") and ep.get("host_key_sha256"))
+        if not trusted:
+            if not trust_and_rotate:
+                from .transport import fetch_host_key
+
+                scanned = await fetch_host_key(ep.get("host") or "", int(ep.get("port") or 22))
+                return _json({
+                    "ok": False,
+                    "error": "host_key_untrusted",
+                    "host_key_info": {
+                        "fingerprint": scanned.get("fingerprint") or "",
+                        "key_line": scanned.get("key_line") or "",
+                        "host": ep.get("host"),
+                        "port": ep.get("port"),
+                    },
+                    "hint": "安全边界：须先信任主机指纹才能更换密钥。请点「信任并更换密钥」。",
+                })
+            # 一步信任
+            from .transport import fetch_host_key
+
+            scanned = await fetch_host_key(ep.get("host") or "", int(ep.get("port") or 22))
+            if not scanned.get("ok"):
+                return _json({
+                    "ok": False,
+                    "error": "host_key_scan_failed",
+                    "hint": "无法获取主机指纹，已拒绝更换密钥。",
+                })
+            self.ssh_store.trust_host_key(
+                asset_id,
+                role,
+                scanned.get("fingerprint") or "",
+                actor=sess["username"],
+                key_line=scanned.get("key_line") or "",
+            )
+            ep = self._ssh_store().get_endpoint(asset_id, role) or ep
+            steps.append("host_key_trusted")
+            trusted = True
+
         steps.append(f"use_password_credential:{cred_id[:10]}")
 
         # 1) 生成密钥对并入库
@@ -2614,6 +2745,500 @@ class WebApp:
             return _json({"ok": True, "summary": summarize_probe(data), "raw": data})
         except Exception as e:
             return _json({"ok": False, "error": str(e)}, 502)
+
+    # ---- 业务检查（轻量）----
+
+    def _checks(self):
+        if not self.checks:
+            raise web.HTTPNotFound(text=json.dumps({"error": "checks_not_configured"}))
+        return self.checks
+
+    def _check_read(self, request: web.Request) -> dict[str, Any]:
+        sess = self._require_auth(request)
+        d = self.policy.effective_decision(
+            subject_type="web_user",
+            subject_id=sess["username"],
+            capability="checks.read",
+            asset_id="*",
+            object_id="*",
+        )
+        if not d["allowed"]:
+            raise web.HTTPForbidden(text=json.dumps({"error": "denied"}))
+        return sess
+
+    def _check_write(self, request: web.Request) -> dict[str, Any]:
+        sess = self._require_auth(request)
+        self._check_csrf(request, sess)
+        if not sess.get("is_admin"):
+            raise web.HTTPForbidden(text=json.dumps({"error": "admin_required"}))
+        d = self.policy.effective_decision(
+            subject_type="web_user",
+            subject_id=sess["username"],
+            capability="checks.write",
+            asset_id="*",
+            object_id="*",
+        )
+        if not d["allowed"]:
+            raise web.HTTPForbidden(text=json.dumps({"error": "denied"}))
+        if d.get("require_approval"):
+            raise web.HTTPForbidden(text=json.dumps({"error": "approval_required"}))
+        return sess
+
+    async def api_checks_list(self, request: web.Request) -> web.Response:
+        self._check_read(request)
+        asset_id = request.rel_url.query.get("asset_id", "")
+        try:
+            return _json({"ok": True, "checks": self._checks().list_checks(asset_id)})
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 502)
+
+    async def api_checks_create(self, request: web.Request) -> web.Response:
+        sess = self._check_write(request)
+        body = await request.json()
+        try:
+            item = self._checks().create_check(
+                asset_id=body.get("asset_id") or "",
+                kind=body.get("kind") or "",
+                name=body.get("name") or "",
+                params=body.get("params") or {},
+                expect=body.get("expect") or {},
+                interval_sec=body.get("interval_sec") or 60,
+                fail_threshold=body.get("fail_threshold") or 2,
+                severity=body.get("severity") or "warning",
+                actor=sess["username"],
+            )
+            return _json({"ok": True, "check": item})
+        except Exception as e:
+            return _json({"ok": False, "error": getattr(e, "code", "error"), "detail": str(e)}, 400)
+
+    async def api_checks_update(self, request: web.Request) -> web.Response:
+        sess = self._check_write(request)
+        body = await request.json()
+        try:
+            fields = {k: body[k] for k in ("name", "params", "expect", "interval_sec", "fail_threshold", "severity", "enabled") if k in body}
+            item = self._checks().update_check(body.get("id") or "", actor=sess["username"], **fields)
+            return _json({"ok": True, "check": item})
+        except Exception as e:
+            return _json({"ok": False, "error": getattr(e, "code", "error"), "detail": str(e)}, 400)
+
+    async def api_checks_delete(self, request: web.Request) -> web.Response:
+        sess = self._check_write(request)
+        body = await request.json()
+        try:
+            self._checks().delete_check(body.get("id") or "", actor=sess["username"])
+            return _json({"ok": True})
+        except Exception as e:
+            return _json({"ok": False, "error": getattr(e, "code", "error"), "detail": str(e)}, 400)
+
+    async def api_checks_run(self, request: web.Request) -> web.Response:
+        sess = self._check_write(request)
+        body = await request.json()
+        cid = body.get("id") or ""
+        try:
+            item = self._checks().get_check(cid)
+            if not item:
+                return _json({"ok": False, "error": "not_found"}, 404)
+            if not self.transport:
+                return _json({"ok": False, "error": "transport_required"}, 400)
+            item["was_failing"] = (item.get("fail_streak") or 0) > 0
+            res = await self._checks().run_one(item)
+            return _json({"ok": True, "result": res})
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 502)
+
+    async def api_checks_activity(self, request: web.Request) -> web.Response:
+        self._check_read(request)
+        try:
+            return _json({"ok": True, "activity": self._checks().activity(50)})
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 502)
+
+    # ---- Prometheus 配置管理（v0.6.x）----
+
+    def _promconfig(self):
+        if not self.promconfig:
+            raise web.HTTPNotFound(text=json.dumps({"error": "promconfig_not_configured"}))
+        return self.promconfig
+
+    def _require_asset(self, asset_id: str) -> dict[str, Any]:
+        """资产必须存在且启用；禁止任意字符串进入执行链。"""
+        asset_id = (asset_id or "").strip()
+        if not asset_id:
+            raise web.HTTPBadRequest(text=json.dumps({"error": "asset_id_required"}))
+        row = self.db.query_one(
+            "SELECT id, display_name, prom_asset, enabled FROM assets WHERE id=?", (asset_id,)
+        )
+        if not row:
+            raise web.HTTPNotFound(text=json.dumps({"error": "asset_not_found"}))
+        if not row["enabled"]:
+            raise web.HTTPForbidden(text=json.dumps({"error": "asset_disabled"}))
+        return dict(row)
+
+    def _policy_for(self, sess: dict, capability: str, asset_id: str = "*", object_id: str = "*") -> dict[str, Any]:
+        return self.policy.effective_decision(
+            subject_type="web_user",
+            subject_id=sess["username"],
+            capability=capability,
+            asset_id=asset_id,
+            object_id=object_id,
+        )
+
+    def _check_prom_write(self, request: web.Request, *, asset_id: str = "*") -> dict[str, Any]:
+        sess = self._require_auth(request)
+        self._check_csrf(request, sess)
+        if not sess.get("is_admin"):
+            raise web.HTTPForbidden(text=json.dumps({"error": "admin_required"}))
+        decision = self._policy_for(sess, "promconfig.write", asset_id=asset_id)
+        if not decision["allowed"]:
+            raise web.HTTPForbidden(text=json.dumps({"error": "denied", "reason": decision.get("reason")}))
+        if decision.get("require_approval"):
+            raise web.HTTPForbidden(
+                text=json.dumps({"error": "approval_required", "require_approval": True})
+            )
+        return sess
+
+    def _check_prom_read(self, request: web.Request) -> dict[str, Any]:
+        sess = self._require_auth(request)
+        decision = self._policy_for(sess, "promconfig.read")
+        if not decision["allowed"]:
+            # 尊重显式 deny，不因 admin 绕过
+            raise web.HTTPForbidden(text=json.dumps({"error": "denied", "reason": decision.get("reason")}))
+        return sess
+
+    async def api_promconfig_overview(self, request: web.Request) -> web.Response:
+        self._check_prom_read(request)
+        try:
+            data = await self._promconfig().overview()
+            return _json({"ok": True, **data})
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 502)
+
+    async def api_promconfig_config(self, request: web.Request) -> web.Response:
+        self._check_prom_read(request)
+        try:
+            data = await self._promconfig().read_config()
+            return _json(data)
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 502)
+
+    async def api_promconfig_targets(self, request: web.Request) -> web.Response:
+        self._check_prom_read(request)
+        try:
+            data = await self._promconfig().list_targets()
+            return _json(data)
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 502)
+
+    async def api_promconfig_target_add(self, request: web.Request) -> web.Response:
+        sess = self._check_prom_write(request)
+        body = await request.json()
+        try:
+            data = await self._promconfig().add_target(
+                address=body.get("address") or "",
+                labels=body.get("labels") or {},
+                actor=sess["username"],
+            )
+            return _json(data)
+        except Exception as e:
+            from .promconfig import PromConfigError
+
+            code = getattr(e, "code", "error")
+            return _json({"ok": False, "error": code, "detail": str(e)}, 400)
+
+    async def api_promconfig_target_update(self, request: web.Request) -> web.Response:
+        sess = self._check_prom_write(request)
+        body = await request.json()
+        try:
+            data = await self._promconfig().update_target(
+                address=body.get("address") or "",
+                new_address=body.get("new_address") or None,
+                labels=body.get("labels"),
+                actor=sess["username"],
+            )
+            return _json(data)
+        except Exception as e:
+            return _json({"ok": False, "error": getattr(e, "code", "error"), "detail": str(e)}, 400)
+
+    async def api_promconfig_target_delete(self, request: web.Request) -> web.Response:
+        sess = self._check_prom_write(request)
+        body = await request.json()
+        try:
+            data = await self._promconfig().delete_target(
+                address=body.get("address") or "", actor=sess["username"]
+            )
+            return _json(data)
+        except Exception as e:
+            return _json({"ok": False, "error": getattr(e, "code", "error"), "detail": str(e)}, 400)
+
+    async def api_promconfig_rules(self, request: web.Request) -> web.Response:
+        self._check_prom_read(request)
+        try:
+            data = await self._promconfig().read_rules()
+            return _json(data)
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 502)
+
+    async def api_promconfig_rule_templates(self, request: web.Request) -> web.Response:
+        self._check_prom_read(request)
+        try:
+            return _json({"ok": True, "templates": await self._promconfig().list_templates()})
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 502)
+
+    async def api_promconfig_rule_apply_template(self, request: web.Request) -> web.Response:
+        sess = self._check_prom_write(request)
+        body = await request.json()
+        try:
+            data = await self._promconfig().apply_template(
+                template_id=body.get("template_id") or "",
+                enabled=bool(body.get("enabled", True)),
+                threshold=body.get("threshold"),
+                duration=body.get("duration"),
+                severity=body.get("severity"),
+                actor=sess["username"],
+            )
+            return _json(data)
+        except Exception as e:
+            return _json({"ok": False, "error": getattr(e, "code", "error"), "detail": str(e)}, 400)
+
+    async def api_promconfig_rule_update(self, request: web.Request) -> web.Response:
+        sess = self._check_prom_write(request)
+        body = await request.json()
+        try:
+            data = await self._promconfig().update_rule(
+                file_path=body.get("file_path") or "",
+                alert=body.get("alert") or "",
+                expr=body.get("expr"),
+                duration=body.get("duration"),
+                severity=body.get("severity"),
+                enabled=body.get("enabled"),
+                actor=sess["username"],
+            )
+            return _json(data)
+        except Exception as e:
+            return _json({"ok": False, "error": getattr(e, "code", "error"), "detail": str(e)}, 400)
+
+    async def api_promconfig_node_status(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        asset_id = request.rel_url.query.get("asset_id", "")
+        try:
+            asset = self._require_asset(asset_id)
+        except web.HTTPException as e:
+            return e
+        decision = self._policy_for(sess, "node_exporter.status", asset_id=asset["id"])
+        if not decision["allowed"]:
+            return _json({"ok": False, "error": "denied"}, 403)
+        try:
+            data = await self._promconfig().node_exporter_status(asset["id"], self._ne_transport(asset["id"]))
+            return _json({"ok": True, "status": data})
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 502)
+
+    def _ssh_store(self):
+        store = getattr(self.transport, "store", None)
+        if store is None:
+            store = getattr(self.transport, "_store", None)
+        return store
+
+    def _ne_transport(self, asset_id: str):
+        """Node Exporter 通道：有 SSH 端点用 SSH；仅本机资产才允许 LocalExec。SSH 失败不得回退。"""
+        from .promconfig import LocalExecTransport
+
+        local_assets = set(
+            str(x).strip()
+            for x in (
+                (self.promconfig.cfg_local_assets() if self.promconfig else []) or []
+            )
+            if str(x).strip()
+        )
+        # 也允许 config 显式登记的本机资产
+        ssh = self.transport
+        store = self._ssh_store() if ssh is not None else None
+        ep = None
+        if store is not None:
+            try:
+                ep = store.get_endpoint(asset_id, "read") or store.get_endpoint(asset_id, "write")
+            except Exception:
+                ep = None
+        if ep:
+            return ssh
+        if asset_id in local_assets:
+            return LocalExecTransport()
+        raise web.HTTPForbidden(
+            text=json.dumps({"error": "asset_channel_unavailable", "asset_id": asset_id})
+        )
+
+    def _json_bool(self, body: dict, key: str, default: bool = False) -> bool:
+        v = body.get(key, default)
+        if isinstance(v, bool):
+            return v
+        raise web.HTTPBadRequest(text=json.dumps({"error": "bad_boolean", "field": key}))
+
+    async def api_promconfig_node_control(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        asset_id = body.get("asset_id") or ""
+        action = body.get("action") or ""
+        if not asset_id or action not in ("install", "start", "stop", "check"):
+            return _json({"ok": False, "error": "bad_request"}, 400)
+        try:
+            asset = self._require_asset(asset_id)
+        except web.HTTPException as e:
+            return e
+        decision = self._policy_for(sess, "node_exporter.manage", asset_id=asset["id"])
+        if not decision["allowed"]:
+            return _json({"ok": False, "error": "denied"}, 403)
+        if decision.get("require_approval") and action in ("install", "start", "stop"):
+            return _json({"ok": False, "error": "approval_required", "require_approval": True}, 403)
+        try:
+            allow_np = self._json_bool(body, "allow_non_private", False)
+        except web.HTTPException as e:
+            return e
+        try:
+            data = await self._promconfig().node_exporter_control(
+                asset_id=asset["id"],
+                action=action,
+                transport=self._ne_transport(asset["id"]),
+                actor=sess["username"],
+                listen_address=body.get("listen_address") or "127.0.0.1:9100",
+                allow_non_private=allow_np,
+            )
+            return _json(data)
+        except Exception as e:
+            return _json({"ok": False, "error": getattr(e, "code", "error"), "detail": str(e)}, 400)
+
+    async def api_promconfig_node_adopt(self, request: web.Request) -> web.Response:
+        """一键接入：检查 → 装/启 node_exporter → 注册目标。"""
+        sess = self._require_auth(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        asset_id = body.get("asset_id") or ""
+        try:
+            asset = self._require_asset(asset_id)
+        except web.HTTPException as e:
+            return e
+        decision = self._policy_for(sess, "node_exporter.manage", asset_id=asset["id"])
+        if not decision["allowed"]:
+            return _json({"ok": False, "error": "denied"}, 403)
+        if decision.get("require_approval"):
+            return _json({"ok": False, "error": "approval_required"}, 403)
+        # 写权限：注册目标
+        d2 = self._policy_for(sess, "promconfig.write", asset_id=asset["id"])
+        if not d2["allowed"] or d2.get("require_approval"):
+            return _json({"ok": False, "error": "denied"}, 403)
+        address = (body.get("address") or "").strip()
+        if not address:
+            host = self._asset_monitor_host(asset)
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            address = f"{host}:9100" if host else ""
+        if not address:
+            return _json({"ok": False, "error": "address_required", "hint": "未配置监控地址，请填写主机地址或添加启用的 SSH 连接。"}, 400)
+        try:
+            allow_np = self._json_bool(body, "allow_non_private", False)
+        except web.HTTPException as e:
+            return e
+        try:
+            data = await self._promconfig().adopt_node(
+                asset_id=asset["id"],
+                address=address,
+                transport=self._ne_transport(asset["id"]),
+                actor=sess["username"],
+                listen_address=body.get("listen_address") or "127.0.0.1:9100",
+                allow_non_private=allow_np,
+            )
+            return _json(data)
+        except Exception as e:
+            return _json({"ok": False, "error": getattr(e, "code", "error"), "detail": str(e)}, 400)
+
+    async def api_promconfig_node_detect(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        asset_id = body.get("asset_id") or ""
+        try:
+            asset = self._require_asset(asset_id)
+        except web.HTTPException as e:
+            return e
+        d = self._policy_for(sess, "node_exporter.status", asset_id=asset["id"])
+        if not d["allowed"] and not sess.get("is_admin"):
+            return _json({"ok": False, "error": "denied"}, 403)
+        try:
+            data = await self._promconfig().detect_exporter(asset["id"], self._ne_transport(asset["id"]))
+            return _json({"ok": True, **data})
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 502)
+
+    async def api_promconfig_node_install(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        asset_id = body.get("asset_id") or ""
+        method = body.get("method") or "auto"
+        try:
+            asset = self._require_asset(asset_id)
+        except web.HTTPException as e:
+            return e
+        d = self._policy_for(sess, "node_exporter.manage", asset_id=asset["id"])
+        if not d["allowed"] or d.get("require_approval"):
+            return _json({"ok": False, "error": "denied"}, 403)
+        try:
+            allow_np = self._json_bool(body, "allow_non_private", True)
+        except web.HTTPException as e:
+            return e
+        try:
+            data = await self._promconfig().install_exporter(
+                asset_id=asset["id"],
+                method=method,
+                transport=self._ne_transport(asset["id"]),
+                actor=sess["username"],
+                listen_address=body.get("listen_address") or "0.0.0.0:9100",
+                allow_non_private=allow_np,
+            )
+            return _json(data)
+        except Exception as e:
+            return _json({"ok": False, "error": getattr(e, "code", "error"), "detail": str(e)}, 400)
+
+    async def api_promconfig_node_register(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        asset_id = body.get("asset_id") or ""
+        try:
+            asset = self._require_asset(asset_id)
+        except web.HTTPException as e:
+            return e
+        sess_w = self._check_prom_write(request, asset_id=asset["id"])
+        try:
+            data = await self._promconfig().register_node_target(
+                asset_id=asset["id"],
+                address=body.get("address") or "",
+                labels=body.get("labels") or {},
+                actor=sess_w["username"],
+            )
+            return _json(data)
+        except Exception as e:
+            return _json({"ok": False, "error": getattr(e, "code", "error"), "detail": str(e)}, 400)
+
+    async def api_promconfig_validate(self, request: web.Request) -> web.Response:
+        sess = self._check_prom_write(request)
+        try:
+            data = await self._promconfig().validate_and_reload(actor=sess["username"])
+            return _json(data)
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 502)
+
+    async def api_promconfig_rollback(self, request: web.Request) -> web.Response:
+        sess = self._check_prom_write(request)
+        body = await request.json()
+        try:
+            data = await self._promconfig().rollback_last(
+                path=body.get("path") or "", actor=sess["username"]
+            )
+            return _json(data)
+        except Exception as e:
+            return _json({"ok": False, "error": getattr(e, "code", "error"), "detail": str(e)}, 400)
 
     # ---- alertmanager ----
 

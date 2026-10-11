@@ -378,7 +378,10 @@ class SSHTransport:
         )
 
     def _endpoint_for_channel(self, asset_id: str, kind: str) -> SSHEndpoint:
-        """按读/写通道找端点：优先精确角色名，再按角色 kind 匹配。"""
+        """按读/写通道找端点：优先精确角色名，再按角色 kind 匹配。
+
+        只读探测在缺少 read 端点时，回落到同资产 write 端点（只读命令仍走 probe）。
+        """
         if kind == "write":
             row = self.store.get_endpoint(asset_id, "write")
             if row and row.get("enabled"):
@@ -397,6 +400,10 @@ class SSHTransport:
                 row = self.store.get_endpoint(asset_id, r["name"])
                 if row and row.get("enabled"):
                     return self._endpoint(asset_id, r["name"])
+        # 同资产 write 端点可做只读探测（避免「只有 write 就完全不能查状态」）
+        wrow = self.store.get_endpoint(asset_id, "write")
+        if wrow and wrow.get("enabled"):
+            return self._endpoint(asset_id, "write")
         raise TransportError("endpoint_missing", f"{asset_id}/read")
 
     async def probe(self, asset_id: str, cmd_tokens: list[str], timeout: float | None = None) -> NTResult:
@@ -534,6 +541,115 @@ class SSHTransport:
             )
         finally:
             # 凭据与临时文件立即清理
+            try:
+                import shutil
+
+                shutil.rmtree(workdir, ignore_errors=True)
+            except Exception:
+                pass
+            secret = ""
+
+    async def send_file(
+        self, asset_id: str, local_path: str, remote_path: str, *, timeout: float = 90.0
+    ) -> NTResult:
+        """把本地文件推到远端固定路径：ssh + cat > path（不依赖 scp/sftp）。"""
+        if not remote_path.startswith("/") or any(c in remote_path for c in " \t\n;|&$`"):
+            raise TransportError("bad_remote_path", remote_path[:80])
+        lp = Path(local_path)
+        if not lp.is_file():
+            raise TransportError("local_file_missing", str(local_path)[:80])
+        ep = self._endpoint_for_channel(asset_id, "write")
+        if not ep.host_key_sha256 or not ep.host_key_trusted_at:
+            raise TransportError("host_key_untrusted", f"{asset_id}/{ep.role}")
+        known_line = ep.host_key_line or ""
+        if not known_line:
+            raise TransportError("host_key_line_missing", f"{asset_id}/{ep.role}")
+        workdir = tempfile.mkdtemp(prefix="ayana-send-")
+        try:
+            env = os.environ.copy()
+            identity = None
+            secret = ""
+            auth_mode = "none"
+            if ep.credential_id and self.cred_store is not None:
+                meta = self.cred_store.get_meta(ep.credential_id)
+                cred_kind = (meta or {}).get("kind") or ""
+                secret = self.cred_store.reveal_secret(ep.credential_id)
+                if cred_kind == "private_key":
+                    auth_mode = "key"
+                    identity = Path(workdir) / "id_key"
+                    identity.write_text(secret, encoding="utf-8")
+                    os.chmod(identity, 0o600)
+                else:
+                    auth_mode = "password"
+                    askpass = Path(workdir) / "askpass.sh"
+                    askpass.write_text("#!/bin/sh\nprintf '%s' \"$AYANA_SSH_PASSWORD\"\n", encoding="utf-8")
+                    os.chmod(askpass, 0o700)
+                    env["AYANA_SSH_PASSWORD"] = secret
+                    env["SSH_ASKPASS"] = str(askpass)
+                    env["SSH_ASKPASS_REQUIRE"] = "force"
+                    env["DISPLAY"] = env.get("DISPLAY") or "ayana:0"
+            known_hosts = Path(workdir) / "known_hosts"
+            known_hosts.write_text(known_line + "\n", encoding="utf-8")
+            validate_ssh_identity(ep.username, ep.host)
+            remote_cmd = f"cat > {remote_path}"
+            argv = [
+                self.ssh_binary,
+                "-o", "StrictHostKeyChecking=yes",
+                "-o", f"UserKnownHostsFile={known_hosts}",
+                "-o", f"ConnectTimeout={max(2, int(timeout) - 1)}",
+                "-p", str(ep.port),
+            ]
+            if auth_mode == "key" and identity:
+                argv += ["-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-i", str(identity)]
+            elif auth_mode == "password":
+                argv += ["-o", "PreferredAuthentications=password,keyboard-interactive"]
+            argv += ["-l", ep.username, "--", ep.host, remote_cmd]
+
+            async def _run_cat(cmd_line: str, data: bytes) -> NTResult:
+                proc = await asyncio.create_subprocess_exec(
+                    *argv[:-1],
+                    cmd_line,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                )
+                try:
+                    out_b, err_b = await asyncio.wait_for(proc.communicate(input=data), timeout=timeout)
+                except asyncio.TimeoutError:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    return NTResult(ok=False, output="timeout", returncode=-1)
+                text = ((out_b or b"") + (err_b or b"")).decode("utf-8", "replace")
+                return NTResult(ok=proc.returncode == 0, output=text[:500], returncode=proc.returncode)
+
+            # 大文件分块写入，避免单次 stdin 过大被 sshd 重置
+            size = lp.stat().st_size
+            chunk = 1024 * 1024
+            if size <= chunk * 2:
+                with open(lp, "rb") as f:
+                    return await _run_cat(f"cat > {remote_path}", f.read())
+            tmp_r = remote_path + ".part"
+            with open(lp, "rb") as f:
+                first = f.read(chunk)
+            r = await _run_cat(f"cat > {tmp_r}", first)
+            if not r.ok:
+                return r
+            with open(lp, "rb") as f:
+                f.read(chunk)
+                while True:
+                    part = f.read(chunk)
+                    if not part:
+                        break
+                    r = await _run_cat(f"cat >> {tmp_r}", part)
+                    if not r.ok:
+                        return r
+            return await self._run(
+                asset_id, "write", ["mv", tmp_r, remote_path], timeout=max(20.0, timeout)
+            )
+        finally:
             try:
                 import shutil
 
