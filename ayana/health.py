@@ -380,9 +380,9 @@ def system_health_ratio(
         }
 
     sources = [
-        _bucket(metric_items, "metrics", "指标", "MELCHIOR-1"),
-        _bucket(check_items, "checks", "检查", "BALTHASAR-2"),
-        _bucket(alert_items, "alerts", "告警", "CASPER-3"),
+        _bucket(metric_items, "metrics", "指标采集", "MELCHIOR-1"),
+        _bucket(check_items, "checks", "业务检查", "BALTHASAR-2"),
+        _bucket(alert_items, "alerts", "告警状态", "CASPER-3"),
     ]
 
     # 唯一分数：对 total>0 的来源求和；total=0 的来源不参与（显示 —）

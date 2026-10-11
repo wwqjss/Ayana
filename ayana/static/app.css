@@ -83,117 +83,118 @@ main { padding: 20px 22px 40px; max-width: 1100px; margin: 0 auto; }
 .badge.dim { background: rgba(255,255,255,.06); color: var(--dim); }
 .badge.err { background: rgba(124,58,237,.18); color: #c4b5fd; }
 
-/* ── 系统健康度 · 指挥台仪表（克制 NERV 氛围） ── */
+/* ── 系统健康度 · 参考图排版 ──
+   中文 PingFang SC / Microsoft YaHei
+   数字 Inter（tabular）
+   MAGI 代号 JetBrains Mono */
 .health-ratio-card {
-  position: relative;
-  overflow: hidden;
-  border-radius: 12px;
-  padding: 18px 20px 14px;
-  background:
-    linear-gradient(180deg, rgba(108,182,255,.04), transparent 48%),
-    var(--card);
+  padding: 22px 24px 18px;
+  border-radius: 14px;
+  background: var(--card);
 }
-.health-ratio-card .hr-corner {
-  position: absolute; width: 12px; height: 12px; pointer-events: none;
-  border-color: rgba(108,182,255,.35); border-style: solid; border-width: 0;
-}
-.health-ratio-card .hr-corner.tl { top: 8px; left: 8px; border-top-width: 1px; border-left-width: 1px; }
-.health-ratio-card .hr-corner.tr { top: 8px; right: 8px; border-top-width: 1px; border-right-width: 1px; }
-.health-ratio-card .hr-corner.bl { bottom: 8px; left: 8px; border-bottom-width: 1px; border-left-width: 1px; }
-.health-ratio-card .hr-corner.br { bottom: 8px; right: 8px; border-bottom-width: 1px; border-right-width: 1px; }
-
 .health-ratio-card .hr-head {
-  display: flex; align-items: baseline; gap: 12px; margin-bottom: 12px;
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 18px;
 }
 .health-ratio-card .hr-title {
-  font-size: 16px; font-weight: 600; letter-spacing: .04em;
+  font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 17px; font-weight: 600; color: var(--ink);
+  letter-spacing: .02em;
 }
-.health-ratio-card .hr-sub {
-  font-size: 10px; letter-spacing: .18em; color: var(--dim);
-  text-transform: uppercase; font-family: ui-monospace, Consolas, monospace;
+.health-ratio-card .hr-badge {
+  font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 12px; font-weight: 600; padding: 4px 12px;
+  border-radius: 999px; letter-spacing: .04em;
+}
+.health-ratio-card .hr-badge.ok {
+  background: rgba(61,214,140,.16); color: var(--ok);
+}
+.health-ratio-card .hr-badge.warn {
+  background: rgba(229,192,123,.18); color: var(--warn);
+}
+.health-ratio-card .hr-badge.bad {
+  background: rgba(240,113,120,.18); color: var(--bad);
+}
+.health-ratio-card .hr-badge.dim {
+  background: rgba(255,255,255,.08); color: var(--dim);
 }
 
-.health-ratio-card .hr-body {
-  display: flex; align-items: center; gap: 20px; flex-wrap: wrap;
-}
-.health-ratio-card .hr-val-box { min-width: 120px; }
 .health-ratio-card .hr-val {
-  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
-  font-size: 42px; font-weight: 600; line-height: 1;
-  letter-spacing: -0.02em;
+  font-family: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 52px; font-weight: 600; line-height: 1.05;
+  letter-spacing: -0.025em;
   font-variant-numeric: tabular-nums;
+  margin: 2px 0 16px;
 }
 .health-ratio-card .hr-val.ok { color: var(--ok); }
 .health-ratio-card .hr-val.warn { color: var(--warn); }
 .health-ratio-card .hr-val.bad { color: var(--bad); }
 .health-ratio-card .hr-val.dim { color: var(--dim); }
-.health-ratio-card .hr-count {
-  margin-top: 6px; font-size: 12px; color: var(--dim);
-  font-family: ui-monospace, Consolas, monospace;
-}
 
-.health-ratio-card .hr-bar-box { flex: 1; min-width: 180px; }
 .health-ratio-card .hr-bar {
-  height: 6px; border-radius: 2px; overflow: hidden;
-  background: rgba(255,255,255,.06);
-  border: 1px solid rgba(255,255,255,.06);
+  height: 10px; border-radius: 999px; overflow: hidden;
+  background: rgba(255,255,255,.08);
 }
 .health-ratio-card .hr-bar-fill {
-  height: 100%; border-radius: 1px;
-  transition: width .45s ease;
+  height: 100%; border-radius: 999px;
+  transition: width .5s ease;
 }
-.health-ratio-card .hr-bar-fill.ok { background: linear-gradient(90deg, rgba(61,214,140,.55), var(--ok)); }
-.health-ratio-card .hr-bar-fill.warn { background: linear-gradient(90deg, rgba(229,192,123,.5), var(--warn)); }
-.health-ratio-card .hr-bar-fill.bad { background: linear-gradient(90deg, rgba(240,113,120,.5), var(--bad)); }
-.health-ratio-card .hr-bar-fill.dim { background: rgba(255,255,255,.15); }
-.health-ratio-card .hr-bar-tip {
-  margin-top: 6px; font-size: 11px; color: var(--dim);
-  font-family: ui-monospace, Consolas, monospace;
+.health-ratio-card .hr-bar-fill.ok { background: var(--ok); }
+.health-ratio-card .hr-bar-fill.warn { background: var(--warn); }
+.health-ratio-card .hr-bar-fill.bad { background: var(--bad); }
+.health-ratio-card .hr-bar-fill.dim { background: rgba(255,255,255,.16); }
+
+.health-ratio-card .hr-count {
+  margin-top: 12px;
+  font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 14px; color: #b7bcc4; letter-spacing: .02em;
+}
+.health-ratio-card .hr-sep {
+  height: 1px; background: rgba(255,255,255,.08);
+  margin: 18px 0 16px;
 }
 
-.health-ratio-card .hr-magi {
-  margin-top: 14px; padding-top: 12px;
-  border-top: 1px dashed rgba(255,255,255,.08);
+.health-ratio-card .hr-magi-item { margin-bottom: 14px; }
+.health-ratio-card .hr-magi-item:last-of-type { margin-bottom: 4px; }
+.health-ratio-card .hr-magi-item.na { opacity: .5; }
+.health-ratio-card .hr-magi-meta {
+  display: flex; align-items: baseline; justify-content: space-between;
+  margin-bottom: 8px;
 }
-.health-ratio-card .hr-magi-title {
-  font-size: 10px; letter-spacing: .16em; color: var(--dim);
-  text-transform: uppercase; margin-bottom: 8px;
-  font-family: ui-monospace, Consolas, monospace;
+.health-ratio-card .hr-magi-name {
+  font-family: "JetBrains Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 13px; color: #c5cad1;
+  letter-spacing: .01em;
 }
-.health-ratio-card .hr-magi-row {
-  display: grid;
-  grid-template-columns: 88px 36px 1fr 56px;
-  gap: 10px; align-items: center;
-  padding: 4px 0;
+.health-ratio-card .hr-magi-frac {
+  font-family: Inter, "Segoe UI", sans-serif;
+  font-size: 15px; font-weight: 600; color: var(--ink);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .01em;
 }
-.health-ratio-card .hr-magi-row.na { opacity: .55; }
-.health-ratio-card .hr-magi-code {
-  font-family: ui-monospace, Consolas, monospace;
-  font-size: 11px; letter-spacing: .06em; color: var(--dim);
-}
-.health-ratio-card .hr-magi-label { font-size: 12px; color: var(--ink); }
 .health-ratio-card .hr-mini {
-  height: 4px; border-radius: 2px; overflow: hidden;
-  background: rgba(255,255,255,.06);
+  height: 6px; border-radius: 999px; overflow: hidden;
+  background: rgba(255,255,255,.08);
 }
 .health-ratio-card .hr-mini-fill {
-  height: 100%; transition: width .45s ease;
+  height: 100%; border-radius: 999px;
+  transition: width .5s ease;
 }
 .health-ratio-card .hr-mini-fill.ok { background: var(--ok); }
 .health-ratio-card .hr-mini-fill.warn { background: var(--warn); }
 .health-ratio-card .hr-mini-fill.bad { background: var(--bad); }
-.health-ratio-card .hr-mini-fill.dim { background: rgba(255,255,255,.12); }
-.health-ratio-card .hr-magi-frac {
-  text-align: right;
-  font-family: ui-monospace, Consolas, monospace;
-  font-size: 12px; color: var(--ink);
-  font-variant-numeric: tabular-nums;
+.health-ratio-card .hr-mini-fill.dim { background: rgba(255,255,255,.16); }
+
+.health-ratio-card .hr-sync {
+  font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 12px; color: var(--dim);
+  letter-spacing: .06em;
+  margin-top: 4px;
 }
-.health-ratio-card .hr-magi-row.na .hr-magi-frac { color: var(--dim); }
 
 @media (max-width: 640px) {
-  .health-ratio-card .hr-val { font-size: 32px; }
-  .health-ratio-card .hr-magi-row { grid-template-columns: 72px 28px 1fr 48px; gap: 6px; }
+  .health-ratio-card .hr-val { font-size: 40px; }
+  .health-ratio-card { padding: 18px 16px 14px; }
 }
 
 .subnav {

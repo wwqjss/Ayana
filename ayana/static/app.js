@@ -689,72 +689,67 @@ function buildHealthRatioCard(hr) {
   const total = hr.total ?? 0;
   const hasRatio = ratio != null && total > 0;
 
-  // 角标装饰（克制的指挥台细线）
-  card.appendChild(el("div", { class: "hr-corner tl" }));
-  card.appendChild(el("div", { class: "hr-corner tr" }));
-  card.appendChild(el("div", { class: "hr-corner bl" }));
-  card.appendChild(el("div", { class: "hr-corner br" }));
-
+  // 顶栏：标题 + 状态角标
   const head = el("div", { class: "hr-head" }, [
     el("div", { class: "hr-title", text: "系统健康度" }),
-    el("div", { class: "hr-sub", text: "SYSTEM HEALTH INDEX" }),
   ]);
+  const st = hasRatio
+    ? (ratio >= 100 ? { t: "全部正常", c: "ok" } : ratio >= 90 ? { t: "轻微波动", c: "warn" } : { t: "存在异常", c: "warn" })
+    : { t: "暂无数据", c: "dim" };
+  if (hasRatio && ratio < 70) st.t = "存在异常";
+  if (hasRatio && colorCls === "bad") { st.t = "存在异常"; st.c = "bad"; }
+  head.appendChild(el("div", { class: "hr-badge " + st.c, text: st.t }));
   card.appendChild(head);
 
-  const body = el("div", { class: "hr-body" });
-  const valBox = el("div", { class: "hr-val-box" });
-  const val = el("div", { class: "hr-val " + colorCls, text: label });
-  valBox.appendChild(val);
-  valBox.appendChild(el("div", {
-    class: "hr-count",
-    text: hasRatio ? `健康 ${healthy} / 总计 ${total}` : "暂无监控项",
-  }));
-  body.appendChild(valBox);
+  // 大数字
+  card.appendChild(el("div", { class: "hr-val " + colorCls, text: label }));
 
-  // 主进度条：唯一分数
-  const barBox = el("div", { class: "hr-bar-box" });
-  const bar = el("div", { class: "hr-bar" });
+  // 主进度条
   const pct = hasRatio ? Math.max(0, Math.min(100, ratio)) : 0;
-  const fill = el("div", {
+  const bar = el("div", { class: "hr-bar" });
+  bar.appendChild(el("div", {
     class: "hr-bar-fill " + colorCls,
     style: `width:${hasRatio ? pct : 0}%`,
-  });
-  bar.appendChild(fill);
-  barBox.appendChild(bar);
-  if (hasRatio) {
-    barBox.appendChild(el("div", {
-      class: "hr-bar-tip",
-      text: `${healthy} 项健康 · 共 ${total} 项监控`,
-    }));
-  }
-  body.appendChild(barBox);
-  card.appendChild(body);
-
-  // MAGI 三行：分项解释，加总 = 主分数
-  const magi = el("div", { class: "hr-magi" });
-  magi.appendChild(el("div", {
-    class: "hr-magi-title",
-    text: "系统同步率 · SYSTEM SYNC RATIO",
   }));
+  card.appendChild(bar);
+
+  card.appendChild(el("div", {
+    class: "hr-count",
+    text: hasRatio ? `健康监控项 ${healthy} / ${total}` : "暂无监控项",
+  }));
+
+  card.appendChild(el("div", { class: "hr-sep" }));
+
+  // MAGI 三行：标签+分数在上，整行细条在下；加总 = 主分数
   (hr.sources || []).forEach((s) => {
     const empty = !s.total;
     const spct = empty ? 0 : Math.round((s.healthy * 100) / s.total);
-    const row = el("div", { class: "hr-magi-row" + (empty ? " na" : "") });
-    row.appendChild(el("div", { class: "hr-magi-code", text: s.code }));
-    row.appendChild(el("div", { class: "hr-magi-label", text: s.label }));
-    const mini = el("div", { class: "hr-mini" });
-    mini.appendChild(el("div", {
-      class: "hr-mini-fill " + (empty ? "dim" : s.state === "ok" ? "ok" : s.state === "warn" ? "warn" : s.state === "bad" ? "bad" : "dim"),
-      style: `width:${empty ? 0 : Math.max(spct, s.healthy > 0 ? 8 : 0)}%`,
+    const cls = empty ? "dim" : s.state === "ok" ? "ok" : s.state === "warn" ? "warn" : s.state === "bad" ? "bad" : "dim";
+    const row = el("div", { class: "hr-magi-item" + (empty ? " na" : "") });
+    const meta = el("div", { class: "hr-magi-meta" });
+    meta.appendChild(el("div", {
+      class: "hr-magi-name",
+      text: `${s.code} · ${s.label}`,
     }));
-    row.appendChild(mini);
-    row.appendChild(el("div", {
+    meta.appendChild(el("div", {
       class: "hr-magi-frac",
       text: empty ? "—" : `${s.healthy}/${s.total}`,
     }));
-    magi.appendChild(row);
+    row.appendChild(meta);
+    const mini = el("div", { class: "hr-mini" });
+    mini.appendChild(el("div", {
+      class: "hr-mini-fill " + cls,
+      style: `width:${empty ? 0 : (spct === 0 ? 0 : Math.max(spct, 4))}%`,
+    }));
+    row.appendChild(mini);
+    card.appendChild(row);
   });
-  card.appendChild(magi);
+
+  card.appendChild(el("div", { class: "hr-sep" }));
+  card.appendChild(el("div", {
+    class: "hr-sync",
+    text: "系统同步率 · SYSTEM SYNC RATIO",
+  }));
   return card;
 }
 

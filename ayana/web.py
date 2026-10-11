@@ -608,14 +608,17 @@ class WebApp:
         except Exception:
             pass
 
-        # 仅当前 firing；已恢复未关闭的历史事件不进入健康度
+        # 告警状态：单项状态（当前有 firing → 0/1；无 → 1/1）
+        # 不把每条历史未结案事件算进来；只反映「此刻告警面是否干净」
         alert_items: list[dict] = []
         try:
-            for row in self.db.query(
-                "SELECT id FROM alert_episodes WHERE status='firing'"
+            n_firing = 0
+            for _row in self.db.query(
+                "SELECT COUNT(*) AS n FROM alert_episodes WHERE status='firing'"
                 " AND (source_state IS NULL OR source_state='firing')"
             ):
-                alert_items.append({"state": "unhealthy", "id": row["id"]})
+                n_firing = int(_row["n"] or 0)
+            alert_items.append({"state": "unhealthy" if n_firing else "healthy"})
         except Exception:
             pass
 
