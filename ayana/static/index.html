@@ -203,6 +203,14 @@
               Ayana 原生检查（TCP / HTTP / 服务 / 自定义命令），与上方 Prometheus 指标同属当前资产。
               异常进入事件与通知。不依赖 Prometheus。
             </p>
+            <div class="assist-box" id="chk-assist-box">
+              <div class="assist-title">自然语言辅助配置</div>
+              <div class="form-row">
+                <input id="chk-assist-input" placeholder="例如：给 KANATA 的 8080 端口做一个检查，每 60 秒一次，连续 2 次失败就严重告警" style="flex:1;min-width:280px">
+                <button class="btn primary" id="chk-assist-go" type="button">帮我填表</button>
+              </div>
+              <div id="chk-assist-msg" class="muted small"></div>
+            </div>
             <div class="form-row">
               <label>所属主机
                 <select id="chk-asset"></select>
@@ -250,6 +258,7 @@
               <button class="btn" id="chk-refresh" type="button">刷新</button>
             </div>
             <div id="chk-list"></div>
+            <div id="chk-summary" class="live-summary"></div>
           </div>
           <div class="card">
             <h2>执行动态</h2>
@@ -831,6 +840,25 @@
       <section id="tab-permissions" class="tab-panel hidden">
 
         <div class="card">
+          <h2>权限工作台</h2>
+          <p class="muted small">
+            用自然语言说想做什么，Ayana 会调出对应真实界面并帮你填写。你仍手动保存；AI 不会执行或改权限。
+          </p>
+          <div class="assist-box">
+            <div class="form-row">
+              <input id="perm-assist-input" placeholder="例如：查看 NERV 的 frps 权限 / 所有服务器允许看日志、重启要确认 / 修改 KANATA 的容器重启权限" style="flex:1;min-width:280px">
+              <button class="btn primary" id="perm-assist-go" type="button">定位并填写</button>
+            </div>
+            <div id="perm-assist-msg" class="muted small"></div>
+          </div>
+          <div class="perm-legend">
+            <span><span class="dot" style="background:var(--bad)"></span>禁止</span>
+            <span><span class="dot" style="background:var(--warn)"></span>需要人工确认</span>
+            <span><span class="dot" style="background:var(--ok)"></span>允许自动执行</span>
+          </div>
+        </div>
+
+        <div class="card" id="perm-panel-defaults">
           <h2>默认授权策略</h2>
           <p class="muted small">
             按操作类型统一配置：禁止 / 需要人工确认 / 允许自动执行。新资产自动继承默认策略，无需逐项授权。
@@ -838,15 +866,10 @@
           <p class="muted small">
             主机侧 commands.json / forced-command / sudoers 仍是最终安全上限，此处不能扩大。
           </p>
-          <div class="perm-legend">
-            <span><span class="dot" style="background:var(--bad)"></span>禁止</span>
-            <span><span class="dot" style="background:var(--warn)"></span>需要人工确认</span>
-            <span><span class="dot" style="background:var(--ok)"></span>允许自动执行</span>
-          </div>
           <div id="perm-defaults"></div>
         </div>
 
-        <div class="card">
+        <div class="card" id="perm-panel-exceptions">
           <h2>资产例外</h2>
           <p class="muted small">对指定主机、容器或服务覆盖默认策略。可一键恢复默认，避免重复配置。</p>
           <div id="perm-exceptions"></div>
@@ -860,9 +883,10 @@
             <label>对象 <input id="perm-ex-object" value="*" placeholder="* 或对象名"></label>
             <button class="btn primary" id="perm-ex-add">添加例外</button>
           </div>
+          <div id="perm-diff-box" class="live-summary"></div>
         </div>
 
-        <div class="card">
+        <div class="card" id="perm-panel-effective">
           <h2>查看最终生效权限</h2>
           <p class="muted small">选择对象后显示命中的规则来源（默认策略 / 资产例外）与最终结论。</p>
           <div class="form-row">
@@ -874,7 +898,7 @@
           <div id="perm-eff-result"></div>
         </div>
 
-        <div class="card">
+        <div class="card" id="perm-panel-ceiling">
           <h3 style="margin:0 0 8px;font-size:14px">Agent 权限上限（ceiling）</h3>
           <p class="muted small">后端强制：Agent（auto_rule / llm）不能超过此处上限，也不能超过源码能力目录。</p>
           <div id="agent-ceiling"></div>

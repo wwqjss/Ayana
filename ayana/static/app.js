@@ -4681,6 +4681,195 @@ on("chk-kind", "change", chkKindChanged);
 on("chk-refresh", "click", () => renderChecks());
 on("chk-asset", "change", () => renderChecks());
 
+/* ---- 自然语言辅助配置（只填表，不保存） ---- */
+async function assistConfigure(domain, text, context) {
+  return api("/api/assist/configure", {
+    method: "POST",
+    body: JSON.stringify({ domain, text, context: context || {} }),
+  });
+}
+
+function assistNote(boxId, lines, cls) {
+  const box = $(boxId);
+  if (!box) return;
+  box.innerHTML = "";
+  (lines || []).forEach((t) => {
+    box.appendChild(el("div", { class: cls || "muted small", text: t, style: "margin:2px 0" }));
+  });
+}
+
+function setVal(id, v) {
+  const n = $(id);
+  if (!n || v == null) return;
+  n.value = v;
+}
+
+function applyCheckFields(fields) {
+  if (!fields) return;
+  if (fields.asset_id) setVal("chk-asset", fields.asset_id);
+  if (fields.kind) {
+    setVal("chk-kind", fields.kind);
+    if (typeof chkKindChanged === "function") chkKindChanged();
+  }
+  if (fields.name) setVal("chk-name", fields.name);
+  if (fields["params.port"] != null) setVal("chk-port", fields["params.port"]);
+  if (fields["params.proto"]) setVal("chk-proto", fields["params.proto"]);
+  if (fields["params.unit"]) setVal("chk-unit", fields["params.unit"]);
+  if (fields["params.cmd"]) setVal("chk-cmd", fields["params.cmd"]);
+  if (fields["expect.mode"]) setVal("chk-expect", fields["expect.mode"]);
+  if (fields["expect.value"]) setVal("chk-expect-val", fields["expect.value"]);
+  if (fields.interval_sec != null) setVal("chk-interval", fields.interval_sec);
+  if (fields.fail_threshold != null) setVal("chk-threshold", fields.fail_threshold);
+  if (fields.severity) setVal("chk-severity", fields.severity);
+  updateCheckSummary();
+}
+
+/** 实时人话摘要：前端固定模板，禁止 AI 生成 */
+function updateCheckSummary() {
+  const box = $("chk-summary");
+  if (!box) return;
+  const kind = (($("chk-kind") || {}).value || "port");
+  const name = (($("chk-name") || {}).value || "").trim() || "（未命名）";
+  const asset = (($("chk-asset") || {}).value || "").trim() || "（未选主机）";
+  const interval = (($("chk-interval") || {}).value || "60");
+  const fails = (($("chk-threshold") || {}).value || "2");
+  const sev = (($("chk-severity") || {}).value || "warning");
+  const sevZh = { info: "提示", warning: "警告", critical: "严重" }[sev] || sev;
+  let target = "";
+  if (kind === "port") {
+    target = `端口 ${(($("chk-port") || {}).value || "?")}/${(($("chk-proto") || {}).value || "tcp")}`;
+  } else if (kind === "service") {
+    target = `服务 ${(($("chk-unit") || {}).value || "?")}`;
+  } else {
+    target = `命令 ${(($("chk-cmd") || {}).value || "?")}`;
+  }
+  box.textContent =
+    `将添加检查「${name}」到「${asset}」：${target}；` +
+    `每 ${interval} 秒检测，连续 ${fails} 次失败触发${sevZh}告警。` +
+    `点「添加检查」才会真正创建。`;
+}
+
+["chk-asset", "chk-kind", "chk-name", "chk-port", "chk-proto", "chk-unit", "chk-cmd",
+  "chk-expect", "chk-expect-val", "chk-interval", "chk-threshold", "chk-severity"].forEach((id) => {
+  on(id, "change", updateCheckSummary);
+  on(id, "input", updateCheckSummary);
+});
+
+on("chk-assist-go", "click", async () => {
+  const text = (($("chk-assist-input") || {}).value || "").trim();
+  const msg = $("chk-assist-msg");
+  if (!text) {
+    assistNote("chk-assist-msg", ["请先用一句话描述要监控什么。"]);
+    return;
+  }
+  assistNote("chk-assist-msg", ["理解中…"]);
+  const res = await assistConfigure("checks", text, {
+    asset_id: monitorState.host || (($("chk-asset") || {}).value || ""),
+  });
+  if (!res.ok) {
+    assistNote("chk-assist-msg", [res.message || res.error || "无法理解，请手动填写表单"], "error");
+    return;
+  }
+  applyCheckFields(res.fields || {});
+  const lines = [];
+  lines.push(`识别来源：${res.source === "llm" ? "语言模型" : "规则解析"} · 已填入表单（请核对后点「添加检查」）`);
+  (res.missing || []).forEach((m) => lines.push(`还需补充 · ${m.label}: ${m.question}`));
+  (res.notes || []).forEach((n) => lines.push(n));
+  if (!(res.missing || []).length) lines.push("信息齐全，可直接提交。");
+  assistNote("chk-assist-msg", lines);
+});
+
+on("perm-assist-go", "click", async () => {
+  const text = (($("perm-assist-input") || {}).value || "").trim();
+  if (!text) {
+    assistNote("perm-assist-msg", ["请描述要查看或修改的权限。"]);
+    return;
+  }
+  assistNote("perm-assist-msg", ["理解中…"]);
+  const res = await assistConfigure("permissions", text, {});
+  if (!res.ok) {
+    assistNote("perm-assist-msg", [res.message || res.error || "无法理解"], "error");
+    return;
+  }
+  applyPermIntent(res, text);
+});
+
+function applyPermIntent(res, rawText) {
+  const f = res.fields || {};
+  const route = res.route || "perm_defaults";
+  // 滚动到真实面板（可交互组件）
+  const panelMap = {
+    perm_defaults: "perm-panel-defaults",
+    perm_exceptions: "perm-panel-exceptions",
+    perm_effective: "perm-panel-effective",
+    perm_workbench: "perm-panel-effective",
+    perm_ceiling: "perm-panel-ceiling",
+  };
+  const pid = panelMap[route] || "perm-panel-defaults";
+  const panel = $(pid);
+  if (panel) {
+    panel.scrollIntoView({ behavior: "smooth", block: "start" });
+    panel.style.outline = "1px solid rgba(108,182,255,.45)";
+    setTimeout(() => { panel.style.outline = ""; }, 1600);
+  }
+
+  // 填写查询/编辑控件（不自动保存）
+  if (f.capability) {
+    setVal("perm-eff-cap", f.capability);
+    setVal("perm-ex-cap", f.capability);
+    setVal("perm-cap", f.capability);
+  }
+  if (f.asset_id) {
+    setVal("perm-eff-asset", f.asset_id);
+    setVal("perm-ex-asset", f.asset_id);
+    setVal("perm-asset", f.asset_id);
+  }
+  if (f.object_id) {
+    setVal("perm-eff-object", f.object_id);
+    setVal("perm-ex-object", f.object_id);
+    setVal("perm-object", f.object_id);
+  }
+
+  const lines = [];
+  lines.push(`识别来源：${res.source === "llm" ? "语言模型" : "规则解析"}`);
+  lines.push(`已定位界面：${({
+    perm_defaults: "默认授权策略",
+    perm_exceptions: "资产例外",
+    perm_effective: "最终生效权限",
+    perm_workbench: "权限编辑（生效查询区）",
+    perm_ceiling: "Agent 权限上限",
+  })[route] || route}`);
+
+  // 变更预览（仅草稿，不写库）
+  if (route === "perm_workbench" || (f.state && f.scope)) {
+    const state = f.state;
+    const stateZh = { deny: "禁止", confirm: "需要人工确认", auto: "允许自动执行" }[state] || state;
+    const scopeZh = f.scope === "exception" ? "资产例外" : "默认策略";
+    const capZh = f.capability || "（未选操作）";
+    const target = `${f.asset_id || "全部资产"} / ${f.object_id || "*"}`;
+    lines.push("—— 变更草稿（未保存）——");
+    lines.push(`拟修改：${scopeZh} · ${capZh} → ${stateZh}`);
+    lines.push(`作用范围：${target}`);
+    if (state === "auto") lines.push("⚠ 放宽为自动执行，请确认后再点保存。");
+    else if (state === "deny") lines.push("将收紧为禁止。");
+    else lines.push("需人工确认（默认安全）。");
+    lines.push("AI 不会保存；请在下方/默认策略区手动点选三态确认。");
+    // 若是默认策略，高亮对应行的 seg（renderPermissions 已画）——用户可直接点
+  }
+
+  // 缺失追问
+  (res.missing || []).forEach((m) => lines.push(`还需补充 · ${m.label || m.key}: ${m.question}`));
+  (res.notes || []).forEach((n) => lines.push(n));
+
+  assistNote("perm-assist-msg", lines);
+
+  // 查询类意图自动跑一次真实查询（只读）
+  if (route === "perm_effective" && f.capability) {
+    const btn = $("perm-eff-lookup");
+    if (btn) btn.click();
+  }
+}
+
 on("monitor-detect", "click", () => {
   const asset = monitorState.host || (($("monitor-host") || {}).value || "") || (($("pc-ne-asset") || {}).value || "");
   if (!asset) {

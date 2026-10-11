@@ -216,6 +216,26 @@ main { padding: 20px 22px 40px; max-width: 1100px; margin: 0 auto; }
   background: rgba(255,255,255,.04); color: var(--ink);
 }
 
+/* 自然语言辅助 */
+.assist-box {
+  margin: 10px 0 14px; padding: 12px 14px;
+  border: 1px dashed rgba(108,182,255,.28);
+  border-radius: 10px;
+  background: rgba(108,182,255,.05);
+}
+.assist-title {
+  font-size: 11px; letter-spacing: .12em; color: var(--acc);
+  text-transform: uppercase; margin-bottom: 8px;
+}
+.live-summary {
+  margin-top: 12px; padding: 10px 12px;
+  border-left: 3px solid var(--acc);
+  background: rgba(108,182,255,.08);
+  border-radius: 0 8px 8px 0;
+  font-size: 13px; line-height: 1.6; color: var(--ink);
+}
+#chk-assist-msg div, #perm-assist-msg div { line-height: 1.55; }
+
 .subnav {
   display: flex; gap: 6px; flex-wrap: wrap;
   margin-bottom: 14px; padding: 4px;

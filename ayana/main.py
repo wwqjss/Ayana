@@ -417,6 +417,7 @@ class App:
             mlog=self.mlog,
             promconfig=self.promconfig,
             checks=self.checks,
+            llm=self.llm,
         )
         self._stop = asyncio.Event()
         self._bg_tasks: list[asyncio.Task] = []

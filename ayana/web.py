@@ -57,6 +57,7 @@ class WebApp:
         mlog=None,
         promconfig=None,
         checks=None,
+        llm=None,
     ):
         self.db = db
         self.auth = auth
@@ -80,6 +81,7 @@ class WebApp:
         self.host_monitor = host_monitor
         self.aibot_manager = aibot_manager
         self.mlog = mlog
+        self.llm = llm
         self.promconfig = promconfig
         self.checks = checks
 
@@ -194,6 +196,60 @@ class WebApp:
         app.router.add_get("/api/prom/probe", self.api_prom_probe)
         app.router.add_get("/api/checks", self.api_checks_list)
         app.router.add_post("/api/checks", self.api_checks_create)
+        app.router.add_post("/api/assist/configure", self.api_assist_configure)
+
+    async def api_assist_configure(self, request: web.Request) -> web.Response:
+        """自然语言 → 填表意图。只读查询 + 字段草稿；不保存。"""
+        sess = self._require_auth(request)
+        self._check_csrf(request, sess)
+        try:
+            body = await request.json()
+        except Exception:
+            return _json({"ok": False, "error": "bad_json"}, 400)
+        domain = str(body.get("domain") or "").strip()
+        text = str(body.get("text") or "").strip()
+        ctx = body.get("context") or {}
+        if domain not in ("checks", "permissions"):
+            return _json({"ok": False, "error": "bad_domain"}, 400)
+
+        # 只读上下文：资产 / 能力 / 现有检查名
+        assets = [r["id"] for r in self.db.query("SELECT id FROM assets ORDER BY id")]
+        caps: list[str] = []
+        try:
+            from .capabilities import list_capabilities
+
+            caps = [c["name"] for c in list_capabilities()]
+        except Exception:
+            caps = []
+        names: list[str] = []
+        if domain == "checks":
+            try:
+                names = [c["name"] for c in self._checks().list_checks("")]
+            except Exception:
+                names = []
+
+        from . import assist
+
+        res = await assist.configure(
+            domain=domain,
+            text=text,
+            context=ctx,
+            llm=self.llm,
+            assets=assets,
+            capabilities=caps,
+            existing_names=names,
+        )
+        # 审计：只记录意图，不记录完整自由文本（可截断）
+        try:
+            self.db.audit(
+                "web_user",
+                sess.get("username") or "",
+                "assist_configure",
+                detail={"domain": domain, "source": res.get("source"), "route": res.get("route")},
+            )
+        except Exception:
+            pass
+        return _json(res)
         app.router.add_post("/api/checks/update", self.api_checks_update)
         app.router.add_post("/api/checks/delete", self.api_checks_delete)
         app.router.add_post("/api/checks/run", self.api_checks_run)
