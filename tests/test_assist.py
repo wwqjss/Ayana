@@ -102,6 +102,56 @@ class AssistParseTest(unittest.TestCase):
         self.assertIn("连续 3 次", s)
         self.assertIn("添加检查", s)
 
+    def test_process_wanted_not_invent_port(self):
+        """「程序是否正常运行」→ service，禁止臆造端口 8080。"""
+        r = asyncio.run(
+            assist.configure(
+                domain="checks",
+                text="检查control上的运行pod的那个底层的c开头的程序是否正常运行",
+                assets=["control", "kanata"],
+            )
+        )
+        self.assertTrue(r["ok"])
+        f = r["fields"]
+        self.assertNotIn("params.port", f)
+        self.assertNotEqual(f.get("kind"), "port")
+        self.assertEqual(f.get("asset_id"), "control")
+        # 无 LLM 时不应假装理解出 containerd
+        self.assertNotEqual(f.get("params.unit"), "containerd")
+        self.assertTrue(r["missing"] or r.get("confirm_question") or r.get("notes"))
+
+    def test_json_repair_extracts_object(self):
+        raw = "好的：\n```json\n{\"route\":\"checks_form\",\"fields\":{\"kind\":\"service\"},}\n```"
+        data = assist._extract_json_object(raw)
+        self.assertEqual(data["route"], "checks_form")
+
+    def test_llm_infer_containerd_confirm(self):
+        class FakeLLM:
+            enabled = True
+
+            async def chat(self, messages, max_tokens=600):
+                return (
+                    '{"route":"checks_form",'
+                    '"fields":{"asset_id":"control","kind":"service","params.unit":"containerd","name":"containerd"},'
+                    '"inferred":["params.unit","name"],'
+                    '"confirm_question":"你说的应该是 containerd，是否需要检查 control 上的 containerd 服务运行状态？",'
+                    '"missing":[],"notes":[]}'
+                )
+
+        r = asyncio.run(
+            assist.configure(
+                domain="checks",
+                text="检查control上的运行pod的那个底层的c开头的程序是否正常运行",
+                llm=FakeLLM(),
+                assets=["control", "kanata"],
+            )
+        )
+        self.assertEqual(r["source"], "llm")
+        self.assertEqual(r["fields"].get("params.unit"), "containerd")
+        self.assertEqual(r["fields"].get("kind"), "service")
+        self.assertIn("containerd", r.get("confirm_question") or "")
+        self.assertNotIn("params.port", r["fields"])
+
 
 if __name__ == "__main__":
     unittest.main()

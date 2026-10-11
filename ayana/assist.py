@@ -142,7 +142,7 @@ def parse_checks_rules(text: str, *, assets: list[str], existing_names: list[str
     if m:
         fields["name"] = m.group(1)
 
-    # 端口：8080 端口 / 端口 8080 / port:8080
+    # 端口：8080 端口 / 端口 8080 / port:8080（禁止无中生有）
     m = re.search(r"(?:端口|port)[:：\s]*(\d{1,5})", t, re.I)
     if not m:
         m = re.search(r"(\d{2,5})\s*(?:端口|port)", t, re.I)
@@ -151,6 +151,16 @@ def parse_checks_rules(text: str, *, assets: list[str], existing_names: list[str
         if 1 <= p <= 65535:
             fields["params.port"] = p
             fields.setdefault("kind", "port")
+
+    # 「程序/进程/服务是否正常运行」→ 服务或命令，不是端口
+    if "kind" not in fields and any(
+        k in t for k in ("程序", "进程", "服务是否", "是否正常", "是否运行", "运行状态", "是否在跑")
+    ):
+        fields["kind"] = "service"
+        # 没有具体 unit 名 → 追问，不猜
+        if not re.search(r"(?:服务|service|unit|程序名|进程名)[:：\s]*([A-Za-z0-9_\-\.\@]{1,64})", t, re.I):
+            if "params.unit" not in fields:
+                pass  # 走 missing
 
     # 服务名
     m = re.search(r"(?:服务|service|unit)[:：\s]*([A-Za-z0-9_\-\.\@]{1,64})", t, re.I)
@@ -194,13 +204,13 @@ def parse_checks_rules(text: str, *, assets: list[str], existing_names: list[str
     elif any(k in t for k in ("警告", "warning", "告警级别", "warn")):
         fields["severity"] = "warning"
 
-    # 名称默认
+    # 名称默认（仅在目标明确时）
     if "name" not in fields:
         if fields.get("kind") == "port" and fields.get("params.port"):
             fields["name"] = f"port-{fields['params.port']}"
         elif fields.get("kind") == "service" and fields.get("params.unit"):
             fields["name"] = str(fields["params.unit"])[:32]
-        elif fields.get("kind") == "command":
+        elif fields.get("kind") == "command" and fields.get("params.cmd"):
             fields["name"] = "http-check"
 
     # 缺失追问
@@ -312,18 +322,34 @@ async def _llm_intent(
     text: str,
     context: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """LLM 意图 JSON；失败返回 None。只出字段与路由，不碰执行。"""
+    """LLM 意图 JSON；失败返回 None。只出字段与路由，不碰执行。
+
+    要求模型做技术语义推断（如「运行 Pod 的底层 c 开头程序」→ containerd），
+    并用 confirm_question 与用户确认推断结果，而不是猜了就填死。
+    """
     if not llm or not getattr(llm, "enabled", False):
         return None
     system = (
-        "你是运维控制台的表单助手。只输出 JSON，不执行任何操作。"
-        "domain=checks 时 fields 键只能是: asset_id,kind,name,params.port,params.proto,"
-        "params.unit,params.cmd,expect.mode,expect.value,interval_sec,fail_threshold,severity。"
-        "domain=permissions 时 fields 键只能是: capability,asset_id,object_id,state,scope。"
-        "state 只能是 deny|confirm|auto。kind 只能是 port|service|command。"
-        "route: checks_form | perm_defaults | perm_exceptions | perm_effective | perm_workbench | perm_ceiling。"
-        "不确定的信息不要编造，放进 missing 数组。"
-        "输出格式: {\"route\":\"...\",\"fields\":{},\"missing\":[{\"key\":\"...\",\"question\":\"...\"}],\"notes\":[]}"
+        "你是 Ayana 运维控制台的配置助手。只输出一个 JSON 对象，不要 Markdown，不要解释。\n"
+        "你的职责：用技术语义理解用户描述，识别运维对象，填写真实表单字段草稿。\n"
+        "你不执行、不保存任何操作。\n\n"
+        "硬规则：\n"
+        "1. 只根据句中线索推断；禁止编造端口/名称/间隔等未出现且无法推断的值。\n"
+        "2. 允许技术推断：例如「运行 Pod 的底层 c 开头程序」在 K8s 语境指容器运行时 containerd；"
+        "「c 开头」+容器/Pod+常驻底层服务，合理答案是 containerd。用 inferred:true 标记推断字段，"
+        "并用 confirm_question 向用户确认，例如：「你说的应该是 containerd，是否检查该服务运行状态？」\n"
+        "3. crictl 是调试工具不是运行时常驻服务；kubelet 不是「c 开头」。\n"
+        "4. domain=checks 时 fields 键只能是: asset_id,kind,name,params.port,params.proto,params.unit,params.cmd,expect.mode,expect.value,interval_sec,fail_threshold,severity。\n"
+        "   kind 只能是 port|service|command。程序/进程/服务是否正常运行 → kind=service（params.unit）或 command。\n"
+        "5. domain=permissions 时 fields 键只能是: capability,asset_id,object_id,state,scope。\n"
+        "   state 只能是 deny|confirm|auto。scope 只能是 default|exception。\n"
+        "6. route: checks_form | perm_defaults | perm_exceptions | perm_effective | perm_workbench | perm_ceiling。\n"
+        "7. uncertain 字段放入 missing，不要用默认值冒充。\n"
+        "8. confirm_question：当你对某个关键推断把握不足或需要用户点头时填写；全部确定可为空。\n"
+        "9. 只输出 JSON，结构示例：\n"
+        '{"route":"checks_form","fields":{"asset_id":"control","kind":"service","params.unit":"containerd"},'
+        '"inferred":["params.unit"],"confirm_question":"你说的应该是 containerd，是否需要检查 control 上的 containerd 服务运行状态？",'
+        '"missing":[],"notes":[]}'
     )
     user = json.dumps(
         {"domain": domain, "text": text[:500], "context": context},
@@ -335,20 +361,57 @@ async def _llm_intent(
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            max_tokens=400,
+            max_tokens=600,
         )
         if not raw:
             return None
-        m = re.search(r"\{[\s\S]*\}", raw)
-        if not m:
-            return None
-        data = json.loads(m.group(0))
+        data = _extract_json_object(raw)
         if not isinstance(data, dict):
             return None
         return data
     except Exception as e:
         log.warning("assist llm intent failed: %s", e)
         return None
+
+
+def _extract_json_object(raw: str) -> dict[str, Any] | None:
+    """从模型输出提取 JSON：容错代码块、尾逗号、单引号、未闭合。"""
+    if not raw:
+        return None
+    s = raw.strip()
+    s = re.sub(r"^```(?:json)?\s*", "", s)
+    s = re.sub(r"\s*```$", "", s)
+    m = re.search(r"\{[\s\S]*\}", s)
+    if not m:
+        return None
+    blob = m.group(0)
+    for attempt in (blob, re.sub(r",\s*([}\]])", r"\1", blob), blob.replace("'", '"')):
+        try:
+            data = json.loads(attempt)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            continue
+    # 尽力截到最后一层括号
+    depth = 0
+    end = 0
+    for i, ch in enumerate(blob):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end > 2:
+        frag = blob[:end]
+        try:
+            data = json.loads(re.sub(r",\s*([}\]])", r"\1", frag))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return None
 
 
 def build_check_summary(fields: dict[str, Any]) -> str:
@@ -398,68 +461,89 @@ async def configure(
     if domain not in ("checks", "permissions"):
         return {"ok": False, "error": "bad_domain", "message": "仅支持 checks / permissions"}
 
-    # 1) LLM 优先
+    # 1) LLM 优先（语义理解）
     result: dict[str, Any] | None = None
+    llm_error = ""
     try:
         llm_raw = await _llm_intent(llm, domain=domain, text=text, context=ctx)
-    except Exception:
+    except Exception as e:
         llm_raw = None
+        llm_error = str(e)[:120]
     if llm_raw and isinstance(llm_raw.get("fields"), dict):
         schema = CHECK_FIELDS if domain == "checks" else PERM_FIELDS
-        fields, unknown = _validate_fields(
-            _flatten("", llm_raw.get("fields") or {}), schema
-        )
-        # 兼容嵌套 fields（params.port 等）
         nested = llm_raw.get("fields") or {}
-        flat = {}
+        flat: dict[str, Any] = {}
         for k, v in nested.items():
             if isinstance(v, dict):
                 flat.update(_flatten(k, v))
             else:
                 flat[k] = v
-        fields, unknown2 = _validate_fields(flat, schema)
-        unknown += unknown2
+        fields, unknown = _validate_fields(flat, schema)
         missing = [
             {"key": str(m.get("key") or ""), "label": str(m.get("label") or ""), "question": str(m.get("question") or "请补充信息")}
             for m in (llm_raw.get("missing") or [])
             if isinstance(m, dict) and m.get("key")
         ]
-        # 反推缺失：required 字段
         if domain == "checks" and "asset_id" not in fields:
             missing.append({"key": "asset_id", "label": "主机", "question": "要监控哪台主机？"})
         notes = [str(n) for n in (llm_raw.get("notes") or []) if n]
         if unknown:
             notes.append("已忽略无法识别的字段：" + ", ".join(unknown[:6]))
+        inferred = [str(x) for x in (llm_raw.get("inferred") or [])]
+        confirm_q = str(llm_raw.get("confirm_question") or "").strip()
         result = {
             "ok": True,
             "domain": domain,
             "route": llm_raw.get("route") or ("checks_form" if domain == "checks" else "perm_workbench"),
             "action": "fill",
             "fields": fields,
+            "inferred": inferred,
+            "confirm_question": confirm_q,
             "missing": missing,
             "notes": notes,
             "source": "llm",
         }
 
-    # 2) 规则兜底（LLM 未给全量 fields 时合并）
+    # 2) 规则兜底 / 合并（不覆盖 LLM 已给出的 kind/目标，避免猜端口）
     if domain == "checks":
         rules = parse_checks_rules(text, assets=assets, existing_names=existing_names)
     else:
         rules = parse_perm_rules(text, assets=assets, capabilities=capabilities)
 
     if not result:
-        result = rules
+        result = dict(rules)
         result["ok"] = True
+        result["inferred"] = []
+        result["confirm_question"] = ""
+        # 规则路径：若无法推断关键目标，明确说明，不冒充语义理解
+        if domain == "checks":
+            f = result.get("fields") or {}
+            if f.get("kind") == "service" and not f.get("params.unit"):
+                result.setdefault("notes", []).append(
+                    "规则模式只能做关键词匹配，无法从技术描述推断组件名；配置 LLM 后可语义理解。"
+                )
+        if llm_error:
+            result.setdefault("notes", []).append("语言模型解析失败，已用规则解析。")
+        elif llm and getattr(llm, "enabled", False):
+            result.setdefault("notes", []).append("语言模型未返回可用结果，已用规则解析。")
+        elif not llm or not getattr(llm, "enabled", False):
+            result.setdefault("notes", []).append("当前未启用语言模型，仅关键词解析。")
     else:
-        # LLM 缺的用规则补
-        for k, v in rules["fields"].items():
+        # LLM 缺的用规则补；但不把规则猜的 port 强加到 LLM 的 service/command 上
+        llm_kind = (result.get("fields") or {}).get("kind")
+        for k, v in rules.get("fields", {}).items():
+            if llm_kind in ("service", "command") and k in ("kind", "params.port", "params.proto", "name"):
+                continue
             result["fields"].setdefault(k, v)
-        if rules.get("route") and result.get("route") in ("", None):
+        if rules.get("route") and not result.get("route"):
             result["route"] = rules["route"]
         have = {m.get("key") for m in result.get("missing") or []}
         for m in rules.get("missing") or []:
             if m["key"] not in have and m["key"] not in result["fields"]:
                 result["missing"].append(m)
+        # LLM 给了 confirm_question 时，保留并展示
+        if not result.get("confirm_question"):
+            result["confirm_question"] = ""
 
     if domain == "checks":
         result["summary"] = build_check_summary(result.get("fields") or {})

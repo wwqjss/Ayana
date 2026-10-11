@@ -4773,9 +4773,19 @@ on("chk-assist-go", "click", async () => {
   applyCheckFields(res.fields || {});
   const lines = [];
   lines.push(`识别来源：${res.source === "llm" ? "语言模型" : "规则解析"} · 已填入表单（请核对后点「添加检查」）`);
+  if (res.confirm_question) {
+    lines.push("确认：" + res.confirm_question);
+  }
+  if ((res.inferred || []).length) {
+    lines.push("推断字段：" + res.inferred.join(", ") + "（请核对）");
+  }
   (res.missing || []).forEach((m) => lines.push(`还需补充 · ${m.label}: ${m.question}`));
   (res.notes || []).forEach((n) => lines.push(n));
-  if (!(res.missing || []).length) lines.push("信息齐全，可直接提交。");
+  if (!(res.missing || []).length && res.confirm_question) {
+    lines.push("请确认后提交，或修改表单。");
+  } else if (!(res.missing || []).length) {
+    lines.push("信息齐全，可直接提交。");
+  }
   assistNote("chk-assist-msg", lines);
 });
 
@@ -4832,6 +4842,7 @@ function applyPermIntent(res, rawText) {
 
   const lines = [];
   lines.push(`识别来源：${res.source === "llm" ? "语言模型" : "规则解析"}`);
+  if (res.confirm_question) lines.push("确认：" + res.confirm_question);
   lines.push(`已定位界面：${({
     perm_defaults: "默认授权策略",
     perm_exceptions: "资产例外",
