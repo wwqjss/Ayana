@@ -60,11 +60,8 @@
 
         <button data-tab="incidents" class="tab">事件</button>
 
-        <button data-tab="checks" class="tab">检查</button>
         <button data-tab="monitor" class="tab">资源</button>
-        <button data-tab="promconfig" class="tab">高级·Prom</button>
-
-        <button data-tab="messages" class="tab">消息记录</button>
+        <button data-tab="checks" class="tab">检查</button>
 
         <button data-tab="connections" class="tab">连接</button>
 
@@ -100,6 +97,16 @@
 
         <div class="banner warn hidden" id="human-banner">需要人工介入</div>
 
+        <div class="card" style="margin-bottom:12px">
+          <h2>待办驾驶舱</h2>
+          <p class="muted small">只显示需要你关注、处理、审批的事项。完整监控列表请到「资源」。</p>
+          <div class="form-row" style="margin-top:10px">
+            <button class="btn" id="overview-goto-monitor" type="button">查看资源监控</button>
+            <button class="btn" id="overview-goto-incidents" type="button">查看事件</button>
+            <button class="btn" id="overview-goto-notify" type="button">通知与消息</button>
+          </div>
+        </div>
+
         <div class="grid" id="overview-grid"></div>
 
       </section>
@@ -124,6 +131,13 @@
 
       <section id="tab-monitor" class="tab-panel hidden">
 
+        <div class="subnav" id="monitor-subnav">
+          <button data-sub="metrics" class="subtab active">主机与指标</button>
+          <button data-sub="onboard" class="subtab">接入</button>
+          <button data-sub="prom" class="subtab">Prometheus / 规则</button>
+        </div>
+
+        <div id="monitor-sub-metrics" class="subpanel">
         <div class="card">
 
           <h2>主机资源</h2>
@@ -140,7 +154,7 @@
 
             <span class="badge dim">暂无数据</span>
 
-            <span class="badge bad">采集失败</span>
+            <span class="badge err">采集故障</span>
 
           </p>
 
@@ -174,14 +188,72 @@
 
           <div id="monitor-hosts-strip" class="monitor-strip"></div>
 
-          <div class="form-row" id="monitor-install-row">
-            <button class="btn primary" id="monitor-detect" type="button">一键接入监控（分步）</button>
-            <span class="muted small">自动判断 Docker / 二进制，推荐安装方式</span>
-          </div>
-          <div id="monitor-install-box"></div>
         </div>
 
         <div id="monitor-body"></div>
+        </div>
+
+        <div id="monitor-sub-onboard" class="subpanel hidden">
+          <div class="card">
+            <h2>一键接入监控</h2>
+            <p class="muted small">全站唯一接入入口。自动判断 Docker / 二进制，推荐安装方式。</p>
+            <div class="form-row" id="monitor-install-row">
+              <button class="btn primary" id="monitor-detect" type="button">一键接入监控（分步）</button>
+              <span class="muted small">给还没有采集器的主机：检查 → 装 Node Exporter → 自动注册。</span>
+            </div>
+            <div id="monitor-install-box"></div>
+            <div class="form-row" style="margin-top:12px">
+              <select id="pc-ne-asset"></select>
+              <input id="pc-ne-register" placeholder="采集地址(自动)" style="min-width:220px">
+              <button class="btn primary" id="pc-ne-register-btn" type="button">一键接入</button>
+              <button class="btn" id="pc-ne-check" type="button">状态</button>
+              <button class="btn" id="pc-ne-start" type="button">启动</button>
+              <button class="btn" id="pc-ne-stop" type="button">停止</button>
+            </div>
+            <div id="promconfig-ne"></div>
+          </div>
+        </div>
+
+        <div id="monitor-sub-prom" class="subpanel hidden">
+        <div class="card">
+          <div class="form-row" style="margin-top:0;justify-content:space-between">
+            <div>
+              <h2 style="margin:0">Prometheus</h2>
+              <p class="muted small" id="promconfig-status" style="margin:4px 0 0">加载中...</p>
+            </div>
+            <div>
+              <button class="btn" id="promconfig-refresh" type="button">刷新</button>
+              <button class="btn" id="promconfig-validate" type="button">应用变更</button>
+            </div>
+          </div>
+          <details class="pc-adv">
+            <summary>高级：校验 / 回滚 / 原文</summary>
+            <div class="form-row">
+              <button class="btn" id="promconfig-rollback" type="button">回滚最近备份</button>
+            </div>
+            <pre id="promconfig-raw" class="code-block"></pre>
+          </details>
+        </div>
+
+        <div class="card">
+          <h2>正在监控</h2>
+          <div class="form-row">
+            <input id="pc-target-addr" placeholder="地址，如 10.0.0.5:9100" style="min-width:220px">
+            <input id="pc-target-asset" placeholder="资产，如 nerv">
+            <button class="btn primary" id="pc-target-add" type="button">添加</button>
+          </div>
+          <div id="promconfig-targets"></div>
+        </div>
+
+        <div class="card">
+          <h2>告警开关</h2>
+          <div id="promconfig-templates"></div>
+          <details class="pc-adv" style="margin-top:8px">
+            <summary>已启用规则（<span id="pc-rules-count">0</span>）</summary>
+            <div id="promconfig-rules"></div>
+          </details>
+        </div>
+        </div>
 
       </section>
 
@@ -244,167 +316,9 @@
         </div>
       </section>
 
-      <section id="tab-promconfig" class="tab-panel hidden">
-        <div class="card">
-          <div class="form-row" style="margin-top:0;justify-content:space-between">
-            <div>
-              <h2 style="margin:0">Prometheus</h2>
-              <p class="muted small" id="promconfig-status" style="margin:4px 0 0">加载中...</p>
-            </div>
-            <div>
-              <button class="btn" id="promconfig-refresh" type="button">刷新</button>
-              <button class="btn" id="promconfig-validate" type="button">应用变更</button>
-            </div>
-          </div>
-          <details class="pc-adv">
-            <summary>高级：校验 / 回滚 / 原文</summary>
-            <div class="form-row">
-              <button class="btn" id="promconfig-rollback" type="button">回滚最近备份</button>
-            </div>
-            <pre id="promconfig-raw" class="code-block"></pre>
-          </details>
-        </div>
-
-        <div class="card">
-          <h2>正在监控</h2>
-          <div class="form-row">
-            <input id="pc-target-addr" placeholder="地址，如 10.0.0.5:9100" style="min-width:220px">
-            <input id="pc-target-asset" placeholder="资产，如 nerv">
-            <button class="btn primary" id="pc-target-add" type="button">添加</button>
-          </div>
-          <div id="promconfig-targets"></div>
-        </div>
-
-        <div class="card">
-          <h2>告警开关</h2>
-          <div id="promconfig-templates"></div>
-          <details class="pc-adv" style="margin-top:8px">
-            <summary>已启用规则（<span id="pc-rules-count">0</span>）</summary>
-            <div id="promconfig-rules"></div>
-          </details>
-        </div>
-
-        <div class="card">
-          <h2>主机接入监控</h2>
-          <p class="muted small">给还没有采集器的主机：检查 → 装 Node Exporter → 自动注册。</p>
-          <div class="form-row">
-            <select id="pc-ne-asset"></select>
-            <input id="pc-ne-register" placeholder="采集地址(自动)" style="min-width:220px">
-            <button class="btn primary" id="pc-ne-register-btn" type="button">一键接入</button>
-            <button class="btn" id="pc-ne-check" type="button">状态</button>
-            <button class="btn" id="pc-ne-stop" type="button">停止</button>
-          </div>
-          <div id="promconfig-ne"></div>
-        </div>
-      </section>
-
-      <section id="tab-messages" class="tab-panel hidden">
-
-        <div class="card">
-
-          <h2>消息记录</h2>
-
-          <p class="muted small">
-
-            统一查看各渠道入站与出站消息。出站通知复用 outbox，不重复存储；入站与机器人回复单独落库。
-
-            不记录敏感凭据；仅管理员可查看。
-
-          </p>
-
-          <div class="form-row" id="msg-filters">
-
-            <label>平台
-
-              <select id="msg-platform">
-
-                <option value="">全部</option>
-
-                <option value="qq">QQ</option>
-
-                <option value="wecom">企业微信</option>
-
-                <option value="webhook">Webhook</option>
-
-              </select>
-
-            </label>
-
-            <label>方向
-
-              <select id="msg-direction">
-
-                <option value="">全部</option>
-
-                <option value="in">入站</option>
-
-                <option value="out">出站</option>
-
-              </select>
-
-            </label>
-
-            <label>状态
-
-              <select id="msg-state">
-
-                <option value="">全部</option>
-
-                <option value="received">已接收</option>
-
-                <option value="processed">已处理</option>
-
-                <option value="ignored">已忽略</option>
-
-                <option value="pending">待发送</option>
-
-                <option value="sent">发送成功</option>
-
-                <option value="failed">发送失败</option>
-
-                <option value="unknown">结果未知</option>
-
-              </select>
-
-            </label>
-
-            <label>内容
-
-              <input id="msg-q" placeholder="搜索内容 / 发送者 / 目标">
-
-            </label>
-
-            <label>开始
-
-              <input id="msg-start" type="datetime-local">
-
-            </label>
-
-            <label>结束
-
-              <input id="msg-end" type="datetime-local">
-
-            </label>
-
-            <button class="btn primary" id="msg-search" type="button">查询</button>
-
-          </div>
-
-          <div id="msg-list"></div>
-
-          <div class="form-row" style="margin-top:10px">
-
-            <button class="btn" id="msg-prev" type="button">上一页</button>
-
-            <button class="btn" id="msg-next" type="button">下一页</button>
-
-            <span class="muted small" id="msg-page"></span>
-
-          </div>
-
-        </div>
-
-      </section>
+      <!-- promconfig / messages 已并入 资源 / 通知；保留空锚点兼容旧 hash -->
+      <section id="tab-promconfig" class="tab-panel hidden"></section>
+      <section id="tab-messages" class="tab-panel hidden"></section>
 
 
 
@@ -576,6 +490,14 @@
 
       <section id="tab-notify" class="tab-panel hidden">
 
+        <div class="subnav" id="notify-subnav">
+          <button data-sub="channels" class="subtab active">通知渠道</button>
+          <button data-sub="messages" class="subtab">消息记录</button>
+          <button data-sub="outbox" class="subtab">发送记录</button>
+        </div>
+
+        <div id="notify-sub-channels" class="subpanel">
+
         <div class="card">
 
           <h2>通知渠道</h2>
@@ -745,7 +667,63 @@
           <div id="notify-list"></div>
 
         </div>
+        </div>
 
+        <div id="notify-sub-messages" class="subpanel hidden">
+          <div class="card">
+            <h2>消息记录</h2>
+            <p class="muted small">
+              统一查看各渠道入站与出站消息。出站通知复用 outbox；入站与机器人回复单独落库。不记录敏感凭据。
+            </p>
+            <div class="form-row" id="msg-filters">
+              <label>平台
+                <select id="msg-platform">
+                  <option value="">全部</option>
+                  <option value="qq">QQ</option>
+                  <option value="wecom">企业微信</option>
+                  <option value="webhook">Webhook</option>
+                </select>
+              </label>
+              <label>方向
+                <select id="msg-direction">
+                  <option value="">全部</option>
+                  <option value="in">入站</option>
+                  <option value="out">出站</option>
+                </select>
+              </label>
+              <label>状态
+                <select id="msg-state">
+                  <option value="">全部</option>
+                  <option value="received">已接收</option>
+                  <option value="processed">已处理</option>
+                  <option value="ignored">已忽略</option>
+                  <option value="pending">待发送</option>
+                  <option value="sent">发送成功</option>
+                  <option value="failed">发送失败</option>
+                  <option value="unknown">结果未知</option>
+                </select>
+              </label>
+              <label>内容
+                <input id="msg-q" placeholder="搜索内容 / 发送者 / 目标">
+              </label>
+              <label>开始
+                <input id="msg-start" type="datetime-local">
+              </label>
+              <label>结束
+                <input id="msg-end" type="datetime-local">
+              </label>
+              <button class="btn primary" id="msg-search" type="button">查询</button>
+            </div>
+            <div id="msg-list"></div>
+            <div class="form-row" style="margin-top:10px">
+              <button class="btn" id="msg-prev" type="button">上一页</button>
+              <button class="btn" id="msg-next" type="button">下一页</button>
+              <span class="muted small" id="msg-page"></span>
+            </div>
+          </div>
+        </div>
+
+        <div id="notify-sub-outbox" class="subpanel hidden">
         <div class="card">
 
           <h2>发送记录（outbox）</h2>
@@ -776,6 +754,7 @@
 
           <div id="notify-outbox"></div>
 
+        </div>
         </div>
 
       </section>

@@ -3,6 +3,8 @@ const state = {
   csrf: "",
   user: null,
   tab: "overview",
+  monitorSub: "metrics",
+  notifySub: "channels",
   assets: [],
   caps: [],
   knowledge: [],
@@ -317,7 +319,15 @@ function setTabHash(tab, focus, assetView) {
 }
 
 function activateTab(tab, focus, assetView) {
-  const valid = ["overview", "incidents", "monitor", "checks", "promconfig", "messages", "connections", "notify", "knowledge", "permissions", "audit"];
+  // 旧 hash 兼容：promconfig → 资源-Prometheus，messages → 通知-消息记录
+  if (tab === "promconfig") {
+    tab = "monitor";
+    queueMicrotask(() => setMonitorSub("prom"));
+  } else if (tab === "messages") {
+    tab = "notify";
+    queueMicrotask(() => setNotifySub("messages"));
+  }
+  const valid = ["overview", "incidents", "monitor", "checks", "connections", "notify", "knowledge", "permissions", "audit"];
   if (!valid.includes(tab)) tab = "overview";
   state.tab = tab;
   state.focus = focus || "";
@@ -331,6 +341,45 @@ function activateTab(tab, focus, assetView) {
   setTabHash(tab, state.focus, state.assetView);
   refreshTab();
 }
+
+function setMonitorSub(sub) {
+  if (!sub) return;
+  state.monitorSub = sub;
+  document.querySelectorAll("#monitor-subnav .subtab").forEach((b) => {
+    b.classList.toggle("active", b.dataset.sub === sub);
+  });
+  ["metrics", "onboard", "prom"].forEach((k) => {
+    const el = document.getElementById("monitor-sub-" + k);
+    if (el) el.classList.toggle("hidden", k !== sub);
+  });
+}
+
+function setNotifySub(sub) {
+  if (!sub) return;
+  state.notifySub = sub;
+  document.querySelectorAll("#notify-subnav .subtab").forEach((b) => {
+    b.classList.toggle("active", b.dataset.sub === sub);
+  });
+  ["channels", "messages", "outbox"].forEach((k) => {
+    const el = document.getElementById("notify-sub-" + k);
+    if (el) el.classList.toggle("hidden", k !== sub);
+  });
+}
+
+document.addEventListener("click", (e) => {
+  const t = e.target.closest(".subtab");
+  if (!t) return;
+  const nav = t.closest("#monitor-subnav") || t.closest("#notify-subnav");
+  if (!nav) return;
+  if (nav.id === "monitor-subnav") setMonitorSub(t.dataset.sub);
+  else setNotifySub(t.dataset.sub);
+  if (nav.id === "monitor-subnav" && t.dataset.sub === "prom") renderPromConfig();
+  if (nav.id === "notify-subnav" && t.dataset.sub === "messages") renderMessages();
+  if (nav.id === "notify-subnav" && t.dataset.sub === "outbox") {
+    const b = $("notify-outbox-refresh");
+    if (b) b.click();
+  }
+});
 
 document.querySelectorAll(".tab").forEach((btn) => {
   btn.addEventListener("click", () => {
@@ -394,12 +443,16 @@ async function refreshTab() {
   if (state.tab === "overview") await renderOverview();
   if (state.tab === "assets") await renderAssets();
   if (state.tab === "incidents") await renderIncidents();
-  if (state.tab === "monitor") await renderMonitor();
+  if (state.tab === "monitor") {
+    if (state.monitorSub === "prom") await renderPromConfig();
+    else if (state.monitorSub !== "onboard") await renderMonitor();
+  }
   if (state.tab === "checks") await renderChecks();
-  if (state.tab === "promconfig") await renderPromConfig();
-  if (state.tab === "messages") await renderMessages();
   if (state.tab === "connections") await renderConnections();
-  if (state.tab === "notify") await renderNotify();
+  if (state.tab === "notify") {
+    if (state.notifySub === "messages") await renderMessages();
+    else await renderNotify();
+  }
   if (state.tab === "knowledge") await renderKnowledge();
   if (state.tab === "permissions") await renderPermissions();
   if (state.tab === "audit") await renderAudit();
@@ -407,7 +460,8 @@ async function refreshTab() {
 
 /* ---- 统一健康状态 ---- */
 function computeAssetHealth(asset, openIncs) {
-  // P0-06：优先使用后端 health 结论，不在此推断「正常」
+  // 优先 host_health_dot（小圆点统一语义），其次 backend health
+  const dot = asset.health_dot || {};
   const h = asset.health || {};
   const openCount = openIncs.filter((i) => i.asset_id === asset.id).length;
   const map = {
@@ -421,11 +475,11 @@ function computeAssetHealth(asset, openIncs) {
   return {
     openCount,
     hasProbe: (h.coverage || "").startsWith("required"),
-    health: h.label || m.health,
-    healthCls: m.healthCls,
+    health: dot.label || h.label || m.health,
+    healthCls: dot.cls || m.healthCls,
     coverage: h.coverage || "无探测项",
     coverageCls: h.state === "healthy" ? "ok" : "warn",
-    probeState: h.state,
+    probeState: dot.state || h.state,
     hysteriaState: "",
     hysteriaTargets: [],
   };
@@ -557,90 +611,65 @@ async function renderOverview() {
       g.appendChild(list);
     }
 
-  // 紧凑统计条
-  const stats = el("div", {
-    style: "display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap",
-  });
-  const mkStat = (label, value, cls) => {
-    return el("div", {
-      style: "flex:1;min-width:120px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 16px;display:flex;align-items:center;gap:10px",
-    }, [
-      el("span", { class: `badge ${cls}`, text: value, style: "font-size:18px;min-width:32px;text-align:center" }),
-      el("span", { text: label, style: "font-size:13px;color:var(--dim)" }),
-    ]);
-  };
-  const openN = (res.open_incidents || []).length;
-  const humanN = (res.need_human || []).length;
-  const actN = (res.recent_actions || []).length;
-  stats.appendChild(mkStat("活动事件", String(openN), openN ? "warn" : "ok"));
-  stats.appendChild(mkStat("需人工", String(humanN), humanN ? "bad" : "ok"));
-  stats.appendChild(mkStat("最近操作", String(actN), "dim"));
-  g.appendChild(stats);
-
-  // 资产长条
-  const openIncs = res.open_incidents || [];
-  const incByObj = buildIncIndex(openIncs);
-  const list = el("div", {});
-  list.appendChild(el("h2", { text: "监控状态", style: "margin-bottom:8px;font-size:14px" }));
-
-  (res.assets || []).forEach((a) => {
-    const h = computeAssetHealth(a, openIncs);
-    const expanded = state.focus === a.id;
-    const row = el("div", {
-      style: "background:var(--card);border:1px solid var(--line);border-radius:10px;margin-bottom:6px;overflow:hidden",
+    // 紧凑统计条
+    const stats = el("div", {
+      style: "display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap",
     });
-    const head = el("div", {
-      style: "display:flex;align-items:center;gap:10px;padding:10px 16px;cursor:pointer",
-      onclick: () => {
-        const newFocus = expanded ? "" : a.id;
-        activateTab("overview", newFocus, false);
-      },
-    }, [
-      el("span", { text: expanded ? "▾" : "▸", style: "width:16px;color:var(--dim);flex-shrink:0" }),
-      el("span", { text: `${a.id} · ${a.display_name}`, style: "font-weight:500;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" }),
-      badge(h.health, h.healthCls),
-      badge(h.coverage, h.coverageCls),
-      el("button", {
-        class: "btn small", text: "详情",
-        onclick: (e) => {
-          e.stopPropagation();
-          activateTab("overview", a.id, true);
-        },
-      }),
-    ]);
-    row.appendChild(head);
+    const mkStat = (label, value, cls) => {
+      return el("div", {
+        style: "flex:1;min-width:120px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 16px;display:flex;align-items:center;gap:10px",
+      }, [
+        el("span", { class: `badge ${cls}`, text: value, style: "font-size:18px;min-width:32px;text-align:center" }),
+        el("span", { text: label, style: "font-size:13px;color:var(--dim)" }),
+      ]);
+    };
+    const openN = (res.open_incidents || []).length;
+    const humanN = (res.need_human || []).length;
+    const pending = res.pending_actions || 0;
+    const src = res.sources || {};
+    const promBad = src.prometheus_unhealthy || 0;
+    stats.appendChild(mkStat("活动事件", String(openN), openN ? "warn" : "ok"));
+    stats.appendChild(mkStat("需人工", String(humanN), humanN ? "bad" : "ok"));
+    stats.appendChild(mkStat("待批准/执行", String(pending), pending ? "warn" : "ok"));
+    stats.appendChild(mkStat("Prom 异常目标", String(promBad), promBad ? "bad" : "ok"));
+    g.appendChild(stats);
 
-    if (expanded) {
-      const body = el("div", {
-        style: "padding:0 16px 16px;border-top:1px solid var(--line)",
-      });
-      body.appendChild(el("p", {
+    // 只列异常主机摘要（正常主机进「资源」）
+    const openIncs = res.open_incidents || [];
+    const badHosts = (res.assets || []).filter((a) => {
+      const st = (a.health && a.health.state) || "";
+      const ds = (a.health_dot && a.health_dot.state) || "";
+      return st === "unhealthy" || st === "degraded" || st === "stale"
+        || ds === "bad" || ds === "warn" || ds === "collect_error";
+    });
+    const hostCard = el("div", { class: "card" });
+    hostCard.appendChild(el("h2", { text: "需要关注的主机" }));
+    if (!badHosts.length) {
+      hostCard.appendChild(el("p", {
         class: "muted small",
-        text: `read=${a.read_alias} write=${a.write_alias} host_id=${a.expected_host_id || "未登记"}`,
-        style: "margin:12px 0",
+        text: "当前没有异常主机。完整监控与指标请到「资源」。",
       }));
-
-      // 对象表：登记对象 + 外部探测统一为标准行
-      const table = renderMonitorTable(a, incByObj);
-      if (table) body.appendChild(table);
-
-      body.appendChild(el("div", { class: "row-actions", style: "margin-top:12px" }, [
-        el("button", {
-          class: "btn", text: "只读调查",
-          onclick: async () => {
-            const r = await api(`/api/assets/${a.id}/investigate`, {
-              method: "POST",
-              body: JSON.stringify({ capability: "asset.summary" }),
-            });
-            showModal("调查结果", [el("pre", { text: JSON.stringify(r, null, 2) })]);
+    } else {
+      badHosts.forEach((a) => {
+        const h = computeAssetHealth(a, openIncs);
+        const row = el("div", {
+          style: "display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--line);cursor:pointer",
+          onclick: () => {
+            activateTab("monitor", "");
+            monitorState.host = a.id;
+            renderMonitor();
           },
-        }),
-      ]));
-      row.appendChild(body);
+        }, [
+          el("div", {}, [
+            el("div", { text: `${a.id} · ${a.display_name}`, style: "font-size:14px" }),
+            el("div", { class: "muted small", text: h.coverage || "" }),
+          ]),
+          badge(h.health, h.healthCls),
+        ]);
+        hostCard.appendChild(row);
+      });
     }
-    list.appendChild(row);
-  });
-  g.appendChild(list);
+    g.appendChild(hostCard);
   } finally {
     state._overviewLoading = false;
   }
@@ -2718,54 +2747,172 @@ function fmtMetricUnit(m) {
   return m.unit || "";
 }
 
-function drawSpark(canvas, points, color) {
+function drawSpark(canvas, seriesList) {
   const ctx = canvas.getContext("2d");
   const dpr = window.devicePixelRatio || 1;
-  const w = canvas.clientWidth || 200, h = canvas.clientHeight || 48;
+  const w = canvas.clientWidth || 220, h = canvas.clientHeight || 56;
   canvas.width = w * dpr; canvas.height = h * dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
-  if (!points || points.length < 2) {
+  const all = (seriesList || []).flatMap((s) => s.points || []);
+  if (all.length < 2) {
     ctx.strokeStyle = "rgba(255,255,255,.12)";
     ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
     return;
   }
-  const vs = points.map((p) => p.v);
+  const vs = all.map((p) => p.v);
   let min = Math.min(...vs), max = Math.max(...vs);
   if (max - min < 1e-9) { max = min + 1; }
-  const pad = 4;
-  const x0 = points[0].t, x1 = points[points.length - 1].t;
-  ctx.beginPath();
-  points.forEach((p, i) => {
-    const x = ((p.t - x0) / Math.max(x1 - x0, 1e-9)) * (w - 2) + 1;
-    const y = h - pad - ((p.v - min) / (max - min)) * (h - pad * 2);
-    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  const pad = 10;
+  const x0 = Math.min(...all.map((p) => p.t)), x1 = Math.max(...all.map((p) => p.t));
+  // 轴刻度（左右 min/max）
+  ctx.fillStyle = "rgba(255,255,255,.35)";
+  ctx.font = "9px sans-serif";
+  ctx.fillText(fmtNum(max), 2, 9);
+  ctx.fillText(fmtNum(min), 2, h - 2);
+  // 时间刻度
+  const tLabel = (t) => {
+    const d = new Date(t * 1000);
+    return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  };
+  ctx.fillText(tLabel(x0), 2, h - 2);
+  ctx.fillText(tLabel(x1), w - 34, h - 2);
+  // 网格
+  ctx.strokeStyle = "rgba(255,255,255,.06)";
+  ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
+
+  (seriesList || []).forEach((s) => {
+    const points = s.points || [];
+    if (points.length < 2) return;
+    const color = s.color || "#6cb6ff";
+    ctx.beginPath();
+    points.forEach((p, i) => {
+      const x = ((p.t - x0) / Math.max(x1 - x0, 1e-9)) * (w - 10) + 4;
+      const y = h - pad - ((p.v - min) / (max - min)) * (h - pad * 2);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.lineTo(w - 6, h - 2); ctx.lineTo(4, h - 2); ctx.closePath();
+    ctx.fillStyle = color + "18"; ctx.fill();
   });
-  ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.stroke();
-  // fill
-  ctx.lineTo(w - 1, h); ctx.lineTo(1, h); ctx.closePath();
-  ctx.fillStyle = color + "22"; ctx.fill();
 }
 
-function metricCard(m) {
+function fmtNum(v) {
+  if (v == null || v !== v) return "-";
+  const x = Math.abs(v);
+  if (x >= 1e9) return (v / 1e9).toFixed(1) + "G";
+  if (x >= 1e6) return (v / 1e6).toFixed(1) + "M";
+  if (x >= 1e3) return (v / 1e3).toFixed(1) + "k";
+  if (x >= 100) return v.toFixed(0);
+  if (x >= 10) return v.toFixed(1);
+  return v.toFixed(2);
+}
+
+function metricCard(m, seriesList) {
+  // seriesList: [{key,label,points,color,value,state}] 可选多序列
   const card = el("div", { class: "metric-card" });
+  const title = m.label || m.key;
   const top = el("div", { class: "top" }, [
-    el("div", { class: "name", text: m.label || m.key }),
+    el("div", { class: "name", text: title }),
     metricStateBadge(m.state),
   ]);
   card.appendChild(top);
   const valWrap = el("div", { class: "val" });
-  valWrap.appendChild(document.createTextNode(fmtMetricVal(m)));
-  valWrap.appendChild(el("span", { class: "unit", text: " " + fmtMetricUnit(m) }));
+  if (seriesList && seriesList.length > 1) {
+    seriesList.forEach((s, i) => {
+      if (i) valWrap.appendChild(el("span", { class: "unit", text: "  ·  " }));
+      const unit = s.unit || "";
+      valWrap.appendChild(el("span", {
+        text: `${s.label || s.key} ${fmtNum(s.value)}`,
+        style: "font-size:13px",
+      }));
+      if (unit) valWrap.appendChild(el("span", { class: "unit", text: " " + unit }));
+    });
+  } else {
+    valWrap.appendChild(document.createTextNode(fmtMetricVal(m)));
+    valWrap.appendChild(el("span", { class: "unit", text: " " + fmtMetricUnit(m) }));
+  }
   card.appendChild(valWrap);
   if (m.state === "not_enabled") {
     return card;
   }
+  // 图例
+  if (seriesList && seriesList.length > 1) {
+    const legend = el("div", { style: "display:flex;gap:10px;flex-wrap:wrap;margin:2px 0 4px" });
+    seriesList.forEach((s) => {
+      legend.appendChild(el("span", {
+        style: `font-size:10px;color:var(--dim)`,
+        text: "● " + (s.label || s.key),
+      }));
+      legend.lastChild.style.color = s.color || "#6cb6ff";
+    });
+    card.appendChild(legend);
+  }
   const canvas = el("canvas", {});
+  canvas.style.width = "100%";
+  canvas.style.height = "56px";
   card.appendChild(canvas);
-  const color = m.state === "bad" ? "#f07178" : m.state === "warn" ? "#e5c07b" : "#6cb6ff";
-  setTimeout(() => drawSpark(canvas, m.points || [], color), 0);
+  const list = seriesList && seriesList.length
+    ? seriesList
+    : [{
+        points: m.points || [],
+        color: m.state === "bad" ? "#f07178" : m.state === "warn" ? "#e5c07b" : "#6cb6ff",
+      }];
+  setTimeout(() => drawSpark(canvas, list), 0);
   return card;
+}
+
+/** 合并指标卡片：Load 1/5/15、Disk R/W、Net Rx/Tx；无数据沉底 */
+function buildMetricGroups(metrics) {
+  const groups = [];
+  const used = new Set();
+  const put = (key, seriesKeys, label) => {
+    const ms = seriesKeys.map((k) => metrics[k]).filter(Boolean);
+    if (!ms.length) return;
+    seriesKeys.forEach((k) => used.add(k));
+    const states = ms.map((m) => m.state);
+    const rank = { collect_error: 5, bad: 4, warn: 3, no_data: 2, ok: 1, not_enabled: 0, partial_no_data: 2 };
+    const worst = states.reduce((a, b) => (rank[b] || 0) > (rank[a] || 0) ? b : a, "ok");
+    const palette = ["#6cb6ff", "#e5c07b", "#3dd68c", "#c4b5fd"];
+    const seriesList = ms.map((m, i) => ({
+      key: m.key,
+      label: (m.label || m.key).replace(/^.*[·\s]/, ""),
+      points: m.points || [],
+      color: palette[i % palette.length],
+      value: m.value,
+      unit: m.unit || "",
+      state: m.state,
+    }));
+    const head = {
+      key,
+      label,
+      state: worst,
+      value: ms[0].value,
+      unit: ms[0].unit || "",
+      points: ms[0].points || [],
+    };
+    groups.push({ head, seriesList, rank: rank[worst] || 0, hasData: ms.some((m) => (m.points || []).length) });
+  };
+  put("cpu", ["cpu"], "CPU 使用率");
+  put("memory", ["memory"], "内存使用率");
+  put("disk", ["disk"], "磁盘使用率(最大)");
+  put("swap", ["swap"], "Swap 使用率");
+  put("load", ["load1", "load5", "load15"], "负载 1/5/15");
+  put("disk_io", ["disk_read", "disk_write"], "磁盘 读/写");
+  put("net", ["net_rx", "net_tx"], "网络 收/发");
+  // 其余未归组
+  Object.keys(metrics).forEach((k) => {
+    if (used.has(k) || !metrics[k]) return;
+    groups.push({ head: metrics[k], seriesList: null, rank: 0, hasData: (metrics[k].points || []).length > 0 });
+  });
+  // 排序：异常 > 警告 > 正常有数据 > 无数据/未启用
+  groups.sort((a, b) => {
+    const aEmpty = !a.hasData || a.head.state === "no_data" || a.head.state === "not_enabled";
+    const bEmpty = !b.hasData || b.head.state === "no_data" || b.head.state === "not_enabled";
+    if (aEmpty !== bEmpty) return aEmpty ? 1 : -1;
+    return (b.rank || 0) - (a.rank || 0);
+  });
+  return groups;
 }
 
 async function renderMonitor() {
@@ -2790,6 +2937,8 @@ async function renderMonitor() {
   // strip
   strip.innerHTML = "";
   monitorState.hosts.forEach((h) => {
+    const hh = h.health || {};
+    const cls = hh.cls || (h.state === "collect_error" ? "err" : h.state === "no_data" ? "dim" : h.state);
     const chip = el("div", {
       class: "monitor-chip" + (h.asset_id === monitorState.host ? " active" : ""),
       onclick: () => {
@@ -2799,15 +2948,18 @@ async function renderMonitor() {
         renderMonitor();
       },
     }, [
-      el("span", { class: "dot " + (h.state === "collect_error" ? "bad" : h.state), text: "" }),
+      el("span", { class: "dot " + cls, text: "" }),
       el("span", { text: h.display_name || h.asset_id }),
     ]);
     strip.appendChild(chip);
   });
-  fillSelect("monitor-host", monitorState.hosts.map((h) => ({
-    v: h.asset_id,
-    t: (h.display_name || h.asset_id) + " · " + (h.state === "ok" ? "正常" : h.state === "warn" ? "偏高" : h.state === "bad" ? "异常" : h.state === "collect_error" ? "采集失败" : "暂无数据"),
-  })));
+  fillSelect("monitor-host", monitorState.hosts.map((h) => {
+    const hh = h.health || {};
+    return {
+      v: h.asset_id,
+      t: (h.display_name || h.asset_id) + " · " + (hh.label || "暂无数据"),
+    };
+  }));
   if (!monitorState.host && monitorState.hosts.length) {
     monitorState.host = monitorState.hosts[0].asset_id;
   }
@@ -2833,11 +2985,10 @@ async function renderMonitor() {
     body.appendChild(el("div", { class: "banner warn", text: "暂无数据：该主机可能未接入 Node Exporter，或标签 asset 未对齐。" }));
   }
   const metrics = hist.metrics || {};
-  const order = ["cpu", "memory", "swap", "disk", "load1", "load5", "load15", "disk_read", "disk_write", "net_rx", "net_tx"];
+  const groups = buildMetricGroups(metrics);
   const grid = el("div", { class: "metric-grid" });
-  order.forEach((k) => {
-    const m = metrics[k];
-    if (m) grid.appendChild(metricCard(m));
+  groups.forEach((g) => {
+    grid.appendChild(metricCard(g.head, g.seriesList));
   });
   body.appendChild(grid);
   body.appendChild(el("p", {
@@ -4029,7 +4180,7 @@ on("chk-kind", "change", chkKindChanged);
 on("chk-refresh", "click", () => renderChecks());
 
 on("monitor-detect", "click", () => {
-  const asset = monitorState.host || (($("monitor-host") || {}).value || "");
+  const asset = monitorState.host || (($("monitor-host") || {}).value || "") || (($("pc-ne-asset") || {}).value || "");
   if (!asset) {
     const box = $("monitor-install-box");
     if (box) box.innerHTML = '<p class="muted small">先选一台主机</p>';
@@ -4037,6 +4188,10 @@ on("monitor-detect", "click", () => {
   }
   pcRunAdoptFlow(asset);
 });
+
+on("overview-goto-monitor", "click", () => activateTab("monitor", ""));
+on("overview-goto-incidents", "click", () => activateTab("incidents", ""));
+on("overview-goto-notify", "click", () => activateTab("notify", ""));
 
 on("chk-add", "click", async () => {
   const kind = ($("chk-kind") || {}).value;

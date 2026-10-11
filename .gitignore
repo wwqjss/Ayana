@@ -21,3 +21,10 @@ ayana-verify.png
 .pw-verify/
 .playwright-cli/
 backups/
+
+# 一次性补丁/验证脚本
+patch_*.py
+fix_*.py
+rebuild_index.py
+check_git.py
+index_git*.html

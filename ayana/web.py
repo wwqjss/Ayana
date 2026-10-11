@@ -550,7 +550,12 @@ class WebApp:
                 samples_by_metric=metric_map.get(a["id"], {}),
                 open_incidents=open_by_asset.get(a["id"], 0),
             )
+            # 小圆点结论：与资源页同一套 host_health（不吸收历史未结案）
+            from .health import host_health as _hh
             d["health"] = health
+            d["health_dot"] = _hh(
+                required_state=health.get("state", "unknown"),
+            )
             d["probe"] = {"state": health.get("state", "unknown")}
             assets.append(d)
         need = [i for i in open_inc if i.get("need_human")]
@@ -1815,6 +1820,8 @@ class WebApp:
 
     async def api_monitor_hosts(self, request: web.Request) -> web.Response:
         self._require_auth(request)
+        from .health import REQUIRED_CHECKS, host_health, object_health
+
         rows = self.db.query(
             "SELECT id, display_name, prom_asset, enabled FROM assets ORDER BY id ASC"
         )
@@ -1823,7 +1830,95 @@ class WebApp:
             status = await self._monitor().hosts_status(assets)
         except Exception as e:
             return _json({"ok": False, "error": str(e)}, 502)
-        return _json({"ok": True, "hosts": status})
+
+        # 统一健康：指标 + required checks + 业务检查 + 当前 firing（不吸收历史未结案）
+        by_id = {s.get("asset_id"): s for s in status}
+        try:
+            firing = self.db.query(
+                "SELECT asset_id, labels_json FROM alert_episodes"
+                " WHERE status='firing' AND (source_state IS NULL OR source_state='firing')"
+                " LIMIT 200"
+            )
+        except Exception:
+            firing = []
+        firing_by_asset: dict[str, list[str]] = {}
+        for ep in firing or []:
+            aid = str(ep["asset_id"] or "")
+            try:
+                labels = json.loads(ep["labels_json"] or "{}")
+            except Exception:
+                labels = {}
+            sev = str(labels.get("severity") or "warning").lower()
+            firing_by_asset.setdefault(aid, []).append(sev)
+
+        out = []
+        for a in assets:
+            aid = a["id"]
+            item = dict(by_id.get(aid) or {
+                "asset_id": aid,
+                "display_name": a.get("display_name") or aid,
+                "prom_asset": a.get("prom_asset") or aid,
+                "state": "no_data",
+                "error": "",
+                "summary": {},
+            })
+            metric_state = item.get("state") or ""
+            metric_error = item.get("error") or ""
+
+            # required checks（无样本 → unknown → no_data）
+            req = REQUIRED_CHECKS.get(aid, [])
+            req_states: list[str] = []
+            if req:
+                for c in req:
+                    try:
+                        samples = await self.prom.probe_success_since(
+                            aid, c.get("object") or "", start=now() - 300
+                        ) if c.get("metric") == "probe_success" else []
+                    except Exception:
+                        samples = []
+                    h = object_health(
+                        asset_id=aid,
+                        object_name=c.get("object") or "",
+                        samples=samples,
+                        required=[c],
+                    )
+                    req_states.append(h.get("state") or "unknown")
+                if "unhealthy" in req_states:
+                    required_state = "unhealthy"
+                elif "stale" in req_states:
+                    required_state = "stale"
+                elif "unknown" in req_states:
+                    required_state = "unknown"
+                elif all(s == "healthy" for s in req_states):
+                    required_state = "healthy"
+                else:
+                    required_state = "degraded"
+            else:
+                required_state = ""
+
+            # 业务检查
+            check_states: list[str] = []
+            try:
+                for c in self.db.query(
+                    "SELECT last_state FROM checks WHERE asset_id=? AND enabled=1", (aid,)
+                ):
+                    check_states.append(c["last_state"] or "no_data")
+            except Exception:
+                pass
+
+            hh = host_health(
+                metric_state=metric_state,
+                metric_error=metric_error,
+                required_state=required_state,
+                check_states=check_states,
+                firing_severities=firing_by_asset.get(aid, []),
+                collect_error=metric_error if metric_state == "collect_error" else "",
+            )
+            item["health"] = hh
+            item["state"] = hh["state"]  # 对外五态
+            item["firing"] = firing_by_asset.get(aid, [])
+            out.append(item)
+        return _json({"ok": True, "hosts": out})
 
     async def api_monitor_host(self, request: web.Request) -> web.Response:
         sess = self._require_auth(request)

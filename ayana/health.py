@@ -195,3 +195,126 @@ def asset_health(
         "objects": obj_rows,
         "open_incidents": open_incidents,
     }
+
+
+# ── 统一主机健康（小圆点唯一来源）────────────────────────────────
+# 五态对外：ok / warn / bad / no_data / collect_error
+# 聚合优先级：collect_error > bad > warn > no_data > ok
+# 不变量：历史未结案 Incident 不反向染色；0 ≠ 无数据。
+
+_HOST_DOT = {
+    "collect_error": {"state": "collect_error", "label": "采集故障", "cls": "err"},
+    "bad": {"state": "bad", "label": "严重异常", "cls": "bad"},
+    "warn": {"state": "warn", "label": "警告", "cls": "warn"},
+    "no_data": {"state": "no_data", "label": "暂无数据", "cls": "dim"},
+    "ok": {"state": "ok", "label": "正常", "cls": "ok"},
+}
+
+_HOST_RANK = {
+    "collect_error": 5,
+    "bad": 4,
+    "warn": 3,
+    "stale": 3,
+    "no_data": 2,
+    "unknown": 2,
+    "partial_no_data": 2,
+    "ok": 1,
+    "healthy": 1,
+    "unhealthy": 4,
+    "degraded": 3,
+    "not_enabled": 0,
+    "": 0,
+}
+
+
+def _norm_host_state(raw: str) -> str:
+    """把各来源状态压到五态。"""
+    r = (raw or "").strip()
+    if r in ("collect_error",):
+        return "collect_error"
+    if r in ("bad", "unhealthy", "critical", "down"):
+        return "bad"
+    if r in ("warn", "warning", "degraded", "stale"):
+        return "warn"
+    if r in ("no_data", "unknown", "partial_no_data", "unobserved"):
+        return "no_data"
+    if r in ("ok", "healthy", "up", "pass", "passed", "not_enabled", "disabled", ""):
+        return "ok" if r in ("ok", "healthy", "up", "pass", "passed") else "ok"
+    return "warn"
+
+
+def _worst(states: list[str]) -> str:
+    best = "ok"
+    for s in states:
+        if _HOST_RANK.get(s, 0) > _HOST_RANK.get(best, 0):
+            best = s
+    return best
+
+
+def host_health(
+    *,
+    metric_state: str = "",
+    metric_error: str = "",
+    required_state: str = "",
+    check_states: list[str] | None = None,
+    firing_severities: list[str] | None = None,
+    collect_error: str = "",
+) -> dict[str, Any]:
+    """主机小圆点结论。Web / QQ / 总览 / 资源只消费此结果。
+
+    参数：
+      metric_state      monitor 指标层（ok/warn/bad/no_data/collect_error）
+      required_state    health.asset_health 聚合（healthy/unhealthy/...）
+      check_states      业务检查最近结论（ok/bad/...）
+      firing_severities 当前 firing 告警的 severity（critical/warning/info）
+      collect_error     采集链路错误（查询失败等）
+    """
+    states: list[str] = []
+    reasons: list[str] = []
+
+    if collect_error or _norm_host_state(metric_state) == "collect_error":
+        states.append("collect_error")
+        reasons.append(collect_error or metric_error or "采集失败")
+    elif metric_state:
+        states.append(_norm_host_state(metric_state))
+
+    if required_state:
+        # healthy→ok, unhealthy→bad, degraded/stale→warn, unknown→no_data
+        mapping = {
+            "healthy": "ok",
+            "unhealthy": "bad",
+            "degraded": "warn",
+            "stale": "warn",
+            "unknown": "no_data",
+        }
+        states.append(mapping.get(required_state, _norm_host_state(required_state)))
+
+    for s in check_states or []:
+        states.append(_norm_host_state(s))
+
+    # 当前 firing 告警可抬升；info 不抬升到红
+    for sev in firing_severities or []:
+        sev = (sev or "").lower()
+        if sev in ("critical", "fatal", "disaster"):
+            states.append("bad")
+        elif sev in ("warning", "warn"):
+            states.append("warn")
+
+    overall = _worst(states) if states else "no_data"
+    # 全部 not_enabled/ok 且无任何样本语义时，若输入为空给 no_data
+    if not states:
+        overall = "no_data"
+
+    dot = _HOST_DOT[overall]
+    return {
+        "state": dot["state"],
+        "label": dot["label"],
+        "cls": dot["cls"],
+        "reasons": reasons,
+        "sources": {
+            "metric": _norm_host_state(metric_state) if metric_state else "",
+            "required": required_state or "",
+            "checks": [_norm_host_state(s) for s in (check_states or [])],
+            "firing": list(firing_severities or []),
+        },
+    }
