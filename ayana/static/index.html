@@ -28,15 +28,19 @@
 
       <p class="muted">运维控制台</p>
 
-      <label>用户名 <input name="username" autocomplete="username" required></label>
+      <div id="login-step1">
+        <label>用户名 <input name="username" id="login-username" autocomplete="username" required></label>
+        <label>密码 <input name="password" id="login-password" type="password" autocomplete="current-password" required></label>
+        <button type="submit" class="btn primary" id="login-next-btn">下一步</button>
+      </div>
 
-      <label>密码 <input name="password" type="password" autocomplete="current-password" required></label>
-
-      <label id="totp-field">TOTP <input name="totp" inputmode="numeric" maxlength="6" placeholder="6 位动态码"></label>
-
-      <label id="recovery-field" class="hidden">恢复码 <input name="recovery_code" placeholder="XXXX-XXXX-XXXX"></label>
-
-      <button type="submit" class="btn primary">登录</button>
+      <div id="login-step2" class="hidden">
+        <p class="muted small" id="login-step2-hint">账号已验证，请输入动态验证码</p>
+        <label>动态码 <input id="login-totp" inputmode="numeric" maxlength="6" placeholder="6 位动态码" autocomplete="one-time-code"></label>
+        <label id="recovery-field" class="hidden">恢复码 <input id="login-recovery" placeholder="XXXX-XXXX-XXXX"></label>
+        <button type="button" class="btn primary" id="login-totp-btn">验证并登录</button>
+        <button type="button" class="btn ghost" id="login-back-btn">返回</button>
+      </div>
 
       <p class="error" id="login-error"></p>
 
@@ -61,8 +65,6 @@
         <button data-tab="incidents" class="tab">事件</button>
 
         <button data-tab="monitor" class="tab">资源</button>
-        <button data-tab="checks" class="tab">检查</button>
-
         <button data-tab="connections" class="tab">连接</button>
 
         <button data-tab="notify" class="tab">通知</button>
@@ -133,6 +135,7 @@
 
         <div class="subnav" id="monitor-subnav">
           <button data-sub="metrics" class="subtab active">主机与指标</button>
+          <button data-sub="checks" class="subtab">业务监控</button>
           <button data-sub="onboard" class="subtab">接入</button>
           <button data-sub="prom" class="subtab">Prometheus / 规则</button>
         </div>
@@ -191,6 +194,67 @@
         </div>
 
         <div id="monitor-body"></div>
+        </div>
+
+        <div id="monitor-sub-checks" class="subpanel hidden">
+          <div class="card">
+            <h2>业务监控</h2>
+            <p class="muted small">
+              Ayana 原生检查（TCP / HTTP / 服务 / 自定义命令），与上方 Prometheus 指标同属当前资产。
+              异常进入事件与通知。不依赖 Prometheus。
+            </p>
+            <div class="form-row">
+              <label>所属主机
+                <select id="chk-asset"></select>
+              </label>
+              <label>类型
+                <select id="chk-kind">
+                  <option value="port">端口监听</option>
+                  <option value="service">服务启动</option>
+                  <option value="command">自定义命令</option>
+                </select>
+              </label>
+              <label>名称 <input id="chk-name" placeholder="如 harbor-http"></label>
+            </div>
+            <div class="form-row" id="chk-params-port">
+              <label>端口 <input id="chk-port" type="number" placeholder="8080"></label>
+              <label>协议
+                <select id="chk-proto"><option value="tcp">tcp</option><option value="udp">udp</option></select>
+              </label>
+            </div>
+            <div class="form-row hidden" id="chk-params-service">
+              <label>服务名 <input id="chk-unit" placeholder="nginx"></label>
+            </div>
+            <div class="form-row hidden" id="chk-params-command">
+              <label>命令(空格分隔) <input id="chk-cmd" placeholder="curl -f http://127.0.0.1:8080/health" style="min-width:320px"></label>
+              <label>期望
+                <select id="chk-expect">
+                  <option value="exit0">退出码 0</option>
+                  <option value="contains">输出包含</option>
+                  <option value="not_contains">输出不含</option>
+                </select>
+              </label>
+              <label>匹配串 <input id="chk-expect-val" placeholder="ok"></label>
+            </div>
+            <div class="form-row">
+              <label>间隔秒 <input id="chk-interval" type="number" value="60"></label>
+              <label>连续失败 <input id="chk-threshold" type="number" value="2"></label>
+              <label>级别
+                <select id="chk-severity">
+                  <option value="warning">warning</option>
+                  <option value="critical">critical</option>
+                  <option value="info">info</option>
+                </select>
+              </label>
+              <button class="btn primary" id="chk-add" type="button">添加检查</button>
+              <button class="btn" id="chk-refresh" type="button">刷新</button>
+            </div>
+            <div id="chk-list"></div>
+          </div>
+          <div class="card">
+            <h2>执行动态</h2>
+            <div id="chk-activity"></div>
+          </div>
         </div>
 
         <div id="monitor-sub-onboard" class="subpanel hidden">
@@ -260,61 +324,8 @@
 
 
       
-      <section id="tab-checks" class="tab-panel hidden">
-        <div class="card">
-          <h2>业务检查</h2>
-          <p class="muted small">盯端口、服务、自定义命令。不依赖 Prometheus；连续失败会告警。</p>
-          <div class="form-row">
-            <label>主机 <select id="chk-asset"></select></label>
-            <label>类型
-              <select id="chk-kind">
-                <option value="port">端口监听</option>
-                <option value="service">服务启动</option>
-                <option value="command">自定义命令</option>
-              </select>
-            </label>
-            <label>名称 <input id="chk-name" placeholder="如 harbor-http"></label>
-          </div>
-          <div class="form-row" id="chk-params-port">
-            <label>端口 <input id="chk-port" type="number" placeholder="8080"></label>
-            <label>协议
-              <select id="chk-proto"><option value="tcp">tcp</option><option value="udp">udp</option></select>
-            </label>
-          </div>
-          <div class="form-row hidden" id="chk-params-service">
-            <label>服务名 <input id="chk-unit" placeholder="nginx"></label>
-          </div>
-          <div class="form-row hidden" id="chk-params-command">
-            <label>命令(空格分隔) <input id="chk-cmd" placeholder="curl -f http://127.0.0.1:8080/health" style="min-width:320px"></label>
-            <label>期望
-              <select id="chk-expect">
-                <option value="exit0">退出码 0</option>
-                <option value="contains">输出包含</option>
-                <option value="not_contains">输出不含</option>
-              </select>
-            </label>
-            <label>匹配串 <input id="chk-expect-val" placeholder="ok"></label>
-          </div>
-          <div class="form-row">
-            <label>间隔秒 <input id="chk-interval" type="number" value="60"></label>
-            <label>连续失败 <input id="chk-threshold" type="number" value="2"></label>
-            <label>级别
-              <select id="chk-severity">
-                <option value="warning">warning</option>
-                <option value="critical">critical</option>
-                <option value="info">info</option>
-              </select>
-            </label>
-            <button class="btn primary" id="chk-add" type="button">添加检查</button>
-            <button class="btn" id="chk-refresh" type="button">刷新</button>
-          </div>
-          <div id="chk-list"></div>
-        </div>
-        <div class="card">
-          <h2>动态</h2>
-          <div id="chk-activity"></div>
-        </div>
-      </section>
+      <!-- 业务检查已并入 资源 → 业务监控；保留空锚点兼容旧 hash -->
+      <section id="tab-checks" class="tab-panel hidden"></section>
 
       <!-- promconfig / messages 已并入 资源 / 通知；保留空锚点兼容旧 hash -->
       <section id="tab-promconfig" class="tab-panel hidden"></section>
@@ -820,85 +831,76 @@
       <section id="tab-permissions" class="tab-panel hidden">
 
         <div class="card">
-
-          <h2>谁能做什么</h2>
-
+          <h2>默认授权策略</h2>
           <p class="muted small">
-
-            按「资产 / 对象」选择处置方式。默认管理 Ayana Agent 自动处置；
-
-            QQ / Web 个人授权见下方「高级权限」。
-
+            按操作类型统一配置：禁止 / 需要人工确认 / 允许自动执行。新资产自动继承默认策略，无需逐项授权。
           </p>
-
           <p class="muted small">
-
             主机侧 commands.json / forced-command / sudoers 仍是最终安全上限，此处不能扩大。
-
           </p>
-
           <div class="perm-legend">
-
             <span><span class="dot" style="background:var(--bad)"></span>禁止</span>
-
-            <span><span class="dot" style="background:var(--warn)"></span>需要我确认</span>
-
-            <span><span class="dot" style="background:var(--ok)"></span>Ayana 可以自动执行</span>
-
+            <span><span class="dot" style="background:var(--warn)"></span>需要人工确认</span>
+            <span><span class="dot" style="background:var(--ok)"></span>允许自动执行</span>
           </div>
+          <div id="perm-defaults"></div>
+        </div>
 
-          <div id="perm-agent"></div>
+        <div class="card">
+          <h2>资产例外</h2>
+          <p class="muted small">对指定主机、容器或服务覆盖默认策略。可一键恢复默认，避免重复配置。</p>
+          <div id="perm-exceptions"></div>
+          <div class="form-row" style="margin-top:12px">
+            <label>新增例外
+              <select id="perm-ex-cap"></select>
+            </label>
+            <label>资产
+              <select id="perm-ex-asset"></select>
+            </label>
+            <label>对象 <input id="perm-ex-object" value="*" placeholder="* 或对象名"></label>
+            <button class="btn primary" id="perm-ex-add">添加例外</button>
+          </div>
+        </div>
 
-          <h3 style="margin:18px 0 8px;font-size:14px">Agent 权限上限（ceiling）</h3>
+        <div class="card">
+          <h2>查看最终生效权限</h2>
+          <p class="muted small">选择对象后显示命中的规则来源（默认策略 / 资产例外）与最终结论。</p>
+          <div class="form-row">
+            <label>操作 <select id="perm-eff-cap"></select></label>
+            <label>资产 <select id="perm-eff-asset"></select></label>
+            <label>对象 <input id="perm-eff-object" value="*" ></label>
+            <button class="btn primary" id="perm-eff-lookup">查询</button>
+          </div>
+          <div id="perm-eff-result"></div>
+        </div>
 
+        <div class="card">
+          <h3 style="margin:0 0 8px;font-size:14px">Agent 权限上限（ceiling）</h3>
           <p class="muted small">后端强制：Agent（auto_rule / llm）不能超过此处上限，也不能超过源码能力目录。</p>
-
           <div id="agent-ceiling"></div>
-
         </div>
 
         <details class="perm-adv card">
-
           <summary>高级权限（QQ / Web 用户等细规则）</summary>
-
           <div class="form-row">
-
             <label>主体类型
-
               <select id="perm-subject-type">
-
                 <option value="web_user">web_user</option>
-
                 <option value="qq_user">qq_user</option>
-
                 <option value="qq_group">qq_group</option>
-
                 <option value="auto_rule">auto_rule</option>
-
               </select>
-
             </label>
-
             <label>主体 ID <input id="perm-subject-id" placeholder="用户名 / QQ 号"></label>
-
             <label>能力 <select id="perm-cap"></select></label>
-
             <label>资产 <select id="perm-asset"></select></label>
-
             <label>对象 <input id="perm-object" value="*" ></label>
-
             <label class="chk"><input type="checkbox" id="perm-allow" checked> 允许</label>
-
             <label class="chk"><input type="checkbox" id="perm-approval" checked> 需批准</label>
-
             <label class="chk"><input type="checkbox" id="perm-auto"> 允许自动</label>
-
             <button class="btn primary" id="perm-save">保存</button>
-
           </div>
-
           <div id="perm-list"></div>
-
         </details>
 
       </section>

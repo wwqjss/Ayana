@@ -160,6 +160,7 @@ class AuthService:
         self.max_failed = max_failed
         self.lockout = lockout
         self._totp_key = totp_key  # S11: TOTP 加密密钥
+        self._pending_logins: dict[str, dict[str, Any]] = {}
 
     def ensure_bootstrap_admin(self, username: str) -> str | None:
         """若无用户则创建管理员，返回临时密码；否则 None。"""
@@ -197,30 +198,96 @@ class AuthService:
         *,
         ip: str = "",
     ) -> dict[str, Any]:
+        """完整登录（兼容旧接口）：密码 + 可选 TOTP 一步完成。"""
+        res = self.begin_login(username, password, ip=ip)
+        if res.get("complete"):
+            return res["session"]
+        return self.complete_login(
+            res["pending_id"], totp_code=totp_code, recovery_code=recovery_code, ip=ip
+        )
+
+    def begin_login(self, username: str, password: str, *, ip: str = "") -> dict[str, Any]:
+        """两阶段登录第一步：只验账号密码。
+
+        - 密码错误 → 抛 AuthError，不进入第二阶段
+        - 未启用 2FA → 直接发会话 {complete: True, session}
+        - 已启用 2FA → {complete: False, need_totp: True, pending_id}
+        """
         if self._recent_failures(username) >= self.max_failed:
             raise AuthError("locked", "尝试过多，请稍后再试")
 
         row = self.db.query_one("SELECT * FROM users WHERE username=?", (username,))
+        if not row or not verify_password(password, row["password_hash"], self.pepper):
+            self.db.execute(
+                "INSERT INTO login_attempts(username, at, ok, ip) VALUES(?,?,?,?)",
+                (username, now(), 0, ip),
+            )
+            raise AuthError("invalid", "用户名或密码错误")
+
+        user_id = int(row["id"])
+        if not row["totp_enabled"]:
+            self.db.execute(
+                "INSERT INTO login_attempts(username, at, ok, ip) VALUES(?,?,?,?)",
+                (username, now(), 1, ip),
+            )
+            return {"complete": True, "session": self._issue_session(user_id, ip)}
+
+        # 2FA 账号：先发 pending，不建完整会话
+        pending_id = "pend_" + pysecrets.token_urlsafe(24)
+        self._pending_logins[pending_id] = {
+            "user_id": user_id,
+            "username": username,
+            "ip": ip,
+            "at": now(),
+        }
+        self._gc_pending()
+        return {
+            "complete": False,
+            "need_totp": True,
+            "pending_id": pending_id,
+            "username": username,
+        }
+
+    def complete_login(
+        self,
+        pending_id: str,
+        *,
+        totp_code: str = "",
+        recovery_code: str = "",
+        ip: str = "",
+    ) -> dict[str, Any]:
+        """两阶段登录第二步：TOTP / 恢复码通过后才建会话。"""
+        self._gc_pending()
+        item = self._pending_logins.get(pending_id or "")
+        if not item:
+            raise AuthError("pending_expired", "登录已过期，请重新输入密码")
+        row = self.db.query_one("SELECT * FROM users WHERE id=?", (item["user_id"],))
+        if not row or not row["totp_enabled"]:
+            del self._pending_logins[pending_id]
+            raise AuthError("invalid", "账号状态已变化，请重新登录")
+
         ok = False
-        user_id = 0
-        if row and verify_password(password, row["password_hash"], self.pepper):
-            user_id = int(row["id"])
-            if not row["totp_enabled"]:
-                ok = True
-            elif recovery_code:
-                ok = self._use_recovery_code(user_id, recovery_code)
-            elif totp_code and totp_verify(decrypt_totp_secret(self._totp_key, row["totp_secret"]), totp_code):
-                ok = True
+        if recovery_code:
+            ok = self._use_recovery_code(int(row["id"]), recovery_code)
+        elif totp_code and totp_verify(
+            decrypt_totp_secret(self._totp_key, row["totp_secret"]), totp_code
+        ):
+            ok = True
 
         self.db.execute(
             "INSERT INTO login_attempts(username, at, ok, ip) VALUES(?,?,?,?)",
-            (username, now(), 1 if ok else 0, ip),
+            (item["username"], now(), 1 if ok else 0, ip or item.get("ip") or ""),
         )
         if not ok:
-            raise AuthError("invalid", "用户名、密码或验证码错误")
+            raise AuthError("totp_invalid", "动态码或恢复码错误")
+        del self._pending_logins[pending_id]
+        return self._issue_session(int(row["id"]), ip or item.get("ip") or "")
 
-        assert row is not None
-        return self._issue_session(user_id, ip)
+    def _gc_pending(self) -> None:
+        cutoff = now() - 300  # 5 分钟
+        dead = [k for k, v in self._pending_logins.items() if v.get("at", 0) < cutoff]
+        for k in dead:
+            self._pending_logins.pop(k, None)
 
     def _use_recovery_code(self, user_id: int, code: str) -> bool:
         needle = hash_recovery_code(code.strip(), self.pepper)

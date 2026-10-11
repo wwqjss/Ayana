@@ -191,6 +191,26 @@ def seed_assets(db: Database) -> None:
             )
 
 
+def ensure_checks_admin_perms(db: Database) -> None:
+    """已有库升级：补齐 admin 的 checks.* 种子（不覆盖已有决定）。"""
+    from .policy import Policy
+
+    policy = Policy(db)
+    for cap in ("checks.read", "checks.write"):
+        row = db.query_one(
+            "SELECT id FROM permissions WHERE subject_type='web_user' AND subject_id='admin'"
+            " AND capability=? AND asset_id='*' AND object_id='*'",
+            (cap,),
+        )
+        if row:
+            continue
+        policy.upsert_permission(
+            subject_type="web_user", subject_id="admin", capability=cap,
+            asset_id="*", object_id="*", allow=True, require_approval=False,
+            auto_allowed=False, actor="system",
+        )
+
+
 def ensure_promconfig_admin_perms(db: Database) -> None:
     """已有库升级：仅为缺失的 admin 权限插入种子，不覆盖已有决定。"""
     from .policy import Policy
@@ -478,6 +498,7 @@ class App:
             log.warning("BOOTSTRAP admin password (rotate after first login): %s", admin)
         try:
             ensure_promconfig_admin_perms(self.db)
+            ensure_checks_admin_perms(self.db)
         except Exception as e:
             log.warning("ensure promconfig admin perms failed: %s", e)
 

@@ -105,6 +105,8 @@ class WebApp:
         app.router.add_get("/ready", self.ready)
         app.router.add_get("/api/me", self.api_me)
         app.router.add_post("/api/login", self.api_login)
+        app.router.add_post("/api/login/step", self.api_login_step)
+        app.router.add_post("/api/login/totp", self.api_login_totp)
         app.router.add_post("/api/logout", self.api_logout)
         app.router.add_post("/api/totp/setup", self.api_totp_setup)
         app.router.add_post("/api/totp/confirm", self.api_totp_confirm)
@@ -130,6 +132,8 @@ class WebApp:
         app.router.add_post("/api/actions/{aid}/execute", self.api_action_execute)
         app.router.add_post("/api/actions/{aid}/verify", self.api_action_verify)
         app.router.add_get("/api/permissions", self.api_permissions)
+        app.router.add_get("/api/permissions/model", self.api_permissions_model)
+        app.router.add_get("/api/permissions/effective", self.api_permissions_effective)
         app.router.add_post("/api/permissions", self.api_permission_upsert)
         app.router.add_post("/api/permissions/delete", self.api_permission_delete)
         app.router.add_post("/api/permissions/preview", self.api_permission_preview)
@@ -377,6 +381,70 @@ class WebApp:
                 "csrf_token": sess["csrf_token"],
             }
         )
+
+    async def api_login_step(self, request: web.Request) -> web.Response:
+        """两阶段登录第一步：密码。未 2FA 直接建会话；2FA 返回 need_totp。"""
+        try:
+            body = await request.json()
+        except Exception:
+            return _json({"ok": False, "error": "bad_json"}, 400)
+        ip = request.remote or ""
+        try:
+            res = self.auth.begin_login(
+                body.get("username", ""), body.get("password", ""), ip=ip
+            )
+        except AuthError as e:
+            return _json({"ok": False, "error": e.code, "message": str(e)}, 401)
+        if res.get("complete"):
+            sess = res["session"]
+            resp = _json({"ok": True, "complete": True, "csrf_token": sess["csrf_token"]})
+            resp.set_cookie(
+                SESSION_COOKIE,
+                sess["session_id"],
+                httponly=True,
+                samesite="Lax",
+                max_age=self.auth.session_ttl,
+                path="/",
+            )
+            self.db.audit("web_user", body.get("username", ""), "login_ok", detail={"ip": ip})
+            return resp
+        return _json(
+            {
+                "ok": True,
+                "complete": False,
+                "need_totp": True,
+                "pending_id": res.get("pending_id", ""),
+                "username": res.get("username", ""),
+            }
+        )
+
+    async def api_login_totp(self, request: web.Request) -> web.Response:
+        """两阶段登录第二步：TOTP / 恢复码。通过后才建完整会话。"""
+        try:
+            body = await request.json()
+        except Exception:
+            return _json({"ok": False, "error": "bad_json"}, 400)
+        ip = request.remote or ""
+        try:
+            sess = self.auth.complete_login(
+                body.get("pending_id", ""),
+                totp_code=body.get("totp", "") or body.get("code", ""),
+                recovery_code=body.get("recovery_code", ""),
+                ip=ip,
+            )
+        except AuthError as e:
+            return _json({"ok": False, "error": e.code, "message": str(e)}, 401)
+        resp = _json({"ok": True, "complete": True, "csrf_token": sess["csrf_token"]})
+        resp.set_cookie(
+            SESSION_COOKIE,
+            sess["session_id"],
+            httponly=True,
+            samesite="Lax",
+            max_age=self.auth.session_ttl,
+            path="/",
+        )
+        self.db.audit("web_user", "", "login_ok", detail={"ip": ip, "stage": "totp"})
+        return resp
 
     async def api_login(self, request: web.Request) -> web.Response:
         try:
@@ -1390,6 +1458,25 @@ class WebApp:
                 "automatic": "自动执行" if cap_kind == "write" else "允许读取",
             }.get(decision, decision)
         return _json({"ok": True, **data})
+
+    async def api_permissions_model(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        return _json({"ok": True, **self.policy.model_view()})
+
+    async def api_permissions_effective(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        q = request.rel_url.query
+        try:
+            data = self.policy.effective_for(
+                capability=q.get("capability", ""),
+                asset_id=q.get("asset_id", ""),
+                object_id=q.get("object_id", ""),
+                subject_type=q.get("subject_type", "auto_rule"),
+                subject_id=q.get("subject_id", "agent"),
+            )
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True, "effective": data})
 
     async def api_permission_upsert(self, request: web.Request) -> web.Response:
         sess = self._require_admin(request)
@@ -2916,8 +3003,12 @@ class WebApp:
             asset_id="*",
             object_id="*",
         )
-        if not d["allowed"]:
-            raise web.HTTPForbidden(text=json.dumps({"error": "denied"}))
+        # admin 拥有管理台读权限；其余用户需显式 checks.read
+        if not d["allowed"] and not sess.get("is_admin"):
+            raise web.HTTPForbidden(
+                text=json.dumps({"ok": False, "error": "denied", "detail": "checks.read not granted"}),
+                content_type="application/json",
+            )
         return sess
 
     def _check_write(self, request: web.Request) -> dict[str, Any]:

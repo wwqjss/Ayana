@@ -196,10 +196,15 @@ function badge(text, cls) {
   return el("span", { class: "badge " + (cls || "dim"), text });
 }
 
-/* ---- login ---- */
+/* ---- login（两阶段） ---- */
 function showLogin() {
   $("login-view").classList.remove("hidden");
   $("main-view").classList.add("hidden");
+  const s1 = $("login-step1"), s2 = $("login-step2");
+  if (s1) s1.classList.remove("hidden");
+  if (s2) s2.classList.add("hidden");
+  const err = $("login-error");
+  if (err) err.textContent = "";
 }
 
 function showMain() {
@@ -213,91 +218,200 @@ function showMain() {
 
 on("use-recovery", "click", (e) => {
   e.preventDefault();
-  $("recovery-field").classList.toggle("hidden");
-  $("totp-field").classList.toggle("hidden");
+  const rec = $("recovery-field");
+  const totp = $("login-totp");
+  if (rec) rec.classList.toggle("hidden");
+  if (totp) totp.placeholder = rec && !rec.classList.contains("hidden") ? "可留空，改用恢复码" : "6 位动态码";
+});
+
+on("login-back-btn", "click", () => {
+  state.pendingLogin = null;
+  $("login-step1").classList.remove("hidden");
+  $("login-step2").classList.add("hidden");
+  $("login-error").textContent = "";
 });
 
 on("login-form", "submit", async (e) => {
   e.preventDefault();
-  const fd = new FormData(e.target);
+  $("login-error").textContent = "";
+  // 第一阶段：只提交账号密码
   const body = {
-    username: fd.get("username"),
-    password: fd.get("password"),
-    totp: fd.get("totp") || "",
-    recovery_code: fd.get("recovery_code") || "",
+    username: ($("login-username") || {}).value || "",
+    password: ($("login-password") || {}).value || "",
   };
-  const res = await api("/api/login", { method: "POST", body: JSON.stringify(body) });
+  const res = await api("/api/login/step", { method: "POST", body: JSON.stringify(body) });
   if (!res.ok) {
     $("login-error").textContent = res.message || res.error || "登录失败";
     return;
   }
+  if (res.complete) {
+    state.csrf = res.csrf_token;
+    await boot();
+    return;
+  }
+  // 需要 2FA
+  state.pendingLogin = { pending_id: res.pending_id, username: res.username };
+  $("login-step1").classList.add("hidden");
+  $("login-step2").classList.remove("hidden");
+  $("login-error").textContent = "";
+  const hint = $("login-step2-hint");
+  if (hint) hint.textContent = `账号 ${res.username || ""} 已验证，请输入动态验证码`;
+  const t = $("login-totp");
+  if (t) t.focus();
+});
+
+async function submitTotpStage() {
+  if (!state.pendingLogin || !state.pendingLogin.pending_id) {
+    $("login-error").textContent = "请先输入账号密码";
+    return;
+  }
+  const totp = (($("login-totp") || {}).value || "").trim();
+  const rec = (($("login-recovery") || {}).value || "").trim();
+  const res = await api("/api/login/totp", {
+    method: "POST",
+    body: JSON.stringify({
+      pending_id: state.pendingLogin.pending_id,
+      totp,
+      recovery_code: rec,
+    }),
+  });
+  if (!res.ok) {
+    $("login-error").textContent = res.message || res.error || "验证失败";
+    return;
+  }
   state.csrf = res.csrf_token;
+  state.pendingLogin = null;
   await boot();
+}
+
+on("login-totp-btn", "click", submitTotpStage);
+on("login-totp", "keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); submitTotpStage(); }
 });
 
 on("logout-btn", "click", async () => {
   await api("/api/logout", { method: "POST", body: "{}" });
   state.csrf = "";
   state.user = null;
+  state.pendingLogin = null;
   showLogin();
 });
 
-on("totp-btn", "click", async () => {
-  const setupPassword = prompt("如需更换 2FA，请输入当前密码（首次绑定可留空）") || "";
-  const setupOtp = prompt("如已有 2FA，请输入当前动态码（首次绑定可留空）") || "";
-  const setup = await api("/api/totp/setup", {
-    method: "POST",
-    body: JSON.stringify({ password: setupPassword, totp: setupOtp }),
-  });
-  if (!setup.ok) {
-    alert(setup.message || setup.error || "TOTP 初始化失败");
-    return;
-  }
-  showModal("绑定 TOTP", [
-    el("p", { class: "muted small", text: "用 Microsoft Authenticator / 谷歌验证器扫码：" }),
-    el("div", {
-      id: "totp-qr",
-      style: "background:#fff;padding:12px;border-radius:8px;display:inline-block;margin:8px 0",
-    }),
-    el("p", { class: "muted small", text: "扫码不可用时，手动输入 Secret：" }),
-    el("pre", { id: "totp-secret", text: setup.secret, style: "user-select:all" }),
-    el("p", { class: "muted small", text: "otpauth：" }),
-    el("pre", { text: setup.otpauth, style: "user-select:all;font-size:10px;max-height:80px" }),
-    el("label", { text: "输入 6 位验证码确认" }, [
-      el("input", { id: "totp-confirm-code", maxlength: "6", style: "width:140px;margin-top:8px;padding:8px" }),
-    ]),
-    el("label", { text: "当前密码（首次绑定可留空；更换必填）" }, [
-      el("input", { id: "totp-confirm-password", type: "password", style: "width:100%;margin-top:8px;padding:8px" }),
-    ]),
-    el("div", { id: "totp-result" }),
+/* ---- 2FA 设置（Ayana 自有弹层，不用 alert/prompt/confirm） ---- */
+function openTotpManage() {
+  const body = $("modal-body");
+  if (!body) return;
+  body.innerHTML = "";
+  const wrap = el("div", { class: "totp-manage" });
+  wrap.appendChild(el("h3", { text: "两步验证（2FA）" }));
+  wrap.appendChild(el("p", {
+    class: "muted small",
+    text: "更换或关闭前需验证当前密码。启用后请保存恢复码（仅显示一次）。",
+  }));
+
+  const form = el("div", { class: "form-col" });
+  form.appendChild(el("label", { text: "当前密码（首次绑定可留空）" }, [
+    el("input", { id: "tm-password", type: "password", placeholder: "当前登录密码" }),
+  ]));
+  form.appendChild(el("label", { text: "当前动态码（已有 2FA 时填写）" }, [
+    el("input", { id: "tm-current-otp", maxlength: "6", inputmode: "numeric", placeholder: "6 位" }),
+  ]));
+  wrap.appendChild(form);
+
+  const actions = el("div", { class: "form-row", style: "margin-top:12px" }, [
     el("button", {
-      class: "btn primary", text: "确认启用",
-      onclick: async () => {
-        const code = $("totp-confirm-code").value.trim();
-        const password = ($("totp-confirm-password") && $("totp-confirm-password").value) || "";
-        const res = await api("/api/totp/confirm", {
-          method: "POST",
-          body: JSON.stringify({ code, password }),
-        });
-        if (!res.ok) {
-          $("totp-result").textContent = res.message || res.error || "失败";
-          return;
-        }
-        if (res.csrf_token) state.csrf = res.csrf_token;
-        $("modal-body").innerHTML = "";
-        $("modal-body").appendChild(el("p", { text: "已启用 2FA。请保存恢复码（仅显示一次）：" }));
-        $("modal-body").appendChild(el("pre", { text: (res.recovery_codes || []).join("\n") }));
-      },
+      class: "btn primary", text: "启用 / 更换 2FA",
+      onclick: () => totpStartSetup(),
+    }),
+    el("button", {
+      class: "btn", text: "关闭 2FA",
+      onclick: () => totpDisable(),
     }),
   ]);
-  // 渲染 QR
+  wrap.appendChild(actions);
+  wrap.appendChild(el("div", { id: "tm-result", style: "margin-top:12px" }));
+  wrap.appendChild(el("div", { id: "tm-setup" }));
+  body.appendChild(wrap);
+  const m = $("modal");
+  if (m) m.classList.remove("hidden");
+}
+
+async function totpStartSetup() {
+  const password = (($("tm-password") || {}).value || "").trim();
+  const totp = (($("tm-current-otp") || {}).value || "").trim();
+  const box = $("tm-result");
+  const setup = await api("/api/totp/setup", {
+    method: "POST",
+    body: JSON.stringify({ password, totp }),
+  });
+  if (!setup.ok) {
+    if (box) box.textContent = setup.message || setup.error || "TOTP 初始化失败";
+    return;
+  }
+  const dest = $("tm-setup");
+  if (!dest) return;
+  dest.innerHTML = "";
+  dest.appendChild(el("p", { class: "muted small", text: "用验证器 App 扫码，或手动输入 Secret：" }));
+  dest.appendChild(el("div", {
+    id: "totp-qr",
+    style: "background:#fff;padding:12px;border-radius:8px;display:inline-block;margin:8px 0",
+  }));
+  dest.appendChild(el("pre", { id: "totp-secret", text: setup.secret, style: "user-select:all" }));
+  dest.appendChild(el("p", { class: "muted small", text: "输入 6 位验证码完成启用" }));
+  dest.appendChild(el("input", {
+    id: "totp-confirm-code", maxlength: "6", inputmode: "numeric",
+    style: "width:140px;padding:8px;margin:6px 0",
+  }));
+  dest.appendChild(el("div", { id: "totp-result" }));
+  dest.appendChild(el("button", {
+    class: "btn primary", text: "确认启用",
+    style: "margin-top:8px",
+    onclick: async () => {
+      const code = (($("totp-confirm-code") || {}).value || "").trim();
+      const password2 = (($("tm-password") || {}).value || "").trim();
+      const res = await api("/api/totp/confirm", {
+        method: "POST",
+        body: JSON.stringify({ code, password: password2 }),
+      });
+      if (!res.ok) {
+        const r = $("totp-result");
+        if (r) r.textContent = res.message || res.error || "失败";
+        return;
+      }
+      if (res.csrf_token) state.csrf = res.csrf_token;
+      dest.innerHTML = "";
+      dest.appendChild(el("p", { text: "已启用 2FA。请保存恢复码（仅显示一次）：" }));
+      dest.appendChild(el("pre", {
+        text: (res.recovery_codes || []).join("\n"),
+        style: "user-select:all;white-space:pre-wrap",
+      }));
+    },
+  }));
   try {
     const qr = window.QR.encode(setup.otpauth, 4);
     $("totp-qr").innerHTML = window.QR.toSvg(qr, 4);
   } catch (e) {
     $("totp-qr").innerHTML = '<span class="muted small">二维码生成失败，请用 Secret 手动添加</span>';
   }
-});
+}
+
+async function totpDisable() {
+  const password = (($("tm-password") || {}).value || "").trim();
+  const totp = (($("tm-current-otp") || {}).value || "").trim();
+  const box = $("tm-result");
+  if (box) box.textContent = "正在关闭 2FA…";
+  const res = await api("/api/totp/disable", {
+    method: "POST",
+    body: JSON.stringify({ password, totp }),
+  });
+  if (!res.ok) {
+    if (box) box.textContent = res.message || res.error || "关闭失败";
+    return;
+  }
+  if (box) box.textContent = "已关闭两步验证。";
+}
+
+on("totp-btn", "click", () => openTotpManage());
 
 /* ---- tabs ---- */
 function currentTabFromHash() {
@@ -319,15 +433,18 @@ function setTabHash(tab, focus, assetView) {
 }
 
 function activateTab(tab, focus, assetView) {
-  // 旧 hash 兼容：promconfig → 资源-Prometheus，messages → 通知-消息记录
+  // 旧 hash 兼容：promconfig → 资源-Prometheus，messages → 通知-消息记录，checks → 资源-业务监控
   if (tab === "promconfig") {
     tab = "monitor";
     queueMicrotask(() => setMonitorSub("prom"));
   } else if (tab === "messages") {
     tab = "notify";
     queueMicrotask(() => setNotifySub("messages"));
+  } else if (tab === "checks") {
+    tab = "monitor";
+    queueMicrotask(() => setMonitorSub("checks"));
   }
-  const valid = ["overview", "incidents", "monitor", "checks", "connections", "notify", "knowledge", "permissions", "audit"];
+  const valid = ["overview", "incidents", "monitor", "connections", "notify", "knowledge", "permissions", "audit"];
   if (!valid.includes(tab)) tab = "overview";
   state.tab = tab;
   state.focus = focus || "";
@@ -348,7 +465,7 @@ function setMonitorSub(sub) {
   document.querySelectorAll("#monitor-subnav .subtab").forEach((b) => {
     b.classList.toggle("active", b.dataset.sub === sub);
   });
-  ["metrics", "onboard", "prom"].forEach((k) => {
+  ["metrics", "checks", "onboard", "prom"].forEach((k) => {
     const el = document.getElementById("monitor-sub-" + k);
     if (el) el.classList.toggle("hidden", k !== sub);
   });
@@ -374,6 +491,10 @@ document.addEventListener("click", (e) => {
   if (nav.id === "monitor-subnav") setMonitorSub(t.dataset.sub);
   else setNotifySub(t.dataset.sub);
   if (nav.id === "monitor-subnav" && t.dataset.sub === "prom") renderPromConfig();
+  if (nav.id === "monitor-subnav" && t.dataset.sub === "checks") {
+    syncChecksAsset();
+    renderChecks();
+  }
   if (nav.id === "notify-subnav" && t.dataset.sub === "messages") renderMessages();
   if (nav.id === "notify-subnav" && t.dataset.sub === "outbox") {
     const b = $("notify-outbox-refresh");
@@ -445,9 +566,12 @@ async function refreshTab() {
   if (state.tab === "incidents") await renderIncidents();
   if (state.tab === "monitor") {
     if (state.monitorSub === "prom") await renderPromConfig();
+    else if (state.monitorSub === "checks") {
+      syncChecksAsset();
+      await renderChecks();
+    }
     else if (state.monitorSub !== "onboard") await renderMonitor();
   }
-  if (state.tab === "checks") await renderChecks();
   if (state.tab === "connections") await renderConnections();
   if (state.tab === "notify") {
     if (state.notifySub === "messages") await renderMessages();
@@ -456,6 +580,13 @@ async function refreshTab() {
   if (state.tab === "knowledge") await renderKnowledge();
   if (state.tab === "permissions") await renderPermissions();
   if (state.tab === "audit") await renderAudit();
+}
+
+function syncChecksAsset() {
+  const sel = $("chk-asset");
+  if (!sel) return;
+  // 默认跟随资源页当前主机，无需重复选择
+  if (monitorState.host) sel.value = monitorState.host;
 }
 
 /* ---- 统一健康状态 ---- */
@@ -1431,109 +1562,267 @@ async function renderKnowledgeDoc(docId, root) {
 }
 
 async function renderPermissions() {
-  const [pRes, aRes] = await Promise.all([api("/api/permissions"), api("/api/assets")]);
   renderAgentCeiling();
-  const root = $("perm-agent");
+  const [mRes, aRes] = await Promise.all([
+    api("/api/permissions/model"),
+    api("/api/assets"),
+  ]);
+  const rootD = $("perm-defaults");
+  const rootE = $("perm-exceptions");
   const adv = $("perm-list");
-  root.innerHTML = "";
+  if (rootD) rootD.innerHTML = "";
+  if (rootE) rootE.innerHTML = "";
   if (adv) adv.innerHTML = "";
-  if (!pRes.ok) return;
-  const perms = pRes.permissions || [];
+  if (!mRes.ok) {
+    if (rootD) rootD.appendChild(el("p", { class: "error", text: "无法加载权限模型" }));
+    return;
+  }
+  const caps = mRes.capabilities || [];
+  const defaults = mRes.defaults || {};
+  const exceptions = mRes.exceptions || [];
   const assets = (aRes && aRes.ok && aRes.assets) || state.assets || [];
 
-  // ---- 默认：Agent × 资产/对象 × 能力 ----
-  if (!assets.length) {
-    root.appendChild(el("div", { class: "muted small", text: "无资产" }));
-  }
-  assets.forEach((a) => {
-    const wrap = el("div", { class: "perm-asset" });
-    wrap.appendChild(el("h3", {
-      text: `${a.id} · ${a.display_name}`,
-      style: "font-size:14px;margin:4px 0 2px",
-    }));
-    const objs = (a.objects || []).length
-      ? a.objects
-      : [{ id: "*", name: "(全部对象)", kind: "" }];
-    objs.forEach((o) => {
-      const box = el("div", { class: "perm-obj" });
-      box.appendChild(el("h3", { text: o.name }));
-      box.appendChild(el("div", {
-        class: "sub",
-        text: `${o.kind || "asset"}${o.unit ? " · " + o.unit : ""}${o.container ? " · " + o.container : ""}${o.port ? " · " + o.port + "/" + (o.protocol || "") : ""}`,
-      }));
-      const objectId = o.id || o.name || "*";
-      kindCaps(o.kind || "").forEach((cap) => {
-        const rule = findAgentRule(perms, a.id, objectId, cap);
-        const stateKey = permFlagsToState(rule);
-        const row = el("div", { class: "perm-row" });
-        row.appendChild(el("div", {
-          class: "cap-name",
-          text: PERM_CAP_LABEL[cap] || cap,
-        }));
-        if (rule && rule.readable) {
-          row.appendChild(el("div", {
-            class: "muted small",
-            text: `服务端结论: ${rule.readable}${rule.decision ? " · " + rule.decision : ""}`,
-            style: "font-size:11px;opacity:.75",
-          }));
-        }
-        row.appendChild(renderSeg(stateKey, async (next) => {
-          const ok = await saveAgentPerm(a.id, objectId, cap, next);
-          if (ok) {
-            const btns = row.querySelector(".seg");
-            if (btns) {
-              btns.querySelectorAll("button").forEach((b) => {
-                b.className = "";
-              });
-              const meta = PERM_STATE_META[next];
-              const idx = ["deny", "confirm", "auto"].indexOf(next);
-              const target = btns.querySelectorAll("button")[idx];
-              if (target) target.className = meta.cls;
-            }
-          }
-        }));
-        box.appendChild(row);
-      });
-      wrap.appendChild(box);
-    });
-    root.appendChild(wrap);
-  });
-
-  // ---- 高级：原始规则表 ----
-  if (!adv) return;
-  adv.appendChild(el("p", {
-    class: "muted small",
-    text: pRes.note || "主机侧 commands.json / forced-command / sudoers 为独立最终安全上限。",
-  }));
-  const table = el("table");
-  table.appendChild(el("tr", {}, [
-    el("th", { text: "id" }), el("th", { text: "主体" }), el("th", { text: "能力" }),
-    el("th", { text: "资产" }), el("th", { text: "对象" }), el("th", { text: "允许" }),
-    el("th", { text: "批准" }), el("th", { text: "自动" }), el("th", { text: "" }),
-  ]));
-  perms.forEach((p) => {
+  // ---- 默认策略：按操作类型 ----
+  if (rootD) {
+    const table = el("table", { class: "perm-default-table" });
     table.appendChild(el("tr", {}, [
-      el("td", { text: String(p.id) }),
-      el("td", { text: p.subject_type + ":" + p.subject_id }),
-      el("td", { text: (PERM_CAP_LABEL[p.capability] || p.capability) + " (" + p.capability + ")" }),
-      el("td", { text: p.asset_id }),
-      el("td", { text: p.object_id }),
-      el("td", {}, [badge(p.allow ? "是" : "否", p.allow ? "ok" : "bad")]),
-      el("td", { text: p.require_approval ? "是" : "否" }),
-      el("td", { text: p.auto_allowed ? "是" : "否" }),
-      el("td", {}, [
-        el("button", {
-          class: "btn danger small", text: "删除",
-          onclick: async () => {
-            await api("/api/permissions/delete", { method: "POST", body: JSON.stringify({ id: p.id }) });
-            refreshTab();
-          },
-        }),
-      ]),
+      el("th", { text: "操作" }),
+      el("th", { text: "说明" }),
+      el("th", { text: "默认策略" }),
+      el("th", { text: "来源" }),
     ]));
-  });
-  adv.appendChild(table);
+    caps.forEach((c) => {
+      const d = defaults[c.capability] || { state: "deny", source: "implicit_deny" };
+      const stateKey = d.state === "auto" ? "auto" : d.state === "confirm" ? "confirm" : "deny";
+      const src = d.source === "default" ? "默认策略"
+        : d.source === "implicit_deny" ? "未配置 · 默认拒绝"
+        : d.source || "默认策略";
+      const row = el("tr", {});
+      row.appendChild(el("td", {}, [
+        el("div", { text: PERM_CAP_LABEL[c.capability] || c.capability }),
+        el("div", { class: "muted small", text: c.capability }),
+      ]));
+      row.appendChild(el("td", { class: "muted small", text: c.description || "" }));
+      row.appendChild(el("td", {}, [
+        renderSeg(stateKey, async (next) => {
+          const flags = permStateToFlags(next);
+          await api("/api/permissions", {
+            method: "POST",
+            body: JSON.stringify({
+              subject_type: "auto_rule",
+              subject_id: "agent",
+              capability: c.capability,
+              asset_id: "*",
+              object_id: "*",
+              ...flags,
+            }),
+          });
+          renderPermissions();
+        }),
+      ]));
+      row.appendChild(el("td", { class: "muted small", text: src }));
+      table.appendChild(row);
+    });
+    rootD.appendChild(table);
+  }
+
+  // ---- 资产例外 ----
+  if (rootE) {
+    if (!exceptions.length) {
+      rootE.appendChild(el("p", {
+        class: "muted small",
+        text: "当前没有资产例外。所有资产继承上方默认策略。",
+      }));
+    } else {
+      const table = el("table");
+      table.appendChild(el("tr", {}, [
+        el("th", { text: "资产" }), el("th", { text: "对象" }),
+        el("th", { text: "操作" }), el("th", { text: "例外策略" }),
+        el("th", { text: "来源" }), el("th", { text: "操作" }),
+      ]));
+      exceptions.forEach((x) => {
+        const stateKey = x.state === "auto" ? "auto" : x.state === "confirm" ? "confirm" : "deny";
+        table.appendChild(el("tr", {}, [
+          el("td", { text: x.asset_id }),
+          el("td", { text: x.object_id }),
+          el("td", { text: PERM_CAP_LABEL[x.capability] || x.capability }),
+          el("td", {}, [
+            renderSeg(stateKey, async (next) => {
+              const flags = permStateToFlags(next);
+              await api("/api/permissions", {
+                method: "POST",
+                body: JSON.stringify({
+                  subject_type: "auto_rule",
+                  subject_id: "agent",
+                  capability: x.capability,
+                  asset_id: x.asset_id,
+                  object_id: x.object_id,
+                  ...flags,
+                }),
+              });
+              renderPermissions();
+            }),
+          ]),
+          el("td", { class: "muted small", text: "资产例外" }),
+          el("td", {}, [
+            el("button", {
+              class: "btn small", text: "恢复默认",
+              onclick: async () => {
+                if (x.id) {
+                  await api("/api/permissions/delete", {
+                    method: "POST",
+                    body: JSON.stringify({ id: x.id }),
+                  });
+                }
+                renderPermissions();
+              },
+            }),
+          ]),
+        ]));
+      });
+      rootE.appendChild(table);
+    }
+
+    // 新增例外表单控件
+    const capSel = $("perm-ex-cap");
+    const assetSel = $("perm-ex-asset");
+    if (capSel) {
+      capSel.innerHTML = "";
+      caps.forEach((c) => {
+        const op = document.createElement("option");
+        op.value = c.capability;
+        op.textContent = (PERM_CAP_LABEL[c.capability] || c.capability) + " · " + c.capability;
+        capSel.appendChild(op);
+      });
+    }
+    if (assetSel) {
+      assetSel.innerHTML = "";
+      assets.forEach((a) => {
+        const op = document.createElement("option");
+        op.value = a.id;
+        op.textContent = a.id + " · " + a.display_name;
+        assetSel.appendChild(op);
+      });
+    }
+  }
+
+  // 生效权限查询控件
+  const effCap = $("perm-eff-cap");
+  if (effCap) {
+    effCap.innerHTML = "";
+    caps.forEach((c) => {
+      const op = document.createElement("option");
+      op.value = c.capability;
+      op.textContent = PERM_CAP_LABEL[c.capability] || c.capability;
+      effCap.appendChild(op);
+    });
+  }
+  const effAsset = $("perm-eff-asset");
+  if (effAsset) {
+    effAsset.innerHTML = "";
+    assets.forEach((a) => {
+      const op = document.createElement("option");
+      op.value = a.id;
+      op.textContent = a.id + " · " + a.display_name;
+      effAsset.appendChild(op);
+    });
+  }
+
+  // 高级原始表
+  const pRes = await api("/api/permissions");
+  if (adv && pRes.ok) {
+    const perms = pRes.permissions || [];
+    adv.appendChild(el("p", {
+      class: "muted small",
+      text: pRes.note || "主机侧 commands.json / forced-command / sudoers 为独立最终安全上限。",
+    }));
+    const table = el("table");
+    table.appendChild(el("tr", {}, [
+      el("th", { text: "id" }), el("th", { text: "主体" }), el("th", { text: "能力" }),
+      el("th", { text: "资产" }), el("th", { text: "对象" }), el("th", { text: "允许" }),
+      el("th", { text: "批准" }), el("th", { text: "自动" }), el("th", { text: "" }),
+    ]));
+    perms.forEach((p) => {
+      table.appendChild(el("tr", {}, [
+        el("td", { text: String(p.id) }),
+        el("td", { text: p.subject_type + ":" + p.subject_id }),
+        el("td", { text: (PERM_CAP_LABEL[p.capability] || p.capability) + " (" + p.capability + ")" }),
+        el("td", { text: p.asset_id }),
+        el("td", { text: p.object_id }),
+        el("td", {}, [badge(p.allow ? "是" : "否", p.allow ? "ok" : "bad")]),
+        el("td", { text: p.require_approval ? "是" : "否" }),
+        el("td", { text: p.auto_allowed ? "是" : "否" }),
+        el("td", {}, [
+          el("button", {
+            class: "btn danger small", text: "删除",
+            onclick: async () => {
+              await api("/api/permissions/delete", { method: "POST", body: JSON.stringify({ id: p.id }) });
+              refreshTab();
+            },
+          }),
+        ]),
+      ]));
+    });
+    adv.appendChild(table);
+  }
 }
+
+on("perm-ex-add", "click", async () => {
+  const capability = ($("perm-ex-cap") || {}).value;
+  const asset_id = ($("perm-ex-asset") || {}).value;
+  const object_id = (($("perm-ex-object") || {}).value || "*").trim() || "*";
+  if (!capability || !asset_id) return;
+  // 新例外默认「需要人工确认」，不自动扩大权限
+  await api("/api/permissions", {
+    method: "POST",
+    body: JSON.stringify({
+      subject_type: "auto_rule",
+      subject_id: "agent",
+      capability,
+      asset_id,
+      object_id,
+      allow: true,
+      require_approval: true,
+      auto_allowed: false,
+    }),
+  });
+  renderPermissions();
+});
+
+on("perm-eff-lookup", "click", async () => {
+  const capability = ($("perm-eff-cap") || {}).value;
+  const asset_id = ($("perm-eff-asset") || {}).value || "";
+  const object_id = (($("perm-eff-object") || {}).value || "*").trim() || "*";
+  const box = $("perm-eff-result");
+  if (!box) return;
+  box.innerHTML = '<p class="muted small">查询中…</p>';
+  const res = await api(`/api/permissions/effective?capability=${encodeURIComponent(capability)}&asset_id=${encodeURIComponent(asset_id)}&object_id=${encodeURIComponent(object_id)}`);
+  box.innerHTML = "";
+  if (!res.ok) {
+    box.appendChild(el("p", { class: "error", text: res.error || "查询失败" }));
+    return;
+  }
+  const e = res.effective || {};
+  const src = e.source === "exception" ? "资产例外" : e.source === "default" ? "默认策略" : "默认拒绝（无规则）";
+  box.appendChild(el("div", { class: "perm-eff-box" }, [
+    el("div", { class: "perm-eff-row" }, [
+      el("span", { class: "muted", text: "操作：" }),
+      el("span", { text: PERM_CAP_LABEL[capability] || capability }),
+    ]),
+    el("div", { class: "perm-eff-row" }, [
+      el("span", { class: "muted", text: "目标：" }),
+      el("span", { text: `${asset_id || "*"} / ${object_id}` }),
+    ]),
+    el("div", { class: "perm-eff-row" }, [
+      el("span", { class: "muted", text: "结论：" }),
+      badge(e.readable || e.state || "—", e.state === "auto" ? "ok" : e.state === "confirm" ? "warn" : "bad"),
+    ]),
+    el("div", { class: "perm-eff-row" }, [
+      el("span", { class: "muted", text: "来源：" }),
+      el("span", { text: src }),
+    ]),
+  ]));
+});
 
 on("perm-save", "click", async () => {
   const body = {
@@ -2825,10 +3114,10 @@ function fmtMetricUnit(m) {
   return m.unit || "";
 }
 
-function drawSpark(canvas, seriesList) {
+function drawSpark(canvas, seriesList, interactive) {
   const ctx = canvas.getContext("2d");
   const dpr = window.devicePixelRatio || 1;
-  const w = canvas.clientWidth || 220, h = canvas.clientHeight || 56;
+  const w = canvas.clientWidth || 220, h = canvas.clientHeight || 64;
   canvas.width = w * dpr; canvas.height = h * dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
@@ -2836,28 +3125,45 @@ function drawSpark(canvas, seriesList) {
   if (all.length < 2) {
     ctx.strokeStyle = "rgba(255,255,255,.12)";
     ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
+    ctx.fillStyle = "rgba(255,255,255,.25)";
+    ctx.font = "11px sans-serif";
+    ctx.fillText("暂无历史数据", 8, h / 2 - 8);
     return;
   }
   const vs = all.map((p) => p.v);
   let min = Math.min(...vs), max = Math.max(...vs);
   if (max - min < 1e-9) { max = min + 1; }
-  const pad = 10;
+  const padL = 36, padR = 8, padT = 12, padB = 16;
   const x0 = Math.min(...all.map((p) => p.t)), x1 = Math.max(...all.map((p) => p.t));
-  // 轴刻度（左右 min/max）
+  const plotW = Math.max(10, w - padL - padR);
+  const plotH = Math.max(10, h - padT - padB);
+
+  // 纵轴刻度
   ctx.fillStyle = "rgba(255,255,255,.35)";
   ctx.font = "9px sans-serif";
-  ctx.fillText(fmtNum(max), 2, 9);
+  ctx.textAlign = "left";
+  ctx.fillText(fmtNum(max), 2, padT - 2);
   ctx.fillText(fmtNum(min), 2, h - 2);
-  // 时间刻度
+  // 横轴时刻
   const tLabel = (t) => {
     const d = new Date(t * 1000);
     return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
   };
-  ctx.fillText(tLabel(x0), 2, h - 2);
-  ctx.fillText(tLabel(x1), w - 34, h - 2);
+  ctx.fillText(tLabel(x0), padL, h - 2);
+  ctx.textAlign = "right";
+  ctx.fillText(tLabel(x1), w - padR, h - 2);
+  ctx.textAlign = "left";
+
   // 网格
   ctx.strokeStyle = "rgba(255,255,255,.06)";
-  ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
+  ctx.lineWidth = 1;
+  [0.25, 0.5, 0.75].forEach((g) => {
+    const y = padT + plotH * g;
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+  });
+
+  const mapX = (t) => padL + ((t - x0) / Math.max(x1 - x0, 1e-9)) * plotW;
+  const mapY = (v) => padT + plotH - ((v - min) / (max - min)) * plotH;
 
   (seriesList || []).forEach((s) => {
     const points = s.points || [];
@@ -2865,14 +3171,48 @@ function drawSpark(canvas, seriesList) {
     const color = s.color || "#6cb6ff";
     ctx.beginPath();
     points.forEach((p, i) => {
-      const x = ((p.t - x0) / Math.max(x1 - x0, 1e-9)) * (w - 10) + 4;
-      const y = h - pad - ((p.v - min) / (max - min)) * (h - pad * 2);
+      const x = mapX(p.t), y = mapY(p.v);
       if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     });
     ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.stroke();
-    ctx.lineTo(w - 6, h - 2); ctx.lineTo(4, h - 2); ctx.closePath();
+    ctx.lineTo(mapX(points[points.length - 1].t), padT + plotH);
+    ctx.lineTo(mapX(points[0].t), padT + plotH);
+    ctx.closePath();
     ctx.fillStyle = color + "18"; ctx.fill();
   });
+
+  // 悬停
+  if (interactive) {
+    canvas.onmousemove = (ev) => {
+      const rect = canvas.getBoundingClientRect();
+      const mx = ev.clientX - rect.left;
+      // 找最近点
+      let best = null, bestDist = 1e9;
+      (seriesList || []).forEach((s) => {
+        (s.points || []).forEach((p) => {
+          const d = Math.abs(mapX(p.t) - mx);
+          if (d < bestDist) { bestDist = d; best = { p, s }; }
+        });
+      });
+      if (!best) return;
+      drawSpark(canvas, seriesList, true);
+      const c2 = canvas.getContext("2d");
+      const px = mapX(best.p.t), py = mapY(best.p.v);
+      c2.strokeStyle = "rgba(255,255,255,.35)";
+      c2.beginPath(); c2.moveTo(px, padT); c2.lineTo(px, padT + plotH); c2.stroke();
+      c2.fillStyle = best.s.color || "#6cb6ff";
+      c2.beginPath(); c2.arc(px, py, 3, 0, Math.PI * 2); c2.fill();
+      const label = `${best.s.label || ""} ${fmtNum(best.p.v)} · ${tLabel(best.p.t)}`;
+      c2.font = "11px sans-serif";
+      const tw = c2.measureText(label).width;
+      const bx = Math.min(Math.max(4, px - tw / 2), w - tw - 8);
+      c2.fillStyle = "rgba(0,0,0,.72)";
+      c2.fillRect(bx, 2, tw + 8, 18);
+      c2.fillStyle = "#e8eaed";
+      c2.fillText(label, bx + 4, 15);
+    };
+    canvas.onmouseleave = () => drawSpark(canvas, seriesList, true);
+  }
 }
 
 function fmtNum(v) {
@@ -2888,7 +3228,7 @@ function fmtNum(v) {
 
 function metricCard(m, seriesList) {
   // seriesList: [{key,label,points,color,value,state}] 可选多序列
-  const card = el("div", { class: "metric-card" });
+  const card = el("div", { class: "metric-card expandable" });
   const title = m.label || m.key;
   const top = el("div", { class: "top" }, [
     el("div", { class: "name", text: title }),
@@ -2912,32 +3252,73 @@ function metricCard(m, seriesList) {
   }
   card.appendChild(valWrap);
   if (m.state === "not_enabled") {
+    card.appendChild(el("div", { class: "muted small", text: "未启用" }));
     return card;
+  }
+  if (m.state === "no_data") {
+    const hasHist = (m.points || []).length > 1;
+    card.appendChild(el("div", {
+      class: "muted small",
+      text: hasHist ? "当前无数据 · 以下为历史趋势" : "暂无数据",
+    }));
   }
   // 图例
   if (seriesList && seriesList.length > 1) {
     const legend = el("div", { style: "display:flex;gap:10px;flex-wrap:wrap;margin:2px 0 4px" });
     seriesList.forEach((s) => {
-      legend.appendChild(el("span", {
-        style: `font-size:10px;color:var(--dim)`,
+      const item = el("span", {
+        style: `font-size:10px`,
         text: "● " + (s.label || s.key),
-      }));
-      legend.lastChild.style.color = s.color || "#6cb6ff";
+      });
+      item.style.color = s.color || "#6cb6ff";
+      legend.appendChild(item);
     });
     card.appendChild(legend);
   }
-  const canvas = el("canvas", {});
+  const canvas = el("canvas", { class: "metric-canvas" });
   canvas.style.width = "100%";
-  canvas.style.height = "56px";
+  canvas.style.height = "64px";
   card.appendChild(canvas);
   const list = seriesList && seriesList.length
     ? seriesList
     : [{
         points: m.points || [],
         color: m.state === "bad" ? "#f07178" : m.state === "warn" ? "#e5c07b" : "#6cb6ff",
+        label: m.label || m.key,
       }];
   setTimeout(() => drawSpark(canvas, list), 0);
+  card.onclick = (e) => {
+    if (e.target.closest("button, select, input, a")) return;
+    openMetricExpand(title, m, list);
+  };
   return card;
+}
+
+function openMetricExpand(title, m, seriesList) {
+  const kids = [];
+  kids.push(el("p", {
+    class: "muted small",
+    text: `${title} · 当前 ${fmtNum(m.value)}${fmtMetricUnit(m) ? " " + fmtMetricUnit(m) : ""} · 状态 ${metricStateBadgeText(m.state)}`,
+  }));
+  const canvas = el("canvas", {});
+  canvas.style.width = "100%";
+  canvas.style.height = "220px";
+  canvas.style.background = "rgba(255,255,255,.03)";
+  canvas.style.borderRadius = "8px";
+  kids.push(canvas);
+  kids.push(el("p", {
+    class: "muted small",
+    text: "悬停曲线可查看数值。时间范围可在资源页切换。",
+  }));
+  showModal(title, kids);
+  setTimeout(() => drawSpark(canvas, seriesList || [], true), 30);
+}
+
+function metricStateBadgeText(st) {
+  return {
+    ok: "正常", warn: "偏高", bad: "异常", no_data: "暂无数据",
+    not_enabled: "未启用", collect_error: "采集故障", partial_no_data: "部分缺测",
+  }[st] || st || "—";
 }
 
 /** 合并指标卡片：Load 1/5/15、Disk R/W、Net Rx/Tx；无数据沉底 */
@@ -4164,39 +4545,70 @@ on("pc-ne-register-btn", "click", async () => {
 /* ---- 业务检查 ---- */
 async function renderChecks() {
   fillSelect("chk-asset", (state.assets || []).map((a) => ({ v: a.id, t: a.id + " / " + a.display_name })));
+  syncChecksAsset();
   const list = $("chk-list");
   const act = $("chk-activity");
   if (!list) return;
   list.innerHTML = '<p class="muted small">加载中…</p>';
+  const focusAsset = (($("chk-asset") || {}).value || monitorState.host || "").trim();
+  const q = focusAsset ? `?asset_id=${encodeURIComponent(focusAsset)}` : "";
   const [cRes, aRes] = await Promise.all([
-    api("/api/checks").catch(() => ({ ok: false })),
+    api("/api/checks" + q).catch(() => ({ ok: false, error: "network" })),
     api("/api/checks/activity").catch(() => ({ ok: false })),
   ]);
   list.innerHTML = "";
   if (!cRes.ok) {
-    list.appendChild(el("p", { class: "error", text: "加载失败: " + (cRes.error || "") }));
+    const err = cRes.error || "";
+    const isDenied = err === "denied" || (cRes.message || "").includes("denied");
+    list.appendChild(el("p", {
+      class: "error",
+      text: isDenied
+        ? "加载失败: denied — 当前账号没有 checks.read 权限（需 admin 或显式授权）。这不是空数据。"
+        : "加载失败: " + (err || cRes.message || "unknown"),
+    }));
     return;
   }
-  const rows = cRes.checks || [];
+  let rows = cRes.checks || [];
+  if (focusAsset) rows = rows.filter((c) => c.asset_id === focusAsset);
+  list.appendChild(el("p", {
+    class: "muted small",
+    text: `来源：Ayana 原生检查${focusAsset ? " · 资产 " + focusAsset : " · 全部资产"} · 共 ${rows.length} 项`,
+  }));
   if (!rows.length) {
-    list.appendChild(el("p", { class: "muted small", text: "还没有检查。选主机和类型，点「添加检查」。" }));
+    list.appendChild(el("p", {
+      class: "muted small",
+      text: focusAsset
+        ? "该资产还没有原生检查。可在上方添加 TCP / 服务 / 命令检查。"
+        : "还没有检查。选主机和类型，点「添加检查」。",
+    }));
   } else {
     const table = el("table", { class: "table" });
     table.appendChild(el("tr", {}, [
-      el("th", { text: "主机" }),
       el("th", { text: "名称" }),
       el("th", { text: "类型" }),
+      el("th", { text: "来源" }),
       el("th", { text: "状态" }),
+      el("th", { text: "间隔 / 失败阈值 / 级别" }),
       el("th", { text: "最近" }),
       el("th", { text: "操作" }),
     ]));
     rows.forEach((c) => {
       const st = c.last_state === "ok" ? "ok" : c.last_state === "fail" ? "bad" : "dim";
       table.appendChild(el("tr", {}, [
-        el("td", { class: "small", text: c.asset_id }),
-        el("td", { class: "small", text: c.name }),
-        el("td", { class: "small", text: c.kind + (c.kind === "port" ? " :" + (c.params.port || "") : c.kind === "service" ? " " + (c.params.unit || "") : "") }),
+        el("td", { class: "small" }, [
+          el("div", { text: c.name }),
+          el("div", { class: "muted small", text: c.asset_id }),
+        ]),
+        el("td", {
+          class: "small",
+          text: c.kind + (c.kind === "port" ? " :" + (c.params.port || "") : c.kind === "service" ? " " + (c.params.unit || "") : ""),
+        }),
+        el("td", {}, [badge("原生", "dim")]),
         el("td", {}, [pcBadge(c.enabled ? c.last_state : "停用", st)]),
+        el("td", {
+          class: "small",
+          text: `${c.interval_sec || 60}s / ${c.fail_threshold || 2} / ${c.severity || "warning"}`,
+        }),
         el("td", { class: "small", text: c.last_detail || (c.last_at ? fmtTime(c.last_at) : "—") }),
         el("td", {}, [
           el("button", {
@@ -4204,7 +4616,10 @@ async function renderChecks() {
             text: "立即测",
             onclick: async () => {
               const r = await api("/api/checks/run", { method: "POST", body: JSON.stringify({ id: c.id }) });
-              if (!r.ok) alert("失败: " + (r.error || r.detail || ""));
+              if (!r.ok) {
+                showModal("执行失败", [el("pre", { text: r.error + "\n" + (r.detail || "") })]);
+                return;
+              }
               renderChecks();
             },
           }),
@@ -4222,10 +4637,18 @@ async function renderChecks() {
           el("button", {
             class: "btn ghost small",
             text: "删除",
-            onclick: async () => {
-              if (!confirm("删除检查 " + c.name + "？")) return;
-              await api("/api/checks/delete", { method: "POST", body: JSON.stringify({ id: c.id }) });
-              renderChecks();
+            onclick: () => {
+              showModal("删除检查", [
+                el("p", { text: `确认删除「${c.name}」？此操作会中断该检查的告警。` }),
+                el("button", {
+                  class: "btn danger", text: "确认删除",
+                  onclick: async () => {
+                    await api("/api/checks/delete", { method: "POST", body: JSON.stringify({ id: c.id }) });
+                    $("modal").classList.add("hidden");
+                    renderChecks();
+                  },
+                }),
+              ]);
             },
           }),
         ]),
@@ -4256,6 +4679,7 @@ function chkKindChanged() {
 }
 on("chk-kind", "change", chkKindChanged);
 on("chk-refresh", "click", () => renderChecks());
+on("chk-asset", "change", () => renderChecks());
 
 on("monitor-detect", "click", () => {
   const asset = monitorState.host || (($("monitor-host") || {}).value || "") || (($("pc-ne-asset") || {}).value || "");

@@ -169,6 +169,155 @@ class Policy:
         sql += " ORDER BY subject_type, subject_id, asset_id, capability"
         return [dict(r) for r in self.db.query(sql, tuple(params))]
 
+    def default_policy(self, *, subject_type: str = "auto_rule", subject_id: str = "agent") -> dict[str, Any]:
+        """按操作类型汇总默认策略（asset_id 为 * 或空）。"""
+        rows = self.list_permissions({"subject_type": subject_type, "subject_id": subject_id})
+        defaults: dict[str, Any] = {}
+        for r in rows:
+            aid = (r.get("asset_id") or "").strip()
+            if aid not in ("*", ""):
+                continue
+            oid = (r.get("object_id") or "").strip()
+            # 默认策略只认对象通配；具体对象的 * 资产规则算「通配对象例外」，仍作默认层
+            if oid not in ("*", ""):
+                continue
+            defaults[r["capability"]] = self._perm_row_state(r)
+        return defaults
+
+    def asset_exceptions(
+        self, *, subject_type: str = "auto_rule", subject_id: str = "agent"
+    ) -> list[dict[str, Any]]:
+        """资产/对象例外：asset_id 或 object_id 具体的规则。"""
+        rows = self.list_permissions({"subject_type": subject_type, "subject_id": subject_id})
+        out = []
+        for r in rows:
+            aid = (r.get("asset_id") or "").strip()
+            oid = (r.get("object_id") or "").strip()
+            if aid in ("*", "") and oid in ("*", ""):
+                continue  # 默认层
+            item = self._perm_row_state(r)
+            item["source"] = "exception"
+            out.append(item)
+        out.sort(key=lambda x: (x.get("asset_id") or "", x.get("object_id") or "", x.get("capability") or ""))
+        return out
+
+    def _perm_row_state(self, r: dict[str, Any]) -> dict[str, Any]:
+        allow = bool(r.get("allow"))
+        require_approval = bool(r.get("require_approval"))
+        auto_allowed = bool(r.get("auto_allowed"))
+        # 三态与 UI 一致：禁止 / 需要确认 / 自动执行
+        # 自动执行不要求 auto_allowed=True（读能力天然是自动）；auto_allowed 仅约束 Agent 无人自动派发
+        if not allow:
+            state = "deny"
+        elif require_approval:
+            state = "confirm"
+        else:
+            state = "auto"
+        return {
+            "id": r.get("id"),
+            "capability": r.get("capability"),
+            "asset_id": r.get("asset_id") or "*",
+            "object_id": r.get("object_id") or "*",
+            "allow": allow,
+            "require_approval": require_approval,
+            "auto_allowed": auto_allowed,
+            "state": state,
+            "source": "default",
+            "updated_at": r.get("updated_at"),
+            "updated_by": r.get("created_by") or "",
+        }
+
+    def model_view(self) -> dict[str, Any]:
+        """权限首页模型：默认策略 + 资产例外 + 可配置操作目录。"""
+        from .capabilities import list_capabilities
+
+        caps = []
+        for c in list_capabilities():
+            caps.append(
+                {
+                    "capability": c["name"],
+                    "kind": c.get("kind", ""),
+                    "risk": c.get("risk", ""),
+                    "description": c.get("description", ""),
+                    "auto_allowed": bool(c.get("auto_allowed", False)),
+                }
+            )
+        defaults = self.default_policy()
+        # 目录内未显式配置的能力：保守为 deny（默认拒绝，不发明授权）
+        for c in caps:
+            if c["capability"] not in defaults:
+                defaults[c["capability"]] = {
+                    "capability": c["capability"],
+                    "asset_id": "*",
+                    "object_id": "*",
+                    "allow": False,
+                    "require_approval": True,
+                    "auto_allowed": False,
+                    "state": "deny",
+                    "source": "implicit_deny",
+                    "id": None,
+                }
+        return {
+            "capabilities": caps,
+            "defaults": defaults,
+            "exceptions": self.asset_exceptions(),
+        }
+
+    def effective_for(
+        self,
+        *,
+        capability: str,
+        asset_id: str = "",
+        object_id: str = "",
+        subject_type: str = "auto_rule",
+        subject_id: str = "agent",
+    ) -> dict[str, Any]:
+        """查看某对象最终生效权限（含命中来源）。"""
+        rule = self._match_rule(
+            subject_type=subject_type,
+            subject_id=subject_id,
+            capability=capability,
+            asset_id=asset_id,
+            object_id=object_id,
+        )
+        if not rule:
+            return {
+                "capability": capability,
+                "asset_id": asset_id,
+                "object_id": object_id,
+                "state": "deny",
+                "source": "implicit_deny",
+                "decision": "forbidden",
+                "readable": "禁止（无规则，默认拒绝）",
+            }
+        item = self._perm_row_state(dict(rule))
+        aid = (rule.get("asset_id") or "").strip()
+        oid = (rule.get("object_id") or "").strip()
+        if aid in ("*", "") and oid in ("*", ""):
+            item["source"] = "default"
+        else:
+            item["source"] = "exception"
+        # 与 check 同源的三态结论
+        cap = get_capability(capability)
+        auto_allowed = bool(rule.get("auto_allowed")) and bool(cap.auto_allowed)
+        decision = self._three_state(
+            allow=bool(rule.get("allow")),
+            require_approval=bool(rule.get("require_approval")),
+            auto_allowed=auto_allowed,
+        )
+        item["decision"] = decision
+        item["readable"] = {
+            "forbidden": "禁止",
+            "approval_required": "需要人工确认",
+            "automatic": "允许自动执行",
+        }.get(decision, decision)
+        item["matched_rule"] = {
+            "id": rule.get("id"),
+            "asset_id": rule.get("asset_id"),
+            "object_id": rule.get("object_id"),
+        }
+        return item
+
     def upsert_permission(
         self,
         *,
