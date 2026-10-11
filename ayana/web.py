@@ -197,6 +197,7 @@ class WebApp:
         app.router.add_get("/api/checks", self.api_checks_list)
         app.router.add_post("/api/checks", self.api_checks_create)
         app.router.add_post("/api/assist/configure", self.api_assist_configure)
+        app.router.add_get("/api/assist/form", self.api_assist_form)
         app.router.add_post("/api/checks/update", self.api_checks_update)
         app.router.add_post("/api/checks/delete", self.api_checks_delete)
         app.router.add_post("/api/checks/run", self.api_checks_run)
@@ -221,6 +222,18 @@ class WebApp:
         app.router.add_post("/api/promconfig/rollback", self.api_promconfig_rollback)
         app.router.add_post("/hooks/alertmanager", self.hook_alertmanager)
         return app
+
+    async def api_assist_form(self, request: web.Request) -> web.Response:
+        """返回真实表单结构化定义（单一来源）。"""
+        self._require_auth(request)
+        from . import formspec
+
+        domain = request.rel_url.query.get("domain", "checks")
+        try:
+            form = formspec.get_form(domain)
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True, "form": form})
 
     async def api_assist_configure(self, request: web.Request) -> web.Response:
         """自然语言 → 填表意图。只读查询 + 字段草稿；不保存。"""

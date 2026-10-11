@@ -125,18 +125,36 @@ class AssistParseTest(unittest.TestCase):
         data = assist._extract_json_object(raw)
         self.assertEqual(data["route"], "checks_form")
 
-    def test_llm_infer_containerd_confirm(self):
+    def test_llm_structured_fill_without_names_in_prompt(self):
+        """模型用自身知识推断；脚本侧不写 containerd 等标准答案。"""
+        import inspect
+        from ayana import assist as A
+
+        src = inspect.getsource(A._llm_intent)
+        self.assertNotIn("containerd", src.lower())
+        self.assertNotIn("calico", src.lower())
+        self.assertNotIn("crictl", src.lower())
+
         class FakeLLM:
             enabled = True
 
-            async def chat(self, messages, max_tokens=600):
-                return (
-                    '{"route":"checks_form",'
-                    '"fields":{"asset_id":"control","kind":"service","params.unit":"containerd","name":"containerd"},'
-                    '"inferred":["params.unit","name"],'
-                    '"confirm_question":"你说的应该是 containerd，是否需要检查 control 上的 containerd 服务运行状态？",'
-                    '"missing":[],"notes":[]}'
-                )
+            async def chat_raw(self, messages, max_tokens=800, json_mode=False, temperature=0.2):
+                # 验证 payload 含表单定义与资产，且无答案级示例
+                body = messages[-1]["content"]
+                assert "form.fields" in body or "fields" in body
+                assert "control" in body
+                assert "containerd" not in messages[0]["content"].lower()
+                return {
+                    "content": (
+                        '{"route":"checks_form",'
+                        '"fields":{"asset_id":"control","kind":"service","params.unit":"containerd"},'
+                        '"inferred":[{"field":"params.unit","reason":"容器运行时","confidence":"high"}],'
+                        '"confirm_question":"你说的应该是 containerd，是否检查其服务状态？",'
+                        '"missing":[],"unsupported":null,"notes":[]}'
+                    ),
+                    "raw": {},
+                    "status": 200,
+                }
 
         r = asyncio.run(
             assist.configure(
@@ -148,9 +166,59 @@ class AssistParseTest(unittest.TestCase):
         )
         self.assertEqual(r["source"], "llm")
         self.assertEqual(r["fields"].get("params.unit"), "containerd")
-        self.assertEqual(r["fields"].get("kind"), "service")
+        self.assertIn("params.unit", r.get("inferred") or [])
         self.assertIn("containerd", r.get("confirm_question") or "")
-        self.assertNotIn("params.port", r["fields"])
+
+    def test_llm_unsupported_k8s_pod_as_systemd(self):
+        class FakeLLM:
+            enabled = True
+
+            async def chat_raw(self, messages, max_tokens=800, json_mode=False, temperature=0.2):
+                return {
+                    "content": (
+                        '{"route":"checks_form","fields":{"asset_id":"control","kind":"command",'
+                        '"params.cmd":"command -v crictl && crictl pods | grep mypod"},'
+                        '"inferred":[],'
+                        '"confirm_question":"Pod 不能当 systemd 服务，是否用命令检查？",'
+                        '"missing":[],'
+                        '"unsupported":{"reason":"K8s Pod 不是 systemd unit","alternatives":["command"]},'
+                        '"notes":["建议 command"]}'
+                    ),
+                    "raw": {},
+                    "status": 200,
+                }
+
+        r = asyncio.run(
+            assist.configure(
+                domain="checks",
+                text="检查 mypod 这个 pod 是否在运行",
+                llm=FakeLLM(),
+                assets=["control"],
+            )
+        )
+        self.assertEqual(r["fields"].get("kind"), "command")
+        self.assertTrue(any("不支持" in n or "Pod" in n for n in r.get("notes") or []))
+
+    def test_llm_cannot_invent_asset(self):
+        class FakeLLM:
+            enabled = True
+
+            async def chat_raw(self, messages, max_tokens=800, json_mode=False, temperature=0.2):
+                return {
+                    "content": '{"route":"checks_form","fields":{"asset_id":"hacked","kind":"port","params.port":22},"inferred":[],"missing":[],"notes":[]}',
+                    "raw": {},
+                    "status": 200,
+                }
+
+        r = asyncio.run(
+            assist.configure(
+                domain="checks",
+                text="随便检查",
+                llm=FakeLLM(),
+                assets=["control", "kanata"],
+            )
+        )
+        self.assertNotIn("asset_id", r["fields"])  # 未知资产被剥掉
 
 
 if __name__ == "__main__":

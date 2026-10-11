@@ -29,15 +29,29 @@ class LLMClient:
 
     async def chat(self, messages: list[dict], *, max_tokens: int = 512) -> str | None:
         """返回文本；失败返回 None。"""
+        raw = await self.chat_raw(messages, max_tokens=max_tokens)
+        return raw.get("content") if raw else None
+
+    async def chat_raw(
+        self,
+        messages: list[dict],
+        *,
+        max_tokens: int = 512,
+        json_mode: bool = False,
+        temperature: float = 0.2,
+    ) -> dict[str, Any] | None:
+        """调用 chat/completions。返回 {content, raw, status}；失败打日志后 None。"""
         if not self.enabled:
             return None
         url = f"{self.base_url}/chat/completions"
-        body = {
+        body: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": 0.3,
+            "temperature": temperature,
         }
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
         try:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self.timeout)
@@ -47,12 +61,21 @@ class LLMClient:
                     json=body,
                     headers={"Authorization": f"Bearer {self.api_key}"},
                 ) as r:
+                    text = await r.text()
                     if r.status != 200:
-                        text = await r.text()
-                        log.warning("llm http %s: %s", r.status, text[:200])
+                        log.warning("llm http %s: %s", r.status, text[:300])
                         return None
-                    data = await r.json()
-                    return data["choices"][0]["message"]["content"]
+                    try:
+                        data = json.loads(text)
+                    except Exception as e:
+                        log.warning("llm bad response json: %s body=%s", e, text[:300])
+                        return None
+                    content = (
+                        data.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content")
+                    )
+                    return {"content": content, "raw": data, "status": r.status}
         except Exception as e:
             log.warning("llm error: %s", e)
             return None

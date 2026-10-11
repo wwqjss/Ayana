@@ -321,57 +321,75 @@ async def _llm_intent(
     domain: str,
     text: str,
     context: dict[str, Any],
-) -> dict[str, Any] | None:
-    """LLM 意图 JSON；失败返回 None。只出字段与路由，不碰执行。
+    assets: list[str],
+    capabilities: list[str],
+    form_payload: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, str]:
+    """(结果, 失败原因)。只出字段草稿，不碰执行。
 
-    要求模型做技术语义推断（如「运行 Pod 的底层 c 开头程序」→ containerd），
-    并用 confirm_question 与用户确认推断结果，而不是猜了就填死。
+    Prompt 不包含任何具体技术名词的标准答案；
+    以真实表单定义 + 资产/能力上下文驱动模型自行推断。
     """
     if not llm or not getattr(llm, "enabled", False):
-        return None
+        return None, "llm_disabled"
+    from . import formspec as fs
+
+    payload = form_payload or fs.form_prompt_payload(
+        domain, assets=assets, capabilities=capabilities, extra=context
+    )
     system = (
-        "你是 Ayana 运维控制台的配置助手。只输出一个 JSON 对象，不要 Markdown，不要解释。\n"
-        "你的职责：用技术语义理解用户描述，识别运维对象，填写真实表单字段草稿。\n"
-        "你不执行、不保存任何操作。\n\n"
-        "硬规则：\n"
-        "1. 只根据句中线索推断；禁止编造端口/名称/间隔等未出现且无法推断的值。\n"
-        "2. 允许技术推断：例如「运行 Pod 的底层 c 开头程序」在 K8s 语境指容器运行时 containerd；"
-        "「c 开头」+容器/Pod+常驻底层服务，合理答案是 containerd。用 inferred:true 标记推断字段，"
-        "并用 confirm_question 向用户确认，例如：「你说的应该是 containerd，是否检查该服务运行状态？」\n"
-        "3. crictl 是调试工具不是运行时常驻服务；kubelet 不是「c 开头」。\n"
-        "4. domain=checks 时 fields 键只能是: asset_id,kind,name,params.port,params.proto,params.unit,params.cmd,expect.mode,expect.value,interval_sec,fail_threshold,severity。\n"
-        "   kind 只能是 port|service|command。程序/进程/服务是否正常运行 → kind=service（params.unit）或 command。\n"
-        "5. domain=permissions 时 fields 键只能是: capability,asset_id,object_id,state,scope。\n"
-        "   state 只能是 deny|confirm|auto。scope 只能是 default|exception。\n"
-        "6. route: checks_form | perm_defaults | perm_exceptions | perm_effective | perm_workbench | perm_ceiling。\n"
-        "7. uncertain 字段放入 missing，不要用默认值冒充。\n"
-        "8. confirm_question：当你对某个关键推断把握不足或需要用户点头时填写；全部确定可为空。\n"
-        "9. 只输出 JSON，结构示例：\n"
-        '{"route":"checks_form","fields":{"asset_id":"control","kind":"service","params.unit":"containerd"},'
-        '"inferred":["params.unit"],"confirm_question":"你说的应该是 containerd，是否需要检查 control 上的 containerd 服务运行状态？",'
-        '"missing":[],"notes":[]}'
+        "你是 Ayana 运维控制台的表单填写助手。\n"
+        "用户会用自然语言描述想监控/配置什么；你根据「表单定义 + 真实上下文」"
+        "理解意图，推断技术对象，返回可填入真实表单的结构化 JSON。\n"
+        "你不执行、不保存、不扩权。\n\n"
+        "必须遵守：\n"
+        "1. 字段名只能来自 form.fields；禁止编造端口/名称/命令/资产。\n"
+        "2. 利用你自己的技术知识推断用户指的组件（容器运行时、网络插件、代理等），"
+        "但必须把推断写进 inferred 并给出 confirm_question，等待用户确认。\n"
+        "3. 遵守 form.constraints 与 capability_boundary："
+        "检查类型必须落在系统实际支持的方式上；不要把无法映射到本表单能力的对象"
+        "硬套进错误 kind。\n"
+        "4. 资产只能来自 context.assets；能力名只能来自 context.capabilities。\n"
+        "5. 信息不足 → missing 列出具体问题，不要用默认值冒充用户意图。\n"
+        "6. 合理默认（如 interval_sec）可填 default，但须在 inferred 标注。\n"
+        "7. 请求超出本表单能力 → unsupported，给出 alternatives。\n"
+        "8. 只输出 JSON 对象，符合 output_schema，不要 Markdown。\n"
     )
     user = json.dumps(
-        {"domain": domain, "text": text[:500], "context": context},
+        {"user_input": text[:800], "scene": payload},
         ensure_ascii=False,
     )
-    try:
-        raw = await llm.chat(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            max_tokens=600,
-        )
-        if not raw:
-            return None
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+    raw = None
+    err = ""
+    # 优先 json_mode；失败再普通对话 + 修复
+    for attempt in range(2):
+        try:
+            resp = await llm.chat_raw(
+                messages, max_tokens=800, json_mode=(attempt == 0), temperature=0.2
+            )
+        except Exception as e:
+            err = f"chat_exception:{e}"
+            continue
+        if not resp or not resp.get("content"):
+            err = err or "empty_content"
+            continue
+        raw = resp.get("content") or ""
         data = _extract_json_object(raw)
-        if not isinstance(data, dict):
-            return None
-        return data
-    except Exception as e:
-        log.warning("assist llm intent failed: %s", e)
-        return None
+        if isinstance(data, dict):
+            return data, ""
+        err = "json_extract_failed"
+        log.warning(
+            "assist llm json extract failed attempt=%s head=%s",
+            attempt,
+            raw[:180].replace("\n", " "),
+        )
+    log.warning("assist llm intent failed: %s", err)
+    return None, err or "unknown"
 
 
 def _extract_json_object(raw: str) -> dict[str, Any] | None:
@@ -461,14 +479,23 @@ async def configure(
     if domain not in ("checks", "permissions"):
         return {"ok": False, "error": "bad_domain", "message": "仅支持 checks / permissions"}
 
-    # 1) LLM 优先（语义理解）
+    # 1) LLM 优先（表单定义 + 真实上下文，无答案级示例）
     result: dict[str, Any] | None = None
     llm_error = ""
+    llm_raw = None
     try:
-        llm_raw = await _llm_intent(llm, domain=domain, text=text, context=ctx)
+        llm_raw, llm_error = await _llm_intent(
+            llm,
+            domain=domain,
+            text=text,
+            context=ctx,
+            assets=assets,
+            capabilities=capabilities,
+        )
     except Exception as e:
         llm_raw = None
-        llm_error = str(e)[:120]
+        llm_error = f"intent_exception:{str(e)[:120]}"
+
     if llm_raw and isinstance(llm_raw.get("fields"), dict):
         schema = CHECK_FIELDS if domain == "checks" else PERM_FIELDS
         nested = llm_raw.get("fields") or {}
@@ -478,19 +505,49 @@ async def configure(
                 flat.update(_flatten(k, v))
             else:
                 flat[k] = v
+        # 资产白名单：不允许凭空资产
+        if domain == "checks" and flat.get("asset_id") and assets:
+            if flat["asset_id"] not in assets:
+                flat.pop("asset_id", None)
+        if domain == "permissions" and flat.get("asset_id") and assets:
+            if flat["asset_id"] not in assets:
+                flat.pop("asset_id", None)
         fields, unknown = _validate_fields(flat, schema)
         missing = [
-            {"key": str(m.get("key") or ""), "label": str(m.get("label") or ""), "question": str(m.get("question") or "请补充信息")}
+            {"key": str(m.get("field") or m.get("key") or ""), "label": str(m.get("label") or ""), "question": str(m.get("question") or "请补充信息")}
             for m in (llm_raw.get("missing") or [])
-            if isinstance(m, dict) and m.get("key")
+            if isinstance(m, dict) and (m.get("field") or m.get("key"))
         ]
         if domain == "checks" and "asset_id" not in fields:
             missing.append({"key": "asset_id", "label": "主机", "question": "要监控哪台主机？"})
         notes = [str(n) for n in (llm_raw.get("notes") or []) if n]
         if unknown:
             notes.append("已忽略无法识别的字段：" + ", ".join(unknown[:6]))
-        inferred = [str(x) for x in (llm_raw.get("inferred") or [])]
+        # inferred 兼容字符串/对象
+        inferred_raw = llm_raw.get("inferred") or []
+        inferred = []
+        inferred_detail = []
+        for item in inferred_raw:
+            if isinstance(item, str):
+                inferred.append(item)
+            elif isinstance(item, dict):
+                fname = str(item.get("field") or item.get("key") or "")
+                if fname:
+                    inferred.append(fname)
+                    inferred_detail.append(
+                        {
+                            "field": fname,
+                            "reason": str(item.get("reason") or ""),
+                            "confidence": str(item.get("confidence") or ""),
+                        }
+                    )
         confirm_q = str(llm_raw.get("confirm_question") or "").strip()
+        unsup = llm_raw.get("unsupported")
+        if isinstance(unsup, dict) and unsup.get("reason"):
+            notes.append("不支持：" + str(unsup.get("reason")))
+            alts = unsup.get("alternatives") or []
+            if alts:
+                notes.append("可选：" + ", ".join(str(a) for a in alts[:4]))
         result = {
             "ok": True,
             "domain": domain,
@@ -498,10 +555,12 @@ async def configure(
             "action": "fill",
             "fields": fields,
             "inferred": inferred,
+            "inferred_detail": inferred_detail,
             "confirm_question": confirm_q,
             "missing": missing,
             "notes": notes,
             "source": "llm",
+            "llm_error": "",
         }
 
     # 2) 规则兜底 / 合并（不覆盖 LLM 已给出的 kind/目标，避免猜端口）
@@ -523,11 +582,14 @@ async def configure(
                     "规则模式只能做关键词匹配，无法从技术描述推断组件名；配置 LLM 后可语义理解。"
                 )
         if llm_error:
-            result.setdefault("notes", []).append("语言模型解析失败，已用规则解析。")
+            result.setdefault("notes", []).append("语言模型解析失败（" + llm_error + "），已用规则解析。")
+            result["llm_error"] = llm_error
         elif llm and getattr(llm, "enabled", False):
             result.setdefault("notes", []).append("语言模型未返回可用结果，已用规则解析。")
+            result["llm_error"] = llm_error or "no_usable_result"
         elif not llm or not getattr(llm, "enabled", False):
             result.setdefault("notes", []).append("当前未启用语言模型，仅关键词解析。")
+            result["llm_error"] = "llm_disabled"
     else:
         # LLM 缺的用规则补；但不把规则猜的 port 强加到 LLM 的 service/command 上
         llm_kind = (result.get("fields") or {}).get("kind")
