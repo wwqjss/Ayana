@@ -569,6 +569,61 @@ class WebApp:
             sources["prometheus_unhealthy"] = sum(1 for t in targets if t.get("health") != "up")
         except Exception as e:
             sources["prometheus_error"] = str(e)[:200]
+
+        # 系统健康度：唯一分数 + MAGI 分项拆解（真实数据）
+        from .health import system_health_ratio
+
+        metric_items: list[dict] = []
+        for a in assets_raw:
+            for c in REQUIRED_CHECKS.get(a["id"], []):
+                samples = (metric_map.get(a["id"]) or {}).get(c.get("metric") or "", [])
+                # 按 selector 过滤
+                sel = c.get("selector") or {}
+                matched = []
+                for s in samples:
+                    m = s.get("metric") or {}
+                    if all(m.get(k) == v for k, v in sel.items()):
+                        matched.append(s)
+                latest = max(matched, key=lambda x: x.get("sample_at") or 0) if matched else None
+                fres = float(c.get("freshness_sec") or 120)
+                if latest is None:
+                    st = "unknown"
+                else:
+                    age = time.time() - float(latest.get("sample_at") or 0)
+                    val = latest.get("value")
+                    if age > fres:
+                        st = "stale"
+                    elif val is None:
+                        st = "unknown"
+                    elif val == 1:
+                        st = "healthy"
+                    else:
+                        st = "unhealthy"
+                metric_items.append({"state": st, "object": c.get("object"), "asset": a["id"]})
+
+        check_items: list[dict] = []
+        try:
+            for row in self.db.query("SELECT last_state FROM checks WHERE enabled=1"):
+                check_items.append({"state": row["last_state"] or "unknown"})
+        except Exception:
+            pass
+
+        # 仅当前 firing；已恢复未关闭的历史事件不进入健康度
+        alert_items: list[dict] = []
+        try:
+            for row in self.db.query(
+                "SELECT id FROM alert_episodes WHERE status='firing'"
+                " AND (source_state IS NULL OR source_state='firing')"
+            ):
+                alert_items.append({"state": "unhealthy", "id": row["id"]})
+        except Exception:
+            pass
+
+        health_ratio = system_health_ratio(
+            metric_items=metric_items,
+            check_items=check_items,
+            alert_items=alert_items,
+        )
         quiet = not need and not open_inc and not pending_actions and not unknown_actions
         data = {
             "ok": True,
@@ -580,6 +635,7 @@ class WebApp:
             "pending_actions": len(pending_actions),
             "unknown_actions": len(unknown_actions),
             "sources": sources,
+            "health_ratio": health_ratio,
             "quiet": quiet,
         }
         self._overview_cache = {"at": time.time(), "data": data}

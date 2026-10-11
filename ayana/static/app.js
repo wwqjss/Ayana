@@ -591,6 +591,10 @@ async function renderOverview() {
     $("human-banner").classList.toggle("hidden", !(res.need_human || []).length);
     $("human-banner").onclick = () => activateTab("incidents", "");
 
+    // 系统健康度（唯一分数 + MAGI 分项拆解）
+    const hr = res.health_ratio || {};
+    g.appendChild(buildHealthRatioCard(hr));
+
     // 需人工列表
     if ((res.need_human || []).length) {
       const list = el("div", { class: "card", style: "margin-bottom:16px" });
@@ -673,6 +677,85 @@ async function renderOverview() {
   } finally {
     state._overviewLoading = false;
   }
+}
+
+/** 系统健康度卡片：唯一分数 + MAGI 三行分项拆解（非独立评分） */
+function buildHealthRatioCard(hr) {
+  const card = el("div", { class: "card health-ratio-card" });
+  const ratio = hr.ratio;
+  const label = hr.label || "—";
+  const colorCls = hr.color || "dim";
+  const healthy = hr.healthy ?? 0;
+  const total = hr.total ?? 0;
+  const hasRatio = ratio != null && total > 0;
+
+  // 角标装饰（克制的指挥台细线）
+  card.appendChild(el("div", { class: "hr-corner tl" }));
+  card.appendChild(el("div", { class: "hr-corner tr" }));
+  card.appendChild(el("div", { class: "hr-corner bl" }));
+  card.appendChild(el("div", { class: "hr-corner br" }));
+
+  const head = el("div", { class: "hr-head" }, [
+    el("div", { class: "hr-title", text: "系统健康度" }),
+    el("div", { class: "hr-sub", text: "SYSTEM HEALTH INDEX" }),
+  ]);
+  card.appendChild(head);
+
+  const body = el("div", { class: "hr-body" });
+  const valBox = el("div", { class: "hr-val-box" });
+  const val = el("div", { class: "hr-val " + colorCls, text: label });
+  valBox.appendChild(val);
+  valBox.appendChild(el("div", {
+    class: "hr-count",
+    text: hasRatio ? `健康 ${healthy} / 总计 ${total}` : "暂无监控项",
+  }));
+  body.appendChild(valBox);
+
+  // 主进度条：唯一分数
+  const barBox = el("div", { class: "hr-bar-box" });
+  const bar = el("div", { class: "hr-bar" });
+  const pct = hasRatio ? Math.max(0, Math.min(100, ratio)) : 0;
+  const fill = el("div", {
+    class: "hr-bar-fill " + colorCls,
+    style: `width:${hasRatio ? pct : 0}%`,
+  });
+  bar.appendChild(fill);
+  barBox.appendChild(bar);
+  if (hasRatio) {
+    barBox.appendChild(el("div", {
+      class: "hr-bar-tip",
+      text: `${healthy} 项健康 · 共 ${total} 项监控`,
+    }));
+  }
+  body.appendChild(barBox);
+  card.appendChild(body);
+
+  // MAGI 三行：分项解释，加总 = 主分数
+  const magi = el("div", { class: "hr-magi" });
+  magi.appendChild(el("div", {
+    class: "hr-magi-title",
+    text: "系统同步率 · SYSTEM SYNC RATIO",
+  }));
+  (hr.sources || []).forEach((s) => {
+    const empty = !s.total;
+    const spct = empty ? 0 : Math.round((s.healthy * 100) / s.total);
+    const row = el("div", { class: "hr-magi-row" + (empty ? " na" : "") });
+    row.appendChild(el("div", { class: "hr-magi-code", text: s.code }));
+    row.appendChild(el("div", { class: "hr-magi-label", text: s.label }));
+    const mini = el("div", { class: "hr-mini" });
+    mini.appendChild(el("div", {
+      class: "hr-mini-fill " + (empty ? "dim" : s.state === "ok" ? "ok" : s.state === "warn" ? "warn" : s.state === "bad" ? "bad" : "dim"),
+      style: `width:${empty ? 0 : Math.max(spct, s.healthy > 0 ? 8 : 0)}%`,
+    }));
+    row.appendChild(mini);
+    row.appendChild(el("div", {
+      class: "hr-magi-frac",
+      text: empty ? "—" : `${s.healthy}/${s.total}`,
+    }));
+    magi.appendChild(row);
+  });
+  card.appendChild(magi);
+  return card;
 }
 
 function tile(label, value, sub, badgeCls, badgeText) {

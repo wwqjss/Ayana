@@ -318,3 +318,86 @@ def host_health(
             "firing": list(firing_severities or []),
         },
     }
+
+
+# ── 系统健康度（驾驶舱唯一分数）────────────────────────────────
+# 公式：健康监控项 ÷ 总监控项 × 100%
+# MAGI 三行只是分项拆解（分子/母项按来源摊开），不是三套独立评分。
+# 采集失败 / 状态未知 → 计入总数但不计入健康；某来源总数为 0 → 显示 —。
+# 已恢复未关闭的历史事件不进入统计（只认当前 firing）。
+
+def _ratio_color(ratio: float | None) -> str:
+    if ratio is None:
+        return "dim"
+    if ratio >= 100:
+        return "ok"
+    if ratio >= 90:
+        return "ok"
+    if ratio >= 70:
+        return "warn"
+    return "bad"
+
+
+def system_health_ratio(
+    *,
+    metric_items: list[dict[str, Any]] | None = None,
+    check_items: list[dict[str, Any]] | None = None,
+    alert_items: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """汇总驾驶舱「系统健康度」。
+
+    metric_items: [{"state": "healthy|unhealthy|stale|unknown|collect_error"}]
+                  通常来自 REQUIRED_CHECKS / 探测项
+    check_items:  [{"state": "ok|bad|unknown|..."}] 业务检查 last_state
+    alert_items:  当前 status=firing 的告警条目；有则全部不健康
+                  （已恢复未关闭历史事件不应传入）
+    """
+
+    def _bucket(items: list[dict[str, Any]] | None, key: str, label: str, code: str) -> dict[str, Any]:
+        rows = items or []
+        total = len(rows)
+        healthy = 0
+        for r in rows:
+            st = (r.get("state") or "").lower()
+            # 仅明确健康才计入分子；unknown / collect_error / stale / 无数据都不算健康
+            if st in ("healthy", "ok", "up", "pass", "passed"):
+                healthy += 1
+        if total == 0:
+            state = "na"
+        elif healthy >= total:
+            state = "ok"
+        elif healthy == 0:
+            state = "bad"
+        else:
+            state = "warn"
+        return {
+            "key": key,
+            "label": label,
+            "code": code,
+            "healthy": healthy,
+            "total": total,
+            "state": state,
+        }
+
+    sources = [
+        _bucket(metric_items, "metrics", "指标", "MELCHIOR-1"),
+        _bucket(check_items, "checks", "检查", "BALTHASAR-2"),
+        _bucket(alert_items, "alerts", "告警", "CASPER-3"),
+    ]
+
+    # 唯一分数：对 total>0 的来源求和；total=0 的来源不参与（显示 —）
+    healthy = sum(s["healthy"] for s in sources if s["total"] > 0)
+    total = sum(s["total"] for s in sources if s["total"] > 0)
+    if total == 0:
+        ratio = None
+    else:
+        ratio = round(healthy * 100.0 / total, 1)
+
+    return {
+        "ratio": ratio,
+        "healthy": healthy,
+        "total": total,
+        "color": _ratio_color(ratio),
+        "label": "—" if ratio is None else (f"{ratio:.1f}%" if ratio < 100 else "100%"),
+        "sources": sources,
+    }
