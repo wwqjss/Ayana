@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Ayana 产品修正提议</title>
-  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="product-notes-styles.css" />
 </head>
 <body>
   <div class="shell">
@@ -361,7 +361,7 @@
           <p>
             <strong>实现提醒：</strong>请把 <code>health.py</code> 的对象健康与 <code>monitor.py</code> 的指标状态合并成一个
             <code>host_health(asset_id)</code> 纯函数，Web / QQ / 总览 / 资源全部只消费它的结论。
-            现在 <code>computeAssetHealth</code> 在 <code>app.js</code> 前端还有一份推断，这正是「两套真相」的技术根因。
+            现在 <code>computeAssetHealth</code> 在 <code>product-notes-app.js</code> 前端还有一份推断，这正是「两套真相」的技术根因。
           </p>
         </div>
       </section>
@@ -830,6 +830,6 @@
       </section>
     </main>
   </div>
-  <script src="app.js"></script>
+  <script src="product-notes-app.js"></script>
 </body>
 </html>

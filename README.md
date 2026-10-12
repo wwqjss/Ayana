@@ -72,7 +72,7 @@ Prometheus / Alertmanager
 | `secrets.json` | 否（600） | token / pepper / 加密密钥等 |
 | `config.example.json` | 是 | 模板，无真实秘密 |
 
-秘密键可用环境变量覆盖：`AYANA_ONESBOT_TOKEN`、`AYANA_WEBHOOK_TOKEN`、`AYANA_WEB_AUTH_PEPPER`、`AYANA_TOTP_ENCRYPT_KEY`、`AYANA_SSH_CREDENTIAL_KEY` 等（见 `ayana/config.py`）。
+秘密键可用环境变量覆盖：`AYANA_ONEWBOT_TOKEN`、`AYANA_WEBHOOK_TOKEN`、`AYANA_WEB_AUTH_PEPPER`、`AYANA_TOTP_ENCRYPT_KEY`、`AYANA_SSH_CREDENTIAL_KEY` 等（见 `ayana/config.py`）。
 
 **安全基线（v0.7.2+）**：
 
@@ -101,4 +101,4 @@ python -m unittest discover tests -q
 
 ## 许可证
 
-按仓库内许可证文件执行；若未附带，请在分发前补充 LICENSE。
+若仓库根目录未附带 LICENSE，请在对外分发前自行补充。
