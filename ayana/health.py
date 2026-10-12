@@ -232,11 +232,11 @@ def _norm_host_state(raw: str) -> str:
     r = (raw or "").strip()
     if r in ("collect_error",):
         return "collect_error"
-    if r in ("bad", "unhealthy", "critical", "down"):
+    if r in ("bad", "fail", "unhealthy", "critical", "down"):
         return "bad"
-    if r in ("warn", "warning", "degraded", "stale"):
+    if r in ("warn", "warning", "degraded", "stale", "partial_no_data"):
         return "warn"
-    if r in ("no_data", "unknown", "partial_no_data", "unobserved"):
+    if r in ("no_data", "unknown", "unobserved"):
         return "no_data"
     if r in ("ok", "healthy", "up", "pass", "passed", "not_enabled", "disabled", ""):
         return "ok" if r in ("ok", "healthy", "up", "pass", "passed") else "ok"
@@ -301,6 +301,13 @@ def host_health(
             states.append("warn")
 
     overall = _worst(states) if states else "no_data"
+    partial = metric_state == "partial_no_data" or (
+        "no_data" in states and any(state in ("ok", "warn", "bad") for state in states)
+    )
+    if partial:
+        reasons.append("部分监控项暂无当前样本，已有观测仍可查看。")
+        if overall == "no_data":
+            overall = "warn"
     # 全部 not_enabled/ok 且无任何样本语义时，若输入为空给 no_data
     if not states:
         overall = "no_data"
@@ -308,9 +315,10 @@ def host_health(
     dot = _HOST_DOT[overall]
     return {
         "state": dot["state"],
-        "label": dot["label"],
+        "label": "部分未观测" if partial and overall == "warn" and "warn" not in states else dot["label"],
         "cls": dot["cls"],
         "reasons": reasons,
+        "partial": partial,
         "sources": {
             "metric": _norm_host_state(metric_state) if metric_state else "",
             "required": required_state or "",

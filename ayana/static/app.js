@@ -408,6 +408,7 @@ async function totpDisable() {
     if (box) box.textContent = res.message || res.error || "关闭失败";
     return;
   }
+  if (res.csrf_token) state.csrf = res.csrf_token;
   if (box) box.textContent = "已关闭两步验证。";
 }
 
@@ -461,11 +462,12 @@ function activateTab(tab, focus, assetView) {
 
 function setMonitorSub(sub) {
   if (!sub) return;
+  if (sub === "onboard") sub = "metrics";
   state.monitorSub = sub;
   document.querySelectorAll("#monitor-subnav .subtab").forEach((b) => {
     b.classList.toggle("active", b.dataset.sub === sub);
   });
-  ["metrics", "checks", "onboard", "prom"].forEach((k) => {
+  ["metrics", "checks", "prom"].forEach((k) => {
     const el = document.getElementById("monitor-sub-" + k);
     if (el) el.classList.toggle("hidden", k !== sub);
   });
@@ -495,6 +497,7 @@ document.addEventListener("click", (e) => {
     syncChecksAsset();
     renderChecks();
   }
+  if (nav.id === "monitor-subnav" && ["metrics", "onboard"].includes(t.dataset.sub)) renderMonitor();
   if (nav.id === "notify-subnav" && t.dataset.sub === "messages") renderMessages();
   if (nav.id === "notify-subnav" && t.dataset.sub === "outbox") {
     const b = $("notify-outbox-refresh");
@@ -504,6 +507,7 @@ document.addEventListener("click", (e) => {
 
 document.querySelectorAll(".tab").forEach((btn) => {
   btn.addEventListener("click", () => {
+    if (btn.dataset.tab === "monitor") setMonitorSub("metrics");
     activateTab(btn.dataset.tab, "");
   });
 });
@@ -529,8 +533,30 @@ async function boot() {
     const h = await fetch("/health").then(r => r.json());
     state.version = "v" + (h.version || "unknown");
   } catch { state.version = "v?"; }
-  await loadMeta();
   showMain();
+  if (me.user && me.user.must_change_password) {
+    await promptPasswordChange();
+    return;
+  }
+  await loadMeta();
+}
+
+async function promptPasswordChange() {
+  const oldPw = prompt("首次登录请修改密码。\n当前密码（bootstrap 临时口令）:", "");
+  if (oldPw === null) return;
+  const newPw = prompt("新密码（至少 10 位）:", "");
+  if (newPw === null) return;
+  const res = await api("/api/password", {
+    method: "POST",
+    body: JSON.stringify({ old_password: oldPw, new_password: newPw }),
+  });
+  if (!res.ok) {
+    alert(res.message || res.error || "修改密码失败");
+    await promptPasswordChange();
+    return;
+  }
+  alert("密码已修改，请使用新密码重新登录。");
+  location.reload();
 }
 
 async function loadMeta() {
@@ -570,7 +596,7 @@ async function refreshTab() {
       syncChecksAsset();
       await renderChecks();
     }
-    else if (state.monitorSub !== "onboard") await renderMonitor();
+    else await renderMonitor();
   }
   if (state.tab === "connections") await renderConnections();
   if (state.tab === "notify") {
@@ -586,7 +612,7 @@ function syncChecksAsset() {
   const sel = $("chk-asset");
   if (!sel) return;
   // 默认跟随资源页当前主机，无需重复选择
-  if (monitorState.host) sel.value = monitorState.host;
+  if (monitorState.host && !sel.dataset.assistDraft) sel.value = monitorState.host;
 }
 
 /* ---- 统一健康状态 ---- */
@@ -767,6 +793,12 @@ async function renderOverview() {
     stats.appendChild(mkStat("需人工", String(humanN), humanN ? "bad" : "ok"));
     stats.appendChild(mkStat("待批准/执行", String(pending), pending ? "warn" : "ok"));
     stats.appendChild(mkStat("Prom 异常目标", String(promBad), promBad ? "bad" : "ok"));
+    const businessTotals = (res.assets || []).reduce((sum, asset) => {
+      const business = asset.business_summary || {};
+      ["total", "healthy", "unknown", "failed"].forEach((key) => { sum[key] += Number(business[key]) || 0; });
+      return sum;
+    }, { total: 0, healthy: 0, unknown: 0, failed: 0 });
+    if (businessTotals.total) stats.appendChild(mkStat("业务检查", String(businessTotals.total), businessTotals.failed ? "bad" : businessTotals.unknown ? "warn" : "ok"));
     g.appendChild(stats);
 
     // 只列异常主机摘要（正常主机进「资源」）
@@ -779,6 +811,9 @@ async function renderOverview() {
     });
     const hostCard = el("div", { class: "card" });
     hostCard.appendChild(el("h2", { text: "需要关注的主机" }));
+    if (businessTotals.total) hostCard.appendChild(el("p", { class: "muted small", text:
+      `业务检查：${businessTotals.healthy} 项正常，${businessTotals.failed} 项异常，${businessTotals.unknown} 项尚未确定。完整结果可在「资源」查看。`,
+    }));
     if (!badHosts.length) {
       hostCard.appendChild(el("p", {
         class: "muted small",
@@ -790,6 +825,7 @@ async function renderOverview() {
         const row = el("div", {
           style: "display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--line);cursor:pointer",
           onclick: () => {
+            setMonitorSub("metrics");
             activateTab("monitor", "");
             monitorState.host = a.id;
             renderMonitor();
@@ -1168,11 +1204,18 @@ async function openIncidentDetail(incId) {
         el("button", {
           class: "btn", text: "批准并执行",
           onclick: async () => {
-            const reason = prompt("批准原因（可空）:", "") || "";
-            await api(`/api/actions/${p.action_id}/approve`, {
+            const reason = prompt("批准原因（可空）:", "");
+            if (reason === null) return;
+            // P1-09: 启用 2FA 的用户需要动态码；失败不得静默关窗
+            const totp = prompt("动态验证码（若账号已启用 2FA，否则留空）:", "") || "";
+            const res = await api(`/api/actions/${p.action_id}/approve`, {
               method: "POST",
-              body: JSON.stringify({ execute: true, reason }),
+              body: JSON.stringify({ execute: true, reason, totp }),
             });
+            if (!res.ok) {
+              alert(res.message || res.error || "批准失败，请检查动态码或权限");
+              return;
+            }
             $("modal").classList.add("hidden");
             openIncidentDetail(incId);
           },
@@ -1180,12 +1223,16 @@ async function openIncidentDetail(incId) {
         el("button", {
           class: "btn danger", text: "拒绝",
           onclick: async () => {
-            const reason = prompt("拒绝原因:", "") || "";
+            const reason = prompt("拒绝原因:", "");
             if (reason === null) return;
-            await api(`/api/actions/${p.action_id}/reject`, {
+            const res = await api(`/api/actions/${p.action_id}/reject`, {
               method: "POST",
               body: JSON.stringify({ reason }),
             });
+            if (!res.ok) {
+              alert(res.message || res.error || "拒绝失败");
+              return;
+            }
             $("modal").classList.add("hidden");
             openIncidentDetail(incId);
           },
@@ -1338,6 +1385,208 @@ const PERM_STATE_META = {
   confirm: { key: "confirm", label: "需要我确认", cls: "on-confirm" },
   auto: { key: "auto", label: "Ayana 可以自动执行", cls: "on-auto" },
 };
+const permDraftControls = new Map();
+const effectivePermissionState = { sequence: 0 };
+function effectivePermissionParameters() {
+  return [
+    ($("perm-eff-cap") || {}).value || "",
+    ($("perm-eff-asset") || {}).value || "",
+    ($("perm-eff-object") || {}).value || "",
+  ];
+}
+function invalidateEffectivePermission() {
+  effectivePermissionState.sequence++;
+  const box = $("perm-eff-result");
+  if (box) box.textContent = "请选择目标后查询当前权限。";
+}
+function permissionCapabilityLabel(capability) {
+  const spec = (state.caps || []).find((item) => item.name === capability || item.capability === capability);
+  return PERM_CAP_LABEL[capability] || (spec && (spec.label || String(spec.description || "").split("（")[0])) || "已选择的操作";
+}
+
+function permissionStateSchema() {
+  return ((assistForms.permissions || {}).fields || []).find((field) => field.name === "state") || {};
+}
+
+function permissionAllowedStates(capability) {
+  return (permissionStateSchema().allowed_states_by_capability || {})[capability] || [];
+}
+
+function permissionStateLabel(capability, policyState) {
+  const schema = permissionStateSchema();
+  return ((schema.value_labels_by_capability || {})[capability] || {})[policyState]
+    || (schema.value_labels || {})[policyState] || "待选择";
+}
+
+function permissionObjects(assetId) {
+  return (((state.assets || []).find((asset) => asset.id === assetId) || {}).objects || []);
+}
+
+function permissionObjectLabel(assetId, objectId) {
+  if (!objectId || objectId === "*") return "全部对象";
+  const objects = permissionObjects(assetId);
+  const object = objects.find((item) => item.id === objectId);
+  if (object) return object.name;
+  const names = objects.filter((item) => [item.name, item.unit, item.container].includes(objectId));
+  return names.length === 1 ? names[0].name : "待确认对象";
+}
+
+function populatePermissionObjects(prefix, desired) {
+  const select = $("perm-" + prefix + "-object");
+  if (!select) return;
+  const asset = ($("perm-" + prefix + "-asset") || {}).value;
+  const objects = permissionObjects(asset);
+  const value = desired == null ? select.value : desired;
+  select.innerHTML = "";
+  select.appendChild(el("option", { value: "", text: "请选择对象" }));
+  select.appendChild(el("option", { value: "*", text: "全部对象" }));
+  objects.forEach((object) => select.appendChild(el("option", { value: object.id, text: object.name })));
+  const matches = objects.filter((object) => [object.name, object.unit, object.container].includes(value));
+  select.value = value === "*" || objects.some((object) => object.id === value) ? value : matches.length === 1 ? matches[0].id : "";
+}
+
+function updatePermissionStateSelect(desired) {
+  const select = $("perm-ex-state");
+  if (!select) return;
+  const capability = ($("perm-ex-cap") || {}).value;
+  const value = desired == null ? select.value : desired;
+  select.innerHTML = "";
+  select.appendChild(el("option", { value: "", text: "请选择策略" }));
+  permissionAllowedStates(capability).forEach((policy) => select.appendChild(el("option", {
+    value: policy, text: permissionStateLabel(capability, policy),
+  })));
+  select.value = value;
+}
+
+async function preparePermissionSubmit(fields, isCurrent, title, button) {
+  if (button && button.disabled) return;
+  if (assistState.permissions.pending) return;
+  if (unresolvedAssistQuestions("permissions").some(isAssistAnswerQuestion)) {
+    assistNote("perm-assist-msg", ["请先回答下方的需求确认问题，再核对并保存权限。"], "error");
+    return;
+  }
+  const assistSequence = assistState.permissions.sequence;
+  if (button) button.disabled = true;
+  try {
+    await ensureAssistForm("permissions");
+    const validation = await api("/api/permissions/validate", { method: "POST", body: JSON.stringify({ fields }) });
+    renderAssistDebug("permissions", { stage: "permission_validation", ...validation });
+    if (!isCurrent() || assistSequence !== assistState.permissions.sequence || assistState.permissions.pending) {
+      assistNote("perm-assist-msg", ["校验期间权限草稿已修改，请重新提交以核对最新配置。"], "error");
+      return;
+    }
+    if (!validation.ok || !validation.payload) {
+      const issues = (validation.issues || []).map((issue) => (issue.label || "配置") + "：" + issue.message);
+      assistNote("perm-assist-msg", issues.length ? issues : [humanFormError(validation, "权限草稿尚不完整，请核对目标和策略后重试。")], "error");
+      return;
+    }
+    const normalized = validation.fields || {};
+    const payload = validation.payload;
+    confirmFormAction(title, permissionSummary(normalized.capability,
+      normalized.scope === "default" ? "*" : normalized.asset_id, normalized.object_id, normalized.state), async () => {
+      const res = await api("/api/permissions", { method: "POST", body: JSON.stringify(payload) });
+      if (res.ok) renderPermissions();
+      else renderAssistDebug("permissions", { stage: "permission_save", ...res });
+      return res;
+    }, () => isCurrent() && !assistState.permissions.pending
+      && assistSequence === assistState.permissions.sequence
+      && !unresolvedAssistQuestions("permissions").some(isAssistAnswerQuestion));
+  } catch (_) {
+    assistNote("perm-assist-msg", ["未能完成权限校验，请稍后重试。权限尚未保存。"], "error");
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function confirmFormAction(title, summary, action, verifySnapshot) {
+  const errorBox = el("p", { class: "error small" });
+  const confirmButton = el("button", {
+    type: "button", class: "btn primary", text: "确认并保存",
+    onclick: async () => {
+      if (confirmButton.disabled) return;
+      if (verifySnapshot && !verifySnapshot()) {
+        errorBox.textContent = "表单已修改，请关闭确认框并重新提交，以核对最新配置。";
+        confirmButton.disabled = true;
+        return;
+      }
+      confirmButton.disabled = true;
+      try {
+        const result = await action();
+        if (!result.ok) {
+          errorBox.textContent = humanFormError(result, "未能保存，请核对配置后重试。");
+          confirmButton.disabled = false;
+        } else {
+          $("modal").classList.add("hidden");
+        }
+      } catch (_) {
+        errorBox.textContent = "网络异常，未能确认保存结果。请刷新列表核对后再试。";
+        confirmButton.disabled = false;
+      }
+    },
+  });
+  showModal(title, [
+    ...summary.map((text) => el("p", { text })),
+    errorBox,
+    el("div", { class: "form-row" }, [
+      el("button", { type: "button", class: "btn", text: "取消", onclick: () => $("modal").classList.add("hidden") }),
+      confirmButton,
+    ]),
+  ]);
+}
+
+function permissionSummary(capability, assetId, objectId, policyState) {
+  const asset = ((state.assets || []).find((a) => a.id === assetId) || {}).display_name || assetId || "全部资产";
+  return [
+    "操作：" + permissionCapabilityLabel(capability),
+    "范围：" + (assetId === "*" ? "全部资产（默认策略）" : asset) + "；对象：" + permissionObjectLabel(assetId, objectId),
+    "策略：" + permissionStateLabel(capability, policyState),
+    "保存后会修改授权策略；主机现有执行限制仍然生效。",
+  ];
+}
+
+function permissionDraftControl(current, target) {
+  const key = JSON.stringify([target.capability, target.asset_id, target.object_id]);
+  const box = el("div");
+  const note = el("span", { class: "perm-draft-note" });
+  const allowed = permissionAllowedStates(target.capability);
+  const seg = el("div", { class: "seg" });
+  const pick = (next) => {
+    control.set(next);
+    assistState.permissions.revision += 1;
+    assistState.permissions.manualResolved.add("state");
+  };
+  const control = {
+    state: current, original: current, element: box,
+    set(next) {
+      if (!allowed.includes(next)) return;
+      this.state = next;
+      [...seg.children].forEach((button, index) => {
+        const policy = allowed[index];
+        button.className = policy === next ? PERM_STATE_META[policy].cls : "";
+      });
+      note.textContent = next === this.original ? "" : "草稿已修改，点击保存才生效。";
+    },
+    reset() { this.set(this.original); },
+  };
+  allowed.forEach((policy) => seg.appendChild(el("button", {
+    type: "button", text: permissionStateLabel(target.capability, policy),
+    class: current === policy ? PERM_STATE_META[policy].cls : "", onclick: () => pick(policy),
+  })));
+  permDraftControls.set(key, control);
+  box.appendChild(seg);
+  box.appendChild(note);
+  box.appendChild(el("button", {
+    type: "button", class: "btn small", text: "保存策略",
+    onclick: async (event) => {
+      const snapshot = control.state;
+      const fields = { capability: target.capability, state: snapshot,
+        scope: target.asset_id === "*" && target.object_id === "*" ? "default" : "exception" };
+      if (fields.scope === "exception") Object.assign(fields, { asset_id: target.asset_id, object_id: target.object_id });
+      await preparePermissionSubmit(fields, () => control.state === snapshot, "确认权限变更", event.target);
+    },
+  }));
+  return box;
+}
 
 function permFlagsToState(p) {
   if (!p) return "deny";
@@ -1566,6 +1815,7 @@ async function renderPermissions() {
   const [mRes, aRes] = await Promise.all([
     api("/api/permissions/model"),
     api("/api/assets"),
+    ensureAssistForm("permissions").catch(() => null),
   ]);
   const rootD = $("perm-defaults");
   const rootE = $("perm-exceptions");
@@ -1581,6 +1831,8 @@ async function renderPermissions() {
   const defaults = mRes.defaults || {};
   const exceptions = mRes.exceptions || [];
   const assets = (aRes && aRes.ok && aRes.assets) || state.assets || [];
+  state.assets = assets;
+  permDraftControls.clear();
 
   // ---- 默认策略：按操作类型 ----
   if (rootD) {
@@ -1599,26 +1851,11 @@ async function renderPermissions() {
         : d.source || "默认策略";
       const row = el("tr", {});
       row.appendChild(el("td", {}, [
-        el("div", { text: PERM_CAP_LABEL[c.capability] || c.capability }),
-        el("div", { class: "muted small", text: c.capability }),
+        el("div", { text: permissionCapabilityLabel(c.capability) }),
       ]));
       row.appendChild(el("td", { class: "muted small", text: c.description || "" }));
       row.appendChild(el("td", {}, [
-        renderSeg(stateKey, async (next) => {
-          const flags = permStateToFlags(next);
-          await api("/api/permissions", {
-            method: "POST",
-            body: JSON.stringify({
-              subject_type: "auto_rule",
-              subject_id: "agent",
-              capability: c.capability,
-              asset_id: "*",
-              object_id: "*",
-              ...flags,
-            }),
-          });
-          renderPermissions();
-        }),
+        permissionDraftControl(stateKey, { capability: c.capability, asset_id: "*", object_id: "*" }),
       ]));
       row.appendChild(el("td", { class: "muted small", text: src }));
       table.appendChild(row);
@@ -1643,25 +1880,11 @@ async function renderPermissions() {
       exceptions.forEach((x) => {
         const stateKey = x.state === "auto" ? "auto" : x.state === "confirm" ? "confirm" : "deny";
         table.appendChild(el("tr", {}, [
-          el("td", { text: x.asset_id }),
-          el("td", { text: x.object_id }),
-          el("td", { text: PERM_CAP_LABEL[x.capability] || x.capability }),
+          el("td", { text: checkHostLabel(x.asset_id) }),
+          el("td", { text: permissionObjectLabel(x.asset_id, x.object_id) }),
+          el("td", { text: permissionCapabilityLabel(x.capability) }),
           el("td", {}, [
-            renderSeg(stateKey, async (next) => {
-              const flags = permStateToFlags(next);
-              await api("/api/permissions", {
-                method: "POST",
-                body: JSON.stringify({
-                  subject_type: "auto_rule",
-                  subject_id: "agent",
-                  capability: x.capability,
-                  asset_id: x.asset_id,
-                  object_id: x.object_id,
-                  ...flags,
-                }),
-              });
-              renderPermissions();
-            }),
+            permissionDraftControl(stateKey, { capability: x.capability, asset_id: x.asset_id, object_id: x.object_id }),
           ]),
           el("td", { class: "muted small", text: "资产例外" }),
           el("td", {}, [
@@ -1691,7 +1914,7 @@ async function renderPermissions() {
       caps.forEach((c) => {
         const op = document.createElement("option");
         op.value = c.capability;
-        op.textContent = (PERM_CAP_LABEL[c.capability] || c.capability) + " · " + c.capability;
+        op.textContent = permissionCapabilityLabel(c.capability);
         capSel.appendChild(op);
       });
     }
@@ -1700,12 +1923,14 @@ async function renderPermissions() {
       assets.forEach((a) => {
         const op = document.createElement("option");
         op.value = a.id;
-        op.textContent = a.id + " · " + a.display_name;
+        op.textContent = a.display_name || a.id;
         assetSel.appendChild(op);
       });
     }
   }
 
+  // 重建查询参数后，原来的结果与尚未完成的查询均不再有效。
+  invalidateEffectivePermission();
   // 生效权限查询控件
   const effCap = $("perm-eff-cap");
   if (effCap) {
@@ -1713,7 +1938,7 @@ async function renderPermissions() {
     caps.forEach((c) => {
       const op = document.createElement("option");
       op.value = c.capability;
-      op.textContent = PERM_CAP_LABEL[c.capability] || c.capability;
+      op.textContent = permissionCapabilityLabel(c.capability);
       effCap.appendChild(op);
     });
   }
@@ -1723,10 +1948,13 @@ async function renderPermissions() {
     assets.forEach((a) => {
       const op = document.createElement("option");
       op.value = a.id;
-      op.textContent = a.id + " · " + a.display_name;
+      op.textContent = a.display_name || a.id;
       effAsset.appendChild(op);
     });
   }
+  populatePermissionObjects("ex");
+  populatePermissionObjects("eff");
+  updatePermissionStateSelect();
 
   // 高级原始表
   const pRes = await api("/api/permissions");
@@ -1767,39 +1995,53 @@ async function renderPermissions() {
   }
 }
 
-on("perm-ex-add", "click", async () => {
+on("perm-ex-add", "click", async (event) => {
   const capability = ($("perm-ex-cap") || {}).value;
   const asset_id = ($("perm-ex-asset") || {}).value;
-  const object_id = (($("perm-ex-object") || {}).value || "*").trim() || "*";
-  if (!capability || !asset_id) return;
-  // 新例外默认「需要人工确认」，不自动扩大权限
-  await api("/api/permissions", {
-    method: "POST",
-    body: JSON.stringify({
-      subject_type: "auto_rule",
-      subject_id: "agent",
-      capability,
-      asset_id,
-      object_id,
-      allow: true,
-      require_approval: true,
-      auto_allowed: false,
-    }),
-  });
-  renderPermissions();
+  const object_id = (($("perm-ex-object") || {}).value || "");
+  const policyState = (($("perm-ex-state") || {}).value || "");
+  if (!capability || !asset_id || !object_id || !permissionAllowedStates(capability).includes(policyState)) {
+    assistNote("perm-assist-msg", ["请先选择操作、主机、对象和可用的例外策略。"], "error");
+    return;
+  }
+  const snapshot = JSON.stringify([capability, asset_id, object_id, policyState]);
+  await preparePermissionSubmit({ capability, asset_id, object_id, state: policyState, scope: "exception" }, () => snapshot === JSON.stringify([
+    (($("perm-ex-cap") || {}).value), (($("perm-ex-asset") || {}).value),
+    (($("perm-ex-object") || {}).value || ""), (($("perm-ex-state") || {}).value),
+  ]), "确认资产例外", event.target);
+});
+
+on("perm-ex-cap", "change", () => updatePermissionStateSelect());
+on("perm-ex-asset", "change", () => populatePermissionObjects("ex"));
+on("perm-eff-cap", "change", invalidateEffectivePermission);
+on("perm-eff-object", "change", invalidateEffectivePermission);
+on("perm-eff-asset", "change", () => {
+  invalidateEffectivePermission();
+  populatePermissionObjects("eff");
 });
 
 on("perm-eff-lookup", "click", async () => {
-  const capability = ($("perm-eff-cap") || {}).value;
-  const asset_id = ($("perm-eff-asset") || {}).value || "";
-  const object_id = (($("perm-eff-object") || {}).value || "*").trim() || "*";
+  const parameters = effectivePermissionParameters();
+  const [capability, asset_id, object_id] = parameters;
+  const sequence = ++effectivePermissionState.sequence;
   const box = $("perm-eff-result");
   if (!box) return;
+  if (!capability || !asset_id || !object_id) {
+    box.textContent = "请先选择要查看的操作、主机和对象。";
+    return;
+  }
   box.innerHTML = '<p class="muted small">查询中…</p>';
-  const res = await api(`/api/permissions/effective?capability=${encodeURIComponent(capability)}&asset_id=${encodeURIComponent(asset_id)}&object_id=${encodeURIComponent(object_id)}`);
+  let res;
+  try {
+    res = await api(`/api/permissions/effective?capability=${encodeURIComponent(capability)}&asset_id=${encodeURIComponent(asset_id)}&object_id=${encodeURIComponent(object_id)}`);
+  } catch (_) {
+    res = { ok: false, hint: "连接中断，请重试权限查询。" };
+  }
+  if (sequence !== effectivePermissionState.sequence
+      || JSON.stringify(parameters) !== JSON.stringify(effectivePermissionParameters())) return;
   box.innerHTML = "";
   if (!res.ok) {
-    box.appendChild(el("p", { class: "error", text: res.error || "查询失败" }));
+    box.appendChild(el("p", { class: "error", text: humanFormError(res, "无法查询当前权限，请核对操作与目标后重试。") }));
     return;
   }
   const e = res.effective || {};
@@ -1807,11 +2049,11 @@ on("perm-eff-lookup", "click", async () => {
   box.appendChild(el("div", { class: "perm-eff-box" }, [
     el("div", { class: "perm-eff-row" }, [
       el("span", { class: "muted", text: "操作：" }),
-      el("span", { text: PERM_CAP_LABEL[capability] || capability }),
+      el("span", { text: permissionCapabilityLabel(capability) }),
     ]),
     el("div", { class: "perm-eff-row" }, [
       el("span", { class: "muted", text: "目标：" }),
-      el("span", { text: `${asset_id || "*"} / ${object_id}` }),
+      el("span", { text: `${checkHostLabel(asset_id)} / ${permissionObjectLabel(asset_id, object_id)}` }),
     ]),
     el("div", { class: "perm-eff-row" }, [
       el("span", { class: "muted", text: "结论：" }),
@@ -1824,8 +2066,8 @@ on("perm-eff-lookup", "click", async () => {
   ]));
 });
 
-on("perm-save", "click", async () => {
-  const body = {
+function collectAdvancedPermission() {
+  return {
     subject_type: $("perm-subject-type").value,
     subject_id: $("perm-subject-id").value,
     capability: $("perm-cap").value,
@@ -1835,9 +2077,19 @@ on("perm-save", "click", async () => {
     require_approval: $("perm-approval").checked,
     auto_allowed: $("perm-auto").checked,
   };
-  const res = await api("/api/permissions", { method: "POST", body: JSON.stringify(body) });
-  showModal(res.ok ? "已保存" : "失败", [el("pre", { text: JSON.stringify(res, null, 2) })]);
-  refreshTab();
+}
+on("perm-save", "click", () => {
+  const body = collectAdvancedPermission();
+  const snapshot = JSON.stringify(body);
+  const policyState = permFlagsToState(body);
+  confirmFormAction("确认高级权限变更", [
+    ...permissionSummary(body.capability, body.asset_id, body.object_id, policyState),
+    "授权主体：" + body.subject_id,
+  ], async () => {
+    const res = await api("/api/permissions", { method: "POST", body: JSON.stringify(body) });
+    if (res.ok) refreshTab();
+    return res;
+  }, () => snapshot === JSON.stringify(collectAdvancedPermission()));
 });
 
 async function renderAudit() {
@@ -2341,7 +2593,7 @@ async function renderConnections() {
             class: "btn small primary", text: "配置 SSH（填密码/密钥）",
             onclick: () => {
               sshFormModal("配置 SSH · " + a.id, [
-                { name: "host", label: "地址 (IP/域名)", required: true, placeholder: "192.0.2.10" },
+                { name: "host", label: "地址 (IP/域名)", required: true, placeholder: "10.0.0.10 或 host.example.com" },
                 { name: "username", label: "用户", value: "root", required: true },
                 { name: "port", label: "端口", value: "22", type: "number" },
                 { name: "password", label: "SSH 密码（与私钥二选一）", type: "password" },
@@ -2427,7 +2679,7 @@ async function renderConnections() {
               if (!secret) return;
               const r = await api("/api/ssh/credentials/rotate", {
                 method: "POST",
-                body: JSON.stringify({ id: c.id, secret, public_key: c.public_key || "" }),
+                body: JSON.stringify({ id: c.id, secret }),
               });
               showModal("轮换结果", [el("pre", { text: JSON.stringify(r, null, 2) })]);
               renderConnections();
@@ -2557,60 +2809,84 @@ on("ssh-test-btn", "click", async () => {
 });
 
 /* ---- Agent ceiling ---- */
+const agentCeilingState = { sequence: 0, pending: 0, rows: new Map() };
+function saveAgentCeiling(row, field, value) {
+  if (agentCeilingState.rows.get(row.capability) !== row) return;
+  row.desired[field] = value;
+  const snapshot = { capability: row.capability, ...row.desired };
+  // 两个开关共用当前草稿，同一能力的整行写入按操作顺序完成。
+  agentCeilingState.sequence++;
+  agentCeilingState.pending++;
+  row.pending++;
+  row.status.textContent = "保存中…";
+  row.status.className = "muted small";
+  row.queue = row.queue.then(async () => {
+    try {
+      const res = await api("/api/agent-ceiling", { method: "POST", body: JSON.stringify(snapshot) });
+      if (!res.ok) {
+        row.error = humanFormError(res, "保存失败，请重试。");
+      } else {
+        row.saved = { allowed: snapshot.allowed, allow_auto: snapshot.allow_auto };
+        row.error = "";
+        row.source.textContent = "用户配置";
+      }
+    } catch (_) {
+      row.error = "保存失败，请检查连接后重试。";
+    }
+  }).finally(() => {
+    agentCeilingState.pending--;
+    row.pending--;
+    if (row.pending) return;
+    row.desired = { ...row.saved };
+    row.allowed.checked = row.saved.allowed;
+    row.auto.checked = row.saved.allow_auto;
+    row.status.textContent = row.error || "已保存";
+    row.status.className = row.error ? "error small" : "muted small";
+  });
+  return row.queue;
+}
 async function renderAgentCeiling() {
-  const res = await api("/api/agent-ceiling");
   const box = $("agent-ceiling");
-  if (!box) return;
+  if (!box || agentCeilingState.pending) return;
+  const sequence = ++agentCeilingState.sequence;
+  const res = await api("/api/agent-ceiling");
+  if (sequence !== agentCeilingState.sequence || agentCeilingState.pending) return;
   box.innerHTML = "";
   if (!res.ok) {
     box.appendChild(el("p", { class: "muted small", text: "无法加载 Agent ceiling" }));
     return;
   }
   const rows = res.agent_ceiling || [];
+  agentCeilingState.rows.clear();
   const table = el("table");
   table.appendChild(el("tr", {}, [
     el("th", { text: "能力" }), el("th", { text: "允许 Agent" }),
     el("th", { text: "允许自动" }), el("th", { text: "来源" }), el("th", { text: "操作" }),
   ]));
   rows.forEach((r) => {
+    const row = {
+      capability: r.capability,
+      desired: { allowed: !!r.allowed, allow_auto: !!r.allow_auto },
+      saved: { allowed: !!r.allowed, allow_auto: !!r.allow_auto },
+      queue: Promise.resolve(), pending: 0, error: "",
+      source: el("td", { class: "muted small", text: r.configured ? "用户配置" : "目录默认" }),
+      status: el("td", { class: "muted small", text: r.updated_by || "" }),
+    };
+    row.allowed = el("input", {
+      type: "checkbox", ...(r.allowed ? { checked: "checked" } : {}),
+      onchange: (e) => saveAgentCeiling(row, "allowed", e.target.checked),
+    });
+    row.auto = el("input", {
+      type: "checkbox", ...(r.allow_auto ? { checked: "checked" } : {}),
+      onchange: (e) => saveAgentCeiling(row, "allow_auto", e.target.checked),
+    });
+    agentCeilingState.rows.set(r.capability, row);
     const tr = el("tr", {}, [
       el("td", { text: r.capability }),
-      el("td", {}, [
-        el("input", {
-          type: "checkbox",
-          ...(r.allowed ? { checked: "checked" } : {}),
-          onchange: async (e) => {
-            await api("/api/agent-ceiling", {
-              method: "POST",
-              body: JSON.stringify({
-                capability: r.capability,
-                allowed: e.target.checked,
-                allow_auto: r.allow_auto,
-              }),
-            });
-            renderAgentCeiling();
-          },
-        }),
-      ]),
-      el("td", {}, [
-        el("input", {
-          type: "checkbox",
-          ...(r.allow_auto ? { checked: "checked" } : {}),
-          onchange: async (e) => {
-            await api("/api/agent-ceiling", {
-              method: "POST",
-              body: JSON.stringify({
-                capability: r.capability,
-                allowed: r.allowed,
-                allow_auto: e.target.checked,
-              }),
-            });
-            renderAgentCeiling();
-          },
-        }),
-      ]),
-      el("td", { class: "muted small", text: r.configured ? "用户配置" : "目录默认" }),
-      el("td", { class: "muted small", text: r.updated_by || "" }),
+      el("td", {}, [row.allowed]),
+      el("td", {}, [row.auto]),
+      row.source,
+      row.status,
     ]);
     table.appendChild(tr);
   });
@@ -2623,6 +2899,9 @@ const termState = {
   fit: null,
   ws: null,
   assetId: "",
+  endpoint: null,
+  generation: 0,
+  visible: false,
   open: false,
 };
 
@@ -2633,14 +2912,15 @@ function setTermStatus(text, cls) {
   n.className = "badge " + (cls || "dim");
 }
 
-function destroyTerminal() {
+function releaseTerminal() {
+  const ws = termState.ws;
+  termState.ws = null;
   try {
-    if (termState.ws) {
-      termState.ws.onclose = null;
-      termState.ws.close();
+    if (ws) {
+      ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+      ws.close();
     }
   } catch (_) {}
-  termState.ws = null;
   try {
     if (termState.term) termState.term.dispose();
   } catch (_) {}
@@ -2650,6 +2930,21 @@ function destroyTerminal() {
   setTermStatus("未连接", "dim");
 }
 
+function destroyTerminal(clearTarget = true) {
+  // 先撤销所有异步回调的身份，再释放连接和终端。
+  termState.generation++;
+  if (clearTarget) {
+    termState.visible = false;
+    termState.assetId = "";
+    termState.endpoint = null;
+  }
+  releaseTerminal();
+}
+
+function currentTerminalRequest(assetId, generation) {
+  return termState.visible && termState.assetId === assetId && termState.generation === generation;
+}
+
 function ensureXterm() {
   const T = window.Terminal || (window.xterm && window.xterm.Terminal);
   const Fit = window.FitAddon && (window.FitAddon.FitAddon || window.FitAddon);
@@ -2657,7 +2952,7 @@ function ensureXterm() {
     showModal("无法打开终端", [el("p", { text: "xterm.js 未加载，请强制刷新页面。" })]);
     return null;
   }
-  destroyTerminal();
+  releaseTerminal();
   const term = new T({
     cursorBlink: true,
     fontSize: 13,
@@ -2686,24 +2981,36 @@ function ensureXterm() {
 }
 
 async function openTerminal(assetId, ep) {
+  destroyTerminal();
   termState.assetId = assetId;
+  termState.endpoint = ep || null;
+  termState.visible = true;
+  const generation = termState.generation;
+  const isCurrent = () => currentTerminalRequest(assetId, generation);
   $("term-title").textContent = `终端 · ${assetId}`;
   $("term-host-label").textContent = ep
     ? `${ep.username || ""}@${ep.host || ""}:${ep.port || 22}`
     : "";
   $("term-modal").classList.remove("hidden");
+  $("term-container").innerHTML = "";
   setTermStatus("检查连接…", "warn");
 
   // 先检查权限 / host key
-  const chk = await api(`/api/terminal/check?asset_id=${encodeURIComponent(assetId)}`);
+  let chk;
+  try {
+    chk = await api(`/api/terminal/check?asset_id=${encodeURIComponent(assetId)}`);
+  } catch (_) {
+    chk = { ok: false, hint: "连接检查失败，请检查网络后重新连接。" };
+  }
+  if (!isCurrent()) return;
   if (chk.detail === "host_key_untrusted" && chk.host_key_info) {
     setTermStatus("待信任指纹", "warn");
-    showHostKeyDialog(assetId, chk, () => openTerminal(assetId, ep));
+    showHostKeyDialog(assetId, chk, () => openTerminal(assetId, ep), isCurrent);
     return;
   }
   if (chk.detail === "host_key_changed") {
     setTermStatus("主机密钥变更", "bad");
-    showHostKeyDialog(assetId, chk, () => openTerminal(assetId, ep));
+    showHostKeyDialog(assetId, chk, () => openTerminal(assetId, ep), isCurrent);
     return;
   }
   if (!chk.ok) {
@@ -2716,10 +3023,10 @@ async function openTerminal(assetId, ep) {
     }));
     return;
   }
-  connectTerminal(assetId);
+  connectTerminal(assetId, generation);
 }
 
-function showHostKeyDialog(assetId, chk, onDone) {
+function showHostKeyDialog(assetId, chk, onDone, isCurrent = () => true) {
   const info = chk.host_key_info || {};
   const changed = chk.detail === "host_key_changed";
   const kids = [];
@@ -2757,6 +3064,7 @@ function showHostKeyDialog(assetId, chk, onDone) {
     class: "btn primary btn-trust",
     text: changed ? "确认换机，信任新指纹" : "信任并连接",
     onclick: async () => {
+      if (!isCurrent()) return;
       if (changed && !confirm("确认服务器身份无误？将覆盖旧指纹。")) return;
       trust.disabled = true;
       const t = await api("/api/ssh/endpoints/trust", {
@@ -2768,6 +3076,7 @@ function showHostKeyDialog(assetId, chk, onDone) {
           host_key_line: info.key_line || "",
         }),
       });
+      if (!isCurrent()) return;
       actions.querySelectorAll(".btn-trust").forEach((b) => b.remove());
       $("modal").classList.add("hidden");
       if (!t.ok) {
@@ -2781,7 +3090,8 @@ function showHostKeyDialog(assetId, chk, onDone) {
   actions.insertBefore(cancel, trust.nextSibling);
 }
 
-function connectTerminal(assetId) {
+function connectTerminal(assetId, generation = termState.generation) {
+  if (!currentTerminalRequest(assetId, generation)) return;
   const term = ensureXterm();
   if (!term) return;
   setTermStatus("连接中…", "warn");
@@ -2791,16 +3101,19 @@ function connectTerminal(assetId) {
   ws.binaryType = "arraybuffer";
   termState.ws = ws;
   termState.open = true;
+  const isCurrent = () => currentTerminalRequest(assetId, generation)
+    && termState.ws === ws && termState.term === term;
 
   term.onData((data) => {
-    if (ws.readyState === 1) ws.send(new TextEncoder().encode(data));
+    if (isCurrent() && ws.readyState === 1) ws.send(new TextEncoder().encode(data));
   });
   term.onResize(({ cols, rows }) => {
-    if (ws.readyState === 1) ws.send(JSON.stringify({ type: "resize", cols, rows }));
+    if (isCurrent() && ws.readyState === 1) ws.send(JSON.stringify({ type: "resize", cols, rows }));
   });
 
-  ws.onopen = () => setTermStatus("等待会话…", "warn");
+  ws.onopen = () => { if (isCurrent()) setTermStatus("等待会话…", "warn"); };
   ws.onmessage = (ev) => {
+    if (!isCurrent()) return;
     if (typeof ev.data === "string") {
       let msg = null;
       try { msg = JSON.parse(ev.data); } catch (_) { return; }
@@ -2813,7 +3126,8 @@ function connectTerminal(assetId) {
         setTermStatus("连接失败", "bad");
         term.write(`\r\n\x1b[31m[${msg.hint || msg.error || "错误"}]\x1b[0m\r\n`);
         if (msg.host_key_info) {
-          showHostKeyDialog(assetId, msg, () => connectTerminal(assetId));
+          showHostKeyDialog(assetId, msg,
+            () => openTerminal(assetId, termState.endpoint), isCurrent);
         }
       } else if (msg.type === "closed") {
         setTermStatus("已断开", "dim");
@@ -2824,9 +3138,11 @@ function connectTerminal(assetId) {
     }
   };
   ws.onclose = () => {
+    if (!isCurrent()) return;
     setTermStatus("已断开", "dim");
   };
   ws.onerror = () => {
+    if (!isCurrent()) return;
     setTermStatus("连接错误", "bad");
   };
 }
@@ -2840,10 +3156,10 @@ on("term-disconnect", "click", () => {
     try { termState.ws.send(JSON.stringify({ type: "close" })); } catch (_) {}
     termState.ws.close();
   }
-  destroyTerminal();
+  destroyTerminal(false);
 });
 on("term-reconnect", "click", () => {
-  if (termState.assetId) connectTerminal(termState.assetId);
+  if (termState.visible && termState.assetId) openTerminal(termState.assetId, termState.endpoint);
 });
 
 /* ---- modal ---- */
@@ -2952,18 +3268,23 @@ function pcProgressRender(box, steps) {
 
 async function pcRunAdoptFlow(asset) {
   const box = $("monitor-install-box");
-  if (!box) return;
+  if (!box || pcRunningByHost[asset]) return;
   pcRunningByHost[asset] = true;
+  box.dataset.hostKey = asset;
   box.dataset.running = "1";
+  if ($("monitor-detect")) $("monitor-detect").disabled = true;
   const steps = [
     { key: "detect", label: "1. 检测主机（Docker / 二进制 / 9100）", status: "pending" },
     { key: "install", label: "2. 安装 / 启动采集器", status: "pending" },
     { key: "register", label: "3. 注册到 Prometheus", status: "pending" },
     { key: "verify", label: "4. 验证是否采到指标", status: "pending" },
   ];
-  const render = () => { pcProgressByHost[asset] = steps.map((s) => Object.assign({}, s)); pcProgressRender(box, steps); };
+  const render = () => {
+    pcProgressByHost[asset] = steps.map((step) => ({ ...step }));
+    if (box.dataset.hostKey === asset) pcProgressRender(box, steps);
+  };
   render();
-
+  try {
   // 1 detect
   steps[0].status = "running";
   render();
@@ -3047,9 +3368,21 @@ async function pcRunAdoptFlow(asset) {
       (sc.error ? " · " + sc.error : "");
   }
   render();
-  pcRunningByHost[asset] = false;
-  if (box) box.dataset.running = "0";
-  if (typeof renderMonitor === "function") renderMonitor();
+  } catch (_) {
+    const step = steps.find((item) => item.status === "running");
+    if (step) {
+      step.status = "fail";
+      step.detail = "连接中断，未能完成这一步。请核对主机状态后重试。";
+      render();
+    }
+  } finally {
+    pcRunningByHost[asset] = false;
+    if (box.dataset.hostKey === asset) {
+      box.dataset.running = "0";
+      if ($("monitor-detect")) $("monitor-detect").disabled = false;
+    }
+    if (monitorState.host === asset && state.tab === "monitor" && state.monitorSub === "metrics") renderMonitor();
+  }
 }
 
 function showModal(title, children) {
@@ -3071,6 +3404,7 @@ const monitorState = {
   range: "1h",
   hosts: [],
   autoTimer: null,
+  requestVersion: 0,
 };
 
 function metricStateBadge(st) {
@@ -3080,6 +3414,7 @@ function metricStateBadge(st) {
     bad: ["异常", "bad"],
     not_enabled: ["未启用", "dim"],
     no_data: ["暂无数据", "dim"],
+    partial_no_data: ["部分未观测", "warn"],
     collect_error: ["采集失败", "bad"],
   };
   const [t, c] = map[st] || [st, "dim"];
@@ -3256,7 +3591,7 @@ function metricCard(m, seriesList) {
     return card;
   }
   if (m.state === "no_data") {
-    const hasHist = (m.points || []).length > 1;
+    const hasHist = (m.points || []).length > 0;
     card.appendChild(el("div", {
       class: "muted small",
       text: hasHist ? "当前无数据 · 以下为历史趋势" : "暂无数据",
@@ -3331,7 +3666,10 @@ function buildMetricGroups(metrics) {
     seriesKeys.forEach((k) => used.add(k));
     const states = ms.map((m) => m.state);
     const rank = { collect_error: 5, bad: 4, warn: 3, no_data: 2, ok: 1, not_enabled: 0, partial_no_data: 2 };
-    const worst = states.reduce((a, b) => (rank[b] || 0) > (rank[a] || 0) ? b : a, "ok");
+    const enabledStates = states.filter((value) => value !== "not_enabled");
+    const worst = enabledStates.length
+      ? enabledStates.reduce((a, b) => (rank[b] || 0) > (rank[a] || 0) ? b : a, enabledStates[0])
+      : "not_enabled";
     const palette = ["#6cb6ff", "#e5c07b", "#3dd68c", "#c4b5fd"];
     const seriesList = ms.map((m, i) => ({
       key: m.key,
@@ -3374,86 +3712,189 @@ function buildMetricGroups(metrics) {
   return groups;
 }
 
-async function renderMonitor() {
-  const body = $("monitor-body");
+function monitorHostPresentation(host) {
+  const health = host.health || {};
+  const states = {
+    ok: ["正常", "ok"], warn: ["偏高", "warn"], bad: ["异常", "bad"],
+    no_data: ["暂无数据", "dim"], collect_error: ["采集故障", "err"],
+    partial_no_data: ["部分未观测", "warn"], unknown: ["观测不全", "warn"],
+  };
+  const [label, cls] = states[host.state] || ["状态暂不可用", "dim"];
+  return { label: health.label || label, cls: health.cls || cls };
+}
+
+function renderMonitorHostControls() {
   const strip = $("monitor-hosts-strip");
-  if (!body) return;
-  // 切主机/重绘时清掉检测结果，避免旧主机按钮串台
-  const ibox = $("monitor-install-box");
-  if (ibox) {
-    const host = monitorState.host || "";
-    ibox.dataset.hostKey = host;
-    // 恢复该主机自己的进度，不丢别人的
-    if (pcProgressByHost[host] && pcProgressByHost[host].length) {
-      pcProgressRender(ibox, pcProgressByHost[host]);
-    } else if (!pcRunningByHost[host]) {
-      ibox.innerHTML = "";
-    }
+  if (strip) {
+    strip.innerHTML = "";
+    monitorState.hosts.forEach((item) => strip.appendChild(el("button", {
+      type: "button", class: "monitor-chip" + (item.asset_id === monitorState.host ? " active" : ""),
+      onclick: () => selectMonitorHost(item.asset_id),
+    }, [el("span", { class: "dot " + monitorHostPresentation(item).cls }), el("span", { text: item.display_name || item.asset_id })])));
   }
-  body.innerHTML = '<p class="muted small">加载中…</p>';
-  const hostsRes = await api("/api/monitor/hosts");
-  monitorState.hosts = (hostsRes.ok && hostsRes.hosts) || [];
-  // strip
-  strip.innerHTML = "";
-  monitorState.hosts.forEach((h) => {
-    const hh = h.health || {};
-    const cls = hh.cls || (h.state === "collect_error" ? "err" : h.state === "no_data" ? "dim" : h.state);
-    const chip = el("div", {
-      class: "monitor-chip" + (h.asset_id === monitorState.host ? " active" : ""),
-      onclick: () => {
-        monitorState.host = h.asset_id;
-        const sel = $("monitor-host");
-        if (sel) sel.value = h.asset_id;
-        renderMonitor();
-      },
-    }, [
-      el("span", { class: "dot " + cls, text: "" }),
-      el("span", { text: h.display_name || h.asset_id }),
-    ]);
-    strip.appendChild(chip);
-  });
-  fillSelect("monitor-host", monitorState.hosts.map((h) => {
-    const hh = h.health || {};
-    return {
-      v: h.asset_id,
-      t: (h.display_name || h.asset_id) + " · " + (hh.label || "暂无数据"),
-    };
-  }));
-  if (!monitorState.host && monitorState.hosts.length) {
-    monitorState.host = monitorState.hosts[0].asset_id;
+  fillSelect("monitor-host", monitorState.hosts.map((item) => ({
+    v: item.asset_id, t: (item.display_name || item.asset_id) + " · " + monitorHostPresentation(item).label,
+  })));
+  if ($("monitor-host")) $("monitor-host").value = monitorState.host;
+}
+
+function selectMonitorHost(assetId) {
+  monitorState.host = assetId;
+  const select = $("monitor-host");
+  if (select) select.value = assetId;
+  syncChecksAsset();
+  return renderMonitor();
+}
+
+function syncMonitorOnboarding(assetId, visible) {
+  const section = $("monitor-onboard");
+  if (section) section.classList.toggle("hidden", !visible);
+  const host = monitorState.hosts.find((item) => item.asset_id === assetId) || {};
+  const changed = (($("pc-ne-asset") || {}).value || "") !== assetId
+    || (($("monitor-install-box") || {}).dataset || {}).hostKey !== assetId;
+  fillSelect("pc-ne-asset", assetId ? [{ v: assetId, t: host.display_name || checkHostLabel(assetId) }] : []);
+  if (changed) pcFillRegisterAddr();
+  const box = $("monitor-install-box");
+  if (box) {
+    if (box.dataset.hostKey !== assetId && $("promconfig-ne")) $("promconfig-ne").innerHTML = "";
+    box.dataset.hostKey = assetId;
+    box.dataset.running = pcRunningByHost[assetId] ? "1" : "0";
+    if (pcProgressByHost[assetId] && pcProgressByHost[assetId].length) pcProgressRender(box, pcProgressByHost[assetId]);
+    else box.innerHTML = "";
   }
-  const sel = $("monitor-host");
-  if (sel) sel.value = monitorState.host || "";
-  if (!monitorState.host) {
-    body.innerHTML = '<p class="muted small">没有主机资产</p>';
-    return;
-  }
-  const res = await api(`/api/monitor/host/${encodeURIComponent(monitorState.host)}?range=${monitorState.range}`);
-  if (!res.ok) {
-    body.innerHTML = "";
-    body.appendChild(el("p", { class: "error", text: res.error || "加载失败" }));
-    return;
-  }
+  const button = $("monitor-detect");
+  if (button) button.disabled = !!pcRunningByHost[assetId];
+}
+
+function monitorHasCurrentMetrics(res) {
+  return [res.overview, res.history].some((section) => section && Object.values(section.metrics || {}).some((metric) =>
+    metric && typeof metric.value === "number" && Number.isFinite(metric.value)
+    && !["no_data", "not_enabled", "collect_error"].includes(metric.state)));
+}
+
+function renderMonitorMetrics(body, res, range) {
   body.innerHTML = "";
-  const hist = res.history || {};
-  const ov = res.overview || {};
-  const bannerState = hist.state || ov.state;
-  if (bannerState === "collect_error") {
-    body.appendChild(el("div", { class: "banner warn", text: "采集失败：" + (hist.error || ov.error || "Prometheus 不可用") }));
-  } else if (bannerState === "no_data") {
-    body.appendChild(el("div", { class: "banner warn", text: "暂无数据：该主机可能未接入 Node Exporter，或标签 asset 未对齐。" }));
+  if (!res.ok) {
+    body.appendChild(el("p", { class: "error", text: humanFormError(res, "暂时无法读取主机资源，业务检查仍可在下方查看。") }));
+    return;
   }
-  const metrics = hist.metrics || {};
-  const groups = buildMetricGroups(metrics);
-  const grid = el("div", { class: "metric-grid" });
-  groups.forEach((g) => {
-    grid.appendChild(metricCard(g.head, g.seriesList));
-  });
-  body.appendChild(grid);
-  body.appendChild(el("p", {
-    class: "muted small",
-    text: `时间范围 ${monitorState.range} · 数据源 Prometheus / Node Exporter · 不在 Ayana 落时序`,
+  const history = res.history || {}, overview = res.overview || {};
+  const bannerState = history.state || overview.state;
+  if (bannerState === "collect_error") body.appendChild(el("div", {
+    class: "banner warn", text: "资源采集暂不可用，请检查采集器和监控连接。下方业务检查单独显示。",
   }));
+  else if (!monitorHasCurrentMetrics(res)) body.appendChild(el("div", {
+    class: "banner warn", text: "这台主机暂无当前资源数据，可以使用上方入口接入监控。业务检查显示在下方。",
+  }));
+  const hasHistory = Object.values(history.metrics || {}).some((metric) => (metric.points || []).length > 0);
+  if (monitorHasCurrentMetrics(res) || hasHistory) {
+    const grid = el("div", { class: "metric-grid" });
+    buildMetricGroups(history.metrics || {}).forEach((group) => grid.appendChild(metricCard(group.head, group.seriesList)));
+    body.appendChild(grid);
+  }
+  body.appendChild(el("p", { class: "muted small", text: `时间范围 ${range} · 数据源 Prometheus / Node Exporter` }));
+}
+
+function businessCheckState(item) {
+  if (item.state) return item.state;
+  if (item.source === "ayana") return !item.enabled ? "disabled" : !item.last_at ? "no_data" : item.last_state;
+  return item.state || "no_data";
+}
+
+function businessStatePresentation(value) {
+  const states = {
+    ok: ["正常", "ok"], fail: ["异常", "bad"], stale: ["样本过期", "warn"],
+    no_data: ["暂无结果", "dim"], collect_error: ["采集失败", "err"],
+    unknown: ["未能确定结果", "warn"], disabled: ["已停用", "dim"],
+  };
+  const [label, cls] = states[value] || ["暂无结果", "dim"];
+  return { label, cls };
+}
+
+function renderMonitorBusiness(res, assetId) {
+  const box = $("monitor-business");
+  if (!box) return;
+  box.innerHTML = "";
+  if (!res.ok) {
+    box.appendChild(el("p", { class: "error", text: humanFormError(res, "业务状态暂时无法读取，请稍后刷新。") }));
+    return;
+  }
+  const items = (res.items || []).filter((item) => !item.asset_id || item.asset_id === assetId);
+  box.appendChild(el("p", { class: "muted small", text: "主机「" + ((res.asset || {}).display_name || checkHostLabel(assetId)) + "」 · 共 " + items.length + " 项业务检查" }));
+  (res.errors || []).forEach((error) => box.appendChild(el("p", {
+    class: "error small", text: (error.source === "ayana" ? "Ayana 原生检查" : "Prometheus 业务监控") + "："
+      + humanFormError(error, "暂时无法读取此来源的检查结果。").slice(0, 240),
+  })));
+  if (!items.length) {
+    box.appendChild(el("p", { class: "muted small", text: (res.errors || []).length
+      ? "当前可读取的来源中还没有业务检查。" : "这台主机还没有业务检查，可点击「配置业务检查」添加。" }));
+    return;
+  }
+  const table = el("table", { class: "table" }, [el("tr", {}, [
+    el("th", { text: "检查" }), el("th", { text: "来源" }), el("th", { text: "状态" }),
+    el("th", { text: "最近结果" }), el("th", { text: "操作" }),
+  ])]);
+  items.forEach((item) => {
+    const status = businessStatePresentation(businessCheckState(item));
+    const native = item.source === "ayana";
+    const recent = native ? checkRecentResult(item) : el("div", { class: "small", text: item.last_at ? fmtTime(item.last_at) : "尚无样本" });
+    if (!native && (item.labels || item.metric)) recent.appendChild(el("details", { class: "assist-debug" }, [
+      el("summary", { text: "高级：采集详情" }),
+      el("pre", { class: "code-block", text: JSON.stringify({ labels: item.labels, metric: item.metric }, null, 2) }),
+    ]));
+    table.appendChild(el("tr", {}, [
+      el("td", { class: "small" }, [el("div", { text: item.name || "业务检查" }), el("div", {
+        class: "muted small", text: native ? checkTypeLabel(item) : item.kind === "proxy" ? "代理连通性" : "服务探测",
+      })]),
+      el("td", {}, [badge(native ? "Ayana 原生" : "Prometheus", "dim")]),
+      el("td", {}, [badge(native && businessCheckState(item) === "no_data" && !item.last_at && item.enabled ? "等待首次检查" : status.label, status.cls)]),
+      el("td", {}, [recent]),
+      el("td", {}, native ? [nativeCheckActions(item)] : [el("span", { class: "muted small", text: "规则可在高级入口配置" })]),
+    ]));
+  });
+  box.appendChild(el("div", { class: "monitor-business-table" }, [table]));
+}
+
+async function renderMonitor() {
+  const body = $("monitor-body"), business = $("monitor-business");
+  if (!body) return;
+  const version = ++monitorState.requestVersion;
+  body.innerHTML = '<p class="muted small">加载资源中…</p>';
+  if (business) business.innerHTML = '<p class="muted small">加载业务状态中…</p>';
+  // Every response belongs to one refresh. Old host/range requests must never replace newer state.
+  const hostsRes = await api("/api/monitor/hosts").catch(() => ({ ok: false }));
+  if (version !== monitorState.requestVersion) return;
+  monitorState.hosts = hostsRes.ok ? hostsRes.hosts || [] : (state.assets || []).map((asset) => ({ asset_id: asset.id, display_name: asset.display_name }));
+  if (!monitorState.hosts.some((host) => host.asset_id === monitorState.host)) monitorState.host = (monitorState.hosts[0] || {}).asset_id || "";
+  const host = monitorState.host, range = monitorState.range;
+  const current = () => version === monitorState.requestVersion && monitorState.host === host && monitorState.range === range;
+  renderMonitorHostControls();
+  syncChecksAsset();
+  syncMonitorOnboarding(host, false);
+  if (!host) {
+    body.innerHTML = '<p class="muted small">没有可查看的主机</p>';
+    if (business) business.innerHTML = '<p class="muted small">添加主机后可以查看业务状态。</p>';
+    return;
+  }
+  await Promise.all([
+    api(`/api/monitor/host/${encodeURIComponent(host)}?range=${encodeURIComponent(range)}`).catch(() => ({ ok: false })).then((res) => {
+      if (!current()) return;
+      if (res.ok && res.health) {
+        monitorState.hosts = monitorState.hosts.map((item) => item.asset_id === host
+          ? { ...item, health: res.health, state: res.health.state || item.state } : item);
+        renderMonitorHostControls();
+      }
+      renderMonitorMetrics(body, res, range);
+      syncMonitorOnboarding(host, res.ok && !monitorHasCurrentMetrics(res));
+    }),
+    (async () => {
+      const [res] = await Promise.all([
+        api(`/api/monitor/business/${encodeURIComponent(host)}`).catch(() => ({ ok: false })),
+        ensureAssistForm("checks").catch(() => null),
+      ]);
+      if (current()) renderMonitorBusiness(res, host);
+    })(),
+  ]);
 }
 
 function stopMonitorAuto() {
@@ -3469,14 +3910,18 @@ on("monitor-refresh", "click", () => renderMonitor());
 on("monitor-auto", "click", () => {
   if (monitorState.autoTimer) { stopMonitorAuto(); return; }
   monitorState.autoTimer = setInterval(() => {
-    if (state.tab === "monitor") renderMonitor();
+    if (state.tab === "monitor" && state.monitorSub === "metrics") renderMonitor();
   }, 30000);
   const b = $("monitor-auto");
   if (b) b.textContent = "停止自动";
 });
 on("monitor-host", "change", (e) => {
-  monitorState.host = e.target.value;
-  renderMonitor();
+  selectMonitorHost(e.target.value);
+});
+on("monitor-configure", "click", () => {
+  setMonitorSub("checks");
+  syncChecksAsset();
+  renderChecks();
 });
 on("monitor-range", "change", (e) => {
   monitorState.range = e.target.value;
@@ -4419,11 +4864,10 @@ async function renderPcNodeExporter() {
   const sel = $("pc-ne-asset");
   if (!box) return;
   if (sel && state.assets) {
-    fillSelect("pc-ne-asset", state.assets.map((a) => ({
-      v: a.id,
-      t: a.id + (a.monitor_host ? " · " + a.monitor_host : ""),
-    })));
-    pcFillRegisterAddr();
+    const host = (state.assets || []).find((asset) => asset.id === monitorState.host) || state.assets[0];
+    const changed = sel.value !== (host || {}).id;
+    fillSelect("pc-ne-asset", host ? [{ v: host.id, t: host.display_name || host.id }] : []);
+    if (changed) pcFillRegisterAddr();
   }
   box.innerHTML = "";
 }
@@ -4471,7 +4915,7 @@ on("pc-ne-check", "click", async () => {
   const asset = ($("pc-ne-asset") || {}).value;
   const r = await api("/api/promconfig/node-exporter?asset_id=" + encodeURIComponent(asset || ""));
   const box = $("promconfig-ne");
-  if (!box) return;
+  if (!box || (($("pc-ne-asset") || {}).value || "") !== asset) return;
   if (!r.ok) {
     box.innerHTML = "";
     box.appendChild(el("p", { class: "error", text: String(r.error || "检查失败") }));
@@ -4495,7 +4939,7 @@ async function pcNodeAction(action) {
     body: JSON.stringify({ asset_id: asset, action, listen_address: "127.0.0.1:9100" }),
   });
   const box = $("promconfig-ne");
-  if (!box) return;
+  if (!box || (($("pc-ne-asset") || {}).value || "") !== asset) return;
   box.innerHTML = "";
   if (!r.ok) {
     box.appendChild(el("p", { class: "error", text: String((r.error || "") + " " + (r.detail || "")) }));
@@ -4518,6 +4962,7 @@ on("pc-ne-register-btn", "click", async () => {
     method: "POST",
     body: JSON.stringify({ asset_id: asset, address }),
   });
+  if ((($("pc-ne-asset") || {}).value || "") !== asset) return;
   if (!r.ok) {
     if (box) {
       box.innerHTML = "";
@@ -4539,13 +4984,101 @@ on("pc-ne-register-btn", "click", async () => {
       }));
     });
   }
-  renderPromConfig();
+  renderMonitor();
 });
 
 /* ---- 业务检查 ---- */
+function checkHostLabel(assetId) {
+  return ((state.assets || []).find((asset) => asset.id === assetId) || {}).display_name || "已登记主机";
+}
+
+function checkFieldValueLabel(name, value) {
+  const field = ((assistForms.checks || {}).fields || []).find((item) => item.name === name);
+  return (field && (field.value_labels || {})[value]) || "未设置";
+}
+
+function checkStateLabel(check) {
+  if (!check.enabled) return "已停用";
+  if (!check.last_at) return "等待首次检查";
+  return { ok: "正常", fail: "异常", unknown: "未能确定结果", no_data: "暂无结果" }[check.last_state] || "暂无结果";
+}
+
+function checkTypeLabel(check) {
+  const params = check.params || {};
+  const target = check.kind === "port" ? " · " + params.port : check.kind === "service" ? " · " + params.unit : "";
+  return checkFieldValueLabel("kind", check.kind) + target;
+}
+
+function checkRecentResult(check) {
+  const box = el("div", { class: "small" }, [el("div", {
+    text: check.last_at ? fmtTime(check.last_at) : "尚未执行",
+  })]);
+  if (check.last_detail) box.appendChild(el("details", { class: "assist-debug" }, [
+    el("summary", { text: "高级：执行详情" }),
+    el("pre", { class: "code-block", text: check.last_detail }),
+  ]));
+  return box;
+}
+
+async function refreshResourceAfterCheck(assetId, showResources = false) {
+  if (showResources && state.tab === "monitor") {
+    monitorState.host = assetId;
+    setMonitorSub("metrics");
+    syncChecksAsset();
+  }
+  if (state.tab === "monitor" && state.monitorSub === "metrics") return renderMonitor();
+  return renderChecks();
+}
+
+function nativeCheckActions(check) {
+  const refresh = () => refreshResourceAfterCheck(check.asset_id);
+  const failed = (res) => showModal("操作未完成", [el("p", { text: humanFormError(res, "请检查主机连接和操作权限后重试。") })]);
+  return el("div", { class: "monitor-business-actions" }, [
+    el("button", {
+      type: "button", class: "btn ghost small", text: "立即测",
+      onclick: async () => {
+        const res = await api("/api/checks/run", { method: "POST", body: JSON.stringify({ id: check.id }) });
+        if (!res.ok) return failed(res);
+        return refresh();
+      },
+    }),
+    el("button", {
+      type: "button", class: "btn ghost small", text: check.enabled ? "停用" : "启用",
+      onclick: async () => {
+        const res = await api("/api/checks/update", { method: "POST", body: JSON.stringify({ id: check.id, enabled: !check.enabled }) });
+        if (!res.ok) return failed(res);
+        return refresh();
+      },
+    }),
+    el("button", {
+      type: "button", class: "btn ghost small", text: "删除",
+      onclick: () => showModal("删除检查", [
+        el("p", { text: `确认删除「${check.name}」？此操作会中断该检查的告警。` }),
+        el("button", {
+          type: "button", class: "btn danger", text: "确认删除",
+          onclick: async () => {
+            const res = await api("/api/checks/delete", { method: "POST", body: JSON.stringify({ id: check.id }) });
+            if (!res.ok) return failed(res);
+            $("modal").classList.add("hidden");
+            return refresh();
+          },
+        }),
+      ]),
+    }),
+  ]);
+}
+
+let checksRenderVersion = 0;
 async function renderChecks() {
-  fillSelect("chk-asset", (state.assets || []).map((a) => ({ v: a.id, t: a.id + " / " + a.display_name })));
+  const version = ++checksRenderVersion;
+  const chosen = (($("chk-asset") || {}).value || "");
+  const hasDraft = !!(($("chk-asset") || {}).dataset || {}).assistDraft;
+  fillSelect("chk-asset", [{ v: "", t: "请选择主机" }, ...(state.assets || []).map((a) => ({ v: a.id, t: a.display_name || a.id }))]);
+  if (chosen || hasDraft) setVal("chk-asset", chosen);
   syncChecksAsset();
+  const formLoad = ensureAssistForm("checks").then(() => chkKindChanged()).catch(() => {
+    assistNote("chk-assist-msg", ["无法加载检查表单定义，请刷新后重试。"], "error");
+  });
   const list = $("chk-list");
   const act = $("chk-activity");
   if (!list) return;
@@ -4555,7 +5088,9 @@ async function renderChecks() {
   const [cRes, aRes] = await Promise.all([
     api("/api/checks" + q).catch(() => ({ ok: false, error: "network" })),
     api("/api/checks/activity").catch(() => ({ ok: false })),
+    formLoad,
   ]);
+  if (version !== checksRenderVersion) return;
   list.innerHTML = "";
   if (!cRes.ok) {
     const err = cRes.error || "";
@@ -4563,8 +5098,8 @@ async function renderChecks() {
     list.appendChild(el("p", {
       class: "error",
       text: isDenied
-        ? "加载失败: denied — 当前账号没有 checks.read 权限（需 admin 或显式授权）。这不是空数据。"
-        : "加载失败: " + (err || cRes.message || "unknown"),
+        ? "当前账号没有查看业务检查的权限，请联系管理员授权。"
+        : "加载失败：" + humanFormError(cRes, "暂时无法加载业务检查，请稍后重试。"),
     }));
     return;
   }
@@ -4572,13 +5107,13 @@ async function renderChecks() {
   if (focusAsset) rows = rows.filter((c) => c.asset_id === focusAsset);
   list.appendChild(el("p", {
     class: "muted small",
-    text: `来源：Ayana 原生检查${focusAsset ? " · 资产 " + focusAsset : " · 全部资产"} · 共 ${rows.length} 项`,
+    text: `来源：Ayana 原生检查${focusAsset ? " · 主机 " + checkHostLabel(focusAsset) : " · 全部主机"} · 共 ${rows.length} 项`,
   }));
   if (!rows.length) {
     list.appendChild(el("p", {
       class: "muted small",
       text: focusAsset
-        ? "该资产还没有原生检查。可在上方添加 TCP / 服务 / 命令检查。"
+        ? "该主机还没有业务检查。可在上方添加端口、服务或只读命令检查。"
         : "还没有检查。选主机和类型，点「添加检查」。",
     }));
   } else {
@@ -4597,74 +5132,33 @@ async function renderChecks() {
       table.appendChild(el("tr", {}, [
         el("td", { class: "small" }, [
           el("div", { text: c.name }),
-          el("div", { class: "muted small", text: c.asset_id }),
+          el("div", { class: "muted small", text: checkHostLabel(c.asset_id) }),
         ]),
         el("td", {
           class: "small",
-          text: c.kind + (c.kind === "port" ? " :" + (c.params.port || "") : c.kind === "service" ? " " + (c.params.unit || "") : ""),
+          text: checkTypeLabel(c),
         }),
         el("td", {}, [badge("原生", "dim")]),
-        el("td", {}, [pcBadge(c.enabled ? c.last_state : "停用", st)]),
+        el("td", {}, [pcBadge(checkStateLabel(c), st)]),
         el("td", {
           class: "small",
-          text: `${c.interval_sec || 60}s / ${c.fail_threshold || 2} / ${c.severity || "warning"}`,
+          text: `每 ${c.interval_sec ?? getSchemaDefault("checks", "interval_sec")} 秒 / 失败 ${c.fail_threshold ?? getSchemaDefault("checks", "fail_threshold")} 次 / ${checkFieldValueLabel("severity", c.severity)}`,
         }),
-        el("td", { class: "small", text: c.last_detail || (c.last_at ? fmtTime(c.last_at) : "—") }),
-        el("td", {}, [
-          el("button", {
-            class: "btn ghost small",
-            text: "立即测",
-            onclick: async () => {
-              const r = await api("/api/checks/run", { method: "POST", body: JSON.stringify({ id: c.id }) });
-              if (!r.ok) {
-                showModal("执行失败", [el("pre", { text: r.error + "\n" + (r.detail || "") })]);
-                return;
-              }
-              renderChecks();
-            },
-          }),
-          el("button", {
-            class: "btn ghost small",
-            text: c.enabled ? "停用" : "启用",
-            onclick: async () => {
-              await api("/api/checks/update", {
-                method: "POST",
-                body: JSON.stringify({ id: c.id, enabled: !c.enabled }),
-              });
-              renderChecks();
-            },
-          }),
-          el("button", {
-            class: "btn ghost small",
-            text: "删除",
-            onclick: () => {
-              showModal("删除检查", [
-                el("p", { text: `确认删除「${c.name}」？此操作会中断该检查的告警。` }),
-                el("button", {
-                  class: "btn danger", text: "确认删除",
-                  onclick: async () => {
-                    await api("/api/checks/delete", { method: "POST", body: JSON.stringify({ id: c.id }) });
-                    $("modal").classList.add("hidden");
-                    renderChecks();
-                  },
-                }),
-              ]);
-            },
-          }),
-        ]),
+        el("td", {}, [checkRecentResult(c)]),
+        el("td", {}, [nativeCheckActions(c)]),
       ]));
     });
     list.appendChild(table);
   }
   if (act) {
     act.innerHTML = "";
-    const items = (aRes && aRes.activity) || [];
+    const items = ((aRes && aRes.activity) || []).filter((item) => !focusAsset || item.asset_id === focusAsset);
     if (!items.length) act.appendChild(el("p", { class: "muted small", text: "暂无动态" }));
     items.slice(0, 20).forEach((x) => {
       act.appendChild(el("p", {
         class: "small",
         style: "margin:4px 0",
-        text: `${fmtTime(x.at)} [${x.state}] ${x.asset_id}/${x.name}: ${x.detail || ""}`,
+        text: `${fmtTime(x.at)} · ${checkHostLabel(x.asset_id)} / ${x.name} · ${checkStateLabel({ enabled: true, last_at: x.at, last_state: x.state })}`,
       }));
     });
   }
@@ -4676,12 +5170,166 @@ function chkKindChanged() {
   if (p) p.classList.toggle("hidden", k !== "port");
   if (s) s.classList.toggle("hidden", k !== "service");
   if (c) c.classList.toggle("hidden", k !== "command");
+  resetCheckConditionalFields();
 }
 on("chk-kind", "change", chkKindChanged);
+on("chk-expect", "change", () => resetCheckConditionalFields());
 on("chk-refresh", "click", () => renderChecks());
-on("chk-asset", "change", () => renderChecks());
+on("chk-asset", "change", () => {
+  if ($("chk-asset")) $("chk-asset").dataset.assistDraft = "1";
+  renderChecks();
+});
 
-/* ---- 自然语言辅助配置（只填表，不保存） ---- */
+/* ---- 自然语言辅助配置：真实表单草稿与追问，不保存、不执行 ---- */
+const assistState = {
+  checks: { sequence: 0, revision: 0, pending: false, response: null, originalText: "", answers: [], manualResolved: new Set() },
+  permissions: { sequence: 0, revision: 0, pending: false, response: null, originalText: "", answers: [], manualResolved: new Set() },
+};
+const assistForms = {};
+const assistFormLoads = {};
+const assistPrefix = (domain) => domain === "checks" ? "chk" : "perm";
+
+async function ensureAssistForm(domain) {
+  if (assistForms[domain]) return assistForms[domain];
+  if (assistFormLoads[domain]) return assistFormLoads[domain];
+  assistFormLoads[domain] = (async () => {
+    const res = await api("/api/assist/form?domain=" + encodeURIComponent(domain));
+    if (!res.ok || !res.form || !Array.isArray(res.form.fields)) {
+      throw new Error("无法读取当前表单定义，请刷新后重试。");
+    }
+    assistForms[domain] = res.form;
+    res.form.fields.forEach((field) => {
+      const node = $(field.control || field.control_id);
+      if (!node) return;
+      if (node.tagName === "SELECT" && Array.isArray(field.values)) {
+        const previous = node.value;
+        node.innerHTML = "";
+        node.appendChild(el("option", { value: "", text: "请选择" + field.label }));
+        field.values.forEach((value) => node.appendChild(el("option", {
+          value, text: (field.value_labels || {})[value] || value,
+        })));
+        node.value = previous || (field.default != null ? String(field.default) : "");
+        if (!previous && field.default != null) markAssistField(node, "默认值", "");
+      }
+      if (node.value === "" && field.default != null) {
+        node.value = field.default;
+        markAssistField(node, "默认值", "");
+      }
+      if (field.minimum != null) node.min = String(field.minimum);
+      if (field.maximum != null) node.max = String(field.maximum);
+      if (field.max_length != null) node.maxLength = field.max_length;
+      if (field.pattern) node.pattern = field.pattern;
+      if (field.help) node.title = field.help;
+      node.dataset.formField = field.name;
+      if (!node.dataset.assistWatched) {
+        node.dataset.assistWatched = "1";
+        ["input", "change"].forEach((event) => node.addEventListener(event, () => {
+          const session = assistState[domain];
+          session.revision += 1;
+          session.manualResolved.add(field.name);
+          markAssistField(node, "已修改", "edited");
+        }));
+      }
+    });
+    return res.form;
+  })();
+  try { return await assistFormLoads[domain]; }
+  finally { delete assistFormLoads[domain]; }
+}
+
+function markAssistField(node, text, source) {
+  const label = node && node.closest("label");
+  if (!label) return;
+  let badge = label.querySelector(".assist-field-source");
+  if (!badge) {
+    badge = el("span", { class: "assist-field-source" });
+    label.appendChild(badge);
+  }
+  badge.textContent = text;
+  badge.className = "assist-field-source " + (source || "");
+}
+
+function collectCheckFields() {
+  const form = assistForms.checks;
+  if (!form) throw new Error("检查表单定义尚未加载，请稍后重试。");
+  const fields = {};
+  form.fields.forEach((field) => {
+    const node = $(field.control || field.control_id);
+    if (!node) return;
+    const value = node.value;
+    fields[field.name] = field.type === "integer" && value !== "" && Number.isFinite(Number(value))
+      ? Number(value) : value;
+  });
+  return Object.fromEntries(form.fields
+    .filter((field) => fieldApplies(field.applicable_if, fields) && Object.prototype.hasOwnProperty.call(fields, field.name))
+    .map((field) => [field.name, fields[field.name]]));
+}
+
+function fieldApplies(condition, fields) {
+  if (!condition) return true;
+  if (Array.isArray(condition.all)) return condition.all.every((rule) => fieldApplies(rule, fields));
+  if (Array.isArray(condition.any)) return condition.any.some((rule) => fieldApplies(rule, fields));
+  if (Object.prototype.hasOwnProperty.call(condition, "equals")) return fields[condition.field] === condition.equals;
+  if (Array.isArray(condition.in)) return condition.in.includes(fields[condition.field]);
+  return false;
+}
+
+function resetCheckConditionalFields() {
+  const form = assistForms.checks;
+  if (!form) return;
+  const values = {};
+  form.fields.forEach((field) => { values[field.name] = (($(field.control || field.control_id) || {}).value || ""); });
+  form.fields.forEach((field) => {
+    const node = $(field.control || field.control_id);
+    if (!node) return;
+    if (!fieldApplies(field.applicable_if, values)) {
+      node.value = "";
+      markAssistField(node, "", "");
+    } else if (field.applicable_if && node.value === "" && field.default != null) {
+      node.value = field.default;
+      markAssistField(node, "默认值", "");
+    }
+  });
+  updateCheckSummary();
+}
+
+function getSchemaDefault(domain, name) {
+  const field = ((assistForms[domain] || {}).fields || []).find((item) => item.name === name);
+  return field && field.default != null ? field.default : null;
+}
+
+function collectPermissionDraft() {
+  const response = assistState.permissions.response || {};
+  const fields = { ...(response.fields || {}) };
+  if (fields.scope === "default") {
+    const control = permDraftControls.get(JSON.stringify([fields.capability, "*", "*"]));
+    if (control) fields.state = control.state;
+  } else {
+    [["capability", "perm-ex-cap"], ["asset_id", "perm-ex-asset"], ["object_id", "perm-ex-object"], ["state", "perm-ex-state"]].forEach(([field, id]) => {
+      if ($(id)) fields[field] = $(id).value;
+    });
+  }
+  return fields;
+}
+
+function humanFormError(res, fallback) {
+  if (res && typeof res.message === "string" && res.message.trim() && !/^[a-z][a-z_0-9.]+$/i.test(res.message.trim())) return res.message;
+  const messages = {
+    denied: "当前账号没有此操作的权限，请联系管理员授权。",
+    approval_required: "此操作需要管理员批准，请先完成审批。",
+    bad_name: "检查名称不符合要求，请使用可读的名称并检查长度。",
+    bad_asset: "选择的主机不存在或已停用，请重新选择。",
+    asset_not_found: "选择的主机不存在，请重新选择。",
+    bad_kind: "请选择系统支持的检查方式。",
+    bad_params: "检查目标不完整或格式不正确，请核对标出的字段。",
+    bad_expect: "探测结果的判断条件不完整，请核对期望内容。",
+    conflict: "此检查已存在，请修改名称或编辑现有检查。",
+    llm_unavailable: "语言模型暂时不可用，请稍后重试，或自行填写表单。",
+    bad_response: "服务器返回的内容无法读取，请稍后重试。",
+  };
+  return messages[(res || {}).error] || fallback || "操作未完成，请核对配置后重试。";
+}
+
 async function assistConfigure(domain, text, context) {
   return api("/api/assist/configure", {
     method: "POST",
@@ -4705,22 +5353,13 @@ function setVal(id, v) {
 }
 
 function applyCheckFields(fields) {
-  if (!fields) return;
-  if (fields.asset_id) setVal("chk-asset", fields.asset_id);
-  if (fields.kind) {
-    setVal("chk-kind", fields.kind);
-    if (typeof chkKindChanged === "function") chkKindChanged();
-  }
-  if (fields.name) setVal("chk-name", fields.name);
-  if (fields["params.port"] != null) setVal("chk-port", fields["params.port"]);
-  if (fields["params.proto"]) setVal("chk-proto", fields["params.proto"]);
-  if (fields["params.unit"]) setVal("chk-unit", fields["params.unit"]);
-  if (fields["params.cmd"]) setVal("chk-cmd", fields["params.cmd"]);
-  if (fields["expect.mode"]) setVal("chk-expect", fields["expect.mode"]);
-  if (fields["expect.value"]) setVal("chk-expect-val", fields["expect.value"]);
-  if (fields.interval_sec != null) setVal("chk-interval", fields.interval_sec);
-  if (fields.fail_threshold != null) setVal("chk-threshold", fields.fail_threshold);
-  if (fields.severity) setVal("chk-severity", fields.severity);
+  const form = assistForms.checks;
+  if (!fields || !form) return;
+  // 新草稿完整替换，避免上一份服务名、命令或告警值混入。
+  form.fields.forEach((field) => setVal(field.control || field.control_id,
+    Object.prototype.hasOwnProperty.call(fields, field.name) ? fields[field.name] : ""));
+  if ($("chk-asset")) $("chk-asset").dataset.assistDraft = "1";
+  chkKindChanged();
   updateCheckSummary();
 }
 
@@ -4728,25 +5367,19 @@ function applyCheckFields(fields) {
 function updateCheckSummary() {
   const box = $("chk-summary");
   if (!box) return;
-  const kind = (($("chk-kind") || {}).value || "port");
-  const name = (($("chk-name") || {}).value || "").trim() || "（未命名）";
-  const asset = (($("chk-asset") || {}).value || "").trim() || "（未选主机）";
-  const interval = (($("chk-interval") || {}).value || "60");
-  const fails = (($("chk-threshold") || {}).value || "2");
-  const sev = (($("chk-severity") || {}).value || "warning");
-  const sevZh = { info: "提示", warning: "警告", critical: "严重" }[sev] || sev;
-  let target = "";
-  if (kind === "port") {
-    target = `端口 ${(($("chk-port") || {}).value || "?")}/${(($("chk-proto") || {}).value || "tcp")}`;
-  } else if (kind === "service") {
-    target = `服务 ${(($("chk-unit") || {}).value || "?")}`;
-  } else {
-    target = `命令 ${(($("chk-cmd") || {}).value || "?")}`;
-  }
-  box.textContent =
-    `将添加检查「${name}」到「${asset}」：${target}；` +
-    `每 ${interval} 秒检测，连续 ${fails} 次失败触发${sevZh}告警。` +
-    `点「添加检查」才会真正创建。`;
+  const read = (id) => (($(id) || {}).value || "").trim();
+  const kind = read("chk-kind");
+  const assetId = read("chk-asset");
+  const asset = ((state.assets || []).find((a) => a.id === assetId) || {}).display_name || assetId || "（未选主机）";
+  const name = read("chk-name") || "（自动生成名称）";
+  const interval = read("chk-interval") || (getSchemaDefault("checks", "interval_sec") != null ? "默认 " + getSchemaDefault("checks", "interval_sec") : "待设置");
+  const fails = read("chk-threshold") || (getSchemaDefault("checks", "fail_threshold") != null ? "默认 " + getSchemaDefault("checks", "fail_threshold") : "待设置");
+  const severity = { info: "提示", warning: "警告", critical: "严重" }[read("chk-severity") || getSchemaDefault("checks", "severity")] || "待设置";
+  let target = "检查方式尚未确定";
+  if (kind === "port") target = `端口 ${read("chk-port") || "待补充"}（${(read("chk-proto") || String(getSchemaDefault("checks", "params.proto") || "待设置")).toUpperCase()}）`;
+  if (kind === "service") target = `服务「${read("chk-unit") || "待补充"}」是否运行`;
+  if (kind === "command") target = `探测命令「${read("chk-cmd") || "待补充"}」`;
+  box.textContent = `准备在「${asset}」添加检查「${name}」：${target}；每 ${interval} 秒检测，连续 ${fails} 次失败触发${severity}告警。核对并确认创建后才会保存。`;
 }
 
 ["chk-asset", "chk-kind", "chk-name", "chk-port", "chk-proto", "chk-unit", "chk-cmd",
@@ -4755,64 +5388,242 @@ function updateCheckSummary() {
   on(id, "input", updateCheckSummary);
 });
 
-on("chk-assist-go", "click", async () => {
-  const text = (($("chk-assist-input") || {}).value || "").trim();
-  const msg = $("chk-assist-msg");
-  if (!text) {
-    assistNote("chk-assist-msg", ["请先用一句话描述要监控什么。"]);
-    return;
-  }
-  assistNote("chk-assist-msg", ["理解中…"]);
-  const res = await assistConfigure("checks", text, {
-    asset_id: monitorState.host || (($("chk-asset") || {}).value || ""),
+function assistFieldLabel(domain, name) {
+  const field = ((assistForms[domain] || {}).fields || []).find((f) => f.name === name);
+  return field ? field.label : "配置内容";
+}
+
+function isAssistAnswerQuestion(question) {
+  return question.mode === "answer" || String(question.field || question.key || "").startsWith("clarification.")
+    || (question.options || []).some((choice) => choice && choice.mode === "answer");
+}
+
+function unresolvedAssistQuestions(domain) {
+  const session = assistState[domain];
+  return ((session.response || {}).missing || []).filter((question) =>
+    isAssistAnswerQuestion(question) || !session.manualResolved.has(question.field || question.key));
+}
+
+function assistFailureLines(domain, res) {
+  const lines = [humanFormError(res, "未能可靠理解这次需求，请补充说明后重试，或自行填写表单。").slice(0, 300)];
+  const reasons = new Set();
+  (Array.isArray((res || {}).issues) ? res.issues : []).forEach((issue) => {
+    if (!issue || typeof issue !== "object") return;
+    let label = assistFieldLabel(domain, issue.field);
+    // Only readable labels belong in the ordinary view; unknown internal keys remain in debug.
+    if (label === "配置内容" && typeof issue.label === "string" && /[\u3400-\u9fff]/.test(issue.label)) label = issue.label.trim().slice(0, 40);
+    const message = humanFormError({ message: issue.message, error: issue.code }, "请检查此项的格式和可用选项。").trim().slice(0, 240);
+    reasons.add(label + "：" + message);
   });
-  if (!res.ok) {
-    assistNote("chk-assist-msg", [res.message || res.error || "无法理解，请手动填写表单"], "error");
-    return;
-  }
-  applyCheckFields(res.fields || {});
+  lines.push(...[...reasons].slice(0, 5));
+  if (reasons.size > 5) lines.push("还有 " + (reasons.size - 5) + " 项需要核对，可在高级区域查看完整说明。");
+  return lines;
+}
+
+function renderAssistDebug(domain, res) {
+  const details = $(assistPrefix(domain) + "-assist-debug");
+  if (!details) return;
+  details.classList.remove("hidden");
+  const pre = details.querySelector("pre");
+  if (pre) pre.textContent = JSON.stringify(res, null, 2);
+}
+
+function setAssistBusy(domain, busy) {
+  const prefix = assistPrefix(domain);
+  assistState[domain].pending = busy;
+  const go = $(prefix + "-assist-go");
+  if (go) go.disabled = busy;
+  const followup = $(prefix + "-assist-followup");
+  if (followup) ["button", "input", "select"].forEach((type) =>
+    followup.querySelectorAll(type).forEach((control) => { control.disabled = busy; }));
+  if (domain === "checks" && $("chk-add")) $("chk-add").disabled = busy;
+}
+
+function markAssistSources(domain, res) {
+  const defaults = new Set(res.defaulted || []);
+  const inferred = new Set((res.inferred_detail || []).map((item) => item.field));
+  (res.inferred || []).forEach((name) => inferred.add(name));
+  ((assistForms[domain] || {}).fields || []).forEach((field) => {
+    const node = $(field.control || field.control_id);
+    if (!node) return;
+    const present = Object.prototype.hasOwnProperty.call(res.fields || {}, field.name);
+    markAssistField(node, !present ? "待补充" : defaults.has(field.name) ? "默认值" : inferred.has(field.name) ? "待核对" : "已填写",
+      inferred.has(field.name) ? "inferred" : "");
+  });
+}
+
+function renderAssistResult(domain, res) {
+  const prefix = assistPrefix(domain);
   const lines = [];
-  lines.push(`识别来源：${res.source === "llm" ? "语言模型" : "规则解析"} · 已填入表单（请核对后点「添加检查」）`);
-  if (res.confirm_question) {
-    lines.push("确认：" + res.confirm_question);
+  if (res.status === "unsupported" || res.unsupported) {
+    const unsupported = res.unsupported || {};
+    lines.push(unsupported.reason || "当前系统无法完成这项配置。");
+    (unsupported.alternatives || []).forEach((alternative) => {
+      const text = typeof alternative === "string" ? alternative : alternative.description || alternative.label;
+      if (text) lines.push("可选方式：" + text);
+    });
+  } else if ((res.missing || []).some(isAssistAnswerQuestion)) {
+    lines.push("还需要确认你的意思，尚未完成配置。", "请回答下方问题；可以选择候选，也可以自己说明。");
+  } else {
+    const queryOnly = domain === "permissions" && ["perm_effective", "perm_ceiling"].includes(res.route);
+    lines.push(domain === "checks" ? "已准备可修改的检查草稿，尚未创建。" : queryOnly ? "已定位权限查询，并填写查询目标。" : "已填写权限草稿，尚未保存。" );
+    (res.inferred_detail || []).forEach((item) => {
+      lines.push("请核对「" + (item.label || assistFieldLabel(domain, item.field)) + "」：" + (item.reason || "根据描述推断。"));
+    });
+    const defaultLabels = (res.defaulted || []).map((name) => assistFieldLabel(domain, name));
+    if (defaultLabels.length) lines.push("采用默认设置：" + defaultLabels.join("、") + "，可以直接修改。");
+    if (res.confirm_question) lines.push("需要确认：" + res.confirm_question);
+    if ((res.missing || []).length) lines.push("还有必要信息需要补充，请回答下方问题，或直接修改对应表单字段。");
+    else if (!queryOnly) lines.push("核对摘要并提交后，还会显示最终确认。");
   }
-  if ((res.inferred || []).length) {
-    lines.push("推断字段：" + res.inferred.join(", ") + "（请核对）");
-  }
-  (res.missing || []).forEach((m) => lines.push(`还需补充 · ${m.label}: ${m.question}`));
-  (res.notes || []).forEach((n) => lines.push(n));
-  if (!(res.missing || []).length && res.confirm_question) {
-    lines.push("请确认后提交，或修改表单。");
-  } else if (!(res.missing || []).length) {
-    lines.push("信息齐全，可直接提交。");
-  }
-  assistNote("chk-assist-msg", lines);
-});
+  assistNote(prefix + "-assist-msg", lines);
+  renderAssistDebug(domain, res);
+  renderAssistFollowup(domain, res);
+}
 
-on("perm-assist-go", "click", async () => {
-  const text = (($("perm-assist-input") || {}).value || "").trim();
+function renderAssistFollowup(domain, res) {
+  const box = $(assistPrefix(domain) + "-assist-followup");
+  if (!box) return;
+  box.innerHTML = "";
+  const questions = res.missing || [];
+  const controls = [];
+  questions.forEach((question, index) => {
+    const key = question.field || question.key || "clarification";
+    const row = el("div", { class: "assist-question" });
+    const id = assistPrefix(domain) + "-assist-answer-" + index;
+    row.appendChild(el("label", { for: id, text: question.question || "请补充" + (question.label || "必要信息") }));
+    let input, custom;
+    if (Array.isArray(question.options) && question.options.length) {
+      input = el("select", { id });
+      input.appendChild(el("option", { value: "", text: "请选择" }));
+      question.options.forEach((choice) => {
+        const value = typeof choice === "string" ? choice : choice.value ?? choice.id ?? choice.label;
+        const label = typeof choice === "string" ? choice : choice.label || String(value);
+        input.appendChild(el("option", { value, text: label }));
+        if (choice.description) row.appendChild(el("p", { class: "assist-choice-help", text: label + "：" + choice.description }));
+      });
+    } else input = el("input", { id, maxlength: 1000, placeholder: "填写你的选择或补充说明" });
+    row.appendChild(input);
+    if (input.tagName === "SELECT" && isAssistAnswerQuestion(question)) {
+      const customId = id + "-custom";
+      row.appendChild(el("label", { for: customId, text: "也可以自己说明" }));
+      custom = el("input", { id: customId, maxlength: 1000, placeholder: "候选不适用时，写下你的意思" });
+      custom.addEventListener("input", () => { if (custom.value.trim()) input.value = ""; });
+      input.addEventListener("change", () => { if (input.value) custom.value = ""; });
+      row.appendChild(custom);
+    }
+    controls.push({ key, input, custom });
+    box.appendChild(row);
+  });
+  if (questions.length) box.appendChild(el("button", {
+    type: "button", class: "btn primary", text: "补充后继续填写",
+    onclick: () => {
+      const answers = controls.map(({ key, input, custom }) => ({ field: key, text: (custom && custom.value.trim()) || input.value.trim() }));
+      if (answers.some((answer) => !answer.text)) {
+        assistNote(assistPrefix(domain) + "-assist-msg", ["请先回答每个必要问题。"], "error");
+        return;
+      }
+      return runAssist(domain, { continuation: true, answers });
+    },
+  }));
+  if (res.confirm_question && !questions.some(isAssistAnswerQuestion)) {
+    box.appendChild(el("button", {
+      type: "button", class: "btn", text: "确认这个理解", style: "margin:8px 8px 0 0",
+      onclick: () => runAssist(domain, { continuation: true, answers: [{ field: "confirmation", text: "确认：" + res.confirm_question }] }),
+    }));
+    const correction = el("input", { placeholder: "有差异时，在这里补充你的意思", style: "margin-top:8px;min-width:260px" });
+    box.appendChild(correction);
+    box.appendChild(el("button", {
+      type: "button", class: "btn", text: "修正理解",
+      onclick: () => {
+        if (correction.value.trim()) runAssist(domain, { continuation: true, answers: [{ field: "clarification", text: correction.value.trim() }] });
+      },
+    }));
+  }
+}
+
+async function runAssist(domain, options = {}) {
+  const prefix = assistPrefix(domain);
+  const session = assistState[domain];
+  const text = options.continuation ? session.originalText : (($(prefix + "-assist-input") || {}).value || "").trim();
   if (!text) {
-    assistNote("perm-assist-msg", ["请描述要查看或修改的权限。"]);
+    assistNote(prefix + "-assist-msg", [domain === "checks" ? "请先描述希望监控什么。" : "请描述要查看或修改的权限。"]);
     return;
   }
-  assistNote("perm-assist-msg", ["理解中…"]);
-  const res = await assistConfigure("permissions", text, {});
-  if (!res.ok) {
-    assistNote("perm-assist-msg", [res.message || res.error || "无法理解"], "error");
-    return;
+  const sequence = ++session.sequence;
+  const revision = session.revision;
+  if (!options.continuation) {
+    session.originalText = text;
+    session.answers = [];
+    session.response = null;
+    session.manualResolved.clear();
+    if ($(prefix + "-assist-followup")) $(prefix + "-assist-followup").innerHTML = "";
   }
-  applyPermIntent(res, text);
+  const answers = [...session.answers, ...(options.answers || [])];
+  setAssistBusy(domain, true);
+  assistNote(prefix + "-assist-msg", ["正在结合当前表单和已登记资产理解需求…"]);
+  try {
+    await ensureAssistForm(domain);
+    const context = { asset_id: domain === "checks" ? (($("chk-asset") || {}).value || "") : "" };
+    if (options.continuation && session.response) {
+      context.draft = {
+        fields: domain === "checks" ? collectCheckFields() : collectPermissionDraft(),
+        original_text: session.originalText, confirm_question: session.response.confirm_question || "",
+      };
+      context.answers = answers;
+    }
+    const res = await assistConfigure(domain, text, context);
+    if (sequence !== session.sequence) return;
+    renderAssistDebug(domain, res);
+    if (revision !== session.revision) {
+      assistNote(prefix + "-assist-msg", ["你已修改表单，这次识别结果没有覆盖修改。可再次点击填写继续。"]);
+      return;
+    }
+    if (!res.ok) {
+      assistNote(prefix + "-assist-msg", assistFailureLines(domain, res), "error");
+      return;
+    }
+    session.response = res;
+    session.answers = answers;
+    session.manualResolved.clear();
+    if (res.status !== "unsupported" && !res.unsupported) {
+      if (domain === "checks") applyCheckFields(res.fields || {});
+      else await applyPermIntent(res, () => sequence === session.sequence && revision === session.revision);
+      if (sequence !== session.sequence || revision !== session.revision) return;
+      markAssistSources(domain, res);
+    } else if (domain === "checks") applyCheckFields({});
+    renderAssistResult(domain, res);
+  } catch (error) {
+    if (sequence === session.sequence) assistNote(prefix + "-assist-msg", ["未完成智能填写，请稍后重试。现有配置未保存。"], "error");
+    renderAssistDebug(domain, { ok: false, message: String(error.message || error) });
+  } finally {
+    if (sequence === session.sequence) setAssistBusy(domain, false);
+  }
+}
+
+["checks", "permissions"].forEach((domain) => {
+  const prefix = assistPrefix(domain);
+  on(prefix + "-assist-go", "click", () => runAssist(domain));
+  on(prefix + "-assist-input", "input", () => {
+    const session = assistState[domain];
+    session.sequence += 1;
+    if (session.pending) assistNote(prefix + "-assist-msg", ["描述已修改，请重新点击填写。"]);
+    setAssistBusy(domain, false);
+  });
 });
 
-function applyPermIntent(res, rawText) {
+async function applyPermIntent(res, isCurrent = () => true) {
   const f = res.fields || {};
-  const route = res.route || "perm_defaults";
+  const route = res.route || (f.scope === "exception" ? "perm_exceptions" : "perm_defaults");
+  if (f.state && !permDraftControls.size) await renderPermissions();
+  if (!isCurrent()) return;
+  permDraftControls.forEach((control) => control.reset());
   // 滚动到真实面板（可交互组件）
   const panelMap = {
     perm_defaults: "perm-panel-defaults",
     perm_exceptions: "perm-panel-exceptions",
     perm_effective: "perm-panel-effective",
-    perm_workbench: "perm-panel-effective",
+    perm_workbench: f.scope === "exception" ? "perm-panel-exceptions" : "perm-panel-defaults",
     perm_ceiling: "perm-panel-ceiling",
   };
   const pid = panelMap[route] || "perm-panel-defaults";
@@ -4823,59 +5634,34 @@ function applyPermIntent(res, rawText) {
     setTimeout(() => { panel.style.outline = ""; }, 1600);
   }
 
-  // 填写查询/编辑控件（不自动保存）
-  if (f.capability) {
-    setVal("perm-eff-cap", f.capability);
-    setVal("perm-ex-cap", f.capability);
-    setVal("perm-cap", f.capability);
+  // 每份草稿重置目标与策略；赋值不会触发保存事件。
+  invalidateEffectivePermission();
+  ["perm-eff-cap", "perm-ex-cap", "perm-cap"].forEach((id) => setVal(id, f.capability || ""));
+  ["perm-eff-asset", "perm-ex-asset", "perm-asset"].forEach((id) => setVal(id, f.asset_id || ""));
+  populatePermissionObjects("ex", f.object_id || "*");
+  populatePermissionObjects("eff", f.object_id || "*");
+  setVal("perm-object", f.object_id || "*");
+  updatePermissionStateSelect(f.state || "");
+  if (f.state && f.capability && f.scope === "default") {
+    const control = permDraftControls.get(JSON.stringify([f.capability, "*", "*"]));
+    if (control) {
+      control.set(f.state);
+      control.element.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
   }
-  if (f.asset_id) {
-    setVal("perm-eff-asset", f.asset_id);
-    setVal("perm-ex-asset", f.asset_id);
-    setVal("perm-asset", f.asset_id);
+  if (f.state) {
+    const flags = permStateToFlags(f.state);
+    if ($("perm-allow")) $("perm-allow").checked = flags.allow;
+    if ($("perm-approval")) $("perm-approval").checked = flags.require_approval;
+    if ($("perm-auto")) $("perm-auto").checked = flags.auto_allowed;
   }
-  if (f.object_id) {
-    setVal("perm-eff-object", f.object_id);
-    setVal("perm-ex-object", f.object_id);
-    setVal("perm-object", f.object_id);
-  }
-
-  const lines = [];
-  lines.push(`识别来源：${res.source === "llm" ? "语言模型" : "规则解析"}`);
-  if (res.confirm_question) lines.push("确认：" + res.confirm_question);
-  lines.push(`已定位界面：${({
-    perm_defaults: "默认授权策略",
-    perm_exceptions: "资产例外",
-    perm_effective: "最终生效权限",
-    perm_workbench: "权限编辑（生效查询区）",
-    perm_ceiling: "Agent 权限上限",
-  })[route] || route}`);
-
-  // 变更预览（仅草稿，不写库）
-  if (route === "perm_workbench" || (f.state && f.scope)) {
-    const state = f.state;
-    const stateZh = { deny: "禁止", confirm: "需要人工确认", auto: "允许自动执行" }[state] || state;
-    const scopeZh = f.scope === "exception" ? "资产例外" : "默认策略";
-    const capZh = f.capability || "（未选操作）";
-    const target = `${f.asset_id || "全部资产"} / ${f.object_id || "*"}`;
-    lines.push("—— 变更草稿（未保存）——");
-    lines.push(`拟修改：${scopeZh} · ${capZh} → ${stateZh}`);
-    lines.push(`作用范围：${target}`);
-    if (state === "auto") lines.push("⚠ 放宽为自动执行，请确认后再点保存。");
-    else if (state === "deny") lines.push("将收紧为禁止。");
-    else lines.push("需人工确认（默认安全）。");
-    lines.push("AI 不会保存；请在下方/默认策略区手动点选三态确认。");
-    // 若是默认策略，高亮对应行的 seg（renderPermissions 已画）——用户可直接点
-  }
-
-  // 缺失追问
-  (res.missing || []).forEach((m) => lines.push(`还需补充 · ${m.label || m.key}: ${m.question}`));
-  (res.notes || []).forEach((n) => lines.push(n));
-
-  assistNote("perm-assist-msg", lines);
+  const preview = $("perm-diff-box");
+  if (preview) preview.textContent = f.state && f.capability
+    ? permissionSummary(f.capability, f.scope === "default" ? "*" : f.asset_id, f.object_id, f.state).join(" ") + " 尚未保存。"
+    : "请选择需要配置的策略，保存前会显示确认摘要。";
 
   // 查询类意图自动跑一次真实查询（只读）
-  if (route === "perm_effective" && f.capability) {
+  if (route === "perm_effective" && f.capability && !(res.missing || []).length) {
     const btn = $("perm-eff-lookup");
     if (btn) btn.click();
   }
@@ -4891,45 +5677,86 @@ on("monitor-detect", "click", () => {
   pcRunAdoptFlow(asset);
 });
 
-on("overview-goto-monitor", "click", () => activateTab("monitor", ""));
+on("overview-goto-monitor", "click", () => {
+  setMonitorSub("metrics");
+  activateTab("monitor", "");
+});
 on("overview-goto-incidents", "click", () => activateTab("incidents", ""));
 on("overview-goto-notify", "click", () => activateTab("notify", ""));
 
-on("chk-add", "click", async () => {
-  const kind = ($("chk-kind") || {}).value;
-  const body = {
-    asset_id: ($("chk-asset") || {}).value,
-    kind,
-    name: ($("chk-name") || {}).value,
-    interval_sec: Number(($("chk-interval") || {}).value || 60),
-    fail_threshold: Number(($("chk-threshold") || {}).value || 2),
-    severity: ($("chk-severity") || {}).value,
-    params: {},
-    expect: {},
-  };
-  if (kind === "port") {
-    body.params = {
-      port: Number(($("chk-port") || {}).value),
-      protocol: ($("chk-proto") || {}).value || "tcp",
-    };
-    if (!body.name) body.name = "port-" + body.params.port;
-  } else if (kind === "service") {
-    body.params = { unit: ($("chk-unit") || {}).value };
-    if (!body.name) body.name = body.params.unit;
-  } else {
-    const raw = ($("chk-cmd") || {}).value || "";
-    body.params = { argv: raw.trim().split(/\s+/).filter(Boolean) };
-    const ev = ($("chk-expect") || {}).value;
-    const evv = ($("chk-expect-val") || {}).value;
-    if (ev === "contains") body.expect = { output_contains: evv };
-    else if (ev === "not_contains") body.expect = { output_not_contains: evv };
-    else body.expect = { exit_code: 0 };
-    if (!body.name) body.name = "cmd";
+function checkPayloadSummary(payload) {
+  const asset = ((state.assets || []).find((a) => a.id === payload.asset_id) || {}).display_name || payload.asset_id;
+  const params = payload.params || {};
+  let target = "";
+  if (payload.kind === "port") target = "检查端口 " + params.port + " 是否监听（" + String(params.protocol || "").toUpperCase() + "）";
+  if (payload.kind === "service") target = "检查服务「" + params.unit + "」是否运行";
+  if (payload.kind === "command") {
+    target = "运行受限探测命令：" + (params.argv || []).map((arg) => /\s/.test(arg) ? JSON.stringify(arg) : arg).join(" ");
+    const expect = payload.expect || {};
+    if (expect.output_contains != null) target += "；输出需包含「" + expect.output_contains + "」";
+    else if (expect.output_not_contains != null) target += "；输出不能包含「" + expect.output_not_contains + "」";
+    else target += "；命令成功结束时视为正常";
   }
-  const r = await api("/api/checks", { method: "POST", body: JSON.stringify(body) });
-  if (!r.ok) alert("添加失败: " + (r.error || r.detail || ""));
-  renderChecks();
-});
+  return [
+    "将在「" + asset + "」创建检查「" + payload.name + "」。", target + "。",
+    "每 " + payload.interval_sec + " 秒检测，连续 " + payload.fail_threshold + " 次失败后触发" + ({ info: "提示", warning: "警告", critical: "严重" }[payload.severity] || "") + "告警。",
+  ];
+}
+
+async function prepareCheckSubmit() {
+  const button = $("chk-add");
+  if (assistState.checks.pending || (button && button.disabled)) return;
+  if (button) button.disabled = true;
+  try {
+    await ensureAssistForm("checks");
+    const fields = collectCheckFields();
+    const session = assistState.checks;
+    if ((session.response || {}).status === "unsupported" && !session.manualResolved.size) {
+      assistNote("chk-assist-msg", ["当前需求超出系统支持的范围。可补充说明选择可用方式，或自行填写一个新的检查。"], "error");
+      return;
+    }
+    const unresolved = unresolvedAssistQuestions("checks");
+    if (unresolved.length) {
+      assistNote("chk-assist-msg", [unresolved.some(isAssistAnswerQuestion)
+        ? "请先回答下方的需求确认问题，再核对并创建。"
+        : "请先补充必要信息，或直接修改对应字段，再核对并创建。"], "error");
+      return;
+    }
+    const assistSequence = session.sequence;
+    const snapshot = JSON.stringify(fields);
+    const validation = await api("/api/checks/validate", { method: "POST", body: JSON.stringify({ fields }) });
+    renderAssistDebug("checks", { stage: "validation", ...validation });
+    if (assistSequence !== session.sequence || session.pending || snapshot !== JSON.stringify(collectCheckFields())) {
+      assistNote("chk-assist-msg", ["校验期间表单已修改，请重新点击添加以核对最新配置。"], "error");
+      return;
+    }
+    if (!validation.ok || !validation.payload) {
+      const issues = (validation.issues || []).map((item) => (item.label || "配置") + "：" + item.message);
+      assistNote("chk-assist-msg", issues.length ? issues : [humanFormError(validation, "检查配置尚不完整，请核对后再提交。")], "error");
+      return;
+    }
+    const payload = validation.payload;
+    const summary = checkPayloadSummary(payload);
+    if (session.response && session.response.confirm_question) summary.push("本次理解：" + session.response.confirm_question);
+    const defaulted = (validation.defaulted || []).map((name) => assistFieldLabel("checks", name));
+    if (defaulted.length) summary.push("未指定的设置采用默认值：" + defaulted.join("、") + "。");
+    summary.push("确认后才会保存并启用此检查。取消不会创建。" );
+    confirmFormAction("确认创建业务检查", summary, async () => {
+      const res = await api("/api/checks", { method: "POST", body: JSON.stringify(payload) });
+      if (res.ok) {
+        assistNote("chk-assist-msg", ["检查已创建，已更新这台主机的资源与业务状态。"]);
+        await refreshResourceAfterCheck(payload.asset_id, true);
+      } else renderAssistDebug("checks", { stage: "create", ...res });
+      return res;
+    }, () => !assistState.checks.pending && assistSequence === assistState.checks.sequence
+      && !unresolvedAssistQuestions("checks").length && snapshot === JSON.stringify(collectCheckFields()));
+  } catch (_) {
+    assistNote("chk-assist-msg", ["未能完成提交前校验，请刷新后重试。检查尚未创建。"], "error");
+  } finally {
+    if (button) button.disabled = assistState.checks.pending;
+  }
+}
+on("chk-add", "click", prepareCheckSubmit);
 
 /* ---- init ---- */
 boot();

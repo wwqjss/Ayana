@@ -10,7 +10,7 @@
 
 <title>Ayana</title>
 
-<link rel="stylesheet" href="/static/app.css?v=13">
+<link rel="stylesheet" href="/static/app.css?v=16">
 
 <link rel="stylesheet" href="/static/xterm/xterm.css">
 
@@ -134,10 +134,9 @@
       <section id="tab-monitor" class="tab-panel hidden">
 
         <div class="subnav" id="monitor-subnav">
-          <button data-sub="metrics" class="subtab active">主机与指标</button>
-          <button data-sub="checks" class="subtab">业务监控</button>
-          <button data-sub="onboard" class="subtab">接入</button>
-          <button data-sub="prom" class="subtab">Prometheus / 规则</button>
+          <button data-sub="metrics" class="subtab active">资源状态</button>
+          <button data-sub="checks" class="subtab">检查配置</button>
+          <button data-sub="prom" class="subtab">高级：Prometheus / 规则</button>
         </div>
 
         <div id="monitor-sub-metrics" class="subpanel">
@@ -151,7 +150,7 @@
 
             <span class="badge ok">正常</span>
 
-            <span class="badge warn">偏高</span>
+            <span class="badge warn">偏高 / 部分未观测</span>
 
             <span class="badge bad">异常</span>
 
@@ -191,67 +190,94 @@
 
           <div id="monitor-hosts-strip" class="monitor-strip"></div>
 
+          <div id="monitor-onboard" class="monitor-onboard hidden">
+            <h3>接入这台主机的资源监控</h3>
+            <p class="muted small">这台主机还没有当前资源数据。接入采集器后可查看资源趋势，下方业务检查可以独立使用。</p>
+            <div class="form-row" id="monitor-install-row">
+              <button class="btn primary" id="monitor-detect" type="button">一键接入监控（分步）</button>
+              <span class="muted small">自动检测采集器、安装并注册。</span>
+            </div>
+            <div id="monitor-install-box"></div>
+            <details class="pc-adv">
+              <summary>高级：采集器管理</summary>
+              <div class="form-row">
+                <label>当前主机 <select id="pc-ne-asset" disabled></select></label>
+                <input id="pc-ne-register" placeholder="采集地址（可留空）" style="min-width:220px">
+                <button class="btn primary" id="pc-ne-register-btn" type="button">注册采集器</button>
+                <button class="btn" id="pc-ne-check" type="button">状态</button>
+                <button class="btn" id="pc-ne-start" type="button">启动</button>
+                <button class="btn" id="pc-ne-stop" type="button">停止</button>
+              </div>
+              <div id="promconfig-ne"></div>
+            </details>
+          </div>
         </div>
 
         <div id="monitor-body"></div>
+        <div class="card" id="monitor-business-card">
+          <div class="monitor-business-heading">
+            <div><h2>业务状态</h2><p class="muted small">当前主机的服务与探测检查，汇总 Prometheus 和 Ayana 原生结果。</p></div>
+            <button class="btn" id="monitor-configure" type="button">配置业务检查</button>
+          </div>
+          <div id="monitor-business" aria-live="polite"></div>
+        </div>
         </div>
 
         <div id="monitor-sub-checks" class="subpanel hidden">
           <div class="card">
-            <h2>业务监控</h2>
+            <h2>配置业务检查</h2>
             <p class="muted small">
-              Ayana 原生检查（TCP / HTTP / 服务 / 自定义命令），与上方 Prometheus 指标同属当前资产。
-              异常进入事件与通知。不依赖 Prometheus。
+              在已登记主机上创建端口监听、服务状态或只读探测检查。结果统一显示在「资源状态」。
+              异常进入事件与通知，原生检查可以独立于 Prometheus 使用。
             </p>
             <div class="assist-box" id="chk-assist-box">
-              <div class="assist-title">自然语言辅助配置</div>
+              <div class="assist-title">描述需求，准备检查</div>
               <div class="form-row">
                 <input id="chk-assist-input" placeholder="例如：给 KANATA 的 8080 端口做一个检查，每 60 秒一次，连续 2 次失败就严重告警" style="flex:1;min-width:280px">
                 <button class="btn primary" id="chk-assist-go" type="button">帮我填表</button>
               </div>
-              <div id="chk-assist-msg" class="muted small"></div>
+              <div id="chk-assist-msg" class="muted small" aria-live="polite"></div>
+              <div id="chk-assist-followup" class="assist-followup"></div>
+              <details id="chk-assist-debug" class="assist-debug hidden"><summary>高级：识别与校验详情</summary><pre class="code-block"></pre></details>
             </div>
+            <h3 class="check-form-title">基本配置</h3>
             <div class="form-row">
               <label>所属主机
                 <select id="chk-asset"></select>
               </label>
               <label>类型
                 <select id="chk-kind">
-                  <option value="port">端口监听</option>
-                  <option value="service">服务启动</option>
-                  <option value="command">自定义命令</option>
+                  <option value="">请选择检查方式</option>
                 </select>
               </label>
-              <label>名称 <input id="chk-name" placeholder="如 harbor-http"></label>
+              <label>检查名称 <input id="chk-name" placeholder="例如：网站运行状态"></label>
             </div>
+            <p class="muted small">名称可使用中文和空格。填写后的内容都可以修改，确认创建后才会保存。</p>
             <div class="form-row" id="chk-params-port">
               <label>端口 <input id="chk-port" type="number" placeholder="8080"></label>
               <label>协议
-                <select id="chk-proto"><option value="tcp">tcp</option><option value="udp">udp</option></select>
+                <select id="chk-proto"><option value="">加载中</option></select>
               </label>
             </div>
             <div class="form-row hidden" id="chk-params-service">
-              <label>服务名 <input id="chk-unit" placeholder="nginx"></label>
+              <label>服务名称 <input id="chk-unit" placeholder="例如：nginx"></label>
             </div>
             <div class="form-row hidden" id="chk-params-command">
-              <label>命令(空格分隔) <input id="chk-cmd" placeholder="curl -f http://127.0.0.1:8080/health" style="min-width:320px"></label>
+              <label>探测命令 <input id="chk-cmd" placeholder="使用此主机允许的只读探测命令" style="min-width:320px"></label>
               <label>期望
                 <select id="chk-expect">
-                  <option value="exit0">退出码 0</option>
-                  <option value="contains">输出包含</option>
-                  <option value="not_contains">输出不含</option>
+                  <option value="">加载中</option>
                 </select>
               </label>
               <label>匹配串 <input id="chk-expect-val" placeholder="ok"></label>
             </div>
+            <h3 class="check-form-title">检查与告警</h3>
             <div class="form-row">
-              <label>间隔秒 <input id="chk-interval" type="number" value="60"></label>
-              <label>连续失败 <input id="chk-threshold" type="number" value="2"></label>
+              <label>检测间隔（秒） <input id="chk-interval" type="number"></label>
+              <label>连续失败次数 <input id="chk-threshold" type="number"></label>
               <label>级别
                 <select id="chk-severity">
-                  <option value="warning">warning</option>
-                  <option value="critical">critical</option>
-                  <option value="info">info</option>
+                  <option value="">加载中</option>
                 </select>
               </label>
               <button class="btn primary" id="chk-add" type="button">添加检查</button>
@@ -263,27 +289,6 @@
           <div class="card">
             <h2>执行动态</h2>
             <div id="chk-activity"></div>
-          </div>
-        </div>
-
-        <div id="monitor-sub-onboard" class="subpanel hidden">
-          <div class="card">
-            <h2>一键接入监控</h2>
-            <p class="muted small">全站唯一接入入口。自动判断 Docker / 二进制，推荐安装方式。</p>
-            <div class="form-row" id="monitor-install-row">
-              <button class="btn primary" id="monitor-detect" type="button">一键接入监控（分步）</button>
-              <span class="muted small">给还没有采集器的主机：检查 → 装 Node Exporter → 自动注册。</span>
-            </div>
-            <div id="monitor-install-box"></div>
-            <div class="form-row" style="margin-top:12px">
-              <select id="pc-ne-asset"></select>
-              <input id="pc-ne-register" placeholder="采集地址(自动)" style="min-width:220px">
-              <button class="btn primary" id="pc-ne-register-btn" type="button">一键接入</button>
-              <button class="btn" id="pc-ne-check" type="button">状态</button>
-              <button class="btn" id="pc-ne-start" type="button">启动</button>
-              <button class="btn" id="pc-ne-stop" type="button">停止</button>
-            </div>
-            <div id="promconfig-ne"></div>
           </div>
         </div>
 
@@ -849,7 +854,9 @@
               <input id="perm-assist-input" placeholder="例如：查看 NERV 的 frps 权限 / 所有服务器允许看日志、重启要确认 / 修改 KANATA 的容器重启权限" style="flex:1;min-width:280px">
               <button class="btn primary" id="perm-assist-go" type="button">定位并填写</button>
             </div>
-            <div id="perm-assist-msg" class="muted small"></div>
+            <div id="perm-assist-msg" class="muted small" aria-live="polite"></div>
+            <div id="perm-assist-followup" class="assist-followup"></div>
+            <details id="perm-assist-debug" class="assist-debug hidden"><summary>高级：识别与校验详情</summary><pre class="code-block"></pre></details>
           </div>
           <div class="perm-legend">
             <span><span class="dot" style="background:var(--bad)"></span>禁止</span>
@@ -880,8 +887,9 @@
             <label>资产
               <select id="perm-ex-asset"></select>
             </label>
-            <label>对象 <input id="perm-ex-object" value="*" placeholder="* 或对象名"></label>
-            <button class="btn primary" id="perm-ex-add">添加例外</button>
+            <label>对象 <select id="perm-ex-object"><option value="*">全部对象</option></select></label>
+            <label>例外策略 <select id="perm-ex-state"><option value="">请选择策略</option></select></label>
+            <button class="btn primary" id="perm-ex-add">保存例外</button>
           </div>
           <div id="perm-diff-box" class="live-summary"></div>
         </div>
@@ -892,7 +900,7 @@
           <div class="form-row">
             <label>操作 <select id="perm-eff-cap"></select></label>
             <label>资产 <select id="perm-eff-asset"></select></label>
-            <label>对象 <input id="perm-eff-object" value="*" ></label>
+            <label>对象 <select id="perm-eff-object"><option value="*">全部对象</option></select></label>
             <button class="btn primary" id="perm-eff-lookup">查询</button>
           </div>
           <div id="perm-eff-result"></div>
@@ -999,7 +1007,7 @@
 
 <script src="/static/xterm/xterm-addon-fit.js"></script>
 
-<script src="/static/app.js?v=37"></script>
+<script src="/static/app.js?v=40"></script>
 
 </body>
 

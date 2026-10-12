@@ -111,6 +111,12 @@ def make_env():
         " VALUES(?,?,?,?,?,?)",
         ("nerv:service:frps", "nerv", "service", "frps", "frps", t),
     )
+    db.execute(
+        "INSERT OR IGNORE INTO users(username, password_hash, totp_enabled, is_admin, created_at, updated_at)"
+        " VALUES('admin','x',0,1,?,?)",
+        (now(), now()),
+    )
+
     policy = Policy(db)
     policy.upsert_permission(
         subject_type="web_user", subject_id="admin", capability="service.restart",

@@ -66,6 +66,12 @@ class AgentLoop:
         inc = dict(inc)
         if inc["status"] != "open":
             return {"ok": True, "skipped": "not_open"}
+        from .incidents import IncidentService
+
+        blocked = IncidentService(self.db).source_block_reason(inc_id)
+        if blocked:
+            self._escalate(inc_id, blocked, None)
+            return {"ok": True, "incident_id": inc_id, "action": "escalated_source", "reason": blocked}
 
         result: dict[str, Any] = {"incident_id": inc_id, "steps": []}
 
@@ -239,7 +245,8 @@ class AgentLoop:
         if decision.get("decision") == "automatic" and self.auto_enabled:
             reasons = pre_result.get("reasons") or []
             hard_stop = any(
-                ("global_pause" in r) or ("control_plane" in r) for r in reasons
+                ("global_pause" in r) or ("control_plane" in r) or ("verification_contract" in r)
+                for r in reasons
             )
             if pre_result.get("status") != "satisfied" and hard_stop:
                 self._escalate(
@@ -483,10 +490,12 @@ class AgentLoop:
             f"decision={decision.get('decision')} "
             f"rule={rule.id}"
         )
+        from .incidents import IncidentService
+
+        IncidentService(self.db).set_need_human(inc_id, reason)
         self.db.execute(
-            "UPDATE incidents SET need_human=1, need_human_reason=?, stage='awaiting_approval',"
-            " updated_at=? WHERE id=?",
-            (reason, now(), inc_id),
+            "UPDATE incidents SET stage='awaiting_approval', updated_at=? WHERE id=?",
+            (now(), inc_id),
         )
         body = fmt_escalate(inc_d, reason, "")
         self.notifier.enqueue(
@@ -557,6 +566,14 @@ class AgentLoop:
         # 本事件自身刚 propose 的不算
         object_locked = bool(locked and locked["n"] > 0)
 
+        from .verify_profiles import profile_for_action
+        from .capabilities import resolve_object_name
+
+        profile = profile_for_action(
+            capability=rule.capability, asset_id=asset_id,
+            object_id=resolve_object_name(dict(obj)) if obj else "",
+        )
+
         return {
             "asset_id": asset_id,
             "object_name": object_name,
@@ -565,7 +582,7 @@ class AgentLoop:
             "probe_samples_ok": probe_samples_ok,
             "service_state": None,
             "exec_channel_ok": transport_ok if transport_ok is not None else True,
-            "verification_ready": True,
+            "verification_ready": profile is not None,
             "global_pause": bool(stop and stop["enabled"]),
             "policy_allowed": policy.get("allowed") and bool(policy.get("auto_allowed")),
             "budget_ok": budget_ok,
@@ -614,10 +631,9 @@ class AgentLoop:
         detail = reason
         if llm_result:
             detail += f" | llm: {llm_result.get('summary', '')[:80]}"
-        self.db.execute(
-            "UPDATE incidents SET need_human=1, need_human_reason=?, updated_at=? WHERE id=?",
-            (detail, now(), inc_id),
-        )
+        from .incidents import IncidentService
+
+        IncidentService(self.db).set_need_human(inc_id, detail)
         self.db.event(
             "agent_escalated",
             f"escalate: {reason}",

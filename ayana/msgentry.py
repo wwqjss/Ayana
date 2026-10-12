@@ -19,6 +19,8 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
+from .readonly_commands import readonly_command, safe_tokens
+
 log = logging.getLogger("ayana.msgentry")
 
 # 唤醒词：@Ayana / @ayana / Ayana（行首或 @ 后）
@@ -72,10 +74,6 @@ _READ_VERBS = frozenset(
         "uptime",
         "ss",
         "netstat",
-        "cat",
-        "head",
-        "tail",
-        "grep",
         "journalctl",
         "version",
         "info",
@@ -85,6 +83,7 @@ _READ_VERBS = frozenset(
 )
 
 # 只读程序（精确白名单，S07: 未知程序默认拒绝）
+# P1-02: 移除 cat/head/tail/grep 任意文件读取与 docker inspect（环境变量泄露）
 _READ_PROGRAMS = frozenset(
     {
         "systemctl",
@@ -100,12 +99,7 @@ _READ_PROGRAMS = frozenset(
         "free",
         "df",
         "ls",
-        "cat",
-        "head",
-        "tail",
-        "grep",
         "ps",
-        "top",
         "ss",
         "netstat",
         "journalctl",
@@ -224,23 +218,22 @@ def classify_command(tokens: list[str]) -> str:
     """
     if not tokens:
         return "unknown"
-    prog = tokens[0].lower()
+    if not safe_tokens(tokens):
+        return "unknown"
+    prog = tokens[0]
 
     # 写程序 + 写动词 → write
     if prog in _WRITE_PROGRAMS and len(tokens) >= 2:
         verb = tokens[1].lower()
         if verb in _WRITE_VERBS:
             return "write"
-        if verb in _READ_VERBS:
-            return "read"
-        return "unknown"  # 未知动词不放行
 
     # 裸写动词（如 kill）→ write
     if prog in _WRITE_VERBS:
         return "write"
 
-    # 只读程序 → read（仅限白名单）
-    if prog in _READ_PROGRAMS:
+    # 完整程序 + 参数语法白名单；未知参数不得继承程序名的读取权限。
+    if readonly_command(tokens):
         return "read"
 
     # 未知程序 → 拒绝（S07 核心修复）

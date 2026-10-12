@@ -185,6 +185,12 @@ def make_env(
              extra.get("port"), extra.get("protocol", "tcp"), extra.get("external_probe", ""),
              1, t),
         )
+    db.execute(
+        "INSERT OR IGNORE INTO users(username, password_hash, totp_enabled, is_admin, created_at, updated_at)"
+        " VALUES('admin','x',0,1,?,?)",
+        (now(), now()),
+    )
+
     policy = Policy(db)
     default_grants = [
         ("asset.summary", True, False, True),

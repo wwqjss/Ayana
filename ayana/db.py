@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 
 class MigrationError(RuntimeError):
@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS users (
   totp_secret TEXT NOT NULL DEFAULT '',
   totp_enabled INTEGER NOT NULL DEFAULT 0,
   is_admin INTEGER NOT NULL DEFAULT 1,
+  must_change_password INTEGER NOT NULL DEFAULT 0,
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL
 );
@@ -732,6 +733,13 @@ def _migrate_v12_asset_host(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v13_users_must_change_password(conn: sqlite3.Connection) -> None:
+    """首登强制改密标记。"""
+    _add_columns(conn, "users", [
+        ("must_change_password", "ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0"),
+    ])
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_v1_baseline,
     2: _migrate_v2_p0_p1_columns,
@@ -745,6 +753,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     10: _migrate_v10_message_log,
     11: _migrate_v11_checks,
     12: _migrate_v12_asset_host,
+    13: _migrate_v13_users_must_change_password,
 }
 
 _MIGRATION_NAMES = {
@@ -887,8 +896,8 @@ class Database:
         conn = self._connect()
         with self._write_lock:
             # 事务深度：用线程局部变量追踪（sqlite3.Connection 不允许自定义属性）
-            depth = getattr(self, "_tx_depth", 0)
-            self._tx_depth = depth + 1
+            depth = getattr(self._local, "tx_depth", 0)
+            self._local.tx_depth = depth + 1
             try:
                 yield conn
                 if depth == 0:
@@ -898,13 +907,14 @@ class Database:
                     conn.rollback()
                 raise
             finally:
-                self._tx_depth = depth
+                self._local.tx_depth = depth
 
     def execute(self, sql: str, params: tuple | dict = ()) -> sqlite3.Cursor:
         conn = self._connect()
         with self._write_lock:
             cur = conn.execute(sql, params)
-            conn.commit()
+            if getattr(self._local, "tx_depth", 0) == 0:
+                conn.commit()
             return cur
 
     def query(self, sql: str, params: tuple | dict = ()) -> list[sqlite3.Row]:

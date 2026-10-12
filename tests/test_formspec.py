@@ -1,0 +1,345 @@
+"""草稿、真实表单和持久化接口共同使用的契约。"""
+
+from __future__ import annotations
+
+import unittest
+
+from ayana.checks import CheckError, build_tokens
+from ayana.formspec import (
+    check_payload, condition_applicability, condition_dependencies, condition_matches,
+    field_applicability, form_prompt_payload, get_form, payload_to_fields,
+    validate_check_payload, validate_fields,
+)
+
+
+ASSETS = [{"id": "romi", "display_name": "ROMI", "enabled": True}]
+
+
+class TestFormContract(unittest.TestCase):
+    def service(self, **extra):
+        return {"asset_id": "romi", "kind": "service", "name": "监控 ROMI 的 nginx 服务",
+                "params.unit": "nginx.service", **extra}
+
+    def test_service_draft_matches_real_execution_and_preserves_name(self):
+        result = validate_fields("checks", self.service(), assets=ASSETS)
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["fields"]["name"], "监控 ROMI 的 nginx 服务")
+        self.assertEqual(result["payload"]["expect"], {"active_state": "active"})
+        self.assertEqual(build_tokens(result["payload"]["kind"], result["payload"]["params"]),
+                         [["systemctl", "is-active", "nginx.service"]])
+        self.assertEqual(set(result["defaulted"]), {"interval_sec", "fail_threshold", "severity"})
+
+    def test_port_adapter_uses_backend_protocol(self):
+        payload = check_payload({"asset_id": "romi", "kind": "port", "params": {"port": "53", "proto": "udp"}}, assets=ASSETS)
+        self.assertEqual(payload["params"], {"port": 53, "protocol": "udp"})
+        self.assertEqual(build_tokens("port", payload["params"])[0][1], "-lnu")
+        fields = payload_to_fields(payload)
+        self.assertEqual(fields["params.proto"], "udp")
+        self.assertEqual(check_payload(fields, assets=ASSETS), payload)
+
+    def test_command_expectation_roundtrip(self):
+        # P1-07: 仅 exit0；contains/not_contains 必须拒绝
+        fields = {"asset_id": "romi", "kind": "command",
+                  "params.cmd": "curl -q --disable http://127.0.0.1/health",
+                  "expect.mode": "exit0"}
+        payload = check_payload(fields, assets=ASSETS)
+        self.assertEqual(payload["expect"], {"exit_code": 0})
+        self.assertEqual(payload["params"]["argv"],
+                         ["curl", "-q", "--disable", "http://127.0.0.1/health"])
+        self.assertEqual(check_payload(payload_to_fields(payload), assets=ASSETS), payload)
+        for mode in ("contains", "not_contains"):
+            bad = {**fields, "expect.mode": mode, "expect.value": "正常"}
+            with self.subTest(mode=mode):
+                result = validate_fields("checks", bad, assets=ASSETS, partial=False)
+                self.assertFalse(result["valid"])
+
+    def test_partial_draft_does_not_guess_kind_or_target(self):
+        result = validate_fields("checks", {"asset_id": "romi"}, assets=ASSETS)
+        self.assertFalse(result["valid"])
+        self.assertNotIn("kind", result["fields"])
+        self.assertNotIn("name", result["fields"])
+        self.assertEqual(result["issues"], [])
+        self.assertEqual([item["field"] for item in result["missing"]], ["kind"])
+        self.assertIsNone(result["payload"])
+
+    def test_missing_target_is_question_not_invalid_model_output(self):
+        result = validate_fields("checks", {"asset_id": "romi", "kind": "service"}, assets=ASSETS)
+        self.assertEqual(result["issues"], [])
+        self.assertEqual([item["field"] for item in result["missing"]], ["params.unit"])
+
+    def test_invalid_integer_is_not_truncated_clamped_or_defaulted(self):
+        for field, values in {"params.port": [True, 80.5, "80.5", 0, 65536],
+                              "interval_sec": [True, 60.5, "60.0", 14, 3601],
+                              "fail_threshold": [False, 2.5, "2.1", 0, 11]}.items():
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    fields = {"asset_id": "romi", "kind": "port", "params.port": 80, field: value}
+                    result = validate_fields("checks", fields, assets=ASSETS)
+                    self.assertFalse(result["valid"])
+                    self.assertIn(field, [i["field"] for i in result["issues"]])
+                    self.assertNotIn(field, result["fields"])
+                    self.assertNotIn(field, result["defaulted"])
+
+    def test_unknown_and_duplicate_fields_are_visible_failures(self):
+        for fields in (self.service(restart=True),
+                       {**self.service(), "params": {"unit": "other"}},
+                       {**self.service(), "params.proto": "udp"}):
+            result = validate_fields("checks", fields, assets=ASSETS)
+            self.assertFalse(result["valid"])
+            self.assertTrue(result["issues"])
+            self.assertIsNone(result["payload"])
+
+    def test_invalid_asset_not_changed_to_default_asset(self):
+        for asset in ("missing", "romi"):
+            assets = ASSETS if asset == "missing" else [{**ASSETS[0], "enabled": False}]
+            result = validate_fields("checks", self.service(asset_id=asset), assets=assets)
+            self.assertEqual(result["issues"][0]["field"], "asset_id")
+            self.assertNotIn("asset_id", result["fields"])
+
+    def test_name_length_and_control_characters_rejected_without_truncation(self):
+        for name in ("检" * 65, "监控\nnginx", "nginx\x00", "nginx\n"):
+            result = validate_fields("checks", self.service(name=name), assets=ASSETS)
+            self.assertFalse(result["valid"])
+            self.assertNotIn("name", result["fields"])
+            self.assertNotIn("name", result["defaulted"])
+
+    def test_omitted_optional_name_gets_readable_display_default(self):
+        fields = self.service()
+        fields.pop("name")
+        result = validate_fields("checks", fields, assets=ASSETS)
+        self.assertEqual(result["fields"]["name"], "ROMI · nginx.service 运行状态")
+        self.assertIn("name", result["defaulted"])
+        unusual_assets = [{**ASSETS[0], "display_name": "ROMI\n网站主机"}]
+        payload = check_payload(fields, assets=unusual_assets)
+        self.assertEqual(payload["name"], "ROMI 网站主机 · nginx.service 运行状态")
+        self.assertTrue(validate_check_payload(payload, assets=unusual_assets)["valid"])
+
+    def test_unsafe_command_or_match_text_missing_blocks_submit(self):
+        for command in ("rm -rf /", "sh -c id", "curl http://x;id", "curl " + "x" * 121,
+                        "curl -X POST http://127.0.0.1/health", "wget http://127.0.0.1/health", "ss -K",
+                        "curl http://127.0.0.1/health"):
+            result = validate_fields("checks", {"asset_id": "romi", "kind": "command", "params.cmd": command}, assets=ASSETS)
+            self.assertIn("params.cmd", [i["field"] for i in result["issues"]])
+            self.assertIsNone(result["payload"])
+        # P1-07: contains 不再要求 expect.value，而是直接拒绝
+        result = validate_fields("checks", {"asset_id": "romi", "kind": "command", "params.cmd": "true", "expect.mode": "contains"}, assets=ASSETS)
+        self.assertFalse(result["valid"])
+        self.assertIn("expect.mode", [i["field"] for i in result["issues"]])
+
+    def test_actual_payload_invalid_expectation_not_silently_dropped(self):
+        base = {"asset_id": "romi", "name": "健康检查", "kind": "command", "params": {"argv": ["true"]}}
+        for expect in ({"exit_code": True}, {"exit_code": 0.0}, {"exit_code": 1},
+                       {"exit_code": 0, "output_contains": "ok"}, {"mode": "contains"},
+                       {"output_contains": ""}):
+            result = validate_check_payload({**base, "expect": expect}, assets=ASSETS)
+            self.assertFalse(result["valid"])
+            self.assertIsNone(result["payload"])
+
+    def test_actual_payload_rejects_unrepresentable_command_tokens(self):
+        for argv in (["echo", "a b"], ["true", ""], ["true", False], "true"):
+            result = validate_check_payload({"asset_id": "romi", "kind": "command", "name": "检查", "params": {"argv": argv}}, assets=ASSETS)
+            self.assertFalse(result["valid"])
+
+    def test_actual_payload_rejects_wrong_internal_field_names(self):
+        for payload in ({"kind": "port", "params": {"port": 80, "proto": "tcp"}},
+                        {"kind": "command", "params": {"cmd": "true"}},
+                        {"kind": "service", "params": {"unit": "nginx"}, "expect": {"active_state": "inactive"}}):
+            result = validate_check_payload({"asset_id": "romi", "name": "检查", **payload}, assets=ASSETS)
+            self.assertFalse(result["valid"])
+            self.assertTrue(result["issues"])
+
+    def test_malformed_actual_payload_returns_issues_without_throwing(self):
+        for malformed in (None, [], "text", {"kind": {}}, {"kind": ["service"]},
+                          {"kind": "service", "params": []}, {"kind": "service", "expect": []},
+                          {1: "unknown", "kind": "service", "params": {1: "nginx"}},
+                          {"kind": "service", "params": {"unit": []}}):
+            with self.subTest(payload=malformed):
+                result = validate_check_payload(malformed, assets=ASSETS)
+                self.assertFalse(result["valid"])
+                self.assertTrue(result["issues"])
+                self.assertIsNone(result["payload"])
+
+    def test_permission_form_uses_known_options_and_conditional_required_fields(self):
+        result = validate_fields("permissions", {"capability": "service.restart", "state": "confirm", "scope": "exception"}, assets=ASSETS, capabilities=["service.restart"])
+        self.assertEqual([m["field"] for m in result["missing"]], ["asset_id"])
+        self.assertFalse(result["valid"])
+        result = validate_fields("permissions", {"capability": "invented", "state": "auto"}, capabilities=[])
+        self.assertEqual(result["issues"][0]["field"], "capability")
+
+    def test_permission_read_states_match_real_policy_behavior(self):
+        for capabilities in (["service.logs"], [{"name": "service.logs", "kind": "read", "description": "读取日志"}]):
+            with self.subTest(capabilities=capabilities):
+                invalid = validate_fields("permissions", {"capability": "service.logs", "state": "confirm"}, capabilities=capabilities)
+                self.assertFalse(invalid["valid"])
+                self.assertEqual(invalid["issues"][0]["code"], "unsupported_state")
+                self.assertNotIn("state", invalid["fields"])
+                for state in ("deny", "auto"):
+                    self.assertTrue(validate_fields("permissions", {"capability": "service.logs", "state": state}, capabilities=capabilities)["valid"])
+                missing = validate_fields("permissions", {"capability": "service.logs"}, capabilities=capabilities)
+                self.assertEqual(missing["missing"][0]["options"], [{"value": "deny", "label": "禁止"}, {"value": "auto", "label": "允许读取"}])
+
+    def test_permission_write_auto_requires_actual_capability(self):
+        for state in ("deny", "confirm", "auto"):
+            self.assertTrue(validate_fields("permissions", {"capability": "service.restart", "state": state}, capabilities=["service.restart"])["valid"])
+        for cap in ("checks.write", "node_exporter.manage", "shell.interactive"):
+            result = validate_fields("permissions", {"capability": cap, "state": "auto"}, capabilities=[cap])
+            self.assertEqual(result["issues"][0]["code"], "unsupported_state")
+        result = validate_fields("permissions", {"capability": "shell.interactive", "state": "confirm"}, capabilities=["shell.interactive"])
+        self.assertEqual(result["issues"][0]["code"], "unsupported_state")
+
+    def test_permission_registered_object_id_and_unique_alias_resolve_same_target(self):
+        assets = [{**ASSETS[0], "objects": [{"id": "obj-web", "kind": "service", "name": "网站服务", "unit": "nginx"}]}]
+        for target in ("obj-web", "nginx", "网站服务"):
+            result = validate_fields("permissions", {"capability": "service.restart", "state": "confirm", "scope": "exception", "asset_id": "romi", "object_id": target}, assets=assets, capabilities=["service.restart"])
+            self.assertTrue(result["valid"], result)
+            self.assertEqual(result["fields"]["object_id"], "obj-web")
+            self.assertEqual(result["payload"]["object_id"], "obj-web")
+            self.assertEqual(bool(result["normalizations"]), target != "obj-web")
+
+    def test_permission_unknown_or_incompatible_object_cannot_broaden_to_wildcard(self):
+        assets = [{**ASSETS[0], "objects": [{"id": "obj-port", "kind": "port", "name": "网站端口", "port": 80}]}]
+        for target, code in (("nginx", "unknown_object"), ("obj-port", "object_kind_mismatch")):
+            result = validate_fields("permissions", {"capability": "service.restart", "state": "auto", "scope": "exception", "asset_id": "romi", "object_id": target}, assets=assets, capabilities=["service.restart"])
+            self.assertFalse(result["valid"])
+            self.assertEqual(result["issues"][0]["code"], code)
+            self.assertNotIn("object_id", result["fields"])
+            self.assertIsNone(result["payload"])
+
+    def test_permission_ambiguous_registered_alias_asks_for_actual_object(self):
+        assets = [{**ASSETS[0], "objects": [
+            {"id": "obj-a", "kind": "service", "name": "网站服务", "unit": "nginx-a"},
+            {"id": "obj-b", "kind": "service", "name": "网站服务", "unit": "nginx-b"},
+        ]}]
+        result = validate_fields("permissions", {"capability": "service.restart", "state": "confirm", "scope": "exception", "asset_id": "romi", "object_id": "网站服务"}, assets=assets, capabilities=["service.restart"])
+        self.assertEqual(result["issues"], [])
+        self.assertFalse(result["valid"])
+        self.assertNotIn("object_id", result["fields"])
+        question = result["missing"][0]
+        self.assertEqual(question["field"], "object_id")
+        self.assertEqual([option["value"] for option in question["options"]], ["obj-a", "obj-b"])
+        self.assertIsNone(result["payload"])
+
+    def test_permission_live_schema_and_prompt_publish_actual_policy_limits(self):
+        state = next(f for f in get_form("permissions")["fields"] if f["name"] == "state")
+        self.assertEqual(state["allowed_states_by_capability"]["service.logs"], ["deny", "auto"])
+        self.assertEqual(state["value_labels_by_capability"]["service.logs"]["auto"], "允许读取")
+        self.assertEqual(state["allowed_states_by_capability"]["shell.interactive"], ["deny"])
+        prompt = form_prompt_payload("permissions", assets=ASSETS, capabilities=["service.logs", "service.restart"])
+        caps = {cap["name"]: cap for cap in prompt["context"]["capabilities"]}
+        self.assertEqual(caps["service.logs"]["allowed_states"], ["deny", "auto"])
+        self.assertIn("不支持", caps["service.logs"]["policy_meaning"])
+        self.assertEqual(caps["service.restart"]["allowed_states"], ["deny", "confirm", "auto"])
+        self.assertEqual(state["validation_context"], ["capability"])
+        object_field = next(f for f in get_form("permissions")["fields"] if f["name"] == "object_id")
+        self.assertEqual(object_field["validation_context"], ["asset_id", "capability", "scope"])
+
+    def test_known_capability_metadata_cannot_override_actual_registry(self):
+        forged = [{"name": "service.logs", "kind": "write", "auto_allowed": True},
+                  {"name": "checks.write", "kind": "write", "auto_allowed": True}]
+        for capability, state in (("service.logs", "confirm"), ("checks.write", "auto")):
+            result = validate_fields("permissions", {"capability": capability, "state": state}, capabilities=forged)
+            self.assertEqual(result["issues"][0]["code"], "unsupported_state")
+
+    def test_prompt_and_frontend_metadata_describe_real_contract(self):
+        form = get_form("checks")
+        fields = {f["name"]: f for f in form["fields"]}
+        self.assertEqual(fields["params.proto"]["submit_path"], "params.protocol")
+        self.assertEqual(fields["params.cmd"]["control_id"], "chk-cmd")
+        self.assertNotIn("default", fields["kind"])
+        self.assertNotIn("pattern", fields["name"])
+        prompt = form_prompt_payload("checks", assets=ASSETS)
+        prompt_fields = {f["name"]: f for f in prompt["form"]["fields"]}
+        self.assertEqual(prompt_fields["params.unit"]["pattern"], fields["params.unit"]["pattern"])
+        self.assertIn("curl", prompt_fields["params.cmd"]["allowed_programs"])
+        self.assertIn("不支持 Docker", prompt["form"]["capability_boundary"]["service"])
+        self.assertIn("GET/HEAD", prompt["form"]["command_boundary"]["curl"])
+        self.assertIn("-O -", prompt["form"]["command_boundary"]["wget"])
+
+    def test_applicability_is_structured_and_matches_actual_required_fields(self):
+        fields = {f["name"]: f for f in get_form("checks")["fields"]}
+        self.assertEqual(fields["params.unit"]["applicable_if"], {"field": "kind", "equals": "service"})
+        self.assertFalse(condition_matches(fields["params.unit"]["applicable_if"], {"kind": "port"}))
+        self.assertTrue(condition_matches(fields["expect.value"]["required_when"], {"kind": "command", "expect.mode": "contains"}))
+        self.assertFalse(condition_matches(fields["expect.value"]["applicable_if"], {"kind": "command", "expect.mode": "exit0"}))
+        permission = {f["name"]: f for f in get_form("permissions")["fields"]}
+        self.assertEqual(permission["state"]["control_id"], "perm-ex-state")
+        self.assertEqual(permission["asset_id"]["required_when"], {"field": "scope", "equals": "exception"})
+
+    def test_check_payload_error_has_friendly_field_issues(self):
+        with self.assertRaises(CheckError) as raised:
+            check_payload(self.service(interval_sec=5), assets=ASSETS)
+        self.assertIn("15 到 3600", raised.exception.detail)
+        self.assertEqual(raised.exception.issues[0]["field"], "interval_sec")
+
+    def test_prompt_routes_and_metadata_fields_are_limited_to_actual_domain(self):
+        for domain, routes in (("checks", {"checks_form"}),
+                               ("permissions", {"perm_defaults", "perm_exceptions", "perm_effective", "perm_workbench", "perm_ceiling"})):
+            with self.subTest(domain=domain):
+                prompt = form_prompt_payload(domain, assets=ASSETS)
+                schema = prompt["output_schema"]
+                names = [field["name"] for field in get_form(domain)["fields"]]
+                self.assertEqual(set(schema["route"].split(" | ")), routes)
+                self.assertEqual(schema["field_names"], names)
+                for metadata in ("missing", "inferred"):
+                    self.assertEqual(schema[metadata][0]["field"].split(" | "), names)
+                self.assertNotIn("clarification", names)
+                self.assertNotIn("component", names)
+
+    def test_prompt_distinguishes_conversation_answers_from_assignable_values(self):
+        prompt = form_prompt_payload("checks", assets=ASSETS)
+        schema = prompt["output_schema"]
+        option = schema["missing"][0]["options"][0]
+        self.assertIn("field_value", option["mode"])
+        self.assertIn("answer", option["mode"])
+        self.assertIn("默认为 field_value", option["mode"])
+        clarification = schema["clarifications"][0]
+        self.assertEqual(set(clarification), {"id", "label", "question", "options"})
+        self.assertIn("^[A-Za-z][A-Za-z0-9_-]{0,63}$", clarification["id"])
+        self.assertIn("非空", clarification["options"][0]["value"])
+        self.assertIn("不直接", clarification["options"][0]["value"])
+        rules = "\n".join(prompt["interpretation_rules"])
+        self.assertIn("背景", rules)
+        self.assertIn("名称前缀", rules)
+        self.assertIn("先询问", rules)
+        self.assertIn("不等于完整技术名称", rules)
+
+    def test_clarification_applicability_preserves_unknown_selectors(self):
+        self.assertIsNone(field_applicability("checks", "params.unit", {}))
+        self.assertIsNone(field_applicability("checks", "params.unit", {"kind": None}))
+        self.assertIsNone(field_applicability("checks", "params.unit", {"kind": ""}))
+        self.assertTrue(field_applicability("checks", "params.unit", {"kind": "service"}))
+        self.assertFalse(field_applicability("checks", "params.unit", {"kind": "port"}))
+        self.assertTrue(field_applicability("checks", "name", {}))
+        self.assertFalse(field_applicability("checks", "made_up", {}))
+        self.assertIsNone(field_applicability("permissions", "asset_id", {}))
+        self.assertTrue(field_applicability("permissions", "asset_id", {"scope": "exception"}))
+        self.assertFalse(field_applicability("permissions", "asset_id", {"scope": "default"}))
+
+    def test_compound_applicability_false_takes_precedence_over_unknown(self):
+        condition = next(field for field in get_form("checks")["fields"] if field["name"] == "expect.value")["applicable_if"]
+        self.assertIsNone(condition_applicability(condition, {}))
+        self.assertIsNone(condition_applicability(condition, {"kind": "command"}))
+        self.assertFalse(condition_applicability(condition, {"kind": "service"}))
+        self.assertFalse(condition_applicability(condition, {"expect.mode": "exit0"}))
+        self.assertTrue(condition_applicability(condition, {"kind": "command", "expect.mode": "contains"}))
+        self.assertFalse(condition_applicability(condition, {"kind": "command", "expect.mode": "exit0"}))
+
+    def test_option_context_is_derived_from_actual_condition_dependencies(self):
+        condition = {"all": [{"field": "kind", "equals": "command"},
+                             {"all": [{"field": "expect.mode", "in": ["contains", "not_contains"]},
+                                      {"field": "kind", "equals": "command"}]}]}
+        self.assertEqual(condition_dependencies(condition), ["kind", "expect.mode"])
+        fields = {field["name"]: field for field in get_form("checks")["fields"]}
+        for field in fields.values():
+            if field.get("applicable_if"):
+                self.assertEqual(field["validation_context"], condition_dependencies(field["applicable_if"]))
+        self.assertEqual(fields["params.unit"]["validation_context"], ["kind"])
+        self.assertEqual(fields["expect.value"]["validation_context"], ["kind", "expect.mode"])
+        draft = {"kind": "port", "params.port": 443}
+        context = {key: draft[key] for key in fields["params.unit"]["validation_context"] if key in draft}
+        candidate = validate_fields("checks", {**context, "params.unit": "example.service"}, assets=ASSETS)
+        self.assertEqual(candidate["issues"][0]["code"], "irrelevant_field")
+
+
+if __name__ == "__main__":
+    unittest.main()

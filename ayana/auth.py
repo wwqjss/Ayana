@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets as pysecrets
 import struct
 import time
@@ -64,7 +65,14 @@ def decrypt_totp_secret(master: str, stored: str) -> str:
         return ""
 
 
+def _as_str(value: Any, default: str = "") -> str:
+    """登录/验证边界只接受字符串；非字符串统一成 default，避免 TypeError 造成 500/枚举。"""
+    return value if isinstance(value, str) else default
+
+
 def hash_password(password: str, pepper: str, *, iterations: int = PBKDF2_ITERATIONS) -> str:
+    password = _as_str(password)
+    pepper = _as_str(pepper)
     salt = os.urandom(16)
     dk = hashlib.pbkdf2_hmac(
         "sha256", (password + pepper).encode("utf-8"), salt, iterations
@@ -73,6 +81,13 @@ def hash_password(password: str, pepper: str, *, iterations: int = PBKDF2_ITERAT
 
 
 def verify_password(password: str, stored: str, pepper: str) -> bool:
+    if not isinstance(password, str) or not isinstance(stored, str) or not isinstance(pepper, str):
+        return False
+    try:
+        # P1-10: 畸形 Unicode（如 lone surrogate）编码失败不得形成 500/枚举
+        (password + pepper).encode("utf-8")
+    except UnicodeEncodeError:
+        return False
     try:
         algo, iter_s, salt_hex, hash_hex = stored.split("$")
         if algo != "pbkdf2_sha256":
@@ -89,6 +104,8 @@ def verify_password(password: str, stored: str, pepper: str) -> bool:
 
 
 def hash_recovery_code(code: str, pepper: str) -> str:
+    code = _as_str(code)
+    pepper = _as_str(pepper)
     return hashlib.sha256((code + pepper).encode("utf-8")).hexdigest()
 
 
@@ -110,7 +127,11 @@ def totp_now(secret_b32: str, *, at: float | None = None) -> str:
 
 
 def totp_verify(secret_b32: str, code: str, *, at: float | None = None) -> bool:
-    if not secret_b32 or not code or not code.isdigit() or len(code) != TOTP_DIGITS:
+    code = _as_str(code)
+    if not isinstance(secret_b32, str) or not secret_b32:
+        return False
+    # P1-10: 仅 ASCII 6 位数字，拒绝全角数字等 isdigit 通过项
+    if not code or not re.fullmatch(r"[0-9]{6}", code):
         return False
     try:
         key = base64.b32decode(secret_b32, casefold=True)
@@ -153,9 +174,19 @@ class AuthError(Exception):
 
 
 class AuthService:
-    def __init__(self, db: Database, pepper: str, session_ttl: int, max_failed: int, lockout: int, totp_key: str = ""):
+    def __init__(
+        self,
+        db: Database,
+        pepper: str,
+        session_ttl: int,
+        max_failed: int,
+        lockout: int,
+        totp_key: str = "",
+        legacy_peppers: list[str] | None = None,
+    ):
         self.db = db
         self.pepper = pepper
+        self.legacy_peppers = [p for p in (legacy_peppers or []) if p and p != pepper]
         self.session_ttl = session_ttl
         self.max_failed = max_failed
         self.lockout = lockout
@@ -168,17 +199,55 @@ class AuthService:
         if row and row["n"] > 0:
             return None
         password = pysecrets.token_urlsafe(12)
-        self.create_user(username, password, is_admin=True)
+        self.create_user(username, password, is_admin=True, must_change_password=True)
         return password
 
-    def create_user(self, username: str, password: str, *, is_admin: bool = True) -> int:
+    def create_user(
+        self,
+        username: str,
+        password: str,
+        *,
+        is_admin: bool = True,
+        must_change_password: bool = False,
+    ) -> int:
         t = now()
         cur = self.db.execute(
-            "INSERT INTO users(username, password_hash, totp_enabled, is_admin, created_at, updated_at)"
-            " VALUES(?,?,?,?,?,?)",
-            (username, hash_password(password, self.pepper), 0, 1 if is_admin else 0, t, t),
+            "INSERT INTO users(username, password_hash, totp_enabled, is_admin,"
+            " must_change_password, created_at, updated_at)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (
+                username,
+                hash_password(password, self.pepper),
+                0,
+                1 if is_admin else 0,
+                1 if must_change_password else 0,
+                t,
+                t,
+            ),
         )
         return int(cur.lastrowid or 0)
+
+    def _verify_password_any(self, password: str, stored: str) -> tuple[bool, str]:
+        """返回 (ok, pepper_used)。legacy pepper 成功时便于登录后重哈希。"""
+        if verify_password(password, stored, self.pepper):
+            return True, self.pepper
+        for p in self.legacy_peppers:
+            if verify_password(password, stored, p):
+                return True, p
+        return False, ""
+
+    def rehash_password(self, user_id: int, password: str) -> None:
+        """登录成功后把口令哈希迁到当前 pepper。"""
+        self.db.execute(
+            "UPDATE users SET password_hash=?, updated_at=? WHERE id=?",
+            (hash_password(password, self.pepper), now(), user_id),
+        )
+
+    def must_change_password(self, user_id: int) -> bool:
+        row = self.db.query_one(
+            "SELECT must_change_password FROM users WHERE id=?", (user_id,)
+        )
+        return bool(row and row["must_change_password"])
 
     def _recent_failures(self, username: str) -> int:
         since = now() - self.lockout
@@ -197,27 +266,36 @@ class AuthService:
         recovery_code: str = "",
         *,
         ip: str = "",
+        ua: str = "",
     ) -> dict[str, Any]:
         """完整登录（兼容旧接口）：密码 + 可选 TOTP 一步完成。"""
-        res = self.begin_login(username, password, ip=ip)
+        res = self.begin_login(username, password, ip=ip, ua=ua)
         if res.get("complete"):
             return res["session"]
         return self.complete_login(
-            res["pending_id"], totp_code=totp_code, recovery_code=recovery_code, ip=ip
+            res["pending_id"], totp_code=totp_code, recovery_code=recovery_code, ip=ip, ua=ua
         )
 
-    def begin_login(self, username: str, password: str, *, ip: str = "") -> dict[str, Any]:
+    def begin_login(self, username: str, password: str, *, ip: str = "", ua: str = "") -> dict[str, Any]:
         """两阶段登录第一步：只验账号密码。
 
         - 密码错误 → 抛 AuthError，不进入第二阶段
         - 未启用 2FA → 直接发会话 {complete: True, session}
         - 已启用 2FA → {complete: False, need_totp: True, pending_id}
         """
+        # A1: 非字符串入参不得区分用户是否存在，统一走失败路径
+        username = _as_str(username)
+        password = _as_str(password)
+        ip = _as_str(ip)
+        ua = _as_str(ua)
         if self._recent_failures(username) >= self.max_failed:
             raise AuthError("locked", "尝试过多，请稍后再试")
 
         row = self.db.query_one("SELECT * FROM users WHERE username=?", (username,))
-        if not row or not verify_password(password, row["password_hash"], self.pepper):
+        ok, used_pepper = (False, "")
+        if row:
+            ok, used_pepper = self._verify_password_any(password, row["password_hash"])
+        if not row or not ok:
             self.db.execute(
                 "INSERT INTO login_attempts(username, at, ok, ip) VALUES(?,?,?,?)",
                 (username, now(), 0, ip),
@@ -225,20 +303,29 @@ class AuthService:
             raise AuthError("invalid", "用户名或密码错误")
 
         user_id = int(row["id"])
+        # pepper 迁移：legacy 命中则登录后重哈希到当前 pepper
+        if used_pepper and used_pepper != self.pepper:
+            try:
+                self.rehash_password(user_id, password)
+            except Exception:
+                pass
         if not row["totp_enabled"]:
             self.db.execute(
                 "INSERT INTO login_attempts(username, at, ok, ip) VALUES(?,?,?,?)",
                 (username, now(), 1, ip),
             )
-            return {"complete": True, "session": self._issue_session(user_id, ip)}
+            return {"complete": True, "session": self._issue_session(user_id, ip, ua)}
 
         # 2FA 账号：先发 pending，不建完整会话
         pending_id = "pend_" + pysecrets.token_urlsafe(24)
         self._pending_logins[pending_id] = {
             "user_id": user_id,
             "username": username,
+            "password_hash": row["password_hash"],
             "ip": ip,
+            "ua": ua,
             "at": now(),
+            "failures": 0,
         }
         self._gc_pending()
         return {
@@ -255,14 +342,23 @@ class AuthService:
         totp_code: str = "",
         recovery_code: str = "",
         ip: str = "",
+        ua: str = "",
     ) -> dict[str, Any]:
         """两阶段登录第二步：TOTP / 恢复码通过后才建会话。"""
         self._gc_pending()
-        item = self._pending_logins.get(pending_id or "")
+        pending_id = _as_str(pending_id)
+        totp_code = _as_str(totp_code)
+        recovery_code = _as_str(recovery_code)
+        ip = _as_str(ip)
+        ua = _as_str(ua)
+        item = self._pending_logins.get(pending_id)
         if not item:
             raise AuthError("pending_expired", "登录已过期，请重新输入密码")
+        if item.get("failures", 0) >= self.max_failed or self._recent_failures(item["username"]) >= self.max_failed:
+            self._revoke_pending(int(item["user_id"]))
+            raise AuthError("locked", "尝试过多，请稍后再试")
         row = self.db.query_one("SELECT * FROM users WHERE id=?", (item["user_id"],))
-        if not row or not row["totp_enabled"]:
+        if not row or not row["totp_enabled"] or row["password_hash"] != item.get("password_hash"):
             del self._pending_logins[pending_id]
             raise AuthError("invalid", "账号状态已变化，请重新登录")
 
@@ -279,9 +375,13 @@ class AuthService:
             (item["username"], now(), 1 if ok else 0, ip or item.get("ip") or ""),
         )
         if not ok:
+            item["failures"] = int(item.get("failures", 0)) + 1
+            if item["failures"] >= self.max_failed or self._recent_failures(item["username"]) >= self.max_failed:
+                self._revoke_pending(int(item["user_id"]))
+                raise AuthError("locked", "尝试过多，请稍后再试")
             raise AuthError("totp_invalid", "动态码或恢复码错误")
         del self._pending_logins[pending_id]
-        return self._issue_session(int(row["id"]), ip or item.get("ip") or "")
+        return self._issue_session(int(row["id"]), ip or item.get("ip") or "", ua or item.get("ua") or "")
 
     def _gc_pending(self) -> None:
         cutoff = now() - 300  # 5 分钟
@@ -289,7 +389,13 @@ class AuthService:
         for k in dead:
             self._pending_logins.pop(k, None)
 
+    def _revoke_pending(self, user_id: int) -> None:
+        for pending_id, item in list(self._pending_logins.items()):
+            if item.get("user_id") == user_id:
+                self._pending_logins.pop(pending_id, None)
+
     def _use_recovery_code(self, user_id: int, code: str) -> bool:
+        code = _as_str(code)
         needle = hash_recovery_code(code.strip(), self.pepper)
         rows = self.db.query(
             "SELECT id FROM recovery_codes WHERE user_id=? AND code_hash=? AND used_at IS NULL",
@@ -314,12 +420,14 @@ class AuthService:
         )
         return {"session_id": sid, "csrf_token": csrf, "expires_at": t + self.session_ttl}
 
-    def get_session(self, session_id: str) -> dict[str, Any] | None:
+    def get_session(self, session_id: str, *, ip: str = "", ua: str = "") -> dict[str, Any] | None:
+        session_id = _as_str(session_id)
         if not session_id:
             return None
         row = self.db.query_one(
-            "SELECT s.id AS session_id, s.csrf_token, s.expires_at, s.user_id,"
-            " u.username, u.is_admin FROM web_sessions s JOIN users u ON u.id=s.user_id"
+            "SELECT s.id AS session_id, s.csrf_token, s.expires_at, s.user_id, s.ip, s.ua,"
+            " u.username, u.is_admin, u.must_change_password"
+            " FROM web_sessions s JOIN users u ON u.id=s.user_id"
             " WHERE s.id=?",
             (session_id,),
         )
@@ -328,24 +436,42 @@ class AuthService:
         if row["expires_at"] < now():
             self.db.execute("DELETE FROM web_sessions WHERE id=?", (session_id,))
             return None
-        return dict(row)
+        # A3/P2-12: 双因素同时变化才拒绝；仅 IP 变化（移动切网）允许
+        sess_ip = (row["ip"] or "").strip()
+        sess_ua = (row["ua"] or "").strip()
+        ip = _as_str(ip).strip()
+        ua = _as_str(ua).strip()
+        ip_mismatch = bool(sess_ip and ip and sess_ip != ip)
+        ua_mismatch = bool(sess_ua and ua and sess_ua != ua)
+        if ip_mismatch and ua_mismatch:
+            return None
+        data = dict(row)
+        data.pop("ip", None)
+        data.pop("ua", None)
+        return data
 
     def logout(self, session_id: str) -> None:
         self.db.execute("DELETE FROM web_sessions WHERE id=?", (session_id,))
 
     def change_password(self, user_id: int, old_password: str, new_password: str) -> None:
+        old_password = _as_str(old_password)
+        new_password = _as_str(new_password)
         if not old_password or not new_password or len(new_password) < 10:
             raise AuthError("weak_password", "新密码至少 10 位")
         row = self.db.query_one("SELECT password_hash FROM users WHERE id=?", (user_id,))
-        if not row or not verify_password(old_password, row["password_hash"], self.pepper):
+        ok = False
+        if row:
+            ok, _ = self._verify_password_any(old_password, row["password_hash"])
+        if not row or not ok:
             raise AuthError("invalid", "原密码错误")
         with self.db.tx() as conn:
             conn.execute(
-                "UPDATE users SET password_hash=?, updated_at=? WHERE id=?",
+                "UPDATE users SET password_hash=?, must_change_password=0, updated_at=? WHERE id=?",
                 (hash_password(new_password, self.pepper), now(), user_id),
             )
             # 改密撤销旧会话
             conn.execute("DELETE FROM web_sessions WHERE user_id=?", (user_id,))
+        self._revoke_pending(user_id)
 
     def setup_totp(self, user_id: int, password: str = "", totp_code: str = "") -> dict[str, str]:
         """生成待确认 secret，不打断现有 2FA。
@@ -355,8 +481,10 @@ class AuthService:
         row = self.db.query_one("SELECT * FROM users WHERE id=?", (user_id,))
         if not row:
             raise AuthError("no_user")
+        password = _as_str(password)
+        totp_code = _as_str(totp_code)
         if row["totp_enabled"]:
-            if not password or not verify_password(password, row["password_hash"], self.pepper):
+            if not password or not self._verify_password_any(password, row["password_hash"])[0]:
                 raise AuthError("reauth_required", "更换 2FA 需要当前密码")
             if not totp_code or not totp_verify(decrypt_totp_secret(self._totp_key, row["totp_secret"]), totp_code):
                 raise AuthError("reauth_required", "更换 2FA 需要当前动态码")
@@ -376,6 +504,8 @@ class AuthService:
 
     def confirm_totp(self, user_id: int, code: str, password: str = "") -> list[str]:
         """用待确认 secret 验证后才启用；之前保留原认证。"""
+        code = _as_str(code)
+        password = _as_str(password)
         row = self.db.query_one("SELECT * FROM users WHERE id=?", (user_id,))
         if not row:
             raise AuthError("no_user")
@@ -392,7 +522,7 @@ class AuthService:
             raise AuthError("invalid_code", "动态验证码错误")
         if row["totp_enabled"] and password:
             # 更换流程需再次确认密码（setup 已验过，这里做一次最终确认）
-            if not verify_password(password, row["password_hash"], self.pepper):
+            if not self._verify_password_any(password, row["password_hash"])[0]:
                 raise AuthError("reauth_required", "原密码错误")
 
         codes = generate_recovery_codes()
@@ -410,13 +540,16 @@ class AuthService:
             conn.execute("DELETE FROM meta WHERE key=?", (f"totp_pending:{user_id}",))
             # 更换认证因素：撤销该用户其它会话（保留当前由调用方决定）
             conn.execute("DELETE FROM web_sessions WHERE user_id=?", (user_id,))
+        self._revoke_pending(user_id)
         return codes
 
     def disable_totp(self, user_id: int, password: str = "", totp_code: str = "") -> None:
+        password = _as_str(password)
+        totp_code = _as_str(totp_code)
         row = self.db.query_one("SELECT * FROM users WHERE id=?", (user_id,))
         if not row:
             raise AuthError("no_user")
-        if not password or not verify_password(password, row["password_hash"], self.pepper):
+        if not password or not self._verify_password_any(password, row["password_hash"])[0]:
             raise AuthError("reauth_required", "需要当前密码")
         if row["totp_enabled"]:
             if not totp_code or not totp_verify(decrypt_totp_secret(self._totp_key, row["totp_secret"]), totp_code):
@@ -428,6 +561,7 @@ class AuthService:
         self.db.execute("DELETE FROM recovery_codes WHERE user_id=?", (user_id,))
         self.db.execute("DELETE FROM meta WHERE key=?", (f"totp_pending:{user_id}",))
         self.db.execute("DELETE FROM web_sessions WHERE user_id=?", (user_id,))
+        self._revoke_pending(user_id)
 
     def totp_enabled(self, username: str) -> bool:
         row = self.db.query_one(
@@ -436,17 +570,52 @@ class AuthService:
         return bool(row and row["totp_enabled"] and row["totp_secret"])
 
     def verify_totp(self, username: str, code: str) -> bool:
-        """验证某用户的 TOTP。调用方不得把 code 传给 LLM/日志。"""
+        """验证某用户的 TOTP。调用方不得把 code 传给 LLM/日志。
+
+        P1-06: 敏感操作 TOTP 与登录共用失败限额，并记录单码重放窗口。
+        """
+        username = _as_str(username)
+        code = _as_str(code)
+        if self._recent_failures(username) >= self.max_failed:
+            raise AuthError("locked", "尝试过多，请稍后再试")
         row = self.db.query_one(
             "SELECT totp_enabled, totp_secret FROM users WHERE username=?", (username,)
         )
         if not row or not row["totp_enabled"] or not row["totp_secret"]:
+            self._record_totp_attempt(username, ok=False)
             return False
         # S11: 解密后验证
         secret = decrypt_totp_secret(self._totp_key, row["totp_secret"])
         if not secret:
+            self._record_totp_attempt(username, ok=False)
             return False
-        return totp_verify(secret, (code or "").strip())
+        # 防重放：同一用户 30s 内不得重复使用同一动态码
+        code_key = f"totp_used:{username}:{code}"
+        recent = self.db.query_one("SELECT value FROM meta WHERE key=?", (code_key,))
+        if recent and recent["value"]:
+            self._record_totp_attempt(username, ok=False)
+            return False
+        ok = totp_verify(secret, code)
+        self._record_totp_attempt(username, ok=ok)
+        if ok:
+            try:
+                self.db.execute(
+                    "INSERT INTO meta(key, value) VALUES(?, ?)"
+                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (code_key, str(int(now()))),
+                )
+            except Exception:
+                pass
+        return ok
+
+    def _record_totp_attempt(self, username: str, *, ok: bool) -> None:
+        try:
+            self.db.execute(
+                "INSERT INTO login_attempts(username, at, ok, ip) VALUES(?,?,?,?)",
+                (username, now(), 1 if ok else 0, "totp-sensitive"),
+            )
+        except Exception:
+            pass
 
     def cleanup(self) -> None:
         self.db.execute("DELETE FROM web_sessions WHERE expires_at<?", (now(),))

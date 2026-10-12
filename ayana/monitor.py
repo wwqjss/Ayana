@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import time
+import json
+import re
 from typing import Any
 
 from .prom import PromClient, PromError
@@ -98,14 +100,21 @@ def _pick_series(samples: list[dict], prefer: str = "") -> list[dict]:
     return samples
 
 
+def asset_label_selector(asset_id: str, *aliases: str) -> str:
+    """Match one configured Prometheus asset label, including case aliases."""
+    names = list(dict.fromkeys((asset_id, *aliases)))
+    exact = re.escape(names[0]) if len(names) == 1 else "(?:" + "|".join(re.escape(name) for name in names) + ")"
+    pattern = "(?i)^" + exact + "$"
+    return "asset=~" + json.dumps(pattern)
+
+
 class HostMonitor:
     def __init__(self, prom: PromClient):
         self.prom = prom
 
     def _asset_sel(self, asset_id: str) -> str:
         # 标签大小写不敏感：romi / ROMI / Romi 视为同一资产
-        esc = asset_id.replace('"', "").replace("\\", "")
-        return f'asset=~"(?i)^{esc}$"'
+        return asset_label_selector(asset_id)
 
     def _history_exprs(self, asset_id: str) -> dict[str, str]:
         sel = self._asset_sel(asset_id)
@@ -138,6 +147,10 @@ class HostMonitor:
 
     def _instant_exprs(self, asset_id: str) -> dict[str, str]:
         return self._history_exprs(asset_id)
+
+    def _exporter_up_expr(self, asset_id: str) -> str:
+        sel = self._asset_sel(asset_id)
+        return f'up{{{sel},job=~"node.*"}} or up{{{sel},job_type="node_exporter"}}'
 
     async def _query_instant(self, expr: str) -> list[dict]:
         data = await self.prom.query(expr)
@@ -234,7 +247,7 @@ class HostMonitor:
             disk = await self._query_instant(exprs["disk"])
             load = await self._query_instant(exprs["load1"])
             load5 = await self._query_instant(exprs["load5"])
-            up = await self._query_instant(f'up{{{self._asset_sel(asset_id)},job=~"node.*"}}')
+            up = await self._query_instant(self._exporter_up_expr(asset_id))
         except PromError as e:
             result["state"] = "collect_error"
             result["error"] = str(e)[:200]
@@ -262,6 +275,7 @@ class HostMonitor:
         }
         # node exporter 是否在采
         up_val = _agg_max(up)
+        result["exporter_up"] = up_val
         if up_val is None and not any(m["value"] is not None for m in metrics.values()):
             result["state"] = "no_data"
         elif up_val is not None and up_val < 1:
@@ -271,7 +285,7 @@ class HostMonitor:
             # 汇总最差状态（not_enabled 不参与告警）
             order = {"ok": 0, "not_enabled": 0, "partial_no_data": 1, "no_data": 1, "warn": 2, "bad": 3, "collect_error": 4}
             states = [m["state"] for m in metrics.values() if m["state"] != "not_enabled"]
-            has_data = any(m["value"] is not None for m in metrics.values())
+            has_data = up_val == 1 or any(m["value"] is not None for m in metrics.values())
             no_data_count = sum(1 for s in states if s == "no_data")
             if no_data_count and has_data:
                 # S20: 部分缺测 → partial_no_data，不改成 ok
@@ -284,7 +298,7 @@ class HostMonitor:
             else:
                 worst = max(states, key=lambda s: order.get(s, 0), default="ok")
                 result["state"] = worst
-            if all(m["value"] is None and m["state"] != "not_enabled" for m in metrics.values()):
+            if not has_data:
                 result["state"] = "no_data"
         result["metrics"] = metrics
         return result
@@ -399,11 +413,14 @@ class HostMonitor:
             out["state"] = "no_data"
         else:
             order = {"ok": 0, "not_enabled": 0, "no_data": 1, "warn": 2, "bad": 3, "collect_error": 4}
+            states = [m.get("state") for m in metrics.values() if m.get("state") != "not_enabled"]
             out["state"] = max(
-                (m.get("state") for m in metrics.values()),
+                states,
                 key=lambda s: order.get(s, 0),
                 default="ok",
             )
+            if out["state"] == "no_data" and any(m.get("value") is not None for m in metrics.values()):
+                out["state"] = "partial_no_data"
         return out
 
     async def hosts_status(self, assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -420,27 +437,10 @@ class HostMonitor:
                 "error": "",
                 "summary": {},
             }
-            try:
-                up = await self._query_instant(
-                    f'up{{{self._asset_sel(prom_asset)},job=~"node.*"}}'
-                )
-                cpu = await self._query_instant(
-                    self._instant_exprs(prom_asset)["cpu"]
-                )
-            except PromError as e:
-                item["state"] = "collect_error"
-                item["error"] = str(e)[:160]
-                out.append(item)
-                continue
-            up_val = _agg_max(up)
-            cpu_val = _agg_max(cpu)
-            if up_val is None and cpu_val is None:
-                item["state"] = "no_data"
-            elif up_val is not None and up_val < 1:
-                item["state"] = "collect_error"
-                item["error"] = "node_exporter_down"
-            else:
-                item["state"] = _state_from_value("cpu", cpu_val) if cpu_val is not None else "no_data"
-            item["summary"] = {"cpu": cpu_val, "up": up_val}
+            overview = await self.host_overview(prom_asset)
+            item["state"] = overview["state"]
+            item["error"] = overview.get("error") or ""
+            item["summary"] = {"cpu": (overview.get("metrics", {}).get("cpu") or {}).get("value"),
+                               "up": overview.get("exporter_up")}
             out.append(item)
         return out

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import asyncio
 from typing import Any
 
 import aiohttp
@@ -40,9 +41,9 @@ class LLMClient:
         json_mode: bool = False,
         temperature: float = 0.2,
     ) -> dict[str, Any] | None:
-        """调用 chat/completions。返回 {content, raw, status}；失败打日志后 None。"""
+        """调用 chat/completions，保留失败分类和截断状态供填表链路判断。"""
         if not self.enabled:
-            return None
+            return {"content": None, "error": "llm_disabled", "status": 0}
         url = f"{self.base_url}/chat/completions"
         body: dict[str, Any] = {
             "model": self.model,
@@ -63,22 +64,27 @@ class LLMClient:
                 ) as r:
                     text = await r.text()
                     if r.status != 200:
-                        log.warning("llm http %s: %s", r.status, text[:300])
-                        return None
+                        log.warning("llm http %s", r.status)
+                        return {"content": None, "error": "llm_http_error", "status": r.status}
                     try:
                         data = json.loads(text)
                     except Exception as e:
-                        log.warning("llm bad response json: %s body=%s", e, text[:300])
-                        return None
-                    content = (
-                        data.get("choices", [{}])[0]
-                        .get("message", {})
-                        .get("content")
-                    )
-                    return {"content": content, "raw": data, "status": r.status}
+                        log.warning("llm bad response json: %s", type(e).__name__)
+                        return {"content": None, "error": "llm_response_format", "status": r.status}
+                    choices = data.get("choices") if isinstance(data, dict) else None
+                    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                        return {"content": None, "error": "llm_response_format", "status": r.status}
+                    choice = choices[0]
+                    message = choice.get("message") or {}
+                    content = message.get("content") if isinstance(message, dict) else None
+                    return {"content": content, "raw": data, "status": r.status,
+                            "finish_reason": choice.get("finish_reason")}
+        except asyncio.TimeoutError:
+            log.warning("llm request timed out")
+            return {"content": None, "error": "llm_timeout", "status": 0}
         except Exception as e:
-            log.warning("llm error: %s", e)
-            return None
+            log.warning("llm error: %s", type(e).__name__)
+            return {"content": None, "error": "llm_connection_error", "status": 0}
 
     async def analyze_incident(
         self,

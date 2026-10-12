@@ -207,6 +207,16 @@ main { padding: 20px 22px 40px; max-width: 1100px; margin: 0 auto; }
 .perm-eff-row { display: flex; gap: 8px; align-items: center; padding: 4px 0; font-size: 13px; }
 .metric-card.expandable { cursor: pointer; }
 .metric-card.expandable:hover { border-color: rgba(108,182,255,.35); }
+.monitor-onboard { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); }
+.monitor-onboard h3 { font-size: 15px; margin: 0 0 8px; }
+.monitor-business-heading { display: flex; justify-content: space-between; gap: 16px; align-items: center; }
+.monitor-business-heading h2 { margin-bottom: 6px; }
+.monitor-business-heading p { margin: 0 0 12px; }
+.monitor-business-table { overflow-x: auto; }
+.monitor-business-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+@media (max-width: 640px) {
+  .monitor-business-heading { align-items: flex-start; flex-direction: column; gap: 4px; }
+}
 .totp-manage .form-col label {
   display: block; font-size: 12px; color: var(--dim); margin: 10px 0;
 }
@@ -235,6 +245,23 @@ main { padding: 20px 22px 40px; max-width: 1100px; margin: 0 auto; }
   font-size: 13px; line-height: 1.6; color: var(--ink);
 }
 #chk-assist-msg div, #perm-assist-msg div { line-height: 1.55; }
+.assist-followup:empty { display: none; }
+.assist-question { margin: 12px 0; padding-top: 10px; border-top: 1px solid var(--line); }
+.assist-question label { display: block; color: var(--ink); margin-bottom: 6px; }
+.assist-question input, .assist-question select {
+  display: block; width: min(100%, 560px); margin: 8px 0; padding: 8px 10px;
+  border-radius: 8px; border: 1px solid var(--line);
+  background: var(--card); color: var(--ink); font: inherit;
+}
+.assist-question input:focus, .assist-question select:focus { outline: none; border-color: var(--acc); }
+.assist-choice-help { margin: 5px 0; color: var(--dim); font-size: 12px; }
+.assist-debug { margin-top: 12px; }
+.assist-debug summary { cursor: pointer; color: var(--dim); font-size: 12px; }
+.assist-field-source { display: inline-block; margin-left: 6px; color: var(--dim); font-size: 11px; }
+.assist-field-source.inferred { color: var(--warn); }
+.check-form-title { font-size: 13px; margin: 16px 0 8px; }
+.perm-draft-note { display: block; margin: 5px 0; color: var(--warn); font-size: 12px; }
+.btn:disabled { opacity: .55; cursor: wait; }
 
 .subnav {
   display: flex; gap: 6px; flex-wrap: wrap;

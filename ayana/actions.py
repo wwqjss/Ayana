@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import time
 from typing import Any
 
@@ -28,6 +29,8 @@ from .db import Database, new_id, now
 from .ntsafe import IdentityGate, NTClient, NTError
 from .policy import Policy
 from .prom import PromClient, group_by_series, match_series, series_key
+
+log = logging.getLogger("ayana.actions")
 
 
 class ActionError(Exception):
@@ -168,6 +171,21 @@ class ActionService:
             raise ActionError("denied", decision.get("reason") or "forbidden")
         if mode == "auto" and decision.get("decision") != "automatic":
             raise ActionError("auto_not_allowed", decision.get("reason", ""))
+        if mode == "auto":
+            from .incidents import IncidentService
+            from .verify_profiles import profile_for_action
+
+            blocked = IncidentService(self.db).source_block_reason(incident_id) if incident_id else ""
+            if blocked:
+                raise ActionError("source_unhealthy", blocked)
+            if profile_for_action(
+                capability=capability, asset_id=asset_id, object_id=resolve_object_name(obj),
+            ) is None:
+                if incident_id:
+                    IncidentService(self.db).set_need_human(
+                        incident_id, "unsupported_verification_profile",
+                    )
+                raise ActionError("unsupported_verification_profile")
 
         if self._object_locked(asset_id, obj["id"]):
             raise ActionError("object_locked", f"{asset_id}/{obj['id']}")
@@ -317,6 +335,35 @@ class ActionService:
             )
             raise ActionError("expired")
 
+        # B2: 职责分离——同一人类主体不得自批；admin web / auto_rule 自动链除外
+        HUMAN_TYPES = {"web_user", "qq_user", "wecom_user"}
+        proposer_type = row.get("proposer_type") or ""
+        proposer_id = row.get("proposer_id") or ""
+        if (
+            approver_type in HUMAN_TYPES
+            and proposer_type in HUMAN_TYPES
+            and approver_id
+            and approver_id == proposer_id
+            and (approver_type == proposer_type or True)
+        ):
+            # 同名跨渠道也视为同一人（qq_user:admin 与 web_user:admin）
+            approver_row = self.db.query_one(
+                "SELECT is_admin FROM users WHERE username=?", (approver_id,)
+            )
+            if not (approver_row and approver_row["is_admin"]):
+                self.db.audit(
+                    approver_type,
+                    approver_id,
+                    "action_approve_denied",
+                    asset_id=row["asset_id"],
+                    object_id=row["object_id"],
+                    action_id=action_id,
+                    detail={"reason": "self_approve_denied", "channel": channel},
+                    incident_id=row.get("incident_id") or "",
+                    channel=channel,
+                )
+                raise ActionError("self_approve_denied", "proposer cannot approve own action")
+
         decision = self.policy.effective_decision(
             subject_type=approver_type,
             subject_id=approver_id,
@@ -433,6 +480,9 @@ class ActionService:
                     ),
                 ),
             )
+            from .incidents import IncidentService
+
+            IncidentService(self.db).clear_awaiting_approval(row["incident_id"], action_id)
         return {
             "id": action_id,
             "state": "approved",
@@ -452,6 +502,18 @@ class ActionService:
     ) -> dict[str, Any]:
         """拒绝提案：零派发。幂等。"""
         row = self._get(action_id)
+        decision = self.policy.effective_decision(
+            subject_type=actor_type, subject_id=actor_id, capability=row["capability"],
+            asset_id=row["asset_id"], object_id=row["object_id"],
+        )
+        if not decision.get("allowed") or decision.get("decision") == "forbidden":
+            self.db.audit(
+                actor_type, actor_id, "action_reject_denied", asset_id=row["asset_id"],
+                object_id=row["object_id"], action_id=action_id,
+                detail={"reason": decision.get("reason", "forbidden"), "channel": channel},
+                incident_id=row.get("incident_id") or "", channel=channel,
+            )
+            raise ActionError("reject_denied", decision.get("reason", "forbidden"))
         state = row["state"]
         if state in ("cancelled", "expired", "rejected"):
             return {"id": action_id, "state": state, "idempotent": True, "already": True}
@@ -688,11 +750,14 @@ class ActionService:
                     )
                     # S14: 到期同步事件为需人工
                     if r["incident_id"]:
-                        conn.execute(
-                            "UPDATE incidents SET need_human=1, need_human_reason=?,"
-                            " stage='need_human' WHERE id=? AND status='open'",
-                            (f"approval_expired:{r['id']}", r["incident_id"]),
-                        )
+                        incident = conn.execute(
+                            "SELECT status FROM incidents WHERE id=?", (r["incident_id"],)
+                        ).fetchone()
+                        if incident and incident["status"] == "open":
+                            from .incidents import IncidentService
+
+                            IncidentService(self.db).clear_awaiting_approval(r["incident_id"], r["id"])
+                            self._mark_need_human(r["incident_id"], f"approval_expired:{r['id']}")
         return n
 
     def cancel_pending_for_incident(self, incident_id: str, reason: str = "incident_recovered") -> int:
@@ -858,6 +923,12 @@ class ActionService:
 
             # 唯一派发门：当前 Policy 复查（P0-02）
             action_mode = (fresh["mode"] or "manual") if "mode" in fresh.keys() else "manual"
+            if reject is None and action_mode == "auto" and fresh["incident_id"]:
+                from .incidents import IncidentService
+
+                blocked = IncidentService(self.db).source_block_reason(fresh["incident_id"])
+                if blocked:
+                    reject = ("source_unhealthy", blocked)
             if reject is None:
                 for subject_type, subject_id in (
                     (fresh["proposer_type"] or "web_user", fresh["proposer_id"] or "system"),
@@ -930,6 +1001,14 @@ class ActionService:
                     reject = ("object_missing", fresh["object_id"])
                 else:
                     obj_d = dict(obj)
+                    if action_mode == "auto":
+                        from .verify_profiles import profile_for_action
+
+                        if profile_for_action(
+                            capability=fresh["capability"], asset_id=fresh["asset_id"],
+                            object_id=resolve_object_name(obj_d),
+                        ) is None:
+                            reject = ("unsupported_verification_profile", "no verification contract")
                     try:
                         object_matches_capability(fresh["capability"], obj_d)
                         tokens = build_write_tokens(fresh["capability"], obj_d)
@@ -1028,6 +1107,8 @@ class ActionService:
                         " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                         _aud,
                     )
+                if code in ("source_unhealthy", "unsupported_verification_profile"):
+                    self._mark_need_human(fresh_d.get("incident_id") or "", f"{code}:{action_id}")
             else:
                 cur = conn.execute(
                     "UPDATE actions SET state='dispatched', dispatched_at=?, exec_account=?,"
@@ -1065,7 +1146,7 @@ class ActionService:
             res = await self._write_channel(row["asset_id"], tokens, timeout=15.0)
             state, detail = classify_exec_result(res)
         except Exception as e:
-            # 未发出/异常：收敛为 unknown + 需人工，释放对象锁
+            # 不能证明是否执行：收敛为 unknown + 需人工，保留对象锁防止重放。
             log.exception("action write_channel failed")
             state, detail = "unknown", f"exec_exception:{str(e)[:120]}"
             res = None
@@ -1129,16 +1210,16 @@ class ActionService:
             )
             if state == "success":
                 obj_row = conn.execute(
-                    "SELECT name FROM objects WHERE asset_id=? AND (id=? OR name=?)",
+                    "SELECT * FROM objects WHERE asset_id=? AND (id=? OR name=?)",
                     (row["asset_id"], row["object_id"], row["object_id"]),
                 ).fetchone()
-                service = (obj_row["name"] if obj_row else "") or ""
+                service = resolve_object_name(dict(obj_row)) if obj_row else ""
                 from .verify_profiles import profile_for_action
 
                 _prof = profile_for_action(
                     capability=row["capability"],
                     asset_id=row["asset_id"],
-                    object_id=row["object_id"] or "",
+                    object_id=service,
                 )
                 profile_id_guess = _prof.id if _prof else ""
                 _incg = conn.execute(
@@ -1178,11 +1259,7 @@ class ActionService:
                     ),
                 )
             elif state == "unknown":
-                conn.execute(
-                    "UPDATE incidents SET need_human=1, need_human_reason=?, stage='need_human',"
-                    " updated_at=? WHERE id=?",
-                    (f"exec_unknown:{action_id}", finished_at, row["incident_id"]),
-                )
+                self._mark_need_human(row["incident_id"], f"exec_unknown:{action_id}")
             elif state == "failure":
                 # 失败终态：尝试收敛仍被 hold 的 Incident
                 pass
@@ -1225,7 +1302,7 @@ class ActionService:
 
         _prof = profile_for_action(
             capability=row["capability"], asset_id=row["asset_id"],
-            object_id=row["object_id"] or "",
+            object_id=service,
         )
         criteria = {
             "window_sec": self.verify_window,
@@ -1271,11 +1348,16 @@ class ActionService:
         profile = get_profile(profile_id) if profile_id else None
         if profile is None:
             profile = profile_for_action(
-                capability=row["capability"], asset_id=asset, object_id=row.get("object_id") or ""
+                capability=row["capability"], asset_id=asset,
+                object_id=self._registered_service_label(row),
             )
         if profile is None:
             # unsupported：不得退回通用 probe_success 猜测
-            self._finish_verification(vid, "unknown", {}, "unsupported_verification_profile")
+            with self.db.tx():
+                self._finish_verification(vid, "unknown", {}, "unsupported_verification_profile")
+                self._mark_need_human(
+                    row.get("incident_id") or "", f"unsupported_verification_profile:{action_id}",
+                )
             return {"id": vid, "status": "unknown", "note": "unsupported_verification_profile"}
 
         # 固定 deadline：不因重试重新开始
@@ -1424,14 +1506,23 @@ class ActionService:
             inc_id = a_now["incident_id"]
             # 非 passed：标记需人工；若已 resolved 则重开（不得假 recovered）
             if status in ("failed", "inconclusive", "unknown") and inc_id:
+                self._mark_need_human(inc_id, f"verify_{status}:{vid}")
                 conn.execute(
-                    "UPDATE incidents SET need_human=1, need_human_reason=?,"
+                    "UPDATE incidents SET"
                     " status=CASE WHEN status='resolved' THEN 'open' ELSE status END,"
                     " resolved_at=CASE WHEN status='resolved' THEN NULL ELSE resolved_at END,"
                     " outcome=CASE WHEN status='resolved' THEN 'unrecovered' ELSE outcome END,"
                     " updated_at=? WHERE id=?",
-                    (f"verify_{status}:{vid}", now(), inc_id),
+                    (now(), inc_id),
                 )
+            elif status == "passed" and inc_id:
+                current_incident = conn.execute(
+                    "SELECT generation FROM incidents WHERE id=?", (inc_id,)
+                ).fetchone()
+                if current_incident and int(current_incident["generation"] or 1) == gen:
+                    from .incidents import IncidentService
+
+                    IncidentService(self.db).clear_awaiting_approval(inc_id, action_id)
             # 统一收敛：passed 不单独 recovered
             if inc_id:
                 try:
@@ -1458,10 +1549,13 @@ class ActionService:
     def _mark_need_human(self, incident_id: str, reason: str) -> None:
         if not incident_id:
             return
+        from .incidents import IncidentService
+
+        service = IncidentService(self.db)
+        service.set_need_human(incident_id, reason)
         self.db.execute(
-            "UPDATE incidents SET need_human=1, need_human_reason=?, stage='need_human',"
-            " updated_at=? WHERE id=?",
-            (reason, now(), incident_id),
+            "UPDATE incidents SET stage='need_human', updated_at=? WHERE id=?",
+            (now(), incident_id),
         )
 
     def resume_pending_verifications(self) -> int:
@@ -1734,7 +1828,7 @@ class ActionService:
 
     def _registered_service_label(self, row: dict) -> str:
         obj = self._object(row["asset_id"], row["object_id"])
-        return (obj or {}).get("name") or ""
+        return resolve_object_name(obj) if obj else ""
 
     def list_actions(
         self, state: str = "", limit: int = 50, manual_only: bool = False

@@ -55,6 +55,7 @@ SECRET_KEYS = (
     "session_signing_key",
     "totp_encrypt_key",
     "ssh_credential_key",
+    "notify_channel_key",
     "llm_api_key",
     "llm_base_url",
     "llm_model",

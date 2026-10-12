@@ -53,6 +53,47 @@ class HostHealthTest(unittest.TestCase):
         h = host_health(metric_state="ok", required_state="healthy")
         self.assertEqual(h["state"], "ok")
 
+    def test_available_resources_with_missing_required_probe_stay_observable(self):
+        h = host_health(metric_state="ok", required_state="unknown", check_states=["ok"])
+        self.assertEqual(h["state"], "warn")
+        self.assertEqual(h["label"], "部分未观测")
+        self.assertEqual(h["cls"], "warn")
+        self.assertTrue(h["partial"])
+        self.assertEqual(h["sources"]["metric"], "ok")
+        self.assertEqual(h["sources"]["required"], "unknown")
+
+    def test_native_business_observation_survives_missing_node_metrics(self):
+        h = host_health(metric_state="no_data", check_states=["ok"])
+        self.assertEqual(h["state"], "warn")
+        self.assertEqual(h["label"], "部分未观测")
+        self.assertTrue(h["partial"])
+        self.assertEqual(h["sources"]["checks"], ["ok"])
+
+    def test_all_sources_unobserved_stay_gray(self):
+        h = host_health(metric_state="no_data", required_state="unknown", check_states=["unknown", "no_data"])
+        self.assertEqual(h["state"], "no_data")
+        self.assertEqual(h["cls"], "dim")
+        self.assertFalse(h["partial"])
+
+    def test_actual_native_fail_state_turns_red_without_firing_alert(self):
+        h = host_health(metric_state="ok", check_states=["ok", "fail"])
+        self.assertEqual(h["state"], "bad")
+        self.assertEqual(h["cls"], "bad")
+
+    def test_partial_resource_measurements_are_yellow(self):
+        h = host_health(metric_state="partial_no_data")
+        self.assertEqual(h["state"], "warn")
+        self.assertEqual(h["cls"], "warn")
+        self.assertTrue(h["partial"])
+
+    def test_partial_observation_does_not_hide_failed_or_stale_business_checks(self):
+        for states, expected in ((["fail", "unknown"], "bad"), (["stale", "unknown"], "warn")):
+            with self.subTest(states=states):
+                h = host_health(metric_state="ok", check_states=states)
+                self.assertEqual(h["state"], expected)
+                self.assertTrue(h["partial"])
+                self.assertNotEqual(h["label"], "部分未观测")
+
 
 if __name__ == "__main__":
     unittest.main()

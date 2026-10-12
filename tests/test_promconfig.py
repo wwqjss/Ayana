@@ -786,9 +786,14 @@ class TestSecurityFailClosed(unittest.TestCase):
             return {"ok": True}
 
         svc._try_reload = _reload_ok
-        with self.assertRaises(PromConfigError) as ctx:
-            asyncio.run(svc.add_target(address="10.0.0.5:9100", actor="t"))
+        # 主机可能安装 promtool 或 Docker；模拟所有候选程序缺失，覆盖真实失败关闭分支。
+        with patch("ayana.promconfig.asyncio.create_subprocess_exec", new_callable=AsyncMock,
+                   side_effect=FileNotFoundError("simulated missing executable")) as spawn:
+            with self.assertRaises(PromConfigError) as ctx:
+                asyncio.run(svc.add_target(address="10.0.0.5:9100", actor="t"))
+        self.assertGreater(spawn.await_count, 0)
         self.assertEqual(ctx.exception.code, "promtool_failed")
+        self.assertIn("promtool_not_found", str(ctx.exception))
 
     def test_reload_failure_rolls_back(self):
         svc = PromConfigService(self.db, self.fs, require_promtool=False)

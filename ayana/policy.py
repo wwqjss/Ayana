@@ -201,27 +201,25 @@ class Policy:
         out.sort(key=lambda x: (x.get("asset_id") or "", x.get("object_id") or "", x.get("capability") or ""))
         return out
 
-    def _perm_row_state(self, r: dict[str, Any]) -> dict[str, Any]:
-        allow = bool(r.get("allow"))
-        require_approval = bool(r.get("require_approval"))
-        auto_allowed = bool(r.get("auto_allowed"))
-        # 三态与 UI 一致：禁止 / 需要确认 / 自动执行
-        # 自动执行不要求 auto_allowed=True（读能力天然是自动）；auto_allowed 仅约束 Agent 无人自动派发
-        if not allow:
-            state = "deny"
-        elif require_approval:
-            state = "confirm"
-        else:
-            state = "auto"
+    def _perm_row_state(self, r: dict[str, Any], *, effective: dict | None = None) -> dict[str, Any]:
+        """展示实际判定结果，不能把无效审批位或上限阻断伪装成有效授权。"""
+        effective = effective or self.effective_decision(
+            subject_type=r["subject_type"], subject_id=r["subject_id"], capability=r["capability"],
+            asset_id=r.get("asset_id") or "*", object_id=r.get("object_id") or "*",
+        )
+        state = {"forbidden": "deny", "approval_required": "confirm", "automatic": "auto"}[effective["decision"]]
         return {
             "id": r.get("id"),
             "capability": r.get("capability"),
             "asset_id": r.get("asset_id") or "*",
             "object_id": r.get("object_id") or "*",
-            "allow": allow,
-            "require_approval": require_approval,
-            "auto_allowed": auto_allowed,
+            "allow": effective["allowed"],
+            "require_approval": effective["require_approval"],
+            "auto_allowed": effective["auto_allowed"],
             "state": state,
+            "decision": effective["decision"],
+            "readable": effective["readable"],
+            "reason": effective["reason"],
             "source": "default",
             "updated_at": r.get("updated_at"),
             "updated_by": r.get("created_by") or "",
@@ -273,44 +271,36 @@ class Policy:
         subject_id: str = "agent",
     ) -> dict[str, Any]:
         """查看某对象最终生效权限（含命中来源）。"""
-        rule = self._match_rule(
+        effective = self.effective_decision(
             subject_type=subject_type,
             subject_id=subject_id,
             capability=capability,
             asset_id=asset_id,
             object_id=object_id,
         )
+        rule = effective["rule"]
         if not rule:
             return {
                 "capability": capability,
                 "asset_id": asset_id,
                 "object_id": object_id,
-                "state": "deny",
+                "state": {"forbidden": "deny", "approval_required": "confirm", "automatic": "auto"}[effective["decision"]],
                 "source": "implicit_deny",
-                "decision": "forbidden",
+                "decision": effective["decision"],
                 "readable": "禁止（无规则，默认拒绝）",
+                "reason": effective["reason"],
+                "allow": effective["allowed"],
+                "require_approval": effective["require_approval"],
+                "auto_allowed": effective["auto_allowed"],
             }
-        item = self._perm_row_state(dict(rule))
+        item = self._perm_row_state(dict(rule), effective=effective)
+        item["capability"] = capability
         aid = (rule.get("asset_id") or "").strip()
         oid = (rule.get("object_id") or "").strip()
         if aid in ("*", "") and oid in ("*", ""):
             item["source"] = "default"
         else:
             item["source"] = "exception"
-        # 与 check 同源的三态结论
-        cap = get_capability(capability)
-        auto_allowed = bool(rule.get("auto_allowed")) and bool(cap.auto_allowed)
-        decision = self._three_state(
-            allow=bool(rule.get("allow")),
-            require_approval=bool(rule.get("require_approval")),
-            auto_allowed=auto_allowed,
-        )
-        item["decision"] = decision
-        item["readable"] = {
-            "forbidden": "禁止",
-            "approval_required": "需要人工确认",
-            "automatic": "允许自动执行",
-        }.get(decision, decision)
         item["matched_rule"] = {
             "id": rule.get("id"),
             "asset_id": rule.get("asset_id"),

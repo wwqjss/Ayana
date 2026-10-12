@@ -1,0 +1,157 @@
+"""Read-only business observations from Prometheus and Ayana checks."""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import math
+import time
+from typing import Any
+
+from .health import REQUIRED_CHECKS
+from .monitor import asset_label_selector
+
+
+def _sample_state(sample: dict | None, freshness: float, at: float) -> str:
+    if not sample or sample.get("sample_at") is None:
+        return "no_data"
+    try:
+        timestamp, value = float(sample["sample_at"]), float(sample["value"])
+    except (KeyError, TypeError, ValueError):
+        return "no_data"
+    if not math.isfinite(timestamp) or not math.isfinite(value):
+        return "no_data"
+    if at - timestamp > freshness:
+        return "stale"
+    return "ok" if value == 1 else "fail" if value == 0 else "no_data"
+
+
+def _matches(labels: dict, selector: dict, aliases: set[str]) -> bool:
+    if labels.get("asset") is not None and str(labels["asset"]).casefold() not in aliases:
+        return False
+    for key, value in selector.items():
+        if key == "asset":
+            if str(labels.get(key, "")).casefold() not in aliases:
+                return False
+        elif labels.get(key) != value:
+            return False
+    return True
+
+
+def _series_key(labels: dict) -> str:
+    return json.dumps({key: value for key, value in labels.items() if key != "__name__"}, sort_keys=True)
+
+
+def _latest_series(samples: list[dict]) -> list[dict]:
+    latest = {}
+    for sample in samples:
+        key = _series_key(sample.get("metric") or {})
+        old = latest.get(key)
+        if old is None or _finite(sample.get("sample_at"), 0) >= _finite(old.get("sample_at"), 0):
+            latest[key] = sample
+    return list(latest.values())
+
+
+def _finite(value: Any, default=None):
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else default
+    except (TypeError, ValueError):
+        return default
+
+
+async def prometheus_checks(prom: Any, asset: dict) -> tuple[list[dict], list[dict]]:
+    """Display configured requirements and discovered probes with actual sample times.
+
+    Component names describe objects; only the registered selectors select series.
+    Global metrics are exposed solely for selectors belonging to this asset.
+    """
+    asset_id = asset["id"]
+    prom_asset = str(asset.get("prom_asset") or asset_id)
+    aliases = {str(asset_id).casefold(), prom_asset.casefold()}
+    requirements = REQUIRED_CHECKS.get(asset_id, [])
+    metrics = {"probe_success"} | {item["metric"] for item in requirements if item.get("metric")}
+    at = time.time()
+
+    async def fetch(metric: str):
+        expression = metric + "{" + asset_label_selector(prom_asset, asset_id) + "}" if metric == "probe_success" else metric
+        try:
+            samples = await prom.query_range_vector(expression, at=at, window_sec=600)
+            return metric, list(samples), ""
+        except Exception:
+            return metric, [], "暂时无法获取 Prometheus 业务检查，请稍后刷新。"
+
+    results = await asyncio.gather(*(fetch(metric) for metric in sorted(metrics)))
+    by_metric = {metric: samples for metric, samples, _ in results}
+    failed = {metric for metric, _, error in results if error}
+    errors = [{"source": "prometheus", "message": error, "metric": metric}
+              for metric, _, error in results if error]
+    items, claimed = [], set()
+
+    def append_item(metric: str, name: str, samples: list[dict], selector: dict,
+                    *, required: bool, freshness: float = 120):
+        latest = _latest_series(samples)
+        states = [_sample_state(sample, freshness, at) for sample in latest]
+        rank = {"ok": 0, "no_data": 1, "stale": 2, "fail": 3}
+        state = max(states, key=lambda value: rank[value]) if states else "no_data"
+        if metric in failed:
+            state = "collect_error"
+        candidates = [sample for sample in latest if _sample_state(sample, freshness, at) == state] or latest
+        sample = max(candidates, key=lambda value: _finite(value.get("sample_at"), 0)) if candidates else {}
+        labels = sample.get("metric") or selector
+        fingerprint = metric + ":" + name + ":" + _series_key(selector)
+        items.append({"id": "prom_" + hashlib.sha256(fingerprint.encode()).hexdigest()[:16],
+                      "asset_id": asset_id, "name": name, "source": "prometheus",
+                      "kind": "proxy" if metric == "hysteria_proxy_up" else "probe",
+                      "metric": metric, "labels": labels, "state": state,
+                      "last_at": _finite(sample.get("sample_at"), 0), "value": _finite(sample.get("value")),
+                      "required": required})
+
+    for requirement in requirements:
+        metric, selector = requirement.get("metric", "probe_success"), requirement.get("selector") or {}
+        samples = [sample for sample in by_metric.get(metric, [])
+                   if _matches(sample.get("metric") or {}, selector, aliases)]
+        claimed.update((metric, _series_key(sample.get("metric") or {})) for sample in samples)
+        append_item(metric, requirement.get("object") or selector.get("service") or metric,
+                    samples, selector, required=True, freshness=float(requirement.get("freshness_sec") or 120))
+
+    # Probe series need not have a statically declared required check to appear.
+    for sample in _latest_series(by_metric.get("probe_success", [])):
+        labels = sample.get("metric") or {}
+        if str(labels.get("asset", "")).casefold() not in aliases:
+            continue
+        if ("probe_success", _series_key(labels)) in claimed:
+            continue
+        name = str(labels.get("service") or labels.get("object") or labels.get("target") or labels.get("instance") or "外部探测")
+        append_item("probe_success", name, [sample], labels, required=False)
+    return items, errors
+
+
+def native_check_items(checks: list[dict]) -> list[dict]:
+    at = time.time()
+    items = []
+    for check in checks:
+        state = check.get("last_state") or "no_data"
+        if not check.get("enabled", True):
+            state = "disabled"
+        elif not check.get("last_at"):
+            state = "no_data"
+        elif at - float(check["last_at"]) > max(120, 2 * int(check.get("interval_sec") or 60)):
+            state = "stale"
+        items.append({**check, "source": "ayana", "state": state, "last_at": check.get("last_at") or 0})
+    return items
+
+
+def required_health(items: list[dict]) -> str:
+    states = [item["state"] for item in items if item.get("required")]
+    if not states:
+        return ""
+    if "collect_error" in states:
+        return "collect_error"
+    if "fail" in states:
+        return "unhealthy"
+    if "stale" in states:
+        return "stale"
+    if "no_data" in states:
+        return "unknown"
+    return "healthy"

@@ -17,11 +17,48 @@ from typing import Any
 
 from .db import Database, new_id, now
 from .messagelog import platform_of_kind
+from .transport import is_blocked_ssrf_host
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 except ImportError:  # pragma: no cover
     AESGCM = None  # type: ignore
+
+
+def _assert_safe_webhook_url(url: str) -> str:
+    """B5: Webhook 目标禁止环回/链路本地/元数据等 SSRF 面。"""
+    from urllib.parse import urlsplit
+
+    u = (url or "").strip()
+    try:
+        parts = urlsplit(u)
+    except ValueError as e:
+        raise ChannelError("bad_url", "invalid url") from e
+    if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+        raise ChannelError("bad_url", "webhook url must be http(s)")
+    if parts.username or parts.password:
+        raise ChannelError("bad_url", "webhook url must not contain userinfo")
+    if is_blocked_ssrf_host(parts.hostname, allow_loopback=False, purpose="webhook"):
+        raise ChannelError("bad_url", "webhook target host is not allowed")
+    return u
+
+
+def _assert_safe_ws_url(url: str) -> str:
+    """B5: WebSocket 目标与 webhook 同级限制。"""
+    from urllib.parse import urlsplit
+
+    u = (url or "").strip()
+    try:
+        parts = urlsplit(u)
+    except ValueError as e:
+        raise ChannelError("bad_ws_url", "invalid url") from e
+    if parts.scheme.lower() not in ("ws", "wss") or not parts.hostname:
+        raise ChannelError("bad_ws_url", "ws_url must be ws(s)://")
+    if parts.username or parts.password:
+        raise ChannelError("bad_ws_url", "ws_url must not contain userinfo")
+    if is_blocked_ssrf_host(parts.hostname, allow_loopback=False, purpose="webhook"):
+        raise ChannelError("bad_ws_url", "ws target host is not allowed")
+    return u
 
 CHANNEL_KINDS = ("qq", "wecom", "wecom_aibot", "webhook")
 
@@ -272,6 +309,8 @@ def _normalize(kind: str, config: dict) -> dict:
         url = str((config or {}).get("url") or (config or {}).get("webhook_url") or "").strip()
         if url and not url.startswith(("http://", "https://")):
             raise ChannelError("bad_url", "wecom webhook must be http(s)")
+        if url:
+            url = _assert_safe_webhook_url(url)
         return {"webhook_masked": _mask_webhook_url(url)}
     if kind == "wecom_aibot":
         bot_id = str((config or {}).get("bot_id") or (config or {}).get("bot_id_masked") or "").strip()
@@ -279,6 +318,8 @@ def _normalize(kind: str, config: dict) -> dict:
         ws_url = str((config or {}).get("ws_url") or "").strip()
         if ws_url and not ws_url.startswith(("ws://", "wss://")):
             raise ChannelError("bad_ws_url", "ws_url must be ws(s)://")
+        if ws_url:
+            ws_url = _assert_safe_ws_url(ws_url)
         return {
             "bot_id_masked": _mask_bot_id(bot_id),
             "targets": targets,
@@ -288,6 +329,7 @@ def _normalize(kind: str, config: dict) -> dict:
         url = str((config or {}).get("url") or "").strip()
         if not url.startswith(("http://", "https://")):
             raise ChannelError("bad_url", "webhook url must be http(s)")
+        url = _assert_safe_webhook_url(url)
         method = str((config or {}).get("method") or "POST").upper()
         if method not in ("POST", "PUT"):
             raise ChannelError("bad_method", method)
@@ -326,6 +368,7 @@ def _normalize_secret(kind: str, secret: dict | None, config: dict | None = None
         if url:
             if not url.startswith(("http://", "https://")):
                 raise ChannelError("bad_url", "wecom webhook must be http(s)")
+            url = _assert_safe_webhook_url(url)
             out["webhook_url"] = url
     elif kind == "webhook":
         # 敏感头 / token 整段加密
@@ -553,7 +596,7 @@ class ChannelStore:
 
     def list_enabled(self) -> list[dict[str, Any]]:
         rows = self.db.query(
-            "SELECT id, name, kind, config_json FROM notify_channels WHERE enabled=1"
+            "SELECT id, name, kind, config_json, created_at, updated_at FROM notify_channels WHERE enabled=1"
             " ORDER BY created_at ASC"
         )
         out = []
@@ -576,6 +619,8 @@ class ChannelStore:
                     "config": cfg,
                     "target": targets[0] if targets else "",
                     "targets": targets,
+                    "created_at": r["created_at"],
+                    "updated_at": r["updated_at"],
                 }
             )
         return out
@@ -841,13 +886,18 @@ class ChannelStore:
         url = str(sec.get("webhook_url") or "").strip()
         if not url:
             return False, "missing_webhook_url"
+        try:
+            url = _assert_safe_webhook_url(url)
+        except ChannelError as e:
+            return False, f"bad_url:{e}"
         payload = json.dumps(
             {"msgtype": "text", "text": {"content": body}}, ensure_ascii=False
         ).encode("utf-8")
         timeout = aiohttp.ClientTimeout(total=12)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(
-                url, data=payload, headers={"Content-Type": "application/json"}
+                url, data=payload, headers={"Content-Type": "application/json"},
+                allow_redirects=False,
             ) as resp:
                 txt = await resp.text()
                 if resp.status != 200:
@@ -868,6 +918,10 @@ class ChannelStore:
         url = str(cfg.get("url") or "").strip()
         if not url:
             return False, "missing_url"
+        try:
+            url = _assert_safe_webhook_url(url)
+        except ChannelError as e:
+            return False, f"bad_url:{e}"
         headers: dict[str, str] = {}
         for k, v in (cfg.get("headers") or {}).items():
             headers[str(k)] = str(v)
@@ -897,7 +951,7 @@ class ChannelStore:
             body_arg = text.encode("utf-8")
         timeout = aiohttp.ClientTimeout(total=12)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.request(method, url, data=body_arg, headers=headers) as resp:
+            async with session.request(method, url, data=body_arg, headers=headers, allow_redirects=False) as resp:
                 txt = await resp.text()
                 if 200 <= resp.status < 300:
                     return True, ""

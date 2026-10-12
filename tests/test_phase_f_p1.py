@@ -190,6 +190,11 @@ def make_db_env():
         " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         ("nerv:service:frps", "nerv", "service", "frps", "frps", "", 32659, "tcp", "frps-probe", 1, t),
     )
+    db.execute(
+        "INSERT OR IGNORE INTO users(username, password_hash, totp_enabled, is_admin, created_at, updated_at)"
+        " VALUES('admin','x',0,1,?,?)",
+        (t, t),
+    )
     return tmp, db
 
 
@@ -588,9 +593,10 @@ class TestReadySemantics(unittest.TestCase):
 
         h, r = asyncio.run(run())
         body = json.loads(r.body)
+        # A2: 未登录只暴露 ok/version，不返回 checks 明细
         self.assertTrue(body["ok"], body)
-        self.assertEqual(body["checks"]["db"], "available")
-        self.assertEqual(body["checks"]["schema"], "current")
+        self.assertEqual(body["detail"], "auth_required")
+        self.assertNotIn("checks", body)
 
     def test_health_alive_even_if_prom_down(self):
         tmp, db = make_db_env()
@@ -607,9 +613,9 @@ class TestReadySemantics(unittest.TestCase):
 
         r = asyncio.run(run())
         body = json.loads(r.body)
-        # Prom 降级不应拖死 ready
+        # Prom 降级不应拖死 ready（未登录时不暴露依赖细节）
         self.assertTrue(body["ok"], body)
-        self.assertEqual(body["checks"].get("prometheus"), "unavailable")
+        self.assertNotIn("checks", body)
 
 
 # ---------------------------------------------------------------------------

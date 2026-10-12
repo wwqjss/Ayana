@@ -16,8 +16,11 @@ from typing import Any
 from .db import Database, new_id, now
 
 try:
+    from cryptography.exceptions import UnsupportedAlgorithm
+    from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 except ImportError:  # pragma: no cover
+    serialization = None  # type: ignore
     AESGCM = None  # type: ignore
 
 
@@ -71,6 +74,28 @@ def generate_keypair() -> tuple[str, str]:
         return priv, pub
 
 
+def public_key_from_private(secret: str, supplied_public_key: str = "") -> str:
+    """验证无密码私钥并推导 OpenSSH 公钥；可选公钥必须属于同一把私钥。"""
+    if serialization is None:
+        raise CredentialError("crypto_unavailable", "cryptography not installed")
+    try:
+        raw = secret.encode("utf-8")
+        loader = (serialization.load_ssh_private_key if "BEGIN OPENSSH PRIVATE KEY" in secret
+                  else serialization.load_pem_private_key)
+        private = loader(raw, password=None)
+        derived = private.public_key().public_bytes(
+            serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH
+        ).decode("ascii")
+    except (ValueError, TypeError, AttributeError, UnicodeError, UnsupportedAlgorithm) as e:
+        raise CredentialError("bad_private_key", "需要有效的无密码 PEM/OpenSSH 私钥") from e
+    if supplied_public_key:
+        supplied = supplied_public_key.strip()
+        if "\n" in supplied or "\r" in supplied or supplied.split()[:2] != derived.split():
+            raise CredentialError("public_key_mismatch", "公钥与提交的私钥不匹配")
+        return supplied
+    return derived
+
+
 def generate_and_store_keypair(
     store: "CredentialStore", *, name: str, actor: str = "web"
 ) -> dict[str, Any]:
@@ -80,7 +105,7 @@ def generate_and_store_keypair(
         name=name, kind="private_key", secret=priv, public_key=pub, actor=actor
     )
     # 私钥不进返回值
-    return {"id": meta["id"], "name": meta["name"], "kind": meta["kind"], "public_key": pub}
+    return {"id": meta["id"], "name": meta["name"], "kind": meta["kind"], "public_key": meta["public_key"]}
 
 
 async def deploy_public_key(
@@ -192,8 +217,8 @@ class CredentialStore:
             raise CredentialError("bad_kind", kind)
         if not secret:
             raise CredentialError("empty_secret")
-        if kind == "private_key" and "PRIVATE KEY" not in secret and "BEGIN" not in secret:
-            raise CredentialError("bad_private_key", "not a PEM/OpenSSH private key")
+        if kind == "private_key":
+            public_key = public_key_from_private(secret, public_key)
         key = self._require_key()
         cid = new_id("cred")
         t = now()
@@ -232,13 +257,17 @@ class CredentialStore:
         key = self._require_key()
         if not secret:
             raise CredentialError("empty_secret")
+        if row["kind"] == "private_key":
+            public_key = public_key_from_private(secret, public_key)
+        else:
+            public_key = public_key or row["public_key"]
         t = now()
         enc = _encrypt(key, secret.encode("utf-8"))
         with self.db.tx() as conn:
             conn.execute(
                 "UPDATE ssh_credentials SET secret_enc=?, public_key=?, updated_at=?, rotated_at=?"
                 " WHERE id=?",
-                (enc, public_key or row["public_key"], t, t, credential_id),
+                (enc, public_key, t, t, credential_id),
             )
             conn.execute(
                 "INSERT INTO audit_log(at, actor_type, actor_id, entry, detail_json, channel)"
@@ -252,7 +281,7 @@ class CredentialStore:
                     "web",
                 ),
             )
-        return {"id": credential_id, "kind": row["kind"], "rotated_at": t}
+        return {"id": credential_id, "kind": row["kind"], "public_key": public_key, "rotated_at": t}
 
     def delete(self, credential_id: str, actor: str = "web") -> None:
         row = self.db.query_one("SELECT * FROM ssh_credentials WHERE id=?", (credential_id,))

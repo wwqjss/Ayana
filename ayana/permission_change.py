@@ -81,6 +81,8 @@ class PermissionChangeService:
 
         if subject_type not in ("web_user", "qq_user", "qq_group", "auto_rule", "llm", "system"):
             raise PermissionChangeError("bad_subject", subject_type)
+        if not isinstance(subject_id, str) or not subject_id.strip():
+            raise PermissionChangeError("bad_subject", "subject_id required")
 
         # 现值快照
         existing = self.policy.check(
@@ -270,6 +272,18 @@ class PermissionChangeService:
                 raise PermissionChangeError(
                     "bad_state", fresh["state"] if fresh else "unknown"
                 )
+            # Policy 的嵌套事务共享本事务：授权、状态、成功审计必须一起提交。
+            self.policy.upsert_permission(
+                subject_type=row["subject_type"],
+                subject_id=row["subject_id"],
+                capability=row["capability"],
+                asset_id=row["asset_id"],
+                object_id=row["object_id"],
+                allow=bool(row["to_allow"]),
+                require_approval=bool(row["to_require_approval"]),
+                auto_allowed=bool(row["to_auto_allowed"]),
+                actor=actor_id,
+            )
             conn.execute(
                 "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, object_id,"
                 " detail_json, incident_id, channel, decision_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -315,18 +329,6 @@ class PermissionChangeService:
                     ),
                 ),
             )
-        # 应用 Policy（在事务外调用，Policy 自写 audit）
-        self.policy.upsert_permission(
-            subject_type=row["subject_type"],
-            subject_id=row["subject_id"],
-            capability=row["capability"],
-            asset_id=row["asset_id"],
-            object_id=row["object_id"],
-            allow=bool(row["to_allow"]),
-            require_approval=bool(row["to_require_approval"]),
-            auto_allowed=bool(row["to_auto_allowed"]),
-            actor=actor_id,
-        )
         return {
             "id": change_id,
             "state": "applied",

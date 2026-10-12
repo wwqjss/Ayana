@@ -25,6 +25,9 @@ class IncidentService:
         ep = self.db.query_one("SELECT * FROM alert_episodes WHERE id=?", (episode_id,))
         if not ep:
             return ""
+        # 服务边界也拒绝隔离来源，不能依赖告警入站或后台调用者过滤。
+        if ep["source_state"] == "quarantine" or ep["source_health"] == "quarantine":
+            return ""
         if ep["incident_id"]:
             return ep["incident_id"]
         asset_id = ep["asset_id"] or ""
@@ -237,13 +240,23 @@ class IncidentService:
             )
         return gen
 
-    def close_manual(self, inc_id: str, reason: str, actor: str = "web_user") -> dict[str, Any]:
+    def close_manual(
+        self, inc_id: str, reason: str, actor: str = "web_user", *,
+        policy=None, actor_type: str = "web_user", is_admin: bool = False,
+    ) -> dict[str, Any]:
         """人工关闭：closed_at/reason；不伪造 resolved_at；outcome=closed_unverified。"""
         t = now()
         with self.db.tx() as conn:
             row = conn.execute("SELECT * FROM incidents WHERE id=?", (inc_id,)).fetchone()
             if not row:
                 return {"ok": False, "error": "not_found"}
+            if policy is not None:
+                visible = policy.check(
+                    subject_type=actor_type, subject_id=actor,
+                    capability="asset.summary", asset_id=row["asset_id"], object_id="*",
+                )
+                if not is_admin or not visible.get("allowed"):
+                    return {"ok": False, "error": "permission_denied"}
             conn.execute(
                 "UPDATE incidents SET status='closed', stage='done',"
                 " closed_at=?, close_reason=?, outcome='closed_unverified',"
@@ -259,10 +272,22 @@ class IncidentService:
         return {"ok": True, "outcome": "closed_unverified"}
 
     def set_need_human(self, inc_id: str, reason: str) -> None:
-        self.db.execute(
-            "UPDATE incidents SET need_human=1, need_human_reason=?, updated_at=? WHERE id=?",
-            (reason, now(), inc_id),
-        )
+        # 兼容旧字段，同时保存并行义务；一次新的等待批准不能覆盖别的人工任务。
+        with self.db.tx() as conn:
+            row = conn.execute(
+                "SELECT need_human, need_human_reason FROM incidents WHERE id=?", (inc_id,)
+            ).fetchone()
+            if not row:
+                return
+            reasons = [s for s in (row["need_human_reason"] or "").splitlines() if s]
+            if row["need_human"] and not reasons:
+                reasons.append("manual_review")
+            if reason and reason not in reasons:
+                reasons.append(reason)
+            conn.execute(
+                "UPDATE incidents SET need_human=1, need_human_reason=?, updated_at=? WHERE id=?",
+                ("\n".join(reasons), now(), inc_id),
+            )
         self.db.event("need_human", reason, incident_id=inc_id)
 
     need_human = set_need_human
@@ -272,6 +297,43 @@ class IncidentService:
             "UPDATE incidents SET need_human=0, need_human_reason='', updated_at=? WHERE id=?",
             (now(), inc_id),
         )
+
+    def clear_awaiting_approval(self, inc_id: str, action_id: str) -> None:
+        """只清除已经决定的这个提案的义务，保留其他人工处理原因。"""
+        if not inc_id:
+            return
+        prefix = f"awaiting_approval:{action_id}"
+        with self.db.tx() as conn:
+            row = conn.execute(
+                "SELECT need_human_reason, stage FROM incidents WHERE id=?", (inc_id,)
+            ).fetchone()
+            if not row:
+                return
+            reasons = [s for s in (row["need_human_reason"] or "").splitlines() if s]
+            remaining = [s for s in reasons if s.split(maxsplit=1)[0] != prefix]
+            if remaining == reasons:
+                return
+            stage = row["stage"]
+            if stage in ("awaiting_approval", "need_human"):
+                stage = "need_human" if remaining else "pending"
+            conn.execute(
+                "UPDATE incidents SET need_human=?, need_human_reason=?, stage=?, updated_at=?"
+                " WHERE id=?",
+                (int(bool(remaining)), "\n".join(remaining), stage, now(), inc_id),
+            )
+
+    def source_block_reason(self, inc_id: str) -> str:
+        """自动恢复的来源闸；无告警来源的人工事件仍可由其他契约约束。"""
+        row = self.db.query_one(
+            "SELECT id, source_state, source_health FROM alert_episodes WHERE incident_id=?"
+            " AND (source_state='quarantine' OR source_health!='ok') LIMIT 1",
+            (inc_id,),
+        )
+        if not row:
+            return ""
+        if row["source_state"] == "quarantine" or row["source_health"] == "quarantine":
+            return f"quarantined_source:{row['id']}"
+        return f"unhealthy_source:{row['id']}:{row['source_health']}"
 
     def set_stage(self, inc_id: str, stage: str, note: str = "") -> None:
         self.db.execute(
@@ -290,6 +352,26 @@ class IncidentService:
             return {"ok": False, "error": "not_found"}
         inc = dict(row)
         gen = int(inc.get("generation") or 1)
+
+        # 兼容修复前遗留的等待批准标志，只用当前代次的决定/通过证据核销对应义务。
+        generation = self.db.query_one(
+            "SELECT at FROM events WHERE incident_id=? AND type IN"
+            " ('generation_bumped','incident_reopened','incident_opened')"
+            " ORDER BY id DESC LIMIT 1", (inc_id,),
+        )
+        cutoff = float(generation["at"]) if generation else 0.0
+        if (generation or gen == 1) and inc.get("need_human") and "awaiting_approval:" in (inc.get("need_human_reason") or ""):
+            decided = self.db.query(
+                "SELECT a.id FROM actions a WHERE a.incident_id=? AND a.created_at>=?"
+                " AND a.state IN ('approved','dispatched','success','failure','unknown','cancelled','expired','rejected')"
+                " AND (a.approved_at IS NOT NULL OR a.state IN ('cancelled','expired','rejected')"
+                " OR EXISTS (SELECT 1 FROM verifications v WHERE v.action_id=a.id"
+                " AND v.status='passed' AND (v.generation IS NULL OR v.generation=?)))",
+                (inc_id, cutoff, gen),
+            )
+            for action in decided:
+                self.clear_awaiting_approval(inc_id, action["id"])
+            inc = dict(self.db.query_one("SELECT * FROM incidents WHERE id=?", (inc_id,)))
 
         firing = self.db.query_one(
             "SELECT COUNT(*) AS n FROM alert_episodes WHERE incident_id=? AND status='firing'",

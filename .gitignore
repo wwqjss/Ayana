@@ -6,6 +6,8 @@ ayana.db-wal
 ayana.db-shm
 ayana.log
 ayana.out
+ayana-start*.log
+bootstrap-admin.password
 *.egg-info/
 .venv/
 __pycache__/
@@ -15,12 +17,21 @@ uv.lock
 # 本地运行/验证产物（不入库）
 *.tar
 *.tar.gz
-ayana-start*.log
 ui-*.png
 ayana-verify.png
 .pw-verify/
 .playwright-cli/
 backups/
+_rt_*.py
+
+# 内部审查与运维脚本（不公开）
+docs/reviews/
+deploy/review-*
+deploy/verify*.py
+deploy/check_llm.py
+deploy/audit_assist.py
+deploy/dep*.sh
+deploy/release-*.sh
 
 # 一次性补丁/验证脚本
 patch_*.py

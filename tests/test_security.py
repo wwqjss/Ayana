@@ -120,6 +120,17 @@ def make_env():
         " VALUES('nerv:service:nginx','nerv','service','nginx','nginx',?)",
         (t,),
     )
+    # B2: 自批限制依赖 users.is_admin
+    db.execute(
+        "INSERT OR IGNORE INTO users(username, password_hash, totp_enabled, is_admin, created_at, updated_at)"
+        " VALUES('admin','x',0,1,?,?)",
+        (t, t),
+    )
+    db.execute(
+        "INSERT OR IGNORE INTO users(username, password_hash, totp_enabled, is_admin, created_at, updated_at)"
+        " VALUES('op','x',0,0,?,?)",
+        (t, t),
+    )
     policy = Policy(db)
     return tmp, db, policy
 
@@ -199,6 +210,19 @@ class TestActionSecurity(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "cancel_denied")
         row = self.db.query_one("SELECT state FROM actions WHERE id=?", (prop["id"],))
         self.assertEqual(row["state"], "proposed")
+
+    def test_non_admin_cannot_self_approve(self):
+        self.policy.upsert_permission(
+            subject_type="web_user", subject_id="op", capability="service.restart",
+            asset_id="nerv", object_id="nerv:service:frps", allow=True,
+        )
+        prop = self.actions.propose(
+            asset_id="nerv", object_id="frps", capability="service.restart",
+            proposer_type="web_user", proposer_id="op",
+        )
+        with self.assertRaises(ActionError) as ctx:
+            self.actions.approve(prop["id"], approver_type="web_user", approver_id="op")
+        self.assertEqual(ctx.exception.code, "self_approve_denied")
 
     def test_execute_rechecks_policy(self):
         prop = self.actions.propose(

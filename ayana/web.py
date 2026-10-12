@@ -9,6 +9,7 @@ import logging
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from aiohttp import web
 
@@ -23,6 +24,59 @@ from .prom import PromClient, summarize_probe
 log = logging.getLogger("ayana.web")
 
 SESSION_COOKIE = "ayana_session"
+
+
+def _host_port(value: str, *, default_port: str = "") -> tuple[str, str]:
+    """解析 Host / Origin 的 hostname 与 port（默认端口与 scheme 对齐）。"""
+    raw = (value or "").strip()
+    if not raw:
+        return "", ""
+    if "://" in raw:
+        try:
+            parts = urlsplit(raw)
+            port = parts.port
+        except ValueError:
+            return "", ""
+        host = (parts.hostname or "").lower()
+        scheme = (parts.scheme or "http").lower()
+        if port is None:
+            port_s = {"https": "443", "wss": "443", "http": "80", "ws": "80"}.get(scheme, "")
+        else:
+            port_s = str(port)
+        return host, port_s
+    # Host 头：可带端口；IPv6 形如 [::1]:6200
+    if raw.startswith("["):
+        end = raw.find("]")
+        host = raw[1:end] if end > 0 else ""
+        rest = raw[end + 1 :] if end > 0 else ""
+        port = rest[1:] if rest.startswith(":") else ""
+        return host.lower(), port or default_port
+    if raw.count(":") == 1:
+        host, port = raw.split(":", 1)
+        return host.lower(), port or default_port
+    return raw.lower(), default_port
+
+
+def _origin_allowed(origin: str, host_hdr: str) -> bool:
+    """B3: Origin 必须与 Host 的 hostname[:port] 精确一致，禁止后缀匹配。"""
+    if not origin:
+        return True
+    o_host, o_port = _host_port(origin)
+    h_host, h_port = _host_port(host_hdr)
+    if not o_host or not h_host:
+        return False
+    if o_host != h_host:
+        return False
+    # 端口：均空或相同；scheme 默认端口与 Host 显式默认端口等价
+    if o_port and h_port:
+        return o_port == h_port
+    if o_port and not h_port:
+        scheme = (urlsplit(origin).scheme or "http").lower()
+        default = {"https": "443", "wss": "443"}.get(scheme, "80")
+        return o_port == default
+    if h_port and not o_port:
+        return h_port in {"80", "443"}
+    return True
 
 
 def _json(data: Any, status: int = 200) -> web.Response:
@@ -136,6 +190,7 @@ class WebApp:
         app.router.add_get("/api/permissions", self.api_permissions)
         app.router.add_get("/api/permissions/model", self.api_permissions_model)
         app.router.add_get("/api/permissions/effective", self.api_permissions_effective)
+        app.router.add_post("/api/permissions/validate", self.api_permission_validate)
         app.router.add_post("/api/permissions", self.api_permission_upsert)
         app.router.add_post("/api/permissions/delete", self.api_permission_delete)
         app.router.add_post("/api/permissions/preview", self.api_permission_preview)
@@ -189,6 +244,7 @@ class WebApp:
         # 主机资源监控
         app.router.add_get("/api/monitor/hosts", self.api_monitor_hosts)
         app.router.add_get("/api/monitor/host/{asset_id}", self.api_monitor_host)
+        app.router.add_get("/api/monitor/business/{asset_id}", self.api_monitor_business)
         app.router.add_get("/api/runbook", self.api_runbook)
         app.router.add_post("/api/agent/auto", self.api_agent_auto_toggle)
         app.router.add_get("/api/agent/status", self.api_agent_status)
@@ -196,6 +252,7 @@ class WebApp:
         app.router.add_get("/api/prom/probe", self.api_prom_probe)
         app.router.add_get("/api/checks", self.api_checks_list)
         app.router.add_post("/api/checks", self.api_checks_create)
+        app.router.add_post("/api/checks/validate", self.api_checks_validate)
         app.router.add_post("/api/assist/configure", self.api_assist_configure)
         app.router.add_get("/api/assist/form", self.api_assist_form)
         app.router.add_post("/api/checks/update", self.api_checks_update)
@@ -231,9 +288,30 @@ class WebApp:
         domain = request.rel_url.query.get("domain", "checks")
         try:
             form = formspec.get_form(domain)
-        except Exception as e:
-            return _json({"ok": False, "error": str(e)}, 400)
+        except KeyError:
+            return _json({"ok": False, "error": "bad_domain", "message": "当前页面尚不支持智能填表。"}, 400)
         return _json({"ok": True, "form": form})
+
+    def _assist_assets(self, sess: dict) -> list[dict]:
+        """Only enabled, visible inventory; no credentials or unrestricted client context."""
+        visible = self._visible_asset_ids(sess)
+        assets = []
+        store = self.ssh_store or self._ssh_store()
+        for row in self.db.query("SELECT id, display_name FROM assets WHERE enabled=1 ORDER BY id"):
+            if row["id"] not in visible:
+                continue
+            asset = dict(row)
+            asset["objects"] = [dict(obj) for obj in self.db.query(
+                "SELECT id, kind, name, unit, container, port, protocol FROM objects WHERE asset_id=? ORDER BY id",
+                (row["id"],),
+            )]
+            if store is not None:
+                endpoints = store.list_endpoints(row["id"])
+                asset["execution"] = {"channel": "registered_ssh",
+                                      "connection_configured": any(ep.get("enabled") for ep in endpoints),
+                                      "boundary": "仅现有只读探测命令；主机受限通道仍是最终边界。"}
+            assets.append(asset)
+        return assets
 
     async def api_assist_configure(self, request: web.Request) -> web.Response:
         """自然语言 → 填表意图。只读查询 + 字段草稿；不保存。"""
@@ -242,27 +320,29 @@ class WebApp:
         try:
             body = await request.json()
         except Exception:
-            return _json({"ok": False, "error": "bad_json"}, 400)
-        domain = str(body.get("domain") or "").strip()
-        text = str(body.get("text") or "").strip()
-        ctx = body.get("context") or {}
+            return _json({"ok": False, "error": "bad_json", "message": "提交内容无法读取，请重新填写。"}, 400)
+        if not isinstance(body, dict) or not isinstance(body.get("text"), str):
+            return _json({"ok": False, "error": "bad_input", "message": "请用文字描述要配置什么。"}, 400)
+        domain = body.get("domain")
+        text = body["text"].strip()
+        ctx = body.get("context", {})
+        if not isinstance(ctx, dict) or len(json.dumps(ctx, ensure_ascii=False)) > 20000:
+            return _json({"ok": False, "error": "bad_context", "message": "补充内容格式不正确或过长，请重新填写。"}, 400)
         if domain not in ("checks", "permissions"):
-            return _json({"ok": False, "error": "bad_domain"}, 400)
+            return _json({"ok": False, "error": "bad_domain", "message": "当前页面尚不支持智能填表。"}, 400)
+        if not text or len(text) > 4000:
+            return _json({"ok": False, "error": "bad_text", "message": "请输入不超过 4000 字的配置描述。"}, 400)
+        if domain == "checks":
+            self._check_read(request)
 
-        assets = [r["id"] for r in self.db.query("SELECT id FROM assets ORDER BY id")]
-        caps: list[str] = []
-        try:
-            from .capabilities import list_capabilities
+        assets = self._assist_assets(sess)
+        from .capabilities import list_capabilities
 
-            caps = [c["name"] for c in list_capabilities()]
-        except Exception:
-            caps = []
+        caps = list_capabilities() if domain == "permissions" else []
         names: list[str] = []
         if domain == "checks":
-            try:
-                names = [c["name"] for c in self._checks().list_checks("")]
-            except Exception:
-                names = []
+            visible_ids = {a["id"] for a in assets}
+            names = [c["name"] for c in self._checks().list_checks("") if c["asset_id"] in visible_ids]
 
         from . import assist
 
@@ -280,7 +360,9 @@ class WebApp:
                 "web_user",
                 sess.get("username") or "",
                 "assist_configure",
-                detail={"domain": domain, "source": res.get("source"), "route": res.get("route")},
+                detail={"domain": domain, "source": res.get("source"), "route": res.get("route"),
+                        "status": res.get("status"), "error": res.get("error"),
+                        "trace_id": (res.get("diagnostics") or {}).get("trace_id")},
             )
         except Exception:
             pass
@@ -289,14 +371,35 @@ class WebApp:
     # ---- auth helpers ----
 
     def _session(self, request: web.Request) -> dict[str, Any] | None:
-        sid = request.cookies.get(SESSION_COOKIE, "")
-        return self.auth.get_session(sid)
+        cookies = getattr(request, "cookies", None) or {}
+        sid = cookies.get(SESSION_COOKIE, "")
+        headers = getattr(request, "headers", None) or {}
+        return self.auth.get_session(
+            sid,
+            ip=getattr(request, "remote", "") or "",
+            ua=headers.get("User-Agent", "") if hasattr(headers, "get") else "",
+        )
 
     def _require_auth(self, request: web.Request) -> dict[str, Any] | None:
         sess = self._session(request)
         if not sess:
             raise web.HTTPUnauthorized(text=json.dumps({"error": "unauthorized"}))
+        self._enforce_password_change(request, sess)
         return sess
+
+    def _enforce_password_change(self, request: web.Request, sess: dict) -> None:
+        """首登强制改密：仅放行 me/logout/password。"""
+        if not sess.get("must_change_password"):
+            return
+        path = request.rel_url.path
+        if path in ("/api/me", "/api/logout", "/api/password"):
+            return
+        raise web.HTTPForbidden(
+            text=json.dumps({
+                "error": "password_change_required",
+                "message": "首次登录或口令已重置，请先修改密码。",
+            })
+        )
 
     def _require_admin(self, request: web.Request) -> dict[str, Any]:
         sess = self._require_auth(request)
@@ -309,13 +412,9 @@ class WebApp:
             return
         origin = request.headers.get("Origin", "")
         host = request.headers.get("Host", "")
-        if origin and host and origin not in (
-            f"http://{host}",
-            f"https://{host}",
-        ):
-            # 允许同源或无 Origin（curl）
-            if not origin.endswith(host):
-                raise web.HTTPForbidden(text=json.dumps({"error": "bad_origin"}))
+        # 允许同源或无 Origin（curl）；非法 Origin 直接拒绝
+        if origin and host and not _origin_allowed(origin, host):
+            raise web.HTTPForbidden(text=json.dumps({"error": "bad_origin"}))
         token = request.headers.get("X-CSRF-Token", "") or (
             request.rel_url.query.get("csrf", "")
         )
@@ -346,10 +445,24 @@ class WebApp:
     async def ready(self, request: web.Request) -> web.Response:
         """是否具备可信处理工作的条件。
 
-        - DB / schema 必须可用，否则 503
-        - 外部依赖（Prom/AM/NT/LLM）降级展示，不拖死全局
-        - worker 最近成功时间 / backlog 可见
+        - 未登录：仅返回 ok/version（A2：不暴露 Worker/积压/依赖细节）
+        - 已登录：DB / schema 必须可用，否则 503；外部依赖降级展示
         """
+        sess = self._session(request)
+        if not sess:
+            try:
+                self.db.query_one("SELECT 1 AS x")
+                ver = self.db.schema_version()
+                from .db import SCHEMA_VERSION
+
+                ok = ver == SCHEMA_VERSION
+            except Exception:
+                ok = False
+            return _json(
+                {"ok": ok, "version": self.version, "detail": "auth_required"},
+                200 if ok else 503,
+            )
+
         checks: dict[str, Any] = {}
         reasons: list[str] = []
 
@@ -444,6 +557,7 @@ class WebApp:
                     "username": sess["username"],
                     "is_admin": sess["is_admin"],
                     "user_id": sess["user_id"],
+                    "must_change_password": bool(sess.get("must_change_password")),
                 },
                 "csrf_token": sess["csrf_token"],
             }
@@ -455,10 +569,13 @@ class WebApp:
             body = await request.json()
         except Exception:
             return _json({"ok": False, "error": "bad_json"}, 400)
+        if not isinstance(body, dict):
+            return _json({"ok": False, "error": "bad_json"}, 400)
         ip = request.remote or ""
+        ua = request.headers.get("User-Agent", "")
         try:
             res = self.auth.begin_login(
-                body.get("username", ""), body.get("password", ""), ip=ip
+                body.get("username", ""), body.get("password", ""), ip=ip, ua=ua
             )
         except AuthError as e:
             return _json({"ok": False, "error": e.code, "message": str(e)}, 401)
@@ -491,13 +608,17 @@ class WebApp:
             body = await request.json()
         except Exception:
             return _json({"ok": False, "error": "bad_json"}, 400)
+        if not isinstance(body, dict):
+            return _json({"ok": False, "error": "bad_json"}, 400)
         ip = request.remote or ""
+        ua = request.headers.get("User-Agent", "")
         try:
             sess = self.auth.complete_login(
                 body.get("pending_id", ""),
                 totp_code=body.get("totp", "") or body.get("code", ""),
                 recovery_code=body.get("recovery_code", ""),
                 ip=ip,
+                ua=ua,
             )
         except AuthError as e:
             return _json({"ok": False, "error": e.code, "message": str(e)}, 401)
@@ -518,7 +639,10 @@ class WebApp:
             body = await request.json()
         except Exception:
             return _json({"ok": False, "error": "bad_json"}, 400)
+        if not isinstance(body, dict):
+            return _json({"ok": False, "error": "bad_json"}, 400)
         ip = request.remote or ""
+        ua = request.headers.get("User-Agent", "")
         try:
             sess = self.auth.login(
                 body.get("username", ""),
@@ -526,6 +650,7 @@ class WebApp:
                 body.get("totp", ""),
                 body.get("recovery_code", ""),
                 ip=ip,
+                ua=ua,
             )
         except AuthError as e:
             return _json({"ok": False, "error": e.code, "message": str(e)}, 401)
@@ -544,6 +669,8 @@ class WebApp:
     async def api_logout(self, request: web.Request) -> web.Response:
         sess = self._session(request)
         if sess:
+            # A3: 已登录会话的注销需 CSRF，防跨站强制登出
+            self._check_csrf(request, sess)
             self.auth.logout(sess["session_id"])
         resp = _json({"ok": True})
         resp.del_cookie(SESSION_COOKIE)
@@ -572,7 +699,11 @@ class WebApp:
         except AuthError as e:
             return _json({"ok": False, "error": e.code, "message": str(e)}, 400)
         # 旧会话已被撤销，给当前会话重新签发
-        new_sess = self.auth._issue_session(sess["user_id"])
+        new_sess = self.auth._issue_session(
+            sess["user_id"],
+            request.remote or "",
+            request.headers.get("User-Agent", ""),
+        )
         self.db.audit("web_user", sess["username"], "totp_enabled")
         resp = _json({"ok": True, "recovery_codes": codes, "csrf_token": new_sess["csrf_token"]})
         resp.set_cookie(
@@ -595,7 +726,11 @@ class WebApp:
             )
         except AuthError as e:
             return _json({"ok": False, "error": e.code, "message": str(e)}, 400)
-        new_sess = self.auth._issue_session(sess["user_id"])
+        new_sess = self.auth._issue_session(
+            sess["user_id"],
+            request.remote or "",
+            request.headers.get("User-Agent", ""),
+        )
         resp = _json({"ok": True, "csrf_token": new_sess["csrf_token"]})
         resp.set_cookie(
             SESSION_COOKIE,
@@ -623,54 +758,33 @@ class WebApp:
     # ---- business api ----
 
     async def api_overview(self, request: web.Request) -> web.Response:
-        self._require_auth(request)
-        from .health import REQUIRED_CHECKS, asset_health
+        sess = self._require_auth(request)
+        from .health import host_health
+        from .business import required_health, native_check_items
 
         # 短缓存：避免前端连点/轮询把 Prom 探测打满（Windows 连接拒绝约 2s/次）
         now_ts = time.time()
+        visible = self._visible_asset_ids(sess)
         cache = getattr(self, "_overview_cache", None)
-        if cache and (now_ts - cache["at"]) < 5.0:
+        if cache and cache.get("visible") == visible and (now_ts - cache["at"]) < 5.0:
             return _json(cache["data"])
 
-        assets_raw = self.db.query("SELECT * FROM assets ORDER BY id")
-        open_inc = self.incidents.list_incidents(status="open", limit=50)
+        assets_raw = [row for row in self.db.query("SELECT * FROM assets ORDER BY id") if row["id"] in visible]
+        open_inc = [incident for incident in self.incidents.list_incidents(status="open", limit=50) if incident.get("asset_id") in visible]
         open_by_asset = {}
         for i in open_inc:
             aid = i.get("asset_id") or ""
             open_by_asset[aid] = open_by_asset.get(aid, 0) + 1
 
-        async def _fetch_metric(asset_id: str, metric: str):
-            try:
-                if metric == "hysteria_proxy_up":
-                    hy = await self.prom.query("hysteria_proxy_up")
-                    return metric, hy.get("result") or []
-                if metric == "probe_success":
-                    return metric, await self.prom.probe_success_since(
-                        asset_id, "", start=now() - 300
-                    )
-            except Exception:
-                return metric, []
-            return metric, []
-
-        # 先并行收集各资产需要的指标，再组装
-        tasks = []
-        for a in assets_raw:
-            req = REQUIRED_CHECKS.get(a["id"], [])
-            metrics = {c.get("metric") for c in req if c.get("metric")}
-            for metric in metrics:
-                tasks.append(_fetch_metric(a["id"], metric))
-        results = await asyncio.gather(*tasks) if tasks else []
-        # (asset_id, metric) 顺序与 tasks 构建顺序一致
-        idx = 0
-        metric_map: dict[str, dict[str, list]] = {}
-        for a in assets_raw:
-            req = REQUIRED_CHECKS.get(a["id"], [])
-            metrics = {c.get("metric") for c in req if c.get("metric")}
-            metric_map[a["id"]] = {}
-            for metric in metrics:
-                _m, samples = results[idx]
-                metric_map[a["id"]][metric] = samples
-                idx += 1
+        # Share the actual samples/selectors and native freshness with resources.
+        results = await asyncio.gather(*(self._prom_business_items(dict(asset)) for asset in assets_raw))
+        business_map = {asset["id"]: result[0] for asset, result in zip(assets_raw, results)}
+        host_status = await self.host_monitor.hosts_status([dict(asset) for asset in assets_raw]) if self.host_monitor else []
+        host_map = {item["asset_id"]: item for item in host_status}
+        native_rows = [dict(row) for row in self.db.query("SELECT asset_id,last_state,last_at,interval_sec FROM checks WHERE enabled=1")
+                       if row["asset_id"] in visible]
+        native_items = native_check_items(native_rows)
+        firing_by_asset = self._monitor_firing()
 
         assets = []
         for a in assets_raw:
@@ -679,22 +793,27 @@ class WebApp:
                 dict(o)
                 for o in self.db.query("SELECT * FROM objects WHERE asset_id=?", (a["id"],))
             ]
-            health = asset_health(
-                asset_id=a["id"],
-                objects=d["objects"],
-                samples_by_metric=metric_map.get(a["id"], {}),
-                open_incidents=open_by_asset.get(a["id"], 0),
-            )
-            # 小圆点结论：与资源页同一套 host_health（不吸收历史未结案）
-            from .health import host_health as _hh
+            prom_items = business_map.get(a["id"], [])
+            native = [item for item in native_items if item["asset_id"] == a["id"]]
+            required_state = required_health(prom_items)
+            state_names = {"ok": "healthy", "fail": "unhealthy", "stale": "stale", "no_data": "unknown", "collect_error": "unknown"}
+            health = {"state": required_state or "unknown", "coverage": f"required {sum(bool(item.get('required')) for item in prom_items)}",
+                      "objects": [{"object": item["name"], "state": state_names.get(item["state"], "unknown")}
+                                  for item in prom_items if item.get("required")]}
             d["health"] = health
-            d["health_dot"] = _hh(
-                required_state=health.get("state", "unknown"),
-            )
+            metric = host_map.get(a["id"], {})
+            d["health_dot"] = host_health(metric_state=metric.get("state", ""), metric_error=metric.get("error", ""),
+                                            required_state=required_state,
+                                            check_states=[item["state"] for item in native + prom_items if not item.get("required")],
+                                            firing_severities=firing_by_asset.get(a["id"], []))
+            states = [item["state"] for item in prom_items + native]
+            d["business_summary"] = {"total": len(states), "healthy": states.count("ok"),
+                                      "failed": states.count("fail"), "unknown": sum(state not in ("ok", "fail") for state in states)}
             d["probe"] = {"state": health.get("state", "unknown")}
             assets.append(d)
         need = [i for i in open_inc if i.get("need_human")]
-        actions = self.actions.list_actions(limit=10)
+        actions = [action for action in self.actions.list_actions(limit=50)
+                   if action.get("asset_id") in visible][:10]
         pending_actions = [x for x in actions if x.get("state") in ("proposed", "approved", "dispatched")]
         unknown_actions = [x for x in actions if x.get("state") == "unknown"]
         sources = {}
@@ -708,52 +827,21 @@ class WebApp:
         # 系统健康度：唯一分数 + MAGI 分项拆解（真实数据）
         from .health import system_health_ratio
 
-        metric_items: list[dict] = []
-        for a in assets_raw:
-            for c in REQUIRED_CHECKS.get(a["id"], []):
-                samples = (metric_map.get(a["id"]) or {}).get(c.get("metric") or "", [])
-                # 按 selector 过滤
-                sel = c.get("selector") or {}
-                matched = []
-                for s in samples:
-                    m = s.get("metric") or {}
-                    if all(m.get(k) == v for k, v in sel.items()):
-                        matched.append(s)
-                latest = max(matched, key=lambda x: x.get("sample_at") or 0) if matched else None
-                fres = float(c.get("freshness_sec") or 120)
-                if latest is None:
-                    st = "unknown"
-                else:
-                    age = time.time() - float(latest.get("sample_at") or 0)
-                    val = latest.get("value")
-                    if age > fres:
-                        st = "stale"
-                    elif val is None:
-                        st = "unknown"
-                    elif val == 1:
-                        st = "healthy"
-                    else:
-                        st = "unhealthy"
-                metric_items.append({"state": st, "object": c.get("object"), "asset": a["id"]})
-
-        check_items: list[dict] = []
-        try:
-            for row in self.db.query("SELECT last_state FROM checks WHERE enabled=1"):
-                check_items.append({"state": row["last_state"] or "unknown"})
-        except Exception:
-            pass
+        metric_items = [{"state": item["state"], "object": item["name"], "asset": aid}
+                        for aid, items in business_map.items() for item in items]
+        check_items = [{"state": item["state"]} for item in native_items]
 
         # 告警状态：单项状态（当前有 firing → 0/1；无 → 1/1）
         # 不把每条历史未结案事件算进来；只反映「此刻告警面是否干净」
         alert_items: list[dict] = []
         try:
-            n_firing = 0
-            for _row in self.db.query(
-                "SELECT COUNT(*) AS n FROM alert_episodes WHERE status='firing'"
+            n_firing = sum(1 for row in self.db.query(
+                "SELECT asset_id FROM alert_episodes WHERE status='firing'"
                 " AND (source_state IS NULL OR source_state='firing')"
-            ):
-                n_firing = int(_row["n"] or 0)
-            alert_items.append({"state": "unhealthy" if n_firing else "healthy"})
+            ) if row["asset_id"] in visible)
+            # Absence of alerts is not a successful observation.
+            if n_firing or metric_items or check_items:
+                alert_items.append({"state": "unhealthy" if n_firing else "healthy"})
         except Exception:
             pass
 
@@ -776,7 +864,7 @@ class WebApp:
             "health_ratio": health_ratio,
             "quiet": quiet,
         }
-        self._overview_cache = {"at": time.time(), "data": data}
+        self._overview_cache = {"at": time.time(), "visible": visible, "data": data}
         return _json(data)
 
     def _visible_asset_ids(self, sess: dict) -> set[str]:
@@ -1057,8 +1145,10 @@ class WebApp:
         return _json({"ok": True})
 
     async def api_asset_detail(self, request: web.Request) -> web.Response:
-        self._require_auth(request)
+        sess = self._require_auth(request)
         asset_id = request.match_info["asset_id"]
+        if asset_id not in self._visible_asset_ids(sess):
+            return _json({"ok": False, "error": "permission_denied"}, 403)
         row = self.db.query_one("SELECT * FROM assets WHERE id=?", (asset_id,))
         if not row:
             return _json({"ok": False, "error": "not_found"}, 404)
@@ -1085,7 +1175,8 @@ class WebApp:
                 data["probe"] = {"state": "unavailable", "reason": str(e)}
         else:
             data["probe"] = {"state": "denied", "reason": "policy"}
-        data["incidents"] = self.incidents.list_incidents(limit=5)
+        data["incidents"] = [inc for inc in self.incidents.list_incidents()
+                             if inc.get("asset_id") == asset_id][:5]
         return _json({"ok": True, "asset": data})
 
     async def api_investigate(self, request: web.Request) -> web.Response:
@@ -1115,17 +1206,21 @@ class WebApp:
 
     async def api_loops(self, request: web.Request) -> web.Response:
         """故障闭环：Incident 关联 Investigation / Action / Verification。"""
-        self._require_auth(request)
+        sess = self._require_auth(request)
         limit = int(request.rel_url.query.get("limit", "50"))
         loops = self.incidents.list_closed_loops(limit=limit)
+        visible = self._visible_asset_ids(sess)
+        loops = [loop for loop in loops if loop.get("asset_id") in visible]
         return _json({"ok": True, "loops": loops})
 
     async def api_incident_detail(self, request: web.Request) -> web.Response:
-        self._require_auth(request)
+        sess = self._require_auth(request)
         inc_id = request.match_info["inc_id"]
         inc = self.incidents.get_incident(inc_id)
         if not inc:
             return _json({"ok": False, "error": "not_found"}, 404)
+        if inc.get("asset_id") not in self._visible_asset_ids(sess):
+            return _json({"ok": False, "error": "permission_denied"}, 403)
         # 附加人话摘要
         from .fmt import alert_name
 
@@ -1323,18 +1418,27 @@ class WebApp:
         }
 
     async def api_incident_close(self, request: web.Request) -> web.Response:
-        sess = self._require_auth(request)
+        sess = self._require_admin(request)
         self._check_csrf(request, sess)
         inc_id = request.match_info["inc_id"]
+        inc = self.incidents.get_incident(inc_id)
+        if not inc:
+            return _json({"ok": False, "error": "not_found"}, 404)
+        if inc.get("asset_id") not in self._visible_asset_ids(sess):
+            return _json({"ok": False, "error": "permission_denied"}, 403)
         body = await request.json()
         reason = body.get("reason", "人工关闭")
         # P0-04：closed ≠ recovered，不伪造 resolved_at
-        res = self.incidents.close_manual(inc_id, reason, actor=sess["username"])
+        res = self.incidents.close_manual(
+            inc_id, reason, actor=sess["username"], policy=self.policy,
+            actor_type="web_user", is_admin=bool(sess.get("is_admin")),
+        )
         if not res.get("ok"):
-            return _json({"ok": False, "error": res.get("error", "not_found")}, 404)
+            status = 403 if res.get("error") == "permission_denied" else 404
+            return _json({"ok": False, "error": res.get("error", "not_found")}, status)
         self.db.audit(
             "web_user", sess["username"], "incident_closed",
-            asset_id="", object_id=inc_id,
+            asset_id=inc.get("asset_id") or "", object_id=inc_id,
             detail={"reason": reason, "outcome": res.get("outcome")},
         )
         return _json({"ok": True, "outcome": res.get("outcome")})
@@ -1353,10 +1457,12 @@ class WebApp:
         })
 
     async def api_action_detail(self, request: web.Request) -> web.Response:
-        self._require_auth(request)
+        sess = self._require_auth(request)
         data = self.actions.get_action(request.match_info["aid"])
         if not data:
             return _json({"ok": False, "error": "not_found"}, 404)
+        if data.get("asset_id") not in self._visible_asset_ids(sess):
+            return _json({"ok": False, "error": "permission_denied"}, 403)
         return _json({"ok": True, "action": data})
 
     async def api_action_propose(self, request: web.Request) -> web.Response:
@@ -1392,7 +1498,12 @@ class WebApp:
                 "web_user", username, "sensitive_totp_required", detail={"missing": True}
             )
             return {"ok": False, "error": "totp_required"}
-        if not self.auth.verify_totp(username, code):
+        try:
+            totp_ok = self.auth.verify_totp(username, code)
+        except AuthError as e:
+            self.db.audit("web_user", username, "sensitive_totp_locked")
+            return {"ok": False, "error": e.code, "message": str(e)}
+        if not totp_ok:
             self.db.audit("web_user", username, "sensitive_totp_failed")
             return {"ok": False, "error": "totp_invalid"}
         self.db.audit("web_user", username, "sensitive_totp_ok")
@@ -1493,6 +1604,11 @@ class WebApp:
     async def api_action_verify(self, request: web.Request) -> web.Response:
         sess = self._require_auth(request)
         self._check_csrf(request, sess)
+        action = self.actions.get_action(request.match_info["aid"])
+        if not action:
+            return _json({"ok": False, "error": "not_found"}, 404)
+        if action.get("asset_id") not in self._visible_asset_ids(sess):
+            return _json({"ok": False, "error": "permission_denied"}, 403)
         try:
             res = await self.actions.verify(request.match_info["aid"])
         except ActionError as e:
@@ -1545,10 +1661,65 @@ class WebApp:
             return _json({"ok": False, "error": str(e)}, 400)
         return _json({"ok": True, "effective": data})
 
+    def _validate_permission_fields(self, sess: dict, fields: Any) -> dict:
+        from . import formspec
+        from .capabilities import list_capabilities
+        result = formspec.validate_fields("permissions", fields, assets=self._assist_assets(sess),
+                                          capabilities=list_capabilities(), partial=False)
+        values = result["fields"]
+        if values.get("scope") == "default" and (values.get("asset_id") or values.get("object_id", "*") != "*"):
+            result["issues"].append({"field": "scope", "label": "范围", "code": "bad_scope",
+                                      "message": "指定主机或对象的授权需要填写资产例外，请明确适用范围。"})
+            result["valid"] = False
+        result["ok"] = result["valid"]
+        result["payload"] = None
+        if result["valid"]:
+            state = values["state"]
+            result["payload"] = {"subject_type": "auto_rule", "subject_id": "agent", "capability": values["capability"],
+                                 "asset_id": "*" if values["scope"] == "default" else values["asset_id"],
+                                 "object_id": values.get("object_id", "*"), "allow": state != "deny",
+                                 "require_approval": state != "auto", "auto_allowed": state == "auto"}
+        result["message"] = "配置校验通过，请核对并确认保存。" if result["valid"] else "授权配置尚未完整或未通过校验，请核对提示。"
+        return result
+
+    async def api_permission_validate(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        self._check_csrf(request, sess)
+        try:
+            body = await request.json()
+        except Exception:
+            return _json({"ok": False, "error": "bad_json", "message": "提交内容无法读取，请重新填写。"}, 400)
+        if not isinstance(body, dict) or set(body) != {"fields"}:
+            return _json({"ok": False, "error": "bad_fields", "message": "请提交需要校验的授权表单字段。"}, 400)
+        return _json(self._validate_permission_fields(sess, body["fields"]))
+
     async def api_permission_upsert(self, request: web.Request) -> web.Response:
         sess = self._require_admin(request)
         self._check_csrf(request, sess)
-        body = await request.json()
+        try:
+            body = await request.json()
+        except Exception:
+            return _json({"ok": False, "error": "bad_json", "message": "提交内容无法读取，请重新填写。"}, 400)
+        if not isinstance(body, dict):
+            return _json({"ok": False, "error": "bad_fields", "message": "授权配置内容的格式不正确。"}, 400)
+        if body.get("subject_type") == "auto_rule" and body.get("subject_id") == "agent":
+            for flag in ("allow", "require_approval", "auto_allowed"):
+                if flag in body and not isinstance(body[flag], bool):
+                    return _json({"ok": False, "error": "bad_state", "message": "请选择禁止、人工确认或允许执行中的一种策略。"}, 400)
+            allow, approval, auto = body.get("allow", True), body.get("require_approval", True), body.get("auto_allowed", False)
+            if allow and not approval and not auto:
+                return _json({"ok": False, "error": "bad_state", "message": "允许执行的策略需要选择人工确认或自动执行。"}, 400)
+            if allow and approval and auto:
+                return _json({"ok": False, "error": "bad_state", "message": "人工确认和自动执行不能同时选择。"}, 400)
+            asset_id = body.get("asset_id", "*")
+            fields = {"capability": body.get("capability"), "state": "deny" if not allow else "confirm" if approval else "auto",
+                      "scope": "default" if asset_id in ("", "*") else "exception", "object_id": body.get("object_id", "*")}
+            if fields["scope"] == "exception":
+                fields["asset_id"] = asset_id
+            validated = self._validate_permission_fields(sess, fields)
+            if not validated["valid"]:
+                return _json(validated, 400)
+            body = validated["payload"]
         try:
             res = self.policy.upsert_permission(
                 subject_type=body["subject_type"],
@@ -1562,7 +1733,7 @@ class WebApp:
                 actor=sess["username"],
             )
         except (PolicyDeny, KeyError) as e:
-            return _json({"ok": False, "error": str(e)}, 400)
+            return _json({"ok": False, "error": str(e), "message": "授权未能保存，请核对操作、适用范围及当前账号权限。"}, 400)
         return _json(res)
 
     async def api_permission_preview(self, request: web.Request) -> web.Response:
@@ -2031,14 +2202,76 @@ class WebApp:
             raise web.HTTPNotFound(text="host_monitor not configured")
         return self.host_monitor
 
+    async def _prom_business_items(self, asset: dict) -> tuple[list[dict], list[dict]]:
+        from .business import prometheus_checks
+
+        key = (asset["id"], asset.get("prom_asset") or asset["id"])
+        cache = getattr(self, "_business_cache", {})
+        cached = cache.get(key)
+        if cached and time.time() - cached[0] < 5:
+            return cached[1]
+        result = await prometheus_checks(self.prom, asset)
+        cache[key] = (time.time(), result)
+        self._business_cache = {entry: value for entry, value in cache.items() if time.time() - value[0] < 5}
+        return result
+
+    def _native_business_states(self, asset_id: str) -> list[str]:
+        from .business import native_check_items
+
+        rows = self.db.query("SELECT last_state,last_at,interval_sec FROM checks WHERE asset_id=? AND enabled=1", (asset_id,))
+        return [item["state"] for item in native_check_items([dict(row) for row in rows])]
+
+    def _monitor_firing(self) -> dict[str, list[str]]:
+        out: dict[str, list[str]] = {}
+        for episode in self.db.query("SELECT asset_id,labels_json FROM alert_episodes WHERE status='firing' AND (source_state IS NULL OR source_state='firing')"):
+            try:
+                labels = json.loads(episode["labels_json"] or "{}")
+            except (TypeError, ValueError):
+                labels = {}
+            severity = str(labels.get("severity") or "warning").lower()
+            out.setdefault(str(episode["asset_id"] or ""), []).append(severity)
+        return out
+
+    async def api_monitor_business(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        asset_id = request.match_info["asset_id"]
+        row = self.db.query_one("SELECT id,display_name,prom_asset FROM assets WHERE id=?", (asset_id,))
+        if not row:
+            return _json({"ok": False, "error": "not_found", "message": "这台主机已不存在，请重新选择。"}, 404)
+        if asset_id not in self._visible_asset_ids(sess):
+            return _json({"ok": False, "error": "denied", "message": "当前账户不能查看这台主机。"}, 403)
+        items, errors = [], []
+        probe_allowed = self.policy.check(subject_type="web_user", subject_id=sess["username"],
+                                          capability="probe.status", asset_id=asset_id, object_id="*")["allowed"]
+        if probe_allowed:
+            prom_items, prom_errors = await self._prom_business_items(dict(row))
+            items.extend(prom_items)
+            errors.extend(prom_errors)
+        else:
+            errors.append({"source": "prometheus", "message": "当前账户没有查看 Prometheus 业务检查的权限。"})
+        try:
+            self._check_read(request)
+        except web.HTTPForbidden:
+            errors.append({"source": "ayana", "message": "当前账户没有查看原生业务检查的权限。"})
+        else:
+            try:
+                from .business import native_check_items
+
+                items.extend(native_check_items(self._checks().list_checks(asset_id)))
+            except Exception:
+                errors.append({"source": "ayana", "message": "暂时无法获取原生业务检查，请稍后刷新。"})
+        return _json({"ok": True, "asset": dict(row), "items": items, "errors": errors})
+
     async def api_monitor_hosts(self, request: web.Request) -> web.Response:
-        self._require_auth(request)
-        from .health import REQUIRED_CHECKS, host_health, object_health
+        sess = self._require_auth(request)
+        from .health import host_health
+        from .business import required_health
 
         rows = self.db.query(
             "SELECT id, display_name, prom_asset, enabled FROM assets ORDER BY id ASC"
         )
-        assets = [dict(r) for r in rows]
+        visible = self._visible_asset_ids(sess)
+        assets = [dict(r) for r in rows if r["id"] in visible]
         try:
             status = await self._monitor().hosts_status(assets)
         except Exception as e:
@@ -2046,23 +2279,7 @@ class WebApp:
 
         # 统一健康：指标 + required checks + 业务检查 + 当前 firing（不吸收历史未结案）
         by_id = {s.get("asset_id"): s for s in status}
-        try:
-            firing = self.db.query(
-                "SELECT asset_id, labels_json FROM alert_episodes"
-                " WHERE status='firing' AND (source_state IS NULL OR source_state='firing')"
-                " LIMIT 200"
-            )
-        except Exception:
-            firing = []
-        firing_by_asset: dict[str, list[str]] = {}
-        for ep in firing or []:
-            aid = str(ep["asset_id"] or "")
-            try:
-                labels = json.loads(ep["labels_json"] or "{}")
-            except Exception:
-                labels = {}
-            sev = str(labels.get("severity") or "warning").lower()
-            firing_by_asset.setdefault(aid, []).append(sev)
+        firing_by_asset = self._monitor_firing()
 
         out = []
         for a in assets:
@@ -2078,44 +2295,13 @@ class WebApp:
             metric_state = item.get("state") or ""
             metric_error = item.get("error") or ""
 
-            # required checks（无样本 → unknown → no_data）
-            req = REQUIRED_CHECKS.get(aid, [])
-            req_states: list[str] = []
-            if req:
-                for c in req:
-                    try:
-                        samples = await self.prom.probe_success_since(
-                            aid, c.get("object") or "", start=now() - 300
-                        ) if c.get("metric") == "probe_success" else []
-                    except Exception:
-                        samples = []
-                    h = object_health(
-                        asset_id=aid,
-                        object_name=c.get("object") or "",
-                        samples=samples,
-                        required=[c],
-                    )
-                    req_states.append(h.get("state") or "unknown")
-                if "unhealthy" in req_states:
-                    required_state = "unhealthy"
-                elif "stale" in req_states:
-                    required_state = "stale"
-                elif "unknown" in req_states:
-                    required_state = "unknown"
-                elif all(s == "healthy" for s in req_states):
-                    required_state = "healthy"
-                else:
-                    required_state = "degraded"
-            else:
-                required_state = ""
+            prom_items, _ = await self._prom_business_items(a)
+            required_state = required_health(prom_items)
 
             # 业务检查
-            check_states: list[str] = []
+            check_states = [item["state"] for item in prom_items if not item.get("required")]
             try:
-                for c in self.db.query(
-                    "SELECT last_state FROM checks WHERE asset_id=? AND enabled=1", (aid,)
-                ):
-                    check_states.append(c["last_state"] or "no_data")
+                check_states.extend(self._native_business_states(aid))
             except Exception:
                 pass
 
@@ -2128,6 +2314,7 @@ class WebApp:
                 collect_error=metric_error if metric_state == "collect_error" else "",
             )
             item["health"] = hh
+            item["metric_state"] = metric_state
             item["state"] = hh["state"]  # 对外五态
             item["firing"] = firing_by_asset.get(aid, [])
             out.append(item)
@@ -2157,12 +2344,21 @@ class WebApp:
             history = await self._monitor().host_history(prom_asset, range_key)
         except Exception as e:
             return _json({"ok": False, "error": str(e)}, 502)
+        from .business import required_health
+        from .health import host_health
+
+        prom_items, _ = await self._prom_business_items(dict(row))
+        health = host_health(metric_state=overview.get("state", ""), metric_error=overview.get("error", ""),
+                             required_state=required_health(prom_items),
+                             check_states=[item["state"] for item in prom_items if not item.get("required")] + self._native_business_states(asset_id),
+                             firing_severities=self._monitor_firing().get(asset_id, []))
         return _json(
             {
                 "ok": True,
                 "asset": dict(row),
                 "overview": overview,
                 "history": history,
+                "health": health,
             }
         )
 
@@ -2198,9 +2394,14 @@ class WebApp:
         return _json({"ok": True, "role": role})
 
     async def api_ssh_endpoints(self, request: web.Request) -> web.Response:
-        self._require_auth(request)
+        sess = self._require_auth(request)
         asset_id = request.rel_url.query.get("asset_id", "")
-        return _json({"ok": True, "endpoints": self._ssh_store().list_endpoints(asset_id)})
+        visible = self._visible_asset_ids(sess)
+        if asset_id and asset_id not in visible:
+            return _json({"ok": False, "error": "permission_denied"}, 403)
+        endpoints = [ep for ep in self._ssh_store().list_endpoints(asset_id)
+                     if ep.get("asset_id") in visible]
+        return _json({"ok": True, "endpoints": endpoints})
 
     async def api_ssh_endpoint_upsert(self, request: web.Request) -> web.Response:
         sess = self._require_admin(request)
@@ -2847,10 +3048,8 @@ class WebApp:
         # S03: Upgrade 前校验 Origin；非法来源直接 HTTP 拒绝，不升级
         origin = request.headers.get("Origin", "")
         host_hdr = request.headers.get("Host", "")
-        if origin and host_hdr:
-            allowed = {f"http://{host_hdr}", f"https://{host_hdr}"}
-            if origin.rstrip("/") not in allowed:
-                return web.Response(status=403, text="origin rejected")
+        if origin and host_hdr and not _origin_allowed(origin, host_hdr):
+            return web.Response(status=403, text="origin rejected")
         ws = web.WebSocketResponse(heartbeat=30)
         await ws.prepare(request)
         sess = self._session(request)
@@ -2918,6 +3117,13 @@ class WebApp:
         async def pump_out():
             loop = asyncio.get_event_loop()
             while not ws.closed and tsess.alive():
+                cur = self._session(request)
+                err = self._terminal_ok(cur, asset_id)
+                if not cur or cur.get("username") != username or err:
+                    await ws.send_json({"type": "error", "error": "permission_revoked", "hint": "终端授权已失效"})
+                    self.terminal.close(sid, username=username, reason="permission_revoked")
+                    await ws.close(code=4403, message=b"permission revoked")
+                    break
                 data = await loop.run_in_executor(None, tsess.read)
                 if data:
                     try:
@@ -2945,6 +3151,11 @@ class WebApp:
                 cur = self._session(request)
                 if not cur or cur.get("username") != username:
                     await ws.send_json({"type": "error", "error": "session_revoked", "hint": "登录已失效"})
+                    break
+                err = self._terminal_ok(cur, asset_id)
+                if err:
+                    await ws.send_json({"type": "error", "error": "permission_revoked", "hint": "终端授权已失效"})
+                    await ws.close(code=4403, message=b"permission revoked")
                     break
                 if msg.type == web.WSMsgType.BINARY:
                     try:
@@ -3073,7 +3284,7 @@ class WebApp:
         # admin 拥有管理台读权限；其余用户需显式 checks.read
         if not d["allowed"] and not sess.get("is_admin"):
             raise web.HTTPForbidden(
-                text=json.dumps({"ok": False, "error": "denied", "detail": "checks.read not granted"}),
+                text=json.dumps({"ok": False, "error": "denied", "message": "当前账户没有查看业务检查的权限，请联系管理员授权。"}),
                 content_type="application/json",
             )
         return sess
@@ -3082,7 +3293,7 @@ class WebApp:
         sess = self._require_auth(request)
         self._check_csrf(request, sess)
         if not sess.get("is_admin"):
-            raise web.HTTPForbidden(text=json.dumps({"error": "admin_required"}))
+            raise web.HTTPForbidden(text=json.dumps({"error": "admin_required", "message": "创建或修改业务检查需要管理员权限。"}))
         d = self.policy.effective_decision(
             subject_type="web_user",
             subject_id=sess["username"],
@@ -3091,10 +3302,43 @@ class WebApp:
             object_id="*",
         )
         if not d["allowed"]:
-            raise web.HTTPForbidden(text=json.dumps({"error": "denied"}))
+            raise web.HTTPForbidden(text=json.dumps({"error": "denied", "message": "当前策略禁止修改业务检查，请先调整授权。"}))
         if d.get("require_approval"):
-            raise web.HTTPForbidden(text=json.dumps({"error": "approval_required"}))
+            raise web.HTTPForbidden(text=json.dumps({"error": "approval_required", "message": "修改业务检查需要审批，当前页面不能直接提交。"}))
         return sess
+
+    @staticmethod
+    def _check_form_error(exc: Exception) -> web.Response:
+        issues = getattr(exc, "issues", [])
+        message = (issues[0].get("message") if issues else None) or getattr(exc, "detail", "")
+        if not message:
+            message = {"not_found": "这项检查已不存在，请刷新后重试。"}.get(
+                getattr(exc, "code", ""), "配置未能保存，请检查表单内容并重试。")
+        return _json({"ok": False, "error": getattr(exc, "code", "validation_failed"),
+                      "message": message, "issues": issues}, 400)
+
+    def _validate_check_body(self, sess: dict, body: dict) -> dict:
+        from .formspec import validate_fields, validate_check_payload
+
+        assets = self._assist_assets(sess)
+        if "fields" in body:
+            return validate_fields("checks", body["fields"], assets=assets, partial=False)
+        return validate_check_payload(body, assets=assets)
+
+    async def api_checks_validate(self, request: web.Request) -> web.Response:
+        """Validate and adapt the real form before user confirmation; never save or execute."""
+        sess = self._check_read(request)
+        self._check_csrf(request, sess)
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("body")
+        except Exception:
+            return _json({"ok": False, "error": "bad_json", "message": "表单内容无法读取，请重新填写。"}, 400)
+        result = self._validate_check_body(sess, body)
+        return _json({"ok": result["valid"], "fields": result["fields"], "payload": result["payload"],
+                      "issues": result["issues"], "missing": result["missing"], "defaulted": result["defaulted"],
+                      "message": "表单校验通过，请核对后确认创建。" if result["valid"] else "配置还不完整或存在错误，请根据提示修改。"})
 
     async def api_checks_list(self, request: web.Request) -> web.Response:
         self._check_read(request)
@@ -3106,32 +3350,32 @@ class WebApp:
 
     async def api_checks_create(self, request: web.Request) -> web.Response:
         sess = self._check_write(request)
-        body = await request.json()
         try:
-            item = self._checks().create_check(
-                asset_id=body.get("asset_id") or "",
-                kind=body.get("kind") or "",
-                name=body.get("name") or "",
-                params=body.get("params") or {},
-                expect=body.get("expect") or {},
-                interval_sec=body.get("interval_sec") or 60,
-                fail_threshold=body.get("fail_threshold") or 2,
-                severity=body.get("severity") or "warning",
-                actor=sess["username"],
-            )
+            body = await request.json()
+            if not isinstance(body, dict):
+                return _json({"ok": False, "error": "bad_input", "message": "表单内容格式不正确。"}, 400)
+            result = self._validate_check_body(sess, body)
+            if not result["valid"]:
+                return _json({"ok": False, "error": "validation_failed", "message": "请修改表单中标出的内容后再创建。",
+                              "issues": result["issues"], "missing": result["missing"]}, 400)
+            item = self._checks().create_check(**result["payload"], actor=sess["username"])
             return _json({"ok": True, "check": item})
         except Exception as e:
-            return _json({"ok": False, "error": getattr(e, "code", "error"), "detail": str(e)}, 400)
+            return self._check_form_error(e)
 
     async def api_checks_update(self, request: web.Request) -> web.Response:
         sess = self._check_write(request)
-        body = await request.json()
         try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                return _json({"ok": False, "error": "bad_input", "message": "表单内容格式不正确。"}, 400)
+            if set(body) - {"id", "name", "params", "expect", "interval_sec", "fail_threshold", "severity", "enabled"}:
+                return _json({"ok": False, "error": "unknown_field", "message": "更新内容包含当前表单不支持的配置项。"}, 400)
             fields = {k: body[k] for k in ("name", "params", "expect", "interval_sec", "fail_threshold", "severity", "enabled") if k in body}
             item = self._checks().update_check(body.get("id") or "", actor=sess["username"], **fields)
             return _json({"ok": True, "check": item})
         except Exception as e:
-            return _json({"ok": False, "error": getattr(e, "code", "error"), "detail": str(e)}, 400)
+            return self._check_form_error(e)
 
     async def api_checks_delete(self, request: web.Request) -> web.Response:
         sess = self._check_write(request)
@@ -3347,6 +3591,8 @@ class WebApp:
             return _json({"ok": False, "error": str(e)}, 502)
 
     def _ssh_store(self):
+        if self.ssh_store is not None:
+            return self.ssh_store
         store = getattr(self.transport, "store", None)
         if store is None:
             store = getattr(self.transport, "_store", None)

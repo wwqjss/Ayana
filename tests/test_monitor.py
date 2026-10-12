@@ -216,5 +216,120 @@ class TestMonitor(unittest.TestCase):
         asyncio.run(run())
 
 
+class TestExporterAvailability(unittest.IsolatedAsyncioTestCase):
+    async def test_host_strip_and_detail_share_memory_threshold_not_only_cpu(self):
+        prom = FakeProm()
+        monitor = HostMonitor(prom)
+
+        async def query(expr):
+            if expr.startswith("up{"):
+                value = 1.0
+            elif "MemAvailable" in expr:
+                value = 97.0
+            elif "SwapTotal" in expr and "SwapFree" not in expr:
+                value = 0.0
+            else:
+                value = 12.0
+            return {"result": [{"metric": {"asset": "edge"}, "value": value}]}
+
+        prom.query = query
+        summary = (await monitor.hosts_status([{"id": "edge"}]))[0]
+        detail = await monitor.host_overview("edge")
+        self.assertEqual(summary["state"], "bad")
+        self.assertEqual(detail["state"], "bad")
+        self.assertEqual(detail["metrics"]["cpu"]["state"], "ok")
+        self.assertEqual(detail["metrics"]["memory"]["state"], "bad")
+
+    async def test_registered_job_type_failure_is_visible_in_list_and_detail(self):
+        prom = FakeProm()
+        monitor = HostMonitor(prom)
+
+        async def query(expr):
+            if expr.startswith("up{"):
+                if 'job_type="node_exporter"' in expr:
+                    return {"result": [{"metric": {"asset": "EDGE-PROBE", "job": "custom-exporters", "job_type": "node_exporter"}, "value": 0.0}]}
+                return {"result": []}
+            if "cpu_seconds_total" in expr:
+                return {"result": [{"metric": {"asset": "EDGE-PROBE"}, "value": 12.0}]}
+            return {"result": []}
+
+        prom.query = query
+        asset = {"id": "edge", "display_name": "边缘主机", "prom_asset": "EDGE-PROBE"}
+        summary = (await monitor.hosts_status([asset]))[0]
+        detail = await monitor.host_overview(asset["prom_asset"])
+        self.assertEqual(summary["asset_id"], "edge")
+        self.assertEqual(summary["state"], "collect_error")
+        self.assertEqual(detail["state"], "collect_error")
+        self.assertEqual(summary["error"], "node_exporter_down")
+        self.assertEqual(detail["error"], "node_exporter_down")
+
+    async def test_legacy_node_job_failure_remains_visible(self):
+        prom = FakeProm()
+        monitor = HostMonitor(prom)
+
+        async def query(expr):
+            if expr.startswith("up{") and 'job=~"node.*"' in expr:
+                return {"result": [{"metric": {"asset": "legacy", "job": "node-exporter"}, "value": 0.0}]}
+            return {"result": []}
+
+        prom.query = query
+        summary = (await monitor.hosts_status([{"id": "legacy"}]))[0]
+        self.assertEqual(summary["state"], "collect_error")
+        self.assertEqual(summary["summary"]["up"], 0.0)
+
+    async def test_healthy_exporter_with_cpu_rate_warming_is_partial_not_empty(self):
+        prom = FakeProm()
+        monitor = HostMonitor(prom)
+
+        async def query(expr):
+            if expr.startswith("up{"):
+                return {"result": [{"metric": {"asset": "new-host", "job_type": "node_exporter"}, "value": 1.0}]}
+            return {"result": []}
+
+        prom.query = query
+        summary = (await monitor.hosts_status([{"id": "new-host"}]))[0]
+        self.assertEqual(summary["state"], "partial_no_data")
+        self.assertIsNone(summary["summary"]["cpu"])
+        self.assertEqual(summary["summary"]["up"], 1.0)
+
+    async def test_zero_swap_with_nan_usage_is_not_failed_collection(self):
+        prom = FakeProm()
+        monitor = HostMonitor(prom)
+
+        async def query(expr):
+            value = float("nan") if "SwapFree" in expr else 0.0 if "SwapTotal" in expr else 10.0
+            return {"result": [{"metric": {"asset": "edge"}, "value": value}]}
+
+        prom.query = query
+        overview = await monitor.host_overview("edge")
+        self.assertEqual(overview["state"], "ok")
+        self.assertEqual(overview["metrics"]["swap"]["state"], "not_enabled")
+        self.assertIsNone(overview["metrics"]["swap"]["value"])
+        self.assertEqual(overview["metrics"]["swap"]["points"], [])
+
+    async def test_available_history_with_missing_metrics_is_partial(self):
+        prom = FakeProm()
+        monitor = HostMonitor(prom)
+
+        async def query(expr):
+            if "cpu_seconds_total" in expr:
+                return {"result": [{"metric": {"asset": "edge"}, "value": 0.0}]}
+            return {"result": []}
+
+        async def query_range(expr, *, start, end, step):
+            if "cpu_seconds_total" in expr:
+                return [{"metric": {"asset": "edge"}, "sample_at": end - step, "value": 0.0}]
+            return []
+
+        prom.query = query
+        prom.query_range_raw = query_range
+        history = await monitor.host_history("edge")
+        self.assertEqual(history["state"], "partial_no_data")
+        self.assertEqual(history["metrics"]["cpu"]["value"], 0.0)
+        self.assertEqual(history["metrics"]["cpu"]["state"], "ok")
+        self.assertEqual(history["metrics"]["memory"]["state"], "no_data")
+        self.assertEqual(len(history["metrics"]["cpu"]["points"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

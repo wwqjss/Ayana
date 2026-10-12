@@ -50,12 +50,13 @@ class Notifier:
         body: str,
         channel: str,
         channel_id: str = "",
+        strict: bool = False,
     ) -> bool:
         t = now()
         if not target:
             try:
                 self.db.execute(
-                    "INSERT INTO notification_outbox(id, dedup_key, channel, target, body,"
+                    "INSERT OR IGNORE INTO notification_outbox(id, dedup_key, channel, target, body,"
                     " state, created_at, last_try_at, next_try_at, last_error, channel_id)"
                     " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                     (
@@ -64,17 +65,20 @@ class Notifier:
                     ),
                 )
             except Exception:
-                pass
+                if strict:
+                    raise
             return False
         try:
             self.db.execute(
-                "INSERT INTO notification_outbox(id, dedup_key, channel, target, body, state,"
+                "INSERT OR IGNORE INTO notification_outbox(id, dedup_key, channel, target, body, state,"
                 " created_at, last_try_at, next_try_at, channel_id)"
                 " VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (new_id("ntf"), dedup_key, channel, target, body, "pending", t, 0, 0, channel_id),
             )
             return True
         except Exception:
+            if strict:
+                raise
             return False
 
     def enqueue(
@@ -98,22 +102,15 @@ class Notifier:
     def _enabled_channels(self) -> list[dict[str, Any]]:
         if not self._channels:
             return []
-        try:
-            return list(self._channels.list_enabled())
-        except Exception:
-            return []
+        # A failed lookup is not an empty configuration; let the obligation retry.
+        return list(self._channels.list_enabled())
 
-    def enqueue_for_event(self, event_id: int | str, *, body: str, typ: str = "") -> bool:
-        """按生命周期 Event 建立通知义务。
-
-        幂等键：ev:<id>:<channel_id> 或 ev:<id>:<channel_id>:<target>（多目标时每目标一行）。
-        """
+    def _event_routes(self) -> list[dict[str, Any]]:
+        """Expected channel/target obligations, shared by enqueue and compensation."""
         channels = self._enabled_channels()
         if not channels:
-            return self.enqueue(
-                dedup_key=f"ev:{event_id}", target="", body=body, channel="qq"
-            )
-        any_ok = False
+            return [{"suffix": "", "target": self.default_target, "channel": "qq", "channel_id": ""}]
+        routes = []
         for ch in channels:
             targets = list(ch.get("targets") or [])
             if not targets:
@@ -124,47 +121,121 @@ class Notifier:
                 targets = [self.default_target] if self.default_target else [""]
             if not targets:
                 targets = [""]
-            multi = len(targets) > 1 or ch.get("kind") == "wecom_aibot"
             for tgt in targets:
-                if multi:
-                    key = f"ev:{event_id}:{ch['id']}:{tgt}"
-                else:
-                    key = f"ev:{event_id}:{ch['id']}"
+                suffix = f":{ch['id']}:{tgt}"
+                routes.append({"suffix": suffix, "target": str(tgt),
+                               "channel": str(ch.get("kind") or "qq"),
+                               "channel_id": str(ch.get("id") or ""),
+                               "created_at": ch.get("created_at", 0),
+                               "updated_at": ch.get("updated_at", 0)})
+        return routes
+
+    def _event_plan(self, event_id: int | str) -> list[dict[str, str]]:
+        """Persist the original recipients so later configuration changes do not replay history."""
+        with self.db.tx() as conn:
+            event = conn.execute("SELECT at,payload_json FROM events WHERE id=?", (event_id,)).fetchone()
+            try:
+                payload = json.loads(event["payload_json"] or "{}") if event else {}
+            except (TypeError, ValueError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            if isinstance(payload.get("_notification_routes"), list):
+                return payload["_notification_routes"]
+            routes = self._event_routes()
+            if event:
+                # Legacy events have no snapshot. Only channels that existed at the
+                # event time are candidates. A legacy short key proves that channel
+                # originally had one target; preserve that recipient when it expands.
+                legacy = conn.execute("SELECT dedup_key,channel_id,target FROM notification_outbox"
+                                      " WHERE dedup_key=? OR dedup_key LIKE ?",
+                                      (f"ev:{event_id}", f"ev:{event_id}:%")).fetchall()
+                old_targets = {}
+                single_target_channels = set()
+                for row in legacy:
+                    old_targets.setdefault(row["channel_id"], set()).add(row["target"])
+                    if row["dedup_key"] == f"ev:{event_id}:{row['channel_id']}":
+                        single_target_channels.add(row["channel_id"])
+                routes = [route for route in routes
+                          if float(route.get("created_at") or 0) <= float(event["at"])
+                          and (route["channel_id"] not in single_target_channels
+                               or route["target"] in old_targets[route["channel_id"]])]
+                legacy_default = [row for row in legacy if not row["channel_id"]]
+                if not any(route["channel_id"] for route in routes) and legacy_default:
+                    routes = [{"suffix": "", "target": legacy_default[0]["target"], "channel": "qq", "channel_id": ""}]
+            plan = [{key: route[key] for key in ("suffix", "target", "channel", "channel_id")}
+                    for route in routes]
+            if event:
+                payload["_notification_routes"] = plan
+                conn.execute("UPDATE events SET payload_json=? WHERE id=?",
+                             (json.dumps(payload, ensure_ascii=False), event_id))
+            return plan
+
+    def _route_exists(self, event_id: int | str, route: dict[str, str]) -> bool:
+        # Include legacy short keys: target count changes must never duplicate delivery.
+        return bool(self.db.query_one(
+            "SELECT 1 FROM notification_outbox WHERE target=? AND ("
+            " (dedup_key LIKE ? AND channel_id=?)"
+            " OR (dedup_key=? AND channel_id='' AND channel=?)) LIMIT 1",
+            (route["target"], f"ev:{event_id}:%", route["channel_id"],
+             f"ev:{event_id}", route["channel"]),
+        ))
+
+    def _enqueue_plan(self, event_id: int | str, body: str, routes: list[dict[str, str]]) -> bool:
+        any_ok = False
+        with self.db.tx():
+            for route in routes:
+                if self._route_exists(event_id, route):
+                    any_ok = any_ok or bool(route["target"])
+                    continue
                 ok = self._insert_outbox(
-                    dedup_key=key,
-                    target=tgt,
-                    body=body,
-                    channel=str(ch.get("kind") or "qq"),
-                    channel_id=str(ch.get("id") or ""),
+                    dedup_key=f"ev:{event_id}{route['suffix']}",
+                    target=route["target"], body=body, channel=route["channel"],
+                    channel_id=route["channel_id"], strict=True,
                 )
                 any_ok = any_ok or ok
         return any_ok
 
+    def enqueue_for_event(self, event_id: int | str, *, body: str, typ: str = "") -> bool:
+        """Atomically establish all channel/target obligations with idempotent keys."""
+        try:
+            return self._enqueue_plan(event_id, body, self._event_plan(event_id))
+        except Exception:
+            return False
+
     def compensate_missing(self, limit: int = 100) -> int:
-        """扫生命周期事件，为缺失 outbox 的补回义务。"""
+        """Repair missing obligations per channel/target, including partial fanout."""
         placeholders = ",".join("?" for _ in LIFECYCLE_TYPES)
-        rows = self.db.query(
-            f"SELECT e.id AS ev_id, e.type, e.payload_json, e.incident_id"
-            f" FROM events e WHERE e.type IN ({placeholders})"
-            f" AND NOT EXISTS (SELECT 1 FROM notification_outbox o"
-            f"               WHERE o.dedup_key = 'ev:' || e.id"
-            f"                  OR o.dedup_key LIKE 'ev:' || e.id || ':%')"
-            f" ORDER BY e.id ASC LIMIT ?",
-            (*LIFECYCLE_TYPES, limit),
-        )
         n = 0
-        for r in rows:
-            body = f"[Ayana] {r['type']} {r['incident_id'] or ''}".strip()
-            try:
-                payload = json.loads(r["payload_json"] or "{}")
-                if payload.get("body"):
-                    body = payload["body"]
-            except Exception:
-                pass
-            if self.enqueue_for_event(r["ev_id"], body=body):
-                n += 1
-            else:
-                n += 1
+        cursor = 0
+        while n < limit:
+            rows = self.db.query(
+                f"SELECT id AS ev_id,type,payload_json,incident_id FROM events"
+                f" WHERE type IN ({placeholders}) AND id>? ORDER BY id LIMIT 100",
+                (*LIFECYCLE_TYPES, cursor),
+            )
+            if not rows:
+                break
+            for r in rows:
+                cursor = r["ev_id"]
+                try:
+                    plan = self._event_plan(cursor)
+                    if all(self._route_exists(cursor, route) for route in plan):
+                        continue
+                    try:
+                        payload = json.loads(r["payload_json"] or "{}")
+                    except (TypeError, ValueError):
+                        payload = {}
+                    if not isinstance(payload, dict):
+                        payload = {}
+                    body = payload.get("body") or f"[Ayana] {r['type']} {r['incident_id'] or ''}".strip()
+                    self._enqueue_plan(cursor, body, plan)
+                    if all(self._route_exists(cursor, route) for route in plan):
+                        n += 1
+                except Exception:
+                    return n
+                if n >= limit:
+                    break
         return n
 
     def _next_try_delay(self, tries: int) -> float:

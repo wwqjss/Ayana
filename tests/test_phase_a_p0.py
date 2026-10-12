@@ -201,6 +201,12 @@ def _allow(policy: Policy, **kw) -> None:
 def _make_actions(tmp: tempfile.TemporaryDirectory):
     db = Database(Path(tmp.name) / "t.db")
     _seed_nerv(db)
+    db.execute(
+        "INSERT OR IGNORE INTO users(username, password_hash, totp_enabled, is_admin, created_at, updated_at)"
+        " VALUES('admin','x',0,1,?,?)",
+        (now(), now()),
+    )
+
     policy = Policy(db)
     _allow(policy)
     prom = RealContractProm()

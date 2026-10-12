@@ -1,3 +1,6 @@
+# 参考单元模板；生产请用 deploy/install.sh --system 生成并写入真实路径。
+# 数据目录必须在 ReadWritePaths 内（DB、secrets 只读配置、日志、bootstrap 口令）。
+
 [Unit]
 Description=Ayana ops agent (non-root)
 After=network-online.target
@@ -8,26 +11,20 @@ Type=simple
 User=ayana
 Group=ayana
 WorkingDirectory=/opt/ayana
-# 固定虚拟环境入口；不使用 root
 ExecStart=/opt/ayana/.venv/bin/python -m ayana.main /etc/ayana/config.json
 Restart=on-failure
 RestartSec=5
-# 单实例由应用 flock 保证；systemd 也拒绝并发
 KillMode=mixed
 TimeoutStopSec=20
 
-# 环境
 Environment=PYTHONUNBUFFERED=1
 # Environment=AYANA_* 可覆盖非秘密项
 
-# 基础加固（按实际 SSH 连通性逐步启用，勿一次加满）
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/ayana /var/log/ayana
-# SSH 需要写 known_hosts / 读密钥：
-# ReadWritePaths+=/var/lib/ayana/.ssh
+ReadWritePaths=/var/lib/ayana
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true

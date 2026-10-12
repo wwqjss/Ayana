@@ -48,58 +48,32 @@ from .web import WebApp
 
 log = logging.getLogger("ayana")
 
+# 示例资产（首次空库播种）。公开版不含真实主机地址；请在 Web「连接」页登记实际资产。
 DEFAULT_ASSETS = [
     {
-        "id": "nerv",
-        "display_name": "NERV",
-        "read_alias": "nerv",
-        "write_alias": "nerv-exec",
-        "expected_host_id": "NERV",
-        "prom_asset": "nerv",
-        "host": "203.0.113.10",
-        "objects": [
-            {"kind": "service", "name": "frps", "unit": "frps", "auto_recover": 1},
-            {"kind": "service", "name": "nginx", "unit": "nginx"},
-            {"kind": "service", "name": "php-fpm", "unit": "php-fpm"},
-            {"kind": "port", "name": "frps-32659", "port": 32659, "protocol": "tcp"},
-            {"kind": "probe", "name": "frps-probe", "external_probe": "tcp_connect"},
-        ],
-    },
-    {
-        "id": "kanata",
-        "display_name": "KANATA",
-        "read_alias": "kanata",
-        "write_alias": "kanata-exec",
-        "expected_host_id": "KANATA",
-        "prom_asset": "kanata",
-        "host": "192.0.2.10",
-        "objects": [
-            {"kind": "container", "name": "harbor-core", "container": "harbor-core"},
-            {"kind": "container", "name": "nginx", "container": "nginx"},
-            {"kind": "service", "name": "alist", "unit": "alist"},
-        ],
-    },
-    {
-        "id": "sora",
-        "display_name": "Sora",
-        "read_alias": "sora",
-        "write_alias": "sora-exec",
-        "expected_host_id": "sora",
-        "prom_asset": "sora",
+        "id": "demo-web",
+        "display_name": "Demo Web",
+        "read_alias": "demo-web",
+        "write_alias": "demo-web-exec",
+        "expected_host_id": "DEMO-WEB",
+        "prom_asset": "demo-web",
         "host": "",
         "objects": [
-            {"kind": "service", "name": "hysteria-server", "unit": "hysteria-server"},
-            {"kind": "port", "name": "hy2-443", "port": 443, "protocol": "udp"},
+            {"kind": "service", "name": "nginx", "unit": "nginx"},
+            {"kind": "port", "name": "http-80", "port": 80, "protocol": "tcp"},
         ],
     },
     {
-        "id": "yomi",
-        "display_name": "Yomi",
-        "read_alias": "yomi",
-        "write_alias": "yomi-exec",
-        "expected_host_id": "yomi",
-        "prom_asset": "yomi",
-        "objects": [],
+        "id": "demo-db",
+        "display_name": "Demo DB",
+        "read_alias": "demo-db",
+        "write_alias": "demo-db-exec",
+        "expected_host_id": "DEMO-DB",
+        "prom_asset": "demo-db",
+        "host": "",
+        "objects": [
+            {"kind": "container", "name": "postgres", "container": "postgres"},
+        ],
     },
 ]
 
@@ -255,13 +229,26 @@ class App:
         log.info("db path resolved to: %s (base_dir=%s) cwd=%s abs=%s",
                  self.db.path, cfg.get("base_dir", ""), os.getcwd(), os.path.abspath(self.db.path))
         seed_assets(self.db)
+        dedicated = str(cfg.get("web_auth_pepper") or "")
+        onewbot = str(cfg.get("onewbot_token") or "")
+        pepper = dedicated or onewbot
+        legacy: list[str] = []
+        if dedicated and onewbot and dedicated != onewbot:
+            # 专用 pepper：历史哈希可能用 onewbot_token，登录成功后自动迁移
+            legacy = [onewbot]
+        if not dedicated:
+            log.warning(
+                "web_auth_pepper not set; falling back to onewbot_token for password pepper. "
+                "Set AYANA_WEB_AUTH_PEPPER to a dedicated secret."
+            )
         self.auth = AuthService(
             self.db,
-            pepper=cfg.get("web_auth_pepper") or cfg["onewbot_token"],
+            pepper=pepper,
             session_ttl=int(cfg.get("web_session_ttl_sec", 43200)),
             max_failed=int(cfg.get("web_max_failed_logins", 8)),
             lockout=int(cfg.get("web_lockout_sec", 900)),
             totp_key=cfg.get("totp_encrypt_key") or "",
+            legacy_peppers=legacy,
         )
         self.policy = Policy(self.db)
         self.nt = NTClient(privilege_mode="restricted_dispatcher")
@@ -482,6 +469,35 @@ class App:
 
         return _T()
 
+    def _write_bootstrap_password(self, password: str) -> None:
+        """P1-05: 一次性口令文件：与 DB 同目录、O_EXCL、0600、拒符号链接。"""
+        try:
+            db_path = Path(self.db.path).resolve()
+            pw_path = db_path.parent / "bootstrap-admin.password"
+            if pw_path.is_symlink() or pw_path.exists():
+                log.warning(
+                    "BOOTSTRAP admin created; password file already exists or is a symlink, not overwritten: %s",
+                    pw_path,
+                )
+                return
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            fd = os.open(str(pw_path), flags, 0o600)
+            try:
+                os.write(fd, (password + "\n").encode("utf-8"))
+            finally:
+                os.close(fd)
+            log.warning(
+                "BOOTSTRAP admin created; one-time password file: %s (mode 600). "
+                "Change password after first login and delete the file.",
+                pw_path,
+            )
+        except Exception as e:
+            log.warning(
+                "BOOTSTRAP admin created but one-time password file was not written (%s). "
+                "Password was not logged; reset via ops if lost.",
+                type(e).__name__,
+            )
+
     async def start(self) -> None:
         # 启动安全检查
         unknown = self.actions.mark_unknown_unfinished()
@@ -496,7 +512,9 @@ class App:
 
         admin = self.auth.ensure_bootstrap_admin("admin")
         if admin:
-            log.warning("BOOTSTRAP admin password (rotate after first login): %s", admin)
+            # B4: 口令不进日志；写入与 db 同目录的 0600 一次性文件（systemd 可写）
+            self._write_bootstrap_password(admin)
+            admin = ""
         try:
             ensure_promconfig_admin_perms(self.db)
             ensure_checks_admin_perms(self.db)
@@ -545,6 +563,7 @@ class App:
         except Exception:
             log.exception("ensure_default_qq failed")
         # 启动已启用的企微智能机器人长连接
+        self._bg_tasks.append(asyncio.create_task(self._bg_aibot()))
         self._bg_tasks.append(asyncio.create_task(self._bg_checks()))
 
         loop = asyncio.get_running_loop()
@@ -644,6 +663,11 @@ class App:
                     "INSERT OR REPLACE INTO meta(key, value) VALUES('worker_reconcile_last_ok', ?)",
                     (str(time.time()),),
                 )
+                for incident in self.db.query(
+                    "SELECT id FROM incidents WHERE status='open' AND need_human=1"
+                    " AND need_human_reason LIKE '%awaiting_approval:%' LIMIT 50"
+                ):
+                    self.incidents.reconcile(incident["id"], resolution_basis="approval_reconcile")
             except Exception as e:
                 log.warning("AM reconcile failed: %s", e)
             await asyncio.sleep(60)
@@ -687,9 +711,10 @@ class App:
                     " LEFT JOIN events h ON h.incident_id = e.incident_id"
                     "   AND h.type='alert_resolved_hold'"
                     "   AND h.payload_json LIKE '%' || e.id || '%'"
-                    " WHERE e.incident_id=''"
+                    " WHERE e.source_state!='quarantine' AND e.source_health!='quarantine'"
+                    " AND (e.incident_id=''"
                     "    OR (e.status='resolved' AND e.incident_id!=''"
-                    "        AND (i.id IS NULL OR i.status='open') AND h.id IS NULL)"
+                    "        AND (i.id IS NULL OR i.status='open') AND h.id IS NULL))"
                     " ORDER BY e.first_seen ASC LIMIT 30"
                 )
                 for r in rows:

@@ -355,7 +355,9 @@ class QQBot:
     def _status_text(self, actor_type: str = "qq_user", actor_id: str = "") -> str:
         # S04: 仅显示调用者有权看到的资产
         assets = self._visible_assets(actor_type, actor_id) if actor_id else []
-        incs = self.incidents.list_incidents(status="open", limit=5) if assets else []
+        visible_ids = {asset["id"] for asset in assets}
+        incs = [inc for inc in self.incidents.list_incidents(status="open")
+                if inc.get("asset_id") in visible_ids][:5] if assets else []
         lines = ["Ayana 状态"]
         if not assets:
             lines.append("目标不可用或无访问权限")
@@ -398,18 +400,23 @@ class QQBot:
         )
 
     def _incident_text(self, inc_id: str, actor_type: str = "qq_user", actor_id: str = "") -> str:
-        # S04: 事件查询需至少有权看到一个资产
+        # Resolve every incident against the caller's visible assets.
         visible = self._visible_assets(actor_type, actor_id) if actor_id else []
         if not visible:
             return ERR_TARGET_UNAVAILABLE
+        visible_ids = {asset["id"] for asset in visible}
         if not inc_id:
-            rows = self.incidents.list_incidents(limit=5)
+            rows = [inc for inc in self.incidents.list_incidents()
+                    if inc.get("asset_id") in visible_ids][:5]
             if not rows:
                 return "无 Incident"
             return "\n".join(
                 f"{r['id']} [{_zstage(r['stage'])}/{_zstatus(r['status'])}] {r['title'][:50]}"
                 for r in rows
             )
+        inc = self.incidents.get_incident(inc_id)
+        if not inc or inc.get("asset_id") not in visible_ids:
+            return ERR_TARGET_UNAVAILABLE
         return self.incidents.summary_text(inc_id, for_qq=True)
 
     async def _investigate(self, args: list[str], actor_type: str, actor_id: str) -> str:

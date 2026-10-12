@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import shlex
 import time
 from typing import Any
@@ -102,6 +103,53 @@ class ControlledExecutor:
             actor_id=actor_id,
         )
 
+    def _map_read_capability(
+        self, asset_id: str, cmd_tokens: list[str]
+    ) -> tuple[str, str]:
+        """P1-02: 读命令映射到具体能力/对象，不再一律 asset.summary。"""
+        prog = (cmd_tokens[0] if cmd_tokens else "").rsplit("/", 1)[-1]
+        # 主机摘要类（无对象边界）
+        if prog in {
+            "hostname", "uname", "whoami", "id", "date", "uptime",
+            "free", "df", "ss", "netstat", "ps", "ls",
+        }:
+            return "asset.summary", "*"
+        if prog == "ping":
+            return "probe.status", "*"
+        if prog == "curl":
+            return "probe.status", "*"
+        # 服务/容器状态与日志：尽量绑定登记对象
+        obj_id = ""
+        if prog == "systemctl" and len(cmd_tokens) >= 3:
+            unit = cmd_tokens[2]
+            obj_id = self._resolve_object_id(asset_id, unit)
+        elif prog in {"docker", "podman"} and len(cmd_tokens) >= 3:
+            name = cmd_tokens[2]
+            obj_id = self._resolve_object_id(asset_id, name)
+        elif prog == "service" and len(cmd_tokens) >= 2:
+            obj_id = self._resolve_object_id(asset_id, cmd_tokens[1])
+        elif prog == "journalctl" and "-u" in cmd_tokens:
+            idx = cmd_tokens.index("-u")
+            if idx + 1 < len(cmd_tokens):
+                obj_id = self._resolve_object_id(asset_id, cmd_tokens[idx + 1])
+        verb = cmd_tokens[1].lower() if len(cmd_tokens) >= 2 else ""
+        if prog in {"systemctl", "service", "docker", "podman", "journalctl"}:
+            if verb in {"logs"} or prog == "journalctl":
+                cap = "service.logs"
+            else:
+                cap = "service.status"
+            return cap, obj_id or "*"
+        return "asset.summary", "*"
+
+    def _resolve_object_id(self, asset_id: str, name: str) -> str:
+        if not name:
+            return ""
+        row = self.db.query_one(
+            "SELECT id FROM objects WHERE asset_id=? AND (id=? OR name=? OR unit=? OR container=?)",
+            (asset_id, name, name, name, name),
+        )
+        return str(row["id"]) if row else ""
+
     async def _exec_read(
         self,
         *,
@@ -110,12 +158,13 @@ class ControlledExecutor:
         actor_type: str,
         actor_id: str,
     ) -> dict[str, Any]:
+        capability, object_id = self._map_read_capability(asset_id, cmd_tokens)
         decision = self.policy.check(
             subject_type=actor_type,
             subject_id=actor_id,
-            capability="asset.summary",
+            capability=capability,
             asset_id=asset_id,
-            object_id="*",
+            object_id=object_id,
         )
         if not decision.get("allowed"):
             self._audit(actor_type, actor_id, "cmd_denied", asset_id, cmd_tokens, channel="msg")
@@ -231,7 +280,7 @@ class ControlledExecutor:
 
         S21: 只接受目录确实支持的精确语法，不悄悄改命令语义。
         """
-        if len(cmd_tokens) < 3:
+        if len(cmd_tokens) != 3 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}", cmd_tokens[2]):
             return None
         prog = cmd_tokens[0].lower()
         verb = cmd_tokens[1].lower()

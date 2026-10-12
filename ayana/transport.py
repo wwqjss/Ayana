@@ -25,6 +25,83 @@ from .ntsafe import NTError, NTResult
 _USERNAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,31}$")
 _HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:\-_]{0,252}$")
 
+# B5: SSRF / 元数据 / 本机探测黑名单（host 名或 IP 字面量）
+_SSRF_BLOCKED_HOSTNAMES = frozenset(
+    {
+        "localhost",
+        "localhost.localdomain",
+        "metadata",
+        "metadata.google.internal",
+        "instance-data",
+    }
+)
+
+
+def _is_ip_literal(host: str) -> bool:
+    h = host.strip().lower()
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    # IPv4
+    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", h):
+        parts = [int(x) for x in h.split(".")]
+        return all(0 <= p <= 255 for p in parts) and len(parts) == 4
+    # 粗 IPv6
+    return ":" in h and re.fullmatch(r"[0-9a-f:]+", h) is not None
+
+
+def _normalize_host_ip(host: str) -> str | None:
+    """规范化主机为 IP 字符串；无法解析为 IP 则返回 None。"""
+    h = (host or "").strip().lower().strip("[]")
+    if not h:
+        return None
+    try:
+        import ipaddress
+
+        addr = ipaddress.ip_address(h)
+        # IPv4-mapped IPv6 → IPv4
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+            return str(addr.ipv4_mapped)
+        return str(addr)
+    except ValueError:
+        return None
+
+
+def is_blocked_ssrf_host(host: str, *, allow_loopback: bool = False, purpose: str = "webhook") -> bool:
+    """环回 / 链路本地（含 169.254.169.254）/ 元数据主机名拒绝。
+
+    allow_loopback=True：允许 127.0.0.1/::1（SSH 本机主机密钥等运维场景）。
+    purpose=webhook：额外拒绝 .local 等 mDNS 名。
+    """
+    raw = (host or "").strip().lower().strip("[]")
+    if not raw:
+        return True
+    if raw in _SSRF_BLOCKED_HOSTNAMES:
+        return True
+    if raw.endswith(".localhost"):
+        return not allow_loopback
+    if purpose == "webhook" and raw.endswith(".local"):
+        return True
+    ip = _normalize_host_ip(raw)
+    if ip is not None:
+        import ipaddress
+
+        addr = ipaddress.ip_address(ip)
+        if addr.is_loopback:
+            return not allow_loopback
+        if addr.is_unspecified or addr.is_multicast or addr.is_reserved:
+            return True
+        # link-local (含 169.254.x.x 与 fe80::/10)
+        if addr.is_link_local:
+            return True
+        # 云元数据
+        if ip in {"169.254.169.254", "fd00:ec2::254"}:
+            return True
+        return False
+    # 非 IP：语法校验
+    if not _HOST_RE.match(host.strip()) and not raw.endswith(".local"):
+        return True
+    return False
+
 
 def validate_ssh_identity(username: str, host: str) -> None:
     """拒绝可被 OpenSSH 解析为选项或带 shell 元字符的 username/host。"""
@@ -69,6 +146,9 @@ async def fetch_host_key(host: str, port: int = 22, *, timeout: float = 8.0) -> 
     # S01: host 也须合法，防止 ssh-keyscan 参数注入
     if not _HOST_RE.match(host) or host.startswith("-"):
         raise TransportError("bad_host", "invalid host syntax")
+    # B5: 禁止 keyscan 链路本地/元数据（本机 127.0.0.1 仍允许，SSH 运维常见）
+    if is_blocked_ssrf_host(host, allow_loopback=True, purpose="ssh"):
+        raise TransportError("ssrf_blocked", "host not allowed")
     proc = await asyncio.create_subprocess_exec(
         "ssh-keyscan",
         "-T", str(max(2, int(timeout))),

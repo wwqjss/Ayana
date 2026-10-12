@@ -99,7 +99,8 @@ class TestNotifyChannels(unittest.TestCase):
             self.store.create(
                 name="bad",
                 kind="webhook",
-                config={"url": "http://127.0.0.1:1/nope"},
+                # B5: 环回目标在创建期拒绝；用文档地址模拟不可达
+                config={"url": "http://192.0.2.1:1/nope"},
                 enabled=True,
             )
             self.store.create(

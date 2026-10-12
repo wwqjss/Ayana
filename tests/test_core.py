@@ -178,6 +178,11 @@ class TestActions(unittest.TestCase):
             " VALUES('nerv:service:frps','nerv','service','frps','frps',?)",
             (t,),
         )
+        self.db.execute(
+            "INSERT OR IGNORE INTO users(username, password_hash, totp_enabled, is_admin, created_at, updated_at)"
+            " VALUES('admin','x',0,1,?,?)",
+            (t, t),
+        )
         self.policy = Policy(self.db)
         self.policy.upsert_permission(
             subject_type="web_user", subject_id="admin", capability="service.restart",

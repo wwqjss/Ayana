@@ -96,8 +96,8 @@ def get_profile(profile_id: str) -> VerificationProfile | None:
 
 def profile_for_action(*, capability: str, asset_id: str = "", object_id: str = "") -> VerificationProfile | None:
     """按 capability + 资产解析 profile；未知返回 None（阻止自动）。"""
-    if capability == "service.restart" and asset_id == "nerv" and (
-        "frps" in (object_id or "") or object_id.endswith("frps")
+    if capability == "service.restart" and asset_id == "nerv" and object_id in (
+        "frps", "nerv:service:frps",
     ):
         return PROFILES["frps.recover"]
     if capability == "service.stop":
