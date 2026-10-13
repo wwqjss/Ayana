@@ -31,31 +31,26 @@ cd Ayana
 
 ## 3. 一键安装（推荐）
 
-### 3.1 从 GitHub 拉安装包（无需先 clone）
+### 3.1 一条命令（脚本自己拉包）
 
 ```bash
-# 下载 Release 安装包
-curl -fsSL https://github.com/wwqjss/Ayana/releases/download/v0.7.2/ayana-v0.7.2-install.tar.gz -o ayana.tgz
-echo 'a6270381b364598f14eaf4ff470998588aff26f60d3fd7bf0fd8c2f3f8cf90e3  ayana.tgz' | sha256sum -c -
-tar -xzf ayana.tgz && cd ayana-pkg
-
-# 只检查（不改系统）
-bash deploy/install.sh --check
-
-# 安装：缺啥装啥，已装完整则跳过
-sudo bash deploy/install.sh --system
-# 或无 systemd：bash deploy/install.sh --user
+curl -fsSL https://raw.githubusercontent.com/wwqjss/Ayana/main/deploy/bootstrap.sh -o bootstrap.sh
+bash bootstrap.sh --system          # root + systemd；缺啥装啥，全齐则跳过
+# bash bootstrap.sh --user           # 无 systemd
+# bash bootstrap.sh --system --check # 只检查
 ```
 
-也可用包内引导脚本（内部等价于上面下载+安装）：
+脚本会自动：
+
+1. 拉取 **最新 Release** 安装包（`ayana-install.tar.gz`，不必改文档里的版本号）
+2. 校验 SHA256（Release 上的 `.sha256`；也可用环境变量钉死）
+3. 调用包内 `deploy/install.sh` 做预检与幂等安装
+
+固定版本 / 钉死哈希（需要可复现时）：
 
 ```bash
-# 需先有 bootstrap.sh（源码 deploy/bootstrap.sh，或自行下载 raw）
-bash deploy/bootstrap.sh --system
+AYANA_VERSION=v0.7.2 AYANA_SHA256=<hash> bash bootstrap.sh --system
 ```
-
-校验：Release 资产 `ayana-v0.7.2-install.tar.gz`  
-SHA256 `a6270381b364598f14eaf4ff470998588aff26f60d3fd7bf0fd8c2f3f8cf90e3`
 
 ### 3.2 已有源码/解压包
 

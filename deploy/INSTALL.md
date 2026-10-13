@@ -2,16 +2,15 @@
 
 完整安装请见 **[docs/INSTALL.md](../docs/INSTALL.md)**。
 
-## 一键安装（从 GitHub 拉包）
+## 一键安装（脚本自己拉包）
 
 ```bash
-curl -fsSL https://github.com/wwqjss/Ayana/releases/download/v0.7.2/ayana-v0.7.2-install.tar.gz -o ayana.tgz
-tar -xzf ayana.tgz && cd ayana-pkg
-bash deploy/install.sh --check
-sudo bash deploy/install.sh --system
+curl -fsSL https://raw.githubusercontent.com/wwqjss/Ayana/main/deploy/bootstrap.sh -o bootstrap.sh
+bash bootstrap.sh --system
 ```
 
-或 `bash deploy/bootstrap.sh --system`（自动下载 Release 包再装）。
+默认拉 **latest** Release（`ayana-install.tar.gz`）并校验 `.sha256`。  
+固定版本：`AYANA_VERSION=v0.7.2 AYANA_SHA256=<hash> bash bootstrap.sh --system`
 
 ## 本地源码一键安装
 
