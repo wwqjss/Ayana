@@ -107,4 +107,6 @@ python -m unittest discover tests -q
 
 ## 许可证
 
-**尚未选定开源许可证**。对外分发或二次使用前，请先确认许可证（见仓库 `LICENSE` 或与作者约定）。
+本项目采用 **MIT License**，详见 [LICENSE](LICENSE)。
+
+Copyright (c) 2026 wwqjss
