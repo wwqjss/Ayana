@@ -31,6 +31,13 @@ cd Ayana
 
 ## 3. 一键安装（推荐）
 
+**先检查（不改动系统）**
+
+```bash
+bash deploy/install.sh --check              # 用户模式
+sudo bash deploy/install.sh --system --check
+```
+
 **系统级（root + systemd）**
 
 ```bash
@@ -43,13 +50,16 @@ sudo bash deploy/install.sh --system
 bash deploy/install.sh --user
 ```
 
-脚本会自动：
+脚本会：
 
-1. 安装代码到 prefix（默认 `/opt/ayana` 或 `~/.local/share/ayana`）
-2. 创建 venv 并安装 `requirements.txt`
-3. **生成** `secrets.json`（0600，不覆盖已有文件）— 无需手填密钥
-4. 写 `config.json`：`db_path` / `log_file` 指向**数据目录**（默认 `/var/lib/ayana` 或 `~/.local/share/ayana-data`）
-5. `--system` 时创建 `ayana` 用户、安装并启动 `ayana.service`
+1. **环境预检**：Python ≥ 3.11、包完整、磁盘、权限/systemd
+2. **检查通过且已装完整 → 跳过安装**（不重复写盘、不覆盖配置）
+3. **有缺失才装对应项**（代码 / venv / deps / secrets / config / unit）
+4. **生成** `secrets.json`（0600，不覆盖已有文件）— 无需手填密钥
+5. 写 `config.json`：`db_path` / `log_file` 指向**数据目录**（默认 `/var/lib/ayana` 或 `~/.local/share/ayana-data`）
+6. `--system` 时创建 `ayana` 用户、安装并启动 `ayana.service`
+
+需要强制重装代码或单元时加 `--force`（才会 `rsync --delete`）。
 
 完成后按脚本输出：查日志中的 bootstrap 口令文件 → 浏览器改密 → 删口令文件。  
 NapCat / 企微**可选**，不影响 Web 登录。
