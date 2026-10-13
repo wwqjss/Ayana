@@ -90,6 +90,29 @@ if command -v "$PYTHON_BIN" >/dev/null 2>&1; then
     miss "python >= 3.11 required, found $PY_VER"
     ENV_OK=0
   fi
+  # venv 模块（Debian 常缺 python3-venv）— 缺则在 root 下自动补
+  if "$PYTHON_BIN" -c 'import venv, ensurepip' >/dev/null 2>&1; then
+    ok "python venv/ensurepip"
+  else
+    if [[ "$(id -u)" -eq 0 ]] && command -v apt-get >/dev/null 2>&1; then
+      warn "python venv/ensurepip missing, trying apt-get install python3-venv"
+      export DEBIAN_FRONTEND=noninteractive
+      if apt-get update -qq && apt-get install -y -qq python3-venv python3.11-venv 2>/dev/null; then
+        if "$PYTHON_BIN" -c 'import venv, ensurepip' >/dev/null 2>&1; then
+          ok "python venv/ensurepip (installed)"
+        else
+          miss "python venv/ensurepip still missing after apt install"
+          ENV_OK=0
+        fi
+      else
+        miss "python venv/ensurepip missing; apt install failed"
+        ENV_OK=0
+      fi
+    else
+      miss "python venv/ensurepip missing (install python3-venv)"
+      ENV_OK=0
+    fi
+  fi
 else
   miss "python3 not found (set PYTHON_BIN=...)"
   ENV_OK=0
