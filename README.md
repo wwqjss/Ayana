@@ -23,7 +23,17 @@ Alertmanager → Event → Incident → 调查 → 权限 → 受控处置 → �
 
 ## 快速开始
 
-完整步骤见 **[安装手册](docs/INSTALL.md)**。从源码最短路径：
+完整步骤见 **[安装手册](docs/INSTALL.md)**。
+
+**一键（从 GitHub Release 拉包）：**
+
+```bash
+curl -fsSL https://github.com/wwqjss/Ayana/releases/download/v0.7.2/ayana-v0.7.2-install.tar.gz -o ayana.tgz
+tar -xzf ayana.tgz && cd ayana-pkg
+sudo bash deploy/install.sh --system    # 缺啥装啥；已装完整则跳过
+```
+
+从源码最短路径：
 
 ```bash
 git clone https://github.com/wwqjss/Ayana.git

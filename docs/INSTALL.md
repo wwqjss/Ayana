@@ -31,6 +31,34 @@ cd Ayana
 
 ## 3. 一键安装（推荐）
 
+### 3.1 从 GitHub 拉安装包（无需先 clone）
+
+```bash
+# 下载 Release 安装包
+curl -fsSL https://github.com/wwqjss/Ayana/releases/download/v0.7.2/ayana-v0.7.2-install.tar.gz -o ayana.tgz
+echo 'a6270381b364598f14eaf4ff470998588aff26f60d3fd7bf0fd8c2f3f8cf90e3  ayana.tgz' | sha256sum -c -
+tar -xzf ayana.tgz && cd ayana-pkg
+
+# 只检查（不改系统）
+bash deploy/install.sh --check
+
+# 安装：缺啥装啥，已装完整则跳过
+sudo bash deploy/install.sh --system
+# 或无 systemd：bash deploy/install.sh --user
+```
+
+也可用包内引导脚本（内部等价于上面下载+安装）：
+
+```bash
+# 需先有 bootstrap.sh（源码 deploy/bootstrap.sh，或自行下载 raw）
+bash deploy/bootstrap.sh --system
+```
+
+校验：Release 资产 `ayana-v0.7.2-install.tar.gz`  
+SHA256 `a6270381b364598f14eaf4ff470998588aff26f60d3fd7bf0fd8c2f3f8cf90e3`
+
+### 3.2 已有源码/解压包
+
 **先检查（不改动系统）**
 
 ```bash
