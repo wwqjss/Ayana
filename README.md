@@ -1,6 +1,6 @@
 # Ayana
 
-运维闭环平台：把告警变成**可调查、可审批、可执行、可验证**的处置流程，而不是只丢一条群消息。
+**运维闭环平台**：把告警变成**可调查、可审批、可执行、可验证**的处置流程，而不是只丢一条群消息。
 
 ```text
 Alertmanager → Event → Incident → 调查 → 权限 → 受控处置 → 独立验证 → Web / IM → 审计
@@ -17,26 +17,32 @@ Alertmanager → Event → Incident → 调查 → 权限 → 受控处置 → �
 
 适合：少量关键主机，需要「半夜自动处置也要留痕、可拒、可验」的运维场景。
 
+当前版本：**v0.7.2**（见 `ayana/__init__.py` / `pyproject.toml`）。
+
 ---
 
 ## 快速开始
 
-完整步骤见 **[安装手册](docs/INSTALL.md)**。最短路径：
+完整步骤见 **[安装手册](docs/INSTALL.md)**。从源码最短路径：
 
 ```bash
+git clone https://github.com/wwqjss/Ayana.git
+cd Ayana
+
 # 1. 依赖：Python 3.11+，建议 venv
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 
 # 2. 配置
 cp config.example.json config.json
-# 编辑 config.json；秘密写入 secrets.json（600）或 AYANA_* 环境变量
+# 编辑 config.json；秘密可用 scripts/gen-secrets.py 生成 secrets.json（600）
+# 或使用 AYANA_* 环境变量
 python -m ayana.main config.json
 ```
 
-首次启动会在**数据库同目录**生成 `bootstrap-admin.password`（0600）。用该口令登录 Web（默认 `http://127.0.0.1:6200`），**立即改密**并删除该文件。
+也可使用 `deploy/install.sh`（`--user` / `--system`）完成目录、依赖、秘密与可选 systemd 安装。
 
-生产部署（systemd、目录权限、秘密管理）见安装手册。
+首次启动会在**数据库同目录**生成 `bootstrap-admin.password`（0600）。用该口令登录 Web（默认 `http://127.0.0.1:6200`），**立即改密**并删除该文件。
 
 ---
 
@@ -101,4 +107,4 @@ python -m unittest discover tests -q
 
 ## 许可证
 
-若仓库根目录未附带 LICENSE，请在对外分发前自行补充。
+**尚未选定开源许可证**。对外分发或二次使用前，请先确认许可证（见仓库 `LICENSE` 或与作者约定）。

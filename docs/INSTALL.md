@@ -1,6 +1,6 @@
 # Ayana 安装手册
 
-适用于 **Ayana v0.7.2**（安全加固版）。本文只描述安装与运维，不含任何真实凭据。
+适用于 **Ayana v0.7.2**。本文只描述安装与运维，不含任何真实凭据。
 
 ---
 
@@ -12,24 +12,28 @@
 | Python | 3.11+（推荐 3.12） |
 | 磁盘 | ≥ 1 GB（含日志与 SQLite） |
 | 网络 | 出站 SSH（受管主机）、可访问 Prometheus / Alertmanager（可选） |
-| 权限 | 专用系统用户 `ayana`；**不要**用 root 跑应用 |
+| 权限 | 专用系统用户 `ayana`；**不要**用 root 长期跑应用 |
 
-可选依赖：
-
-- `aiohttp`：Web / WebSocket（**必须**，生产安装）
-- `cryptography`：SSH 凭据与 TOTP 加密（**强烈建议**）
-- `paramiko`：人工 Web 终端
-- 目标机：`ssh`、`ssh-keyscan`；Prometheus 场景可选 `promtool`
+依赖见仓库 `requirements.txt`：`aiohttp`（Web）、`cryptography`（凭据/TOTP 加密，强烈建议）、`paramiko`（Web 终端）。目标机需要 `ssh` / `ssh-keyscan`。
 
 ---
 
-## 2. 一键安装（推荐）
+## 2. 获取代码
+
+```bash
+git clone https://github.com/wwqjss/Ayana.git
+cd Ayana
+```
+
+本地若另有 `ayana-v0.7.2-install.tar.gz` 发布包，可解压后同样进入目录安装；**以 GitHub 仓库为准**。
+
+---
+
+## 3. 一键安装（推荐）
 
 **系统级（root + systemd）**
 
 ```bash
-tar -xzf ayana-v0.7.2-install.tar.gz
-cd ayana-v0.7.2
 sudo bash deploy/install.sh --system
 ```
 
@@ -60,27 +64,7 @@ python3 scripts/gen-secrets.py -o /etc/ayana/secrets.json
 
 ---
 
-## 3. 手动安装（可选）
-
-**方式 A — 发布包**
-
-```bash
-tar -xzf ayana-v0.7.2-install.tar.gz
-cd ayana-v0.7.2
-```
-
-**方式 B — 源码仓库**
-
-```bash
-git clone <仓库地址> ayana
-cd ayana
-```
-
-安装包 **不包含**：`secrets.json`、`config.json`、数据库、日志、内部审查文档。
-
----
-
-## 3. 目录与用户（生产）
+## 4. 目录与用户（生产）
 
 ```bash
 sudo useradd --system --home /var/lib/ayana --shell /usr/sbin/nologin ayana
@@ -99,7 +83,7 @@ sudo install -d -o root -g ayana -m 640 /etc/ayana
 
 ---
 
-## 4. 安装依赖
+## 5. 安装依赖
 
 ```bash
 cd /opt/ayana
@@ -114,7 +98,7 @@ sudo .venv/bin/pip install aiohttp cryptography paramiko
 
 ---
 
-## 5. 配置
+## 6. 配置
 
 ```bash
 sudo cp /opt/ayana/config.example.json /etc/ayana/config.json
@@ -171,7 +155,7 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 
 ---
 
-## 6. 首次启动与管理员
+## 7. 首次启动与管理员
 
 ```bash
 sudo -u ayana /opt/ayana/.venv/bin/python -m ayana.main /etc/ayana/config.json
@@ -187,7 +171,7 @@ sudo -u ayana /opt/ayana/.venv/bin/python -m ayana.main /etc/ayana/config.json
 
 ---
 
-## 7. systemd
+## 8. systemd
 
 ```bash
 sudo cp /opt/ayana/deploy/ayana.service /etc/systemd/system/ayana.service
@@ -207,7 +191,7 @@ sudo systemctl status ayana
 
 ---
 
-## 8. 验收清单
+## 9. 验收清单
 
 - [ ] `GET /health` 返回 `ok: true`
 - [ ] 未登录 `GET /ready` 仅返回 `ok/version`（无内部明细）
@@ -226,7 +210,7 @@ cd /opt/ayana && .venv/bin/python -m unittest discover tests -q
 
 ---
 
-## 9. 备份与升级
+## 10. 备份与升级
 
 **备份**（SQLite 在线备份，勿直接拷 WAL 未 checkpoint 文件）：
 
@@ -246,7 +230,7 @@ sudo tar -C /var/lib/ayana -czf /var/backups/ayana-state.tgz backup-*.db bootstr
 
 ---
 
-## 10. 与监控栈对接
+## 11. 与监控栈对接
 
 ### Alertmanager
 
@@ -272,7 +256,7 @@ receivers:
 
 ---
 
-## 11. 故障排查
+## 12. 故障排查
 
 | 现象 | 处理 |
 |------|------|
@@ -287,7 +271,7 @@ receivers:
 
 ---
 
-## 12. 安全建议摘要
+## 13. 安全建议摘要
 
 1. 仅监听本机 + 反代 TLS；不要裸奔公网 6200。  
 2. 每个秘密独立随机；权限 600/640。  
