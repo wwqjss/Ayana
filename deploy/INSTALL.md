@@ -37,6 +37,17 @@ sudo bash deploy/install.sh --system --force
 - `secrets.json` / 已有 `config.json` 永不覆盖
 - `--force` 才 `rsync --delete` 同步代码；平时重跑不会删你手工放的文件
 
+## 取默认口令
+
+```bash
+# system 安装
+sudo cat /var/lib/ayana/bootstrap-admin.password
+journalctl -u ayana -n 50 | grep BOOTSTRAP
+
+# user 安装（默认）
+cat ~/.local/share/ayana-data/bootstrap-admin.password
+```
+
 退出码：`--check` 时 0=完整可跳过、2=有缺失、1=环境不通过。
 
 `deploy/ayana.service` 为单元模板；`--system` 会按实际路径生成并启用。

@@ -195,9 +195,20 @@ sudo -u ayana /opt/ayana/.venv/bin/python -m ayana.main /etc/ayana/config.json
 ```
 
 1. 观察日志：出现 `BOOTSTRAP admin created` 与口令文件路径（通常在 DB 目录）。
-2. 打开 `http://<主机>:6200`，用户 `admin`，粘贴临时口令。
-3. 界面会要求**修改密码**（至少 10 位）。
-4. 删除口令文件：`rm -f /var/lib/ayana/bootstrap-admin.password`。
+2. **取默认口令**：
+
+   ```bash
+   # system 安装
+   sudo cat /var/lib/ayana/bootstrap-admin.password
+   # 或 journalctl -u ayana -n 50 | grep BOOTSTRAP
+
+   # user 安装（默认数据目录）
+   cat ~/.local/share/ayana-data/bootstrap-admin.password
+   ```
+
+3. 打开 `http://<主机>:6200`，用户 `admin`，粘贴临时口令。
+4. 界面会要求**修改密码**（至少 10 位）。
+5. 删除口令文件：`sudo rm -f /var/lib/ayana/bootstrap-admin.password`。
 5. 建议启用 **2FA**（控制台 → 2FA）。
 
 口令文件权限 0600；**不会**写入应用日志。若文件丢失，用运维流程重置（停机改库或重装空库），不要在日志里找口令。

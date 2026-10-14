@@ -53,6 +53,17 @@ python -m ayana.main config.json
 
 首次启动会在**数据库同目录**生成 `bootstrap-admin.password`（0600）。用该口令登录 Web（默认 `http://127.0.0.1:6200`），**立即改密**并删除该文件。
 
+```bash
+# 取默认口令（system 安装；用户安装把路径换成数据目录）
+sudo cat /var/lib/ayana/bootstrap-admin.password
+
+# 也可从日志确认路径
+journalctl -u ayana -n 50 | grep BOOTSTRAP
+
+# 登录改密后删除
+sudo rm -f /var/lib/ayana/bootstrap-admin.password
+```
+
 ---
 
 ## 架构一览
