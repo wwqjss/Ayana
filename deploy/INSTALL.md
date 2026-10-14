@@ -1,4 +1,4 @@
-# Ayana 部署说明
+﻿# Ayana 部署说明
 
 完整安装请见 **[docs/INSTALL.md](../docs/INSTALL.md)**。
 
@@ -10,7 +10,7 @@ bash bootstrap.sh --system
 ```
 
 默认拉 **latest** Release（`ayana-install.tar.gz`）并校验 `.sha256`。  
-固定版本：`AYANA_VERSION=v0.7.2 AYANA_SHA256=<hash> bash bootstrap.sh --system`
+固定版本：`AYANA_VERSION=v0.7.3 AYANA_SHA256=<hash> bash bootstrap.sh --system`
 
 ## 本地源码一键安装
 

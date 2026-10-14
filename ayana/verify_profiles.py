@@ -41,17 +41,18 @@ class VerificationProfile:
 
 
 # 受控 profile 表（审查后追加，不允许模型写入）
+# 发行版仅保留通用契约，不绑定特定资产/服务名。
 PROFILES: dict[str, VerificationProfile] = {
-    "frps.recover": VerificationProfile(
-        id="frps.recover",
-        name="NERV frps 恢复",
+    "svc.recover": VerificationProfile(
+        id="svc.recover",
+        name="服务恢复（通用）",
         capability="service.restart",
         object_kind="service",
         checks=(
             {
                 "kind": "prom_range",
                 "metric": "probe_success",
-                "selector": {"asset": "nerv", "service": "frps"},
+                "selector": {"asset": "*", "service": "*"},
                 "success_value": 1,
             },
         ),
@@ -83,9 +84,9 @@ PROFILES: dict[str, VerificationProfile] = {
     ),
 }
 
-# capability → 默认 profile
+# capability → 默认 profile（仅无歧义的通用能力）
 CAP_PROFILE = {
-    "service.restart": "frps.recover",
+    "service.restart": "svc.recover",
     "service.stop": "svc.stop",
 }
 
@@ -95,17 +96,9 @@ def get_profile(profile_id: str) -> VerificationProfile | None:
 
 
 def profile_for_action(*, capability: str, asset_id: str = "", object_id: str = "") -> VerificationProfile | None:
-    """按 capability + 资产解析 profile；未知返回 None（阻止自动）。"""
-    if capability == "service.restart" and asset_id == "nerv" and object_id in (
-        "frps", "nerv:service:frps",
-    ):
-        return PROFILES["frps.recover"]
-    if capability == "service.stop":
-        return PROFILES["svc.stop"]
-    # 其余：仅当 capability 有唯一映射且对象不歧义
-    pid = CAP_PROFILE.get(capability)
-    if pid and capability == "service.stop":
-        return PROFILES[pid]
+    """按 capability 解析通用 profile；未知返回 None（阻止自动）。"""
+    if capability in CAP_PROFILE:
+        return PROFILES.get(CAP_PROFILE[capability])
     return None
 
 

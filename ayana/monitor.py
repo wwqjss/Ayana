@@ -249,8 +249,28 @@ class HostMonitor:
             load5 = await self._query_instant(exprs["load5"])
             up = await self._query_instant(self._exporter_up_expr(asset_id))
         except PromError as e:
-            result["state"] = "collect_error"
-            result["error"] = str(e)[:200]
+            msg = str(e)[:200]
+            low = msg.lower()
+            conn_down = any(
+                k in low
+                for k in (
+                    "circuit_open",
+                    "timeout",
+                    "cannot connect",
+                    "connection refused",
+                    "connectorerror",
+                    "clientconnector",
+                    "all connection attempts failed",
+                    "prometheus unavailable",
+                    "not_configured",
+                )
+            )
+            if "node_exporter_down" in low or not conn_down:
+                result["state"] = "collect_error"
+                result["error"] = msg
+            else:
+                result["state"] = "not_configured"
+                result["error"] = msg
             return result
 
         def blk(key, samples, unit, label, thresh_key=None):
@@ -350,12 +370,32 @@ class HostMonitor:
                 instant = await self._query_instant(expr)
             except PromError as e:
                 collect_err = str(e)[:200]
+                _low = collect_err.lower()
+                _conn = any(
+                    k in _low
+                    for k in (
+                        "circuit_open",
+                        "timeout",
+                        "cannot connect",
+                        "connection refused",
+                        "connectorerror",
+                        "clientconnector",
+                        "all connection attempts failed",
+                        "prometheus unavailable",
+                        "not_configured",
+                    )
+                )
+                _st = (
+                    "not_configured"
+                    if _conn and "node_exporter_down" not in _low
+                    else "collect_error"
+                )
                 metrics[key] = {
                     "key": key,
                     "label": label,
                     "unit": unit,
                     "value": None,
-                    "state": "collect_error",
+                    "state": _st,
                     "points": [],
                     "error": collect_err,
                 }
@@ -406,13 +446,41 @@ class HostMonitor:
         )
         metrics["swap"] = swap_blk
         out["metrics"] = metrics
-        if collect_err and all(m.get("state") == "collect_error" for m in metrics.values()):
-            out["state"] = "collect_error"
+        err_states = ("collect_error", "not_configured")
+        if collect_err and all(m.get("state") in err_states for m in metrics.values()):
+            low = collect_err.lower()
+            conn_down = any(
+                k in low
+                for k in (
+                    "circuit_open",
+                    "timeout",
+                    "cannot connect",
+                    "connection refused",
+                    "connectorerror",
+                    "clientconnector",
+                    "all connection attempts failed",
+                    "prometheus unavailable",
+                    "not_configured",
+                )
+            )
+            out["state"] = (
+                "not_configured"
+                if conn_down and "node_exporter_down" not in low
+                else "collect_error"
+            )
             out["error"] = collect_err
         elif all(m.get("value") is None and m.get("state") != "not_enabled" for m in metrics.values()):
             out["state"] = "no_data"
         else:
-            order = {"ok": 0, "not_enabled": 0, "no_data": 1, "warn": 2, "bad": 3, "collect_error": 4}
+            order = {
+                "ok": 0,
+                "not_enabled": 0,
+                "no_data": 1,
+                "not_configured": 1,
+                "warn": 2,
+                "bad": 3,
+                "collect_error": 4,
+            }
             states = [m.get("state") for m in metrics.values() if m.get("state") != "not_enabled"]
             out["state"] = max(
                 states,

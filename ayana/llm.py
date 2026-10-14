@@ -156,7 +156,7 @@ class LLMClient:
             ' "hypotheses": [{"text": "...", "confidence": "high|medium|low",'
             ' "supporting": ["ev_id"], "contradicting": ["ev_id"]}],'
             ' "missing_evidence": ["..."],'
-            ' "next_tools": [{"capability": "service.status", "object_id": "frps", "why": "..."}],'
+            ' "next_tools": [{"capability": "service.status", "object_id": "nginx", "why": "..."}],'
             ' "stop": false, "stop_reason": ""}\n'
             "stop_reason 取值之一: enough_evidence/need_more_evidence/need_human/"
             "transport_unavailable/deadline_reached/tool_budget_exhausted/no_progress。"

@@ -135,6 +135,41 @@ def make_env():
     return tmp, db, policy
 
 
+def _install_test_recover_profile(asset_id: str = "nerv", service: str = "frps"):
+    """测试专用：发行版不再内置特定资产 profile，这里临时注册一个。"""
+    from ayana import verify_profiles as vp
+
+    pid = f"test.{asset_id}.recover"
+    vp.PROFILES[pid] = vp.VerificationProfile(
+        id=pid,
+        name="test recover",
+        capability="service.restart",
+        object_kind="service",
+        checks=(
+            {
+                "kind": "prom_range",
+                "metric": "probe_success",
+                "selector": {"asset": asset_id, "service": service},
+                "success_value": 1,
+            },
+        ),
+        warmup_sec=5.0,
+        continuous_success_sec=30.0,
+        max_sample_gap_sec=20.0,
+        deadline_sec=120.0,
+        expect="up",
+    )
+    orig = vp.profile_for_action
+
+    def _pfa(*, capability, asset_id="", object_id=""):
+        if capability == "service.restart":
+            return vp.PROFILES[pid]
+        return orig(capability=capability, asset_id=asset_id, object_id=object_id)
+
+    vp.profile_for_action = _pfa
+    return lambda: setattr(vp, "profile_for_action", orig)
+
+
 class TestObjectBinding(unittest.TestCase):
     def test_params_cannot_override_target(self):
         obj = {"kind": "service", "name": "frps", "unit": "frps"}
@@ -167,6 +202,8 @@ class TestClassifyExec(unittest.TestCase):
 class TestActionSecurity(unittest.TestCase):
     def setUp(self):
         self.tmp, self.db, self.policy = make_env()
+        self._restore_pfa = _install_test_recover_profile("nerv", "frps")
+        self.addCleanup(self._restore_pfa)
         self.policy.upsert_permission(
             subject_type="web_user", subject_id="admin", capability="service.restart",
             asset_id="nerv", object_id="nerv:service:frps", allow=True,

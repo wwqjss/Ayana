@@ -1,11 +1,9 @@
 ---
 id: ayana-port-bind-failed
 title: Ayana 重启后 6200 拒绝连接
-status: active
+status: example
 type: issue
-objects:
-  - kanata:ayana
-  - kanata:ayana-6200
+objects: []
 tags:
   - ayana
   - 6200

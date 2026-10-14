@@ -132,6 +132,10 @@ async function api(path, opts = {}) {
   });
   let data = null;
   try { data = await res.json(); } catch (_) { data = { ok: false, error: "bad_response" }; }
+  // 首登强制改密：任何受保护 API 被拒时，切到正式改密页，不得留在业务界面
+  if (data && data.error === "password_change_required") {
+    showPasswordChange(true);
+  }
   return data;
 }
 
@@ -200,15 +204,24 @@ function badge(text, cls) {
 function showLogin() {
   $("login-view").classList.remove("hidden");
   $("main-view").classList.add("hidden");
+  const pvc = $("pw-change-view");
+  if (pvc) pvc.classList.add("hidden");
+  const sv = $("setup-view");
+  if (sv) sv.classList.add("hidden");
   const s1 = $("login-step1"), s2 = $("login-step2");
   if (s1) s1.classList.remove("hidden");
   if (s2) s2.classList.add("hidden");
   const err = $("login-error");
   if (err) err.textContent = "";
+  resetRecoveryToggle();
 }
 
 function showMain() {
   $("login-view").classList.add("hidden");
+  const pvc = $("pw-change-view");
+  if (pvc) pvc.classList.add("hidden");
+  const sv = $("setup-view");
+  if (sv) sv.classList.add("hidden");
   $("main-view").classList.remove("hidden");
   $("username").textContent = state.user && state.user.username || "";
   $("ver").textContent = state.version || "";
@@ -216,19 +229,192 @@ function showMain() {
   activateTab(tab, focus);
 }
 
+function resetRecoveryToggle() {
+  const rec = $("recovery-field");
+  const totpField = $("totp-field");
+  const totp = $("login-totp");
+  const link = $("use-recovery");
+  if (rec) rec.classList.add("hidden");
+  if (totpField) totpField.classList.remove("hidden");
+  if (totp) {
+    totp.value = "";
+    totp.placeholder = "6 位动态码";
+    totp.classList.remove("hidden");
+  }
+  if (link) link.textContent = "使用恢复码";
+}
+
+/* ---- 正式改密页（首登强制 / 普通主动） ---- */
+function showPasswordChange(forced) {
+  const pvc = $("pw-change-view");
+  if (!pvc) return;
+  $("login-view").classList.add("hidden");
+  $("main-view").classList.add("hidden");
+  const sv = $("setup-view");
+  if (sv) sv.classList.add("hidden");
+  pvc.classList.remove("hidden");
+  state.pwChangeForced = !!forced;
+  const desc = $("pw-change-desc");
+  const oldWrap = $("pw-old-wrap");
+  const cancelBtn = $("pw-change-cancel");
+  const err = $("pw-change-error");
+  if (err) err.textContent = "";
+  if (forced) {
+    if (desc) desc.textContent = "首次登录或口令已重置，请设置新密码后继续。完成前无法使用控制台功能。";
+    if (oldWrap) oldWrap.classList.add("hidden");
+    if (cancelBtn) cancelBtn.classList.add("hidden");
+    const oldInput = $("pw-old");
+    if (oldInput) oldInput.value = "";
+  } else {
+    if (desc) desc.textContent = "修改登录密码。需要验证当前密码；成功后需重新登录。";
+    if (oldWrap) oldWrap.classList.remove("hidden");
+    if (cancelBtn) cancelBtn.classList.remove("hidden");
+  }
+  const n = $("pw-new"), c = $("pw-confirm");
+  if (n) { n.value = ""; n.focus(); }
+  if (c) c.value = "";
+}
+
+/* ---- 一次性 Token 注册管理员 ---- */
+function showSetupRegister(tokenHint) {
+  const sv = $("setup-view");
+  if (!sv) return;
+  $("login-view").classList.add("hidden");
+  $("main-view").classList.add("hidden");
+  const pvc = $("pw-change-view");
+  if (pvc) pvc.classList.add("hidden");
+  sv.classList.remove("hidden");
+  const hint = $("setup-token-hint");
+  if (hint && tokenHint) {
+    hint.textContent = "Token 文件：" + tokenHint + "（权限 600，用完即失效）。";
+  }
+  const err = $("setup-error");
+  if (err) err.textContent = "";
+  const t = $("setup-token");
+  if (t) t.focus();
+}
+
+on("setup-form", "submit", async (e) => {
+  e.preventDefault();
+  const err = $("setup-error");
+  if (err) err.textContent = "";
+  const token = (($("setup-token") || {}).value || "").trim();
+  const username = (($("setup-username") || {}).value || "").trim();
+  const password = (($("setup-password") || {}).value || "");
+  const confirm = (($("setup-confirm") || {}).value || "");
+  if (!token) { if (err) err.textContent = "请输入初始化 Token"; return; }
+  if (!username || username.length < 2) { if (err) err.textContent = "请输入用户名（至少 2 位）"; return; }
+  if (password.length < 10) {
+    if (err) err.textContent = `密码至少 10 位（当前 ${password.length} 位）`;
+    return;
+  }
+  if (password !== confirm) { if (err) err.textContent = "两次输入的密码不一致"; return; }
+  const res = await api("/api/setup/register", {
+    method: "POST",
+    body: JSON.stringify({ token, username, password, confirm_password: confirm }),
+  });
+  if (!res || !res.ok) {
+    if (err) err.textContent = (res && (res.message || res.error)) || "注册失败";
+    return;
+  }
+  state.csrf = res.csrf_token || "";
+  state.user = res.user || { username, is_admin: true, must_change_password: false };
+  showMain();
+  await loadMeta();
+});
+
 on("use-recovery", "click", (e) => {
   e.preventDefault();
   const rec = $("recovery-field");
-  const totp = $("login-totp");
-  if (rec) rec.classList.toggle("hidden");
-  if (totp) totp.placeholder = rec && !rec.classList.contains("hidden") ? "可留空，改用恢复码" : "6 位动态码";
+  const totpField = $("totp-field");
+  const link = $("use-recovery");
+  if (!rec || !totpField) return;
+  const useRec = rec.classList.contains("hidden");
+  if (useRec) {
+    rec.classList.remove("hidden");
+    totpField.classList.add("hidden");
+    if (link) link.textContent = "改用动态码";
+    const r = $("login-recovery");
+    if (r) r.focus();
+  } else {
+    resetRecoveryToggle();
+  }
 });
+
+on("pw-change-cancel", "click", () => {
+  // 仅普通主动改密可取消；首登强制改密不允许进入业务界面
+  if (state.pwChangeForced) return;
+  showMain();
+});
+
+on("pw-change-logout", "click", async () => {
+  try { await api("/api/logout", { method: "POST", body: "{}" }); } catch (_) {}
+  state.csrf = "";
+  state.user = null;
+  state.pendingLogin = null;
+  state.pwChangeForced = false;
+  showLogin();
+});
+
+on("pw-change-form", "submit", async (e) => {
+  e.preventDefault();
+  const err = $("pw-change-error");
+  const forced = !!state.pwChangeForced;
+  const oldPw = (($("pw-old") || {}).value || "");
+  const newPw = (($("pw-new") || {}).value || "");
+  const confirmPw = (($("pw-confirm") || {}).value || "");
+  if (err) err.textContent = "";
+  if (!newPw) { if (err) err.textContent = "请输入新密码"; return; }
+  if (newPw.length < 10) {
+    if (err) err.textContent = `新密码至少 10 位（当前 ${newPw.length} 位）`;
+    return;
+  }
+  if (newPw !== confirmPw) {
+    if (err) err.textContent = "两次输入的新密码不一致";
+    return;
+  }
+  if (!forced && !oldPw) {
+    if (err) err.textContent = "请输入当前密码";
+    return;
+  }
+  if (forced && oldPw && oldPw === newPw) {
+    if (err) err.textContent = "新密码不能与当前密码相同";
+    return;
+  }
+  const body = { new_password: newPw, confirm_password: confirmPw };
+  if (!forced) body.old_password = oldPw;
+  const res = await api("/api/password", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  if (!res || !res.ok) {
+    if (err) err.textContent = (res && (res.message || res.error)) || "修改密码失败";
+    return;
+  }
+  if (forced) {
+    // 首登/重置改密成功：会话保留，直接进入控制台（监控在资源页配置）
+    if (state.user) state.user.must_change_password = false;
+    state.pwChangeForced = false;
+    showMain();
+    await loadMeta();
+    return;
+  }
+  // 普通主动改密：会话已撤销，回登录页
+  state.csrf = "";
+  state.user = null;
+  showLogin();
+  const le = $("login-error");
+  if (le) le.textContent = "密码已修改，请使用新密码登录。";
+});
+
+on("chg-pw-btn", "click", () => showPasswordChange(false));
 
 on("login-back-btn", "click", () => {
   state.pendingLogin = null;
   $("login-step1").classList.remove("hidden");
   $("login-step2").classList.add("hidden");
   $("login-error").textContent = "";
+  resetRecoveryToggle();
 });
 
 on("login-form", "submit", async (e) => {
@@ -254,6 +440,7 @@ on("login-form", "submit", async (e) => {
   $("login-step1").classList.add("hidden");
   $("login-step2").classList.remove("hidden");
   $("login-error").textContent = "";
+  resetRecoveryToggle();
   const hint = $("login-step2-hint");
   if (hint) hint.textContent = `账号 ${res.username || ""} 已验证，请输入动态验证码`;
   const t = $("login-totp");
@@ -525,7 +712,18 @@ window.addEventListener("popstate", () => {
 
 async function boot() {
   const me = await api("/api/me");
-  if (!me.ok) { showLogin(); return; }
+  if (!me.ok) {
+    // 未登录：先看是否开放 Token 注册（必须 setup_state=pending）
+    try {
+      const st = await api("/api/setup/status");
+      if (st && st.register_open) {
+        showSetupRegister(st.token_hint || "");
+        return;
+      }
+    } catch (_) {}
+    showLogin();
+    return;
+  }
   state.user = me.user;
   state.csrf = me.csrf_token || state.csrf;
   // 版本取服务端 health，不硬编码
@@ -533,30 +731,13 @@ async function boot() {
     const h = await fetch("/health").then(r => r.json());
     state.version = "v" + (h.version || "unknown");
   } catch { state.version = "v?"; }
-  showMain();
+  // 首登强制改密：在改密完成前不得进入业务界面
   if (me.user && me.user.must_change_password) {
-    await promptPasswordChange();
+    showPasswordChange(true);
     return;
   }
+  showMain();
   await loadMeta();
-}
-
-async function promptPasswordChange() {
-  const oldPw = prompt("首次登录请修改密码。\n当前密码（bootstrap 临时口令）:", "");
-  if (oldPw === null) return;
-  const newPw = prompt("新密码（至少 10 位）:", "");
-  if (newPw === null) return;
-  const res = await api("/api/password", {
-    method: "POST",
-    body: JSON.stringify({ old_password: oldPw, new_password: newPw }),
-  });
-  if (!res.ok) {
-    alert(res.message || res.error || "修改密码失败");
-    await promptPasswordChange();
-    return;
-  }
-  alert("密码已修改，请使用新密码重新登录。");
-  location.reload();
 }
 
 async function loadMeta() {
@@ -3652,7 +3833,8 @@ function openMetricExpand(title, m, seriesList) {
 function metricStateBadgeText(st) {
   return {
     ok: "正常", warn: "偏高", bad: "异常", no_data: "暂无数据",
-    not_enabled: "未启用", collect_error: "采集故障", partial_no_data: "部分缺测",
+    not_enabled: "未启用", collect_error: "采集故障", not_configured: "监控未接入",
+    partial_no_data: "部分缺测",
   }[st] || st || "—";
 }
 
@@ -3665,7 +3847,7 @@ function buildMetricGroups(metrics) {
     if (!ms.length) return;
     seriesKeys.forEach((k) => used.add(k));
     const states = ms.map((m) => m.state);
-    const rank = { collect_error: 5, bad: 4, warn: 3, no_data: 2, ok: 1, not_enabled: 0, partial_no_data: 2 };
+    const rank = { collect_error: 5, bad: 4, warn: 3, no_data: 2, not_configured: 2, ok: 1, not_enabled: 0, partial_no_data: 2 };
     const enabledStates = states.filter((value) => value !== "not_enabled");
     const worst = enabledStates.length
       ? enabledStates.reduce((a, b) => (rank[b] || 0) > (rank[a] || 0) ? b : a, enabledStates[0])
@@ -3717,10 +3899,16 @@ function monitorHostPresentation(host) {
   const states = {
     ok: ["正常", "ok"], warn: ["偏高", "warn"], bad: ["异常", "bad"],
     no_data: ["暂无数据", "dim"], collect_error: ["采集故障", "err"],
+    not_configured: ["监控未接入", "dim"],
     partial_no_data: ["部分未观测", "warn"], unknown: ["观测不全", "warn"],
   };
   const [label, cls] = states[host.state] || ["状态暂不可用", "dim"];
-  return { label: health.label || label, cls: health.cls || cls };
+  let text = health.label || label;
+  // 示例资产（demo-* 未填主机）不伪装成真实故障
+  const id = String(host.asset_id || "");
+  const hasHost = !!(host.host || (host.asset && host.asset.host));
+  if (id.startsWith("demo-") && !hasHost) text = "示例 · 未接入";
+  return { label: text, cls: health.cls || cls };
 }
 
 function renderMonitorHostControls() {
@@ -3769,7 +3957,7 @@ function syncMonitorOnboarding(assetId, visible) {
 function monitorHasCurrentMetrics(res) {
   return [res.overview, res.history].some((section) => section && Object.values(section.metrics || {}).some((metric) =>
     metric && typeof metric.value === "number" && Number.isFinite(metric.value)
-    && !["no_data", "not_enabled", "collect_error"].includes(metric.state)));
+    && !["no_data", "not_enabled", "collect_error", "not_configured"].includes(metric.state)));
 }
 
 function renderMonitorMetrics(body, res, range) {
@@ -3780,11 +3968,19 @@ function renderMonitorMetrics(body, res, range) {
   }
   const history = res.history || {}, overview = res.overview || {};
   const bannerState = history.state || overview.state;
-  if (bannerState === "collect_error") body.appendChild(el("div", {
+  if (bannerState === "not_configured" || res.monitor_not_configured) body.appendChild(el("div", {
+    class: "banner warn",
+    text: "监控尚未接入：无法连接 Prometheus 或还没有采集数据。可在上方配置地址，或点击「一键接入监控」。原生业务检查显示在下方。",
+  }));
+  else if (bannerState === "collect_error") body.appendChild(el("div", {
     class: "banner warn", text: "资源采集暂不可用，请检查采集器和监控连接。下方业务检查单独显示。",
   }));
   else if (!monitorHasCurrentMetrics(res)) body.appendChild(el("div", {
     class: "banner warn", text: "这台主机暂无当前资源数据，可以使用上方入口接入监控。业务检查显示在下方。",
+  }));
+  if (res.sample) body.appendChild(el("div", {
+    class: "banner",
+    text: "这是示例资产（未配置真实主机地址），不代表线上故障。请在「连接」页登记实际主机。",
   }));
   const hasHistory = Object.values(history.metrics || {}).some((metric) => (metric.points || []).length > 0);
   if (monitorHasCurrentMetrics(res) || hasHistory) {
@@ -3805,6 +4001,7 @@ function businessStatePresentation(value) {
   const states = {
     ok: ["正常", "ok"], fail: ["异常", "bad"], stale: ["样本过期", "warn"],
     no_data: ["暂无结果", "dim"], collect_error: ["采集失败", "err"],
+    not_configured: ["监控未接入", "dim"],
     unknown: ["未能确定结果", "warn"], disabled: ["已停用", "dim"],
   };
   const [label, cls] = states[value] || ["暂无结果", "dim"];
@@ -3885,7 +4082,8 @@ async function renderMonitor() {
         renderMonitorHostControls();
       }
       renderMonitorMetrics(body, res, range);
-      syncMonitorOnboarding(host, res.ok && !monitorHasCurrentMetrics(res));
+      // 无数据 / 接口失败 都应露出接入入口，不得因 403/502 藏掉
+      syncMonitorOnboarding(host, !res.ok || !monitorHasCurrentMetrics(res));
     }),
     (async () => {
       const [res] = await Promise.all([

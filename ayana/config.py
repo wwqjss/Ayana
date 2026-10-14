@@ -45,6 +45,10 @@ DEFAULTS: dict[str, Any] = {
         "local_assets": [],
         "require_promtool": True,
     },
+    # 监控 required checks / 自动 runbook：由部署方配置，发行版默认为空
+    # 格式见 docs/migration-monitor-v073.md；不得把特定环境数据写进代码默认值
+    "required_checks": {},
+    "runbook_rules": [],
 }
 
 # 秘密键：优先环境变量 AYANA_<KEY>，其次 secrets.json

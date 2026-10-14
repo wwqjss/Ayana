@@ -6,6 +6,7 @@ import asyncio
 import hmac
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -168,6 +169,10 @@ class WebApp:
         app.router.add_post("/api/totp/confirm", self.api_totp_confirm)
         app.router.add_post("/api/totp/disable", self.api_totp_disable)
         app.router.add_post("/api/password", self.api_change_password)
+        app.router.add_get("/api/setup/status", self.api_setup_status)
+        app.router.add_post("/api/setup/register", self.api_setup_register)
+        app.router.add_get("/api/setup/monitor", self.api_setup_monitor_get)
+        app.router.add_post("/api/setup/monitor", self.api_setup_monitor_post)
         app.router.add_get("/api/overview", self.api_overview)
         app.router.add_get("/api/assets", self.api_assets)
         app.router.add_get("/api/assets/{asset_id}", self.api_asset_detail)
@@ -388,11 +393,11 @@ class WebApp:
         return sess
 
     def _enforce_password_change(self, request: web.Request, sess: dict) -> None:
-        """首登强制改密：仅放行 me/logout/password。"""
+        """首登强制改密：仅放行 me/logout/password 与首登监控配置。"""
         if not sess.get("must_change_password"):
             return
         path = request.rel_url.path
-        if path in ("/api/me", "/api/logout", "/api/password"):
+        if path in ("/api/me", "/api/logout", "/api/password", "/api/setup/monitor"):
             return
         raise web.HTTPForbidden(
             text=json.dumps({
@@ -745,15 +750,255 @@ class WebApp:
     async def api_change_password(self, request: web.Request) -> web.Response:
         sess = self._require_auth(request)
         self._check_csrf(request, sess)
-        body = await request.json()
         try:
+            body = await request.json()
+        except Exception:
+            return _json({"ok": False, "error": "bad_json", "message": "请求体不是合法 JSON"}, 400)
+        if not isinstance(body, dict):
+            return _json({"ok": False, "error": "bad_json", "message": "请求体不是合法 JSON"}, 400)
+
+        old_password = body.get("old_password", "")
+        new_password = body.get("new_password", "")
+        confirm_password = body.get("confirm_password", "")
+        if isinstance(confirm_password, str) and confirm_password != "" and confirm_password != new_password:
+            return _json(
+                {"ok": False, "error": "mismatch", "message": "两次输入的新密码不一致"},
+                400,
+            )
+
+        must = bool(sess.get("must_change_password"))
+        try:
+            # 首登/强制改密：不要求旧密，保留当前会话；主动改密：验旧密并撤销全部会话
             self.auth.change_password(
-                sess["user_id"], body.get("old_password", ""), body.get("new_password", "")
+                sess["user_id"],
+                old_password if isinstance(old_password, str) else "",
+                new_password if isinstance(new_password, str) else "",
+                require_old=not must,
+                keep_session_id=sess.get("session_id") if must else None,
             )
         except AuthError as e:
             return _json({"ok": False, "error": e.code, "message": str(e)}, 400)
-        self.db.audit("web_user", sess["username"], "password_changed")
-        return _json({"ok": True})
+        self.db.audit(
+            "web_user",
+            sess["username"],
+            "password_changed",
+            detail={"forced": must},
+        )
+        return _json({"ok": True, "must_change_password": False, "session_kept": bool(must)})
+
+    # ---- first-run setup token registration ----
+
+    def _setup_token_hint(self) -> str:
+        """告诉用户去哪里看 token 文件，不暴露 token 本身。"""
+        try:
+            from pathlib import Path as _P
+
+            db_path = _P(self.db.path).resolve()
+            return str(db_path.parent / "setup-admin.token")
+        except Exception:
+            return "与数据库同目录的 setup-admin.token"
+
+    async def api_setup_status(self, request: web.Request) -> web.Response:
+        """公开：是否可注册。仅 pending 且服务端状态明确时才 true。"""
+        sess = self._session(request)
+        if sess:
+            return _json(
+                {
+                    "ok": True,
+                    "setup_required": bool(sess.get("must_change_password")),
+                    "register_open": False,
+                    "state": self.auth.setup_state() if self.auth else "unknown",
+                    "logged_in": True,
+                }
+            )
+        state = self.auth.setup_state() if self.auth else "unknown"
+        n = self.auth.user_count() if self.auth else 0
+        # 双重条件：显式 pending + 空用户；缺一不可
+        register_open = state == "pending" and n == 0
+        return _json(
+            {
+                "ok": True,
+                "setup_required": False,
+                "register_open": register_open,
+                "state": state,
+                "logged_in": False,
+                "token_hint": self._setup_token_hint() if register_open else "",
+            }
+        )
+
+    async def api_setup_register(self, request: web.Request) -> web.Response:
+        """Token 一次性注册管理员。无会话可访问；成功即建会话。"""
+        try:
+            body = await request.json()
+        except Exception:
+            return _json({"ok": False, "error": "bad_json", "message": "请求体不是合法 JSON"}, 400)
+        if not isinstance(body, dict):
+            return _json({"ok": False, "error": "bad_json", "message": "请求体不是合法 JSON"}, 400)
+        token = body.get("token", "")
+        username = body.get("username", "")
+        password = body.get("password", "")
+        confirm = body.get("confirm_password", "")
+        if isinstance(confirm, str) and confirm and confirm != password:
+            return _json(
+                {"ok": False, "error": "mismatch", "message": "两次输入的密码不一致"},
+                400,
+            )
+        ip = request.remote or ""
+        ua = request.headers.get("User-Agent", "")
+        try:
+            sess = self.auth.register_admin(
+                token if isinstance(token, str) else "",
+                username if isinstance(username, str) else "",
+                password if isinstance(password, str) else "",
+                ip=ip,
+                ua=ua,
+            )
+        except AuthError as e:
+            return _json({"ok": False, "error": e.code, "message": str(e)}, 400)
+        self.db.audit(
+            "web_user",
+            str(username),
+            "admin_registered",
+            detail={"ip": ip, "method": "setup_token"},
+        )
+        self._try_seed_admin_perms(str(username))
+        resp = _json(
+            {
+                "ok": True,
+                "csrf_token": sess["csrf_token"],
+                "user": {"username": str(username), "is_admin": True, "must_change_password": False},
+            }
+        )
+        resp.set_cookie(
+            SESSION_COOKIE,
+            sess["session_id"],
+            httponly=True,
+            samesite="Lax",
+            max_age=self.auth.session_ttl,
+            path="/",
+        )
+        return resp
+
+    def _try_seed_admin_perms(self, username: str) -> None:
+        """注册后补齐 admin 种子权限（只补缺失）。"""
+        try:
+            if not self.db.query_one(
+                "SELECT id FROM users WHERE username=? AND is_admin=1", (username,)
+            ):
+                return
+            from .policy import Policy as _P
+
+            policy = _P(self.db)
+            for cap in (
+                "asset.summary",
+                "probe.status",
+                "checks.read",
+                "checks.write",
+                "promconfig.read",
+                "promconfig.write",
+                "node_exporter.status",
+                "node_exporter.manage",
+                "shell.interactive",
+            ):
+                row = self.db.query_one(
+                    "SELECT id FROM permissions WHERE subject_type='web_user' AND subject_id=?"
+                    " AND capability=? AND asset_id='*' AND object_id='*'",
+                    (username, cap),
+                )
+                if row:
+                    continue
+                policy.upsert_permission(
+                    subject_type="web_user",
+                    subject_id=username,
+                    capability=cap,
+                    asset_id="*",
+                    object_id="*",
+                    allow=True,
+                    require_approval=False,
+                    auto_allowed=False,
+                    actor="system",
+                )
+        except Exception as e:
+            log.warning("seed admin perms after register failed: %s", e)
+
+    # ---- monitoring setup (resource page; not on first-login) ----
+
+    async def api_setup_monitor_get(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        prom_url = self._meta_get("prometheus_url") or getattr(self.prom, "base_url", "")
+        am_url = self._meta_get("alertmanager_url") or str(
+            (getattr(self, "cfg", None) or {}).get("alertmanager_url") or ""
+        )
+        if not hasattr(self, "cfg"):
+            am_url = self._meta_get("alertmanager_url")
+        return _json(
+            {
+                "ok": True,
+                "prometheus_url": prom_url,
+                "alertmanager_url": am_url,
+                "is_admin": bool(sess.get("is_admin")),
+            }
+        )
+
+    async def api_setup_monitor_post(self, request: web.Request) -> web.Response:
+        """首次登录/独立部署：配置监控接入地址。写 DB meta 并立即生效。"""
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        try:
+            body = await request.json()
+        except Exception:
+            return _json({"ok": False, "error": "bad_json", "message": "请求体不是合法 JSON"}, 400)
+        if not isinstance(body, dict):
+            return _json({"ok": False, "error": "bad_json", "message": "请求体不是合法 JSON"}, 400)
+
+        prom_url = str(body.get("prometheus_url") or "").strip()
+        am_url = str(body.get("alertmanager_url") or "").strip()
+        for label, url in (("prometheus_url", prom_url), ("alertmanager_url", am_url)):
+            if not url:
+                continue
+            if not re.fullmatch(r"https?://[^\s]+", url):
+                return _json(
+                    {"ok": False, "error": "bad_url", "message": f"{label} 必须是 http(s) 地址"},
+                    400,
+                )
+            if len(url) > 300:
+                return _json(
+                    {"ok": False, "error": "bad_url", "message": f"{label} 过长"},
+                    400,
+                )
+
+        if prom_url:
+            self._meta_set("prometheus_url", prom_url.rstrip("/"))
+            if getattr(self, "prom", None):
+                self.prom.base_url = prom_url.rstrip("/")
+                # 换地址后重置熔断，便于立即探测
+                self.prom._fail_streak = 0
+                self.prom._open_until = 0.0
+        if am_url:
+            self._meta_set("alertmanager_url", am_url.rstrip("/"))
+
+        probe = {"ok": None, "error": ""}
+        if prom_url and getattr(self, "prom", None):
+            try:
+                await self.prom.query("1")
+                probe = {"ok": True, "error": ""}
+            except Exception as e:
+                probe = {"ok": False, "error": str(e)[:200]}
+
+        self.db.audit(
+            "web_user",
+            sess["username"],
+            "monitor_setup",
+            detail={"prometheus_url": prom_url or "", "probe_ok": probe.get("ok")},
+        )
+        return _json(
+            {
+                "ok": True,
+                "prometheus_url": prom_url or getattr(self.prom, "base_url", ""),
+                "alertmanager_url": am_url,
+                "probe": probe,
+            }
+        )
 
     # ---- business api ----
 
@@ -872,7 +1117,7 @@ class WebApp:
         if not sess:
             return set()
         username = sess.get("username") or ""
-        if username == "admin":
+        if username == "admin" or sess.get("is_admin"):
             return {r["id"] for r in self.db.query("SELECT id FROM assets")}
         rows = self.db.query("SELECT id FROM assets")
         out = set()
@@ -887,6 +1132,41 @@ class WebApp:
             if decision.get("allowed"):
                 out.add(r["id"])
         return out
+
+    @staticmethod
+    def _is_sample_asset(row: Any) -> bool:
+        """播种示例资产：demo-* 且未配置真实主机地址。"""
+        if row is None:
+            return False
+        if isinstance(row, dict):
+            aid = str(row.get("id") or "")
+            host = str(row.get("host") or "").strip()
+        else:
+            try:
+                aid = str(row["id"] or "")
+                host = str(row["host"] or "").strip()
+            except (KeyError, IndexError, TypeError):
+                return False
+        return aid.startswith("demo-") and not host
+
+    @staticmethod
+    def _monitor_not_onboarded(overview: dict) -> bool:
+        """监控未接入：连接失败/无样本，而不是采集器装好后故障。"""
+        state = (overview or {}).get("state") or ""
+        if state in ("no_data", "not_configured"):
+            return True
+        return False
+
+    def _meta_get(self, key: str) -> str:
+        row = self.db.query_one("SELECT value FROM meta WHERE key=?", (key,))
+        return str(row["value"]) if row and row["value"] is not None else ""
+
+    def _meta_set(self, key: str, value: str) -> None:
+        self.db.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
 
     def _asset_monitor_host(self, asset: dict, endpoints: list[dict] | None = None) -> str:
         """Resolve the monitoring host from current asset/connection configuration."""
@@ -2317,6 +2597,8 @@ class WebApp:
             item["metric_state"] = metric_state
             item["state"] = hh["state"]  # 对外五态
             item["firing"] = firing_by_asset.get(aid, [])
+            item["host"] = a.get("host") or ""
+            item["sample"] = self._is_sample_asset(a)
             out.append(item)
         return _json({"ok": True, "hosts": out})
 
@@ -2324,17 +2606,21 @@ class WebApp:
         sess = self._require_auth(request)
         asset_id = request.match_info["asset_id"]
         range_key = request.rel_url.query.get("range", "1h")
-        decision = self.policy.check(
-            subject_type="web_user",
-            subject_id=sess["username"],
-            capability="asset.summary",
-            asset_id=asset_id,
-            object_id="*",
-        )
-        if not decision["allowed"]:
-            return _json({"ok": False, "error": "denied"}, 403)
+        # 与 _visible_asset_ids 一致：admin 全部可见；其余走 asset.summary
+        if sess.get("is_admin") or sess.get("username") == "admin":
+            pass
+        else:
+            decision = self.policy.check(
+                subject_type="web_user",
+                subject_id=sess["username"],
+                capability="asset.summary",
+                asset_id=asset_id,
+                object_id="*",
+            )
+            if not decision["allowed"]:
+                return _json({"ok": False, "error": "denied"}, 403)
         row = self.db.query_one(
-            "SELECT id, display_name, prom_asset FROM assets WHERE id=?", (asset_id,)
+            "SELECT id, display_name, prom_asset, host FROM assets WHERE id=?", (asset_id,)
         )
         if not row:
             return _json({"ok": False, "error": "not_found"}, 404)
@@ -2352,6 +2638,9 @@ class WebApp:
                              required_state=required_health(prom_items),
                              check_states=[item["state"] for item in prom_items if not item.get("required")] + self._native_business_states(asset_id),
                              firing_severities=self._monitor_firing().get(asset_id, []))
+        # 示例资产 / 未接入监控：明确区分，不伪装成采集故障
+        sample = self._is_sample_asset(row)
+        not_onboarded = self._monitor_not_onboarded(overview)
         return _json(
             {
                 "ok": True,
@@ -2359,6 +2648,9 @@ class WebApp:
                 "overview": overview,
                 "history": history,
                 "health": health,
+                "sample": sample,
+                "monitor_not_configured": not_onboarded,
+                "prometheus_url": getattr(self.prom, "base_url", ""),
             }
         )
 

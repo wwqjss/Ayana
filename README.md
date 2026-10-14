@@ -1,4 +1,4 @@
-# Ayana
+﻿# Ayana
 
 **运维闭环平台**：把告警变成**可调查、可审批、可执行、可验证**的处置流程，而不是只丢一条群消息。
 
@@ -17,7 +17,7 @@ Alertmanager → Event → Incident → 调查 → 权限 → 受控处置 → �
 
 适合：少量关键主机，需要「半夜自动处置也要留痕、可拒、可验」的运维场景。
 
-当前版本：**v0.7.2**（见 `ayana/__init__.py` / `pyproject.toml`）。
+当前版本：**v0.7.3**（见 `ayana/__init__.py` / `pyproject.toml`）。
 
 ---
 
@@ -100,7 +100,7 @@ Prometheus / Alertmanager
 
 秘密键可用环境变量覆盖：`AYANA_ONEWBOT_TOKEN`、`AYANA_WEBHOOK_TOKEN`、`AYANA_WEB_AUTH_PEPPER`、`AYANA_TOTP_ENCRYPT_KEY`、`AYANA_SSH_CREDENTIAL_KEY` 等（见 `ayana/config.py`）。
 
-**安全基线（v0.7.2+）**：
+**安全基线（v0.7.3+）**：
 
 - 登录：PBKDF2、失败锁定、TOTP 2FA、恢复码、会话绑定
 - 首登强制改密；bootstrap 口令不写日志

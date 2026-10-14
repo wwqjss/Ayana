@@ -30,7 +30,7 @@ class KnowledgeDoc:
     title: str
     status: str = "active"
     type: str = "system"
-    objects: list[str] = field(default_factory=list)  # sora:google / asset:name
+    objects: list[str] = field(default_factory=list)  # asset:name 或 name
     tags: list[str] = field(default_factory=list)
     body: str = ""
     path: str = ""
@@ -153,7 +153,7 @@ def parse_doc(path: Path, text: str | None = None) -> KnowledgeDoc:
 # ---- 对象引用 ----
 
 def _match_object(doc_objects: list[str], asset_id: str, object_name: str) -> bool:
-    """sora:google | sora:* | *:google | google | sora:probe:google"""
+    """asset:object | asset:* | *:object | object | asset:probe:object"""
     name = object_name.split(":")[-1] if object_name else ""
     refs = {o.strip() for o in doc_objects}
     candidates = set()
@@ -169,7 +169,7 @@ def _match_object(doc_objects: list[str], asset_id: str, object_name: str) -> bo
             continue
         if r in candidates:
             return True
-        # sora:probe:google → sora:google / google
+        # asset:probe:object → asset:object / object
         parts = r.split(":")
         if len(parts) >= 2:
             a, n = parts[0], parts[-1]

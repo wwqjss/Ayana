@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # Ayana 一键安装引导：自己拉包 → 预检 → 缺啥装啥 / 全齐则跳过。
 #
 # 用法（目标机上直接跑）：
@@ -9,7 +9,7 @@
 #
 # 版本：
 #   默认 latest（跟随 GitHub 最新 Release，文档不用改版本号）
-#   固定版本：AYANA_VERSION=v0.7.2 bash bootstrap.sh --system
+#   固定版本：AYANA_VERSION=v0.7.3 bash bootstrap.sh --system
 #
 # 校验（可选）：
 #   AYANA_SHA256=<hash> bash bootstrap.sh ...

@@ -202,6 +202,115 @@ class AuthService:
         self.create_user(username, password, is_admin=True, must_change_password=True)
         return password
 
+    # ---- 一次性 Setup Token 注册管理员 ----
+
+    def user_count(self) -> int:
+        row = self.db.query_one("SELECT COUNT(*) AS n FROM users")
+        return int(row["n"] if row else 0)
+
+    def setup_state(self) -> str:
+        """服务端初始化状态：pending / completed / unknown。
+
+        不得仅凭用户数为 0 开放注册；必须有显式 setup_state。
+        """
+        row = self.db.query_one("SELECT value FROM meta WHERE key='setup_state'")
+        return str(row["value"]) if row and row["value"] else "unknown"
+
+    def _set_setup_state(self, state: str) -> None:
+        self.db.execute(
+            "INSERT INTO meta(key, value) VALUES('setup_state', ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (state,),
+        )
+
+    def ensure_setup_initialized(self) -> dict[str, Any]:
+        """启动时判定注册门闩。返回 {state, token, token_hint}。
+
+        规则（防 DB 异常/迁移失败误开注册）：
+        - 已有用户 → 一律 completed，即使 meta 丢失
+        - meta=completed → 永不重开
+        - 无用户且无 setup_state（真正首次安装）→ pending + 生成一次性 token
+        - pending 但已有用户（异常）→ 收敛为 completed 并作废 token
+        """
+        n = self.user_count()
+        state = self.setup_state()
+        if n > 0:
+            if state != "completed":
+                self._set_setup_state("completed")
+                self.db.execute("DELETE FROM meta WHERE key='setup_token_hash'")
+            return {"state": "completed", "token": "", "token_hint": ""}
+        if state == "completed":
+            # 空库但标记完成：视为异常，不开放注册
+            return {"state": "completed", "token": "", "token_hint": ""}
+        if state == "pending":
+            row = self.db.query_one("SELECT value FROM meta WHERE key='setup_token_hash'")
+            if row and row["value"]:
+                return {"state": "pending", "token": "", "token_hint": ""}
+            # pending 却无 token hash：重新发一枚（仅限仍无用户）
+            token = self._issue_setup_token()
+            return {"state": "pending", "token": token, "token_hint": ""}
+        # unknown + 无用户：首次安装
+        token = self._issue_setup_token()
+        self._set_setup_state("pending")
+        return {"state": "pending", "token": token, "token_hint": ""}
+
+    def _issue_setup_token(self) -> str:
+        token = pysecrets.token_urlsafe(24)
+        self.db.execute(
+            "INSERT INTO meta(key, value) VALUES('setup_token_hash', ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (hash_recovery_code(token, self.pepper),),
+        )
+        return token
+
+    def verify_setup_token(self, token: str) -> bool:
+        """校验一次性 Token；不匹配不区分原因。"""
+        token = _as_str(token).strip()
+        if not token or self.setup_state() != "pending" or self.user_count() > 0:
+            return False
+        row = self.db.query_one("SELECT value FROM meta WHERE key='setup_token_hash'")
+        if not row or not row["value"]:
+            return False
+        return hmac.compare_digest(hash_recovery_code(token, self.pepper), str(row["value"]))
+
+    def register_admin(
+        self,
+        token: str,
+        username: str,
+        password: str,
+        *,
+        ip: str = "",
+        ua: str = "",
+    ) -> dict[str, Any]:
+        """Token 一次性注册管理员。成功后关闭注册并撤销 token。"""
+        username = _as_str(username).strip()
+        password = _as_str(password)
+        if self.setup_state() != "pending":
+            raise AuthError("setup_closed", "注册已关闭，无法再次开放")
+        if self.user_count() > 0:
+            # 空库条件已不满足：立即收敛，禁止误开
+            self._set_setup_state("completed")
+            self.db.execute("DELETE FROM meta WHERE key='setup_token_hash'")
+            raise AuthError("setup_closed", "系统已初始化，注册已关闭")
+        if not username or not re.fullmatch(r"[A-Za-z0-9._-]{2,32}", username):
+            raise AuthError("bad_username", "用户名需 2–32 位字母/数字/._-")
+        if not password or len(password) < 10:
+            raise AuthError("weak_password", "密码至少 10 位")
+        if not self.verify_setup_token(token):
+            raise AuthError("bad_token", "初始化 Token 无效或已使用")
+
+        uid = self.create_user(
+            username, password, is_admin=True, must_change_password=False
+        )
+        # 一次性：关闭注册、作废 token
+        self._set_setup_state("completed")
+        self.db.execute("DELETE FROM meta WHERE key='setup_token_hash'")
+        self.db.execute(
+            "INSERT INTO login_attempts(username, at, ok, ip) VALUES(?,?,?,?)",
+            (username, now(), 1, _as_str(ip)),
+        )
+        return self._issue_session(uid, _as_str(ip), _as_str(ua))
+
     def create_user(
         self,
         username: str,
@@ -453,25 +562,84 @@ class AuthService:
     def logout(self, session_id: str) -> None:
         self.db.execute("DELETE FROM web_sessions WHERE id=?", (session_id,))
 
-    def change_password(self, user_id: int, old_password: str, new_password: str) -> None:
+    def change_password(
+        self,
+        user_id: int,
+        old_password: str,
+        new_password: str,
+        *,
+        require_old: bool | None = None,
+        keep_session_id: str | None = None,
+    ) -> None:
+        """修改密码。
+
+        - 首次/强制改密（must_change_password=1）：不要求旧密码，仅校验新密码。
+        - 普通主动改密：必须验证旧密码。
+        - keep_session_id 非空时保留该会话（首登改密后继续使用），其余会话一律撤销。
+        - 错误码与失败原因一一对应，禁止把「缺旧密/弱新密」混成同一条提示。
+        """
         old_password = _as_str(old_password)
         new_password = _as_str(new_password)
-        if not old_password or not new_password or len(new_password) < 10:
-            raise AuthError("weak_password", "新密码至少 10 位")
-        row = self.db.query_one("SELECT password_hash FROM users WHERE id=?", (user_id,))
-        ok = False
-        if row:
+        if not new_password:
+            raise AuthError("weak_password", "请输入新密码")
+        if len(new_password) < 10:
+            raise AuthError(
+                "weak_password", f"新密码至少 10 位（当前 {len(new_password)} 位）"
+            )
+        if old_password and new_password == old_password:
+            raise AuthError("weak_password", "新密码不能与当前密码相同")
+
+        row = self.db.query_one(
+            "SELECT password_hash, must_change_password FROM users WHERE id=?",
+            (user_id,),
+        )
+        if not row:
+            raise AuthError("no_user", "用户不存在")
+
+        must = bool(row["must_change_password"])
+        # 首登/强制改密默认不验旧密；普通改密必须验。require_old 可显式覆盖。
+        need_old = (not must) if require_old is None else bool(require_old)
+        if need_old:
+            if not old_password:
+                raise AuthError("invalid", "请输入当前密码")
             ok, _ = self._verify_password_any(old_password, row["password_hash"])
-        if not row or not ok:
-            raise AuthError("invalid", "原密码错误")
+            if not ok:
+                raise AuthError("invalid", "当前密码错误")
+
         with self.db.tx() as conn:
             conn.execute(
                 "UPDATE users SET password_hash=?, must_change_password=0, updated_at=? WHERE id=?",
                 (hash_password(new_password, self.pepper), now(), user_id),
             )
-            # 改密撤销旧会话
-            conn.execute("DELETE FROM web_sessions WHERE user_id=?", (user_id,))
+            # 改密撤销旧会话；首登改密可保留当前会话以便继续使用
+            if keep_session_id:
+                conn.execute(
+                    "DELETE FROM web_sessions WHERE user_id=? AND id<>?",
+                    (user_id, keep_session_id),
+                )
+            else:
+                conn.execute("DELETE FROM web_sessions WHERE user_id=?", (user_id,))
         self._revoke_pending(user_id)
+
+    def reset_user_password(self, username: str = "admin") -> str:
+        """服务器本地管理员恢复：重置口令并强制下次登录改密。
+
+        仅限本机运维 CLI 使用，不暴露任何网络 API。返回一次性新口令。
+        """
+        username = _as_str(username)
+        row = self.db.query_one("SELECT id FROM users WHERE username=?", (username,))
+        if not row:
+            raise AuthError("no_user", f"用户不存在: {username}")
+        password = pysecrets.token_urlsafe(12)
+        uid = int(row["id"])
+        with self.db.tx() as conn:
+            conn.execute(
+                "UPDATE users SET password_hash=?, must_change_password=1, updated_at=? WHERE id=?",
+                (hash_password(password, self.pepper), now(), uid),
+            )
+            conn.execute("DELETE FROM web_sessions WHERE user_id=?", (uid,))
+        self._revoke_pending(uid)
+        return password
 
     def setup_totp(self, user_id: int, password: str = "", totp_code: str = "") -> dict[str, str]:
         """生成待确认 secret，不打断现有 2FA。

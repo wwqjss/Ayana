@@ -11,24 +11,42 @@ import time
 from typing import Any
 
 # 每对象 required checks：metric + selector + freshness
-# 可按 asset 表达
-REQUIRED_CHECKS: dict[str, list[dict[str, Any]]] = {
-    "nerv": [
-        {"object": "frps", "metric": "probe_success", "selector": {"asset": "nerv", "service": "frps"}, "freshness_sec": 120},
-        {"object": "nginx", "metric": "probe_success", "selector": {"asset": "nerv", "service": "nginx"}, "freshness_sec": 120},
-    ],
-    "sora": [
-        {"object": "google", "metric": "hysteria_proxy_up", "selector": {"target": "google"}, "freshness_sec": 180},
-        {"object": "youtube", "metric": "hysteria_proxy_up", "selector": {"target": "youtube"}, "freshness_sec": 180},
-        {"object": "hysteria-server", "metric": "probe_success", "selector": {"asset": "sora", "service": "hysteria"}, "freshness_sec": 180},
-    ],
-    "kanata": [
-        {"object": "harbor-core", "metric": "probe_success", "selector": {"asset": "kanata", "service": "harbor"}, "freshness_sec": 180},
-    ],
-    "yomi": [],
-}
+# 可按 asset 表达。
+# 正式发行版不得内置任何个人/特定环境的资产与业务检查。
+# 默认为空；运行时由 config.required_checks 注入（见 apply_required_checks）。
+REQUIRED_CHECKS: dict[str, list[dict[str, Any]]] = {}
 
 FRESHNESS_DEFAULT = 120.0
+
+
+def apply_required_checks(cfg_checks: Any) -> dict[str, list[dict[str, Any]]]:
+    """把 config.required_checks 合并进 REQUIRED_CHECKS（启动时调用）。
+
+    原地更新，保证 `from .health import REQUIRED_CHECKS` 的调用方可见。
+    仅接受 {asset_id: [ {object, metric, selector, freshness_sec}, ... ]}。
+    """
+    out: dict[str, list[dict[str, Any]]] = {}
+    if isinstance(cfg_checks, dict):
+        for asset_id, items in cfg_checks.items():
+            if not isinstance(asset_id, str) or not isinstance(items, list):
+                continue
+            cleaned = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                cleaned.append(
+                    {
+                        "object": str(item.get("object") or ""),
+                        "metric": str(item.get("metric") or "probe_success"),
+                        "selector": dict(item.get("selector") or {}),
+                        "freshness_sec": float(item.get("freshness_sec") or 120),
+                    }
+                )
+            if cleaned:
+                out[asset_id] = cleaned
+    REQUIRED_CHECKS.clear()
+    REQUIRED_CHECKS.update(out)
+    return out
 
 
 def _sample_state(sample: dict | None, freshness: float, *, expect_ok: bool = True) -> str:
@@ -204,6 +222,7 @@ def asset_health(
 
 _HOST_DOT = {
     "collect_error": {"state": "collect_error", "label": "采集故障", "cls": "err"},
+    "not_configured": {"state": "not_configured", "label": "监控未接入", "cls": "dim"},
     "bad": {"state": "bad", "label": "严重异常", "cls": "bad"},
     "warn": {"state": "warn", "label": "警告", "cls": "warn"},
     "no_data": {"state": "no_data", "label": "暂无数据", "cls": "dim"},
@@ -216,6 +235,7 @@ _HOST_RANK = {
     "warn": 3,
     "stale": 3,
     "no_data": 2,
+    "not_configured": 2,
     "unknown": 2,
     "partial_no_data": 2,
     "ok": 1,
@@ -232,6 +252,8 @@ def _norm_host_state(raw: str) -> str:
     r = (raw or "").strip()
     if r in ("collect_error",):
         return "collect_error"
+    if r in ("not_configured",):
+        return "not_configured"
     if r in ("bad", "fail", "unhealthy", "critical", "down"):
         return "bad"
     if r in ("warn", "warning", "degraded", "stale", "partial_no_data"):
@@ -272,11 +294,33 @@ def host_health(
     states: list[str] = []
     reasons: list[str] = []
 
-    if collect_error or _norm_host_state(metric_state) == "collect_error":
-        states.append("collect_error")
-        reasons.append(collect_error or metric_error or "采集失败")
+    metric_norm = _norm_host_state(metric_state) if metric_state else ""
+    if collect_error or metric_norm == "collect_error":
+        err_l = (collect_error or metric_error or "").lower()
+        conn_down = any(
+            k in err_l
+            for k in (
+                "circuit_open",
+                "timeout",
+                "cannot connect",
+                "connection refused",
+                "connectorerror",
+                "clientconnector",
+                "all connection attempts failed",
+                "prometheus unavailable",
+                "not_configured",
+            )
+        )
+        if metric_norm == "not_configured" or (
+            "node_exporter_down" not in err_l and conn_down
+        ):
+            states.append("not_configured")
+            reasons.append("监控未接入或 Prometheus 不可达")
+        else:
+            states.append("collect_error")
+            reasons.append(collect_error or metric_error or "采集失败")
     elif metric_state:
-        states.append(_norm_host_state(metric_state))
+        states.append(metric_norm or _norm_host_state(metric_state))
 
     if required_state:
         # healthy→ok, unhealthy→bad, degraded/stale→warn, unknown→no_data

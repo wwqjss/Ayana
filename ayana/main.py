@@ -186,11 +186,22 @@ def ensure_checks_admin_perms(db: Database) -> None:
 
 
 def ensure_promconfig_admin_perms(db: Database) -> None:
-    """已有库升级：仅为缺失的 admin 权限插入种子，不覆盖已有决定。"""
+    """已有库升级：仅为缺失的 admin 权限插入种子，不覆盖已有决定。
+
+    监控只读能力（asset.summary / probe.status）与 promconfig / node_exporter
+    一并补齐：admin 是初始运维账号，资源详情与业务检查只读必须可用。
+    """
     from .policy import Policy
 
     policy = Policy(db)
-    for cap in ("promconfig.read", "promconfig.write", "node_exporter.status", "node_exporter.manage"):
+    for cap in (
+        "asset.summary",
+        "probe.status",
+        "promconfig.read",
+        "promconfig.write",
+        "node_exporter.status",
+        "node_exporter.manage",
+    ):
         row = db.query_one(
             "SELECT id, allow, require_approval FROM permissions"
             " WHERE subject_type='web_user' AND subject_id='admin' AND capability=?"
@@ -255,6 +266,14 @@ class App:
         self.gate = IdentityGate(self.nt, load_bindings(self.db))
         self.knowledge = KnowledgeBase(self.db)
         self.prom = PromClient(cfg.get("prometheus_url", "http://127.0.0.1:9090"))
+        # 首登/设置页写入的运行时覆盖（DB meta），优先于 config.json
+        try:
+            _prow = self.db.query_one("SELECT value FROM meta WHERE key='prometheus_url'")
+            if _prow and str(_prow["value"] or "").strip():
+                self.prom.base_url = str(_prow["value"]).strip().rstrip("/")
+                log.info("prometheus_url overridden from meta: %s", self.prom.base_url)
+        except Exception as e:
+            log.warning("load prometheus_url meta failed: %s", e)
         self.incidents = IncidentService(self.db)
         # SSH：凭据加密 + 端点；有端点用原生 SSH，否则回落 NT（迁移期）
         self.creds = CredentialStore(self.db, master_key=cfg.get("ssh_credential_key") or "")
@@ -498,6 +517,34 @@ class App:
                 type(e).__name__,
             )
 
+    def _write_setup_token(self, token: str) -> Path | None:
+        """Setup Token 文件：与 DB 同目录、O_EXCL、0600、拒符号链接。Token 不进日志。"""
+        try:
+            db_path = Path(self.db.path).resolve()
+            tok_path = db_path.parent / "setup-admin.token"
+            if tok_path.is_symlink():
+                log.warning("setup token path is a symlink, not written: %s", tok_path)
+                return None
+            if tok_path.exists():
+                # 已有未消费的 token 文件：不覆盖，便于用户仍可打开
+                log.info("setup token file already exists: %s", tok_path)
+                return tok_path
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            fd = os.open(str(tok_path), flags, 0o600)
+            try:
+                os.write(fd, (token + "\n").encode("utf-8"))
+            finally:
+                os.close(fd)
+            log.warning(
+                "SETUP registration open; one-time token file: %s (mode 600). "
+                "Open the web console and register the admin account with this token.",
+                tok_path,
+            )
+            return tok_path
+        except Exception as e:
+            log.warning("setup token file was not written (%s)", type(e).__name__)
+            return None
+
     async def start(self) -> None:
         # 启动安全检查
         unknown = self.actions.mark_unknown_unfinished()
@@ -510,11 +557,15 @@ class App:
         if resumed:
             log.info("resumed %d pending verifications", resumed)
 
-        admin = self.auth.ensure_bootstrap_admin("admin")
-        if admin:
-            # B4: 口令不进日志；写入与 db 同目录的 0600 一次性文件（systemd 可写）
-            self._write_bootstrap_password(admin)
-            admin = ""
+        # 一次性 Token 注册门闩：不单凭用户数=0 开放
+        try:
+            setup = self.auth.ensure_setup_initialized()
+            if setup.get("token"):
+                self._write_setup_token(str(setup["token"]))
+                setup["token"] = ""
+            log.info("setup state: %s", setup.get("state"))
+        except Exception as e:
+            log.warning("setup init failed: %s", e)
         try:
             ensure_promconfig_admin_perms(self.db)
             ensure_checks_admin_perms(self.db)
@@ -742,6 +793,20 @@ class App:
 async def amain(config_path: str) -> None:
     cfg = load_config(config_path)
     setup_logging(cfg.get("log_level", "INFO"), cfg.get("log_file"))
+    # 监控 required checks / runbook 从配置注入（发行版默认为空）
+    try:
+        from .health import apply_required_checks
+        from .runbook import apply_runbook_rules
+
+        apply_required_checks(cfg.get("required_checks"))
+        apply_runbook_rules(cfg.get("runbook_rules"))
+        log.info(
+            "monitor config loaded: required_assets=%d runbook_rules=%d",
+            len(cfg.get("required_checks") or {}),
+            len(cfg.get("runbook_rules") or []),
+        )
+    except Exception as e:
+        log.warning("apply monitor config failed: %s", e)
     lock = acquire_single_instance_lock(cfg.get("instance_lock") or "/tmp/ayana.lock")
     try:
         log.info("Ayana v%s starting", VERSION)
@@ -761,11 +826,88 @@ async def amain(config_path: str) -> None:
             pass
 
 
+def _build_auth_for_ops(cfg: dict, db: Database) -> AuthService:
+    """与 App 同一套 pepper 逻辑，供本地运维 CLI 使用。"""
+    dedicated = str(cfg.get("web_auth_pepper") or "")
+    onewbot = str(cfg.get("onewbot_token") or "")
+    pepper = dedicated or onewbot
+    legacy: list[str] = []
+    if dedicated and onewbot and dedicated != onewbot:
+        legacy = [onewbot]
+    return AuthService(
+        db,
+        pepper=pepper,
+        session_ttl=int(cfg.get("web_session_ttl_sec", 43200)),
+        max_failed=int(cfg.get("web_max_failed_logins", 8)),
+        lockout=int(cfg.get("web_lockout_sec", 900)),
+        totp_key=cfg.get("totp_encrypt_key") or "",
+        legacy_peppers=legacy,
+    )
+
+
+def _write_one_time_password(db: Database, password: str, filename: str) -> Path | None:
+    """一次性口令文件：与 DB 同目录、O_EXCL、0600、拒符号链接。口令不进日志。"""
+    try:
+        db_path = Path(db.path).resolve()
+        pw_path = db_path.parent / filename
+        if pw_path.is_symlink() or pw_path.exists():
+            log.warning("password file already exists or is a symlink, not overwritten: %s", pw_path)
+            return None
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        fd = os.open(str(pw_path), flags, 0o600)
+        try:
+            os.write(fd, (password + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+        return pw_path
+    except Exception as e:
+        log.warning("one-time password file was not written (%s)", type(e).__name__)
+        return None
+
+
+def _reset_admin_password(cfg: dict, username: str) -> int:
+    """服务器本地管理员恢复：重置口令 + 强制改密 + 撤销全部会话。"""
+    db = Database(cfg["db_path"])
+    try:
+        auth = _build_auth_for_ops(cfg, db)
+        password = auth.reset_user_password(username)
+        pw_path = _write_one_time_password(db, password, f"reset-{username}.password")
+        if pw_path:
+            print(f"OK: user '{username}' password reset; must_change_password=1; all sessions revoked.")
+            print(f"One-time password written to: {pw_path} (mode 600). Login and change it, then delete the file.")
+        else:
+            print(f"OK: user '{username}' password reset; must_change_password=1; all sessions revoked.")
+            print("WARNING: could not write one-time password file (exists?). Password was not printed.")
+        return 0
+    except Exception as e:
+        print(f"ERROR: reset failed: {e}", file=sys.stderr)
+        return 1
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
 def cli() -> None:
     parser = argparse.ArgumentParser(prog="ayana")
     parser.add_argument("config", nargs="?", default="config.json")
     parser.add_argument("--seed-only", action="store_true")
+    parser.add_argument(
+        "--reset-admin-password",
+        action="store_true",
+        help="本地重置指定用户口令并强制下次登录改密（写入一次性口令文件，不打印口令）",
+    )
+    parser.add_argument(
+        "--reset-admin-user",
+        default="admin",
+        help="与 --reset-admin-password 搭配：目标用户名（默认 admin）",
+    )
     args = parser.parse_args()
+    if args.reset_admin_password:
+        cfg = load_config(args.config)
+        setup_logging(cfg.get("log_level", "INFO"), None)
+        sys.exit(_reset_admin_password(cfg, args.reset_admin_user))
     if args.seed_only:
         cfg = load_config(args.config)
         setup_logging(cfg.get("log_level", "INFO"), None)

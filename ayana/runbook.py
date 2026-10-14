@@ -154,46 +154,41 @@ CAPABILITY_TEMPLATE = {
 }
 
 
-# 默认 runbook 表
-RUNBOOK: list[RunbookRule] = [
-    RunbookRule(
-        id="rb_frps_down_restart",
-        name="frps 不可达 → 重启",
-        asset_id="nerv",
-        object_name="frps",
-        alertname="TargetDown",
-        capability="service.restart",
-        reason="runbook: frps 探测失败自动重启",
-        require_probe_fail=True,
-        require_service_state="",
-        max_per_day=3,
-        cooldown_sec=1800,
-    ),
-    RunbookRule(
-        id="rb_nginx_down_restart",
-        name="nginx 不可达 → 重启",
-        asset_id="nerv",
-        object_name="nginx",
-        alertname="TargetDown",
-        capability="service.restart",
-        reason="runbook: nginx 探测失败自动重启",
-        require_probe_fail=True,
-        max_per_day=3,
-        cooldown_sec=1800,
-    ),
-    RunbookRule(
-        id="rb_hy2_down_restart",
-        name="hysteria-server 不可达 → 重启",
-        asset_id="sora",
-        object_name="hysteria-server",
-        alertname="TargetDown",
-        capability="service.restart",
-        reason="runbook: hysteria 探测失败自动重启",
-        require_probe_fail=True,
-        max_per_day=3,
-        cooldown_sec=1800,
-    ),
-]
+# 默认 runbook 表：发行版不得内置针对特定资产的自动处置规则。
+# 运行时由 config.runbook_rules 注入（见 apply_runbook_rules）。
+RUNBOOK: list[RunbookRule] = []
+
+
+def apply_runbook_rules(cfg_rules: Any) -> list[RunbookRule]:
+    """把 config.runbook_rules 解析为 RunbookRule 列表并替换 RUNBOOK（原地）。"""
+    out: list[RunbookRule] = []
+    if isinstance(cfg_rules, list):
+        for raw in cfg_rules:
+            if not isinstance(raw, dict):
+                continue
+            rid = str(raw.get("id") or "").strip()
+            if not rid:
+                continue
+            out.append(
+                RunbookRule(
+                    id=rid,
+                    name=str(raw.get("name") or rid),
+                    asset_id=str(raw.get("asset_id") or "*"),
+                    object_name=str(raw.get("object_name") or "*"),
+                    alertname=str(raw.get("alertname") or "*"),
+                    category=str(raw.get("category") or "*"),
+                    capability=str(raw.get("capability") or ""),
+                    reason=str(raw.get("reason") or ""),
+                    require_probe_fail=bool(raw.get("require_probe_fail", True)),
+                    require_service_state=str(raw.get("require_service_state") or ""),
+                    max_per_day=int(raw.get("max_per_day") or 3),
+                    cooldown_sec=int(raw.get("cooldown_sec") or 1800),
+                    manual_only=bool(raw.get("manual_only", False)),
+                )
+            )
+    RUNBOOK.clear()
+    RUNBOOK.extend(out)
+    return list(RUNBOOK)
 
 
 def match_runbook(
