@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import logging
+import time
+import uuid
 from typing import Any
 
 from .msgentry import error_reply, parse_entry
@@ -154,7 +156,29 @@ class WeComBot:
             return
 
         try:
-            if entry.kind == "slash":
+            if entry.kind == "watch_ping":
+                reply = (
+                    f"AYANA-WATCH-PONG {entry.request_id} "
+                    f"ts={int(time.time())} node=kanata"
+                )
+            elif entry.kind == "urgent":
+                rid = uuid.uuid4().hex[:12]
+                extra = entry.nl_text or "（无补充说明）"
+                reply = (
+                    f"[紧急呼叫] 已收到\n"
+                    f"请求ID: {rid}\n"
+                    f"内容: {extra}\n"
+                    f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+            elif entry.kind == "settings":
+                reply = (
+                    "可用触发词（不必 @）：\n"
+                    "· 紧急呼叫 [说明]\n"
+                    "· 设置\n"
+                    "· AYANA-WATCH-PING <request_id>\n"
+                    "也可继续使用 @Ayana /help、@Ayana -c …"
+                )
+            elif entry.kind == "slash":
                 reply = await self.qqbot.dispatch(
                     entry.text,
                     user_id=user_id,

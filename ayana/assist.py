@@ -466,7 +466,7 @@ async def configure(*, domain: str, text: str, context: dict | None = None, llm:
                                 "format_normalizations": ["empty_optional_unsupported"] if isinstance(data.get("unsupported"), dict) and meta["unsupported"] is None else []}}
     log.warning("assist failed trace=%s reason=%s", trace, error)
     messages = {
-        "llm_disabled": "尚未配置语言模型，智能填表暂不可用。你可以手动填写表单。",
+        "llm_disabled": "尚未配置语言模型，智能填表暂不可用。请在右上角「用户名 → 全局设置 → AI 模型」填写 API Key / Base URL / 模型名；或在服务器 secrets.json、AYANA_LLM_API_KEY 等环境变量中配置后重启 Ayana。也可以手动填写表单。",
         "llm_timeout": "理解请求超时，请稍后重试；表单内容没有更改。",
         "invalid_model_fields": "AI 生成的配置未通过表单校验，请重试或根据提示手动填写。",
         "llm_truncated": "AI 返回的内容不完整，重试后仍未得到可用配置，请重新描述。",

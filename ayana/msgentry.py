@@ -29,6 +29,22 @@ WAKE_RE = re.compile(
     re.DOTALL,
 )
 
+# 关键词唤醒（可独立于 @）：紧急呼叫 / 设置 / 守望探针
+# 可选前置 @Ayana；探针可带「紧急呼叫」前缀，便于群内人话触发。
+_WATCH_PING_RE = re.compile(
+    r"^(?:@?(?:Ayana|ayana|AYANA)\b[\s:：]*)?(?:紧急呼叫[\s:：]*)?"
+    r"AYANA-WATCH-PING\s+(\S+)\s*$",
+    re.DOTALL | re.IGNORECASE,
+)
+_URGENT_RE = re.compile(
+    r"^(?:@?(?:Ayana|ayana|AYANA)\b[\s:：]*)?紧急呼叫\b[\s:：]*(.*)$",
+    re.DOTALL,
+)
+_SETTINGS_RE = re.compile(
+    r"^(?:@?(?:Ayana|ayana|AYANA)\b[\s:：]*)?设置\b[\s:：]*(.*)$",
+    re.DOTALL,
+)
+
 # 通用占位符（不得替换为真实资产名）
 PH_HOST = "<host>"
 PH_CMD = "<command>"
@@ -113,7 +129,7 @@ _READ_PROGRAMS = frozenset(
 class ParsedEntry:
     """解析结果。"""
 
-    kind: str  # slash | controlled | nl | empty | unknown
+    kind: str  # slash | controlled | nl | empty | unknown | urgent | settings | watch_ping
     text: str = ""
     slash_cmd: str = ""
     slash_args: list[str] = field(default_factory=list)
@@ -123,6 +139,7 @@ class ParsedEntry:
     nl_text: str = ""
     error: str = ""
     error_hint: str = ""
+    request_id: str = ""
 
 
 def parse_entry(raw: str) -> ParsedEntry:
@@ -130,6 +147,23 @@ def parse_entry(raw: str) -> ParsedEntry:
     text = (raw or "").strip()
     if not text:
         return ParsedEntry(kind="empty")
+
+    # 守望探针（最高优先，必须整包匹配 request_id）
+    m = _WATCH_PING_RE.match(text)
+    if m:
+        return ParsedEntry(
+            kind="watch_ping",
+            text=text,
+            request_id=m.group(1).strip(),
+        )
+
+    # 关键词：紧急呼叫 / 设置（可带 @Ayana 前缀）
+    m = _URGENT_RE.match(text)
+    if m:
+        return ParsedEntry(kind="urgent", text=text, nl_text=m.group(1).strip())
+    m = _SETTINGS_RE.match(text)
+    if m:
+        return ParsedEntry(kind="settings", text=text, nl_text=m.group(1).strip())
 
     # 去唤醒词（若存在）
     m = WAKE_RE.match(text)

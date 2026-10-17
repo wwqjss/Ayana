@@ -409,6 +409,84 @@ on("pw-change-form", "submit", async (e) => {
 
 on("chg-pw-btn", "click", () => showPasswordChange(false));
 
+/* ---- 全局设置（用户名旁） ---- */
+on("settings-btn", "click", async () => {
+  const res = await api("/api/settings/global");
+  if (!res || !res.ok) {
+    showModal("全局设置", [
+      el("p", { class: "error", text: (res && (res.message || res.error)) || "加载失败" }),
+    ]);
+    return;
+  }
+
+  const wrap = el("div", { class: "totp-manage" });
+  wrap.appendChild(el("h3", { text: "全局设置" }));
+  wrap.appendChild(el("p", {
+    class: "muted small",
+    text: "AI 模型用于「帮我填表」等智能辅助；监控地址影响资源曲线与一键接入。API Key 只保存不回显。",
+  }));
+
+  const form = el("div", { class: "form-col" });
+  form.appendChild(el("h4", { text: "AI 模型", style: "margin:10px 0 4px" }));
+  form.appendChild(el("label", { text: "Base URL" }, [
+    el("input", { id: "gs-llm-base", type: "url", placeholder: "https://api.example.com/v1", value: res.llm_base_url || "" }),
+  ]));
+  form.appendChild(el("label", { text: "模型名" }, [
+    el("input", { id: "gs-llm-model", placeholder: "例如 gpt-4o-mini / mimo-v2.6-flash", value: res.llm_model || "" }),
+  ]));
+  form.appendChild(el("label", {
+    text: res.llm_api_key_set ? "API Key（已配置，留空则不改）" : "API Key",
+  }, [
+    el("input", {
+      id: "gs-llm-key", type: "password", autocomplete: "new-password",
+      placeholder: res.llm_api_key_set ? (res.llm_api_key_masked || "已保存") : "sk-…",
+    }),
+  ]));
+
+  form.appendChild(el("h4", { text: "监控地址", style: "margin:14px 0 4px" }));
+  form.appendChild(el("label", { text: "Prometheus URL" }, [
+    el("input", { id: "gs-prom-url", type: "url", placeholder: "http://127.0.0.1:9090", value: res.prometheus_url || "" }),
+  ]));
+  form.appendChild(el("label", { text: "Alertmanager URL" }, [
+    el("input", { id: "gs-am-url", type: "url", placeholder: "http://127.0.0.1:9093", value: res.alertmanager_url || "" }),
+  ]));
+  const promSt = res.prometheus_ok
+    ? "Prometheus：可用"
+    : "Prometheus：不可用（" + (res.prometheus_error || "未连接") + "）。安装后一键接入才能验证指标。";
+  form.appendChild(el("p", { class: "muted small", text: promSt }));
+  wrap.appendChild(form);
+  const msg = el("p", { class: "error" });
+  wrap.appendChild(msg);
+
+  showModal("全局设置", [wrap]);
+  const actions = $("modal") && $("modal").querySelector(".modal-actions");
+  const saveBtn = el("button", {
+    class: "btn primary",
+    text: "保存",
+    onclick: async () => {
+      const payload = {
+        llm_base_url: (($("gs-llm-base") || {}).value || "").trim(),
+        llm_model: (($("gs-llm-model") || {}).value || "").trim(),
+        prometheus_url: (($("gs-prom-url") || {}).value || "").trim(),
+        alertmanager_url: (($("gs-am-url") || {}).value || "").trim(),
+      };
+      const key = (($("gs-llm-key") || {}).value || "").trim();
+      if (key) payload.llm_api_key = key;
+      const r = await api("/api/settings/global", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      if (r && r.ok) {
+        msg.textContent = "已保存";
+        setTimeout(() => { $("modal").classList.add("hidden"); }, 500);
+      } else {
+        msg.textContent = (r && (r.message || r.error)) || "保存失败";
+      }
+    },
+  });
+  if (actions) actions.insertBefore(saveBtn, actions.firstChild);
+});
+
 on("login-back-btn", "click", () => {
   state.pendingLogin = null;
   $("login-step1").classList.remove("hidden");
@@ -3466,6 +3544,19 @@ async function pcRunAdoptFlow(asset) {
   };
   render();
   try {
+  // 0. 前置：必须已有可用 Prometheus，否则提示需安装，不进入安装/注册
+  const mon = await api("/api/setup/monitor");
+  if (!mon || mon.prometheus_ok === false) {
+    const hint = (mon && mon.prometheus_hint)
+      || "未检测到可用的 Prometheus，请先安装并启动 Prometheus（或在「设置」中配置 prometheus_url）。";
+    steps[0].status = "fail";
+    steps[0].detail = hint;
+    steps[1].status = "pending";
+    steps[2].status = "pending";
+    steps[3].status = "pending";
+    render();
+    return;
+  }
   // 1 detect
   steps[0].status = "running";
   render();
@@ -4326,14 +4417,17 @@ async function loadNotifyChannels() {
   root.innerHTML = "";
   const chans = res.channels || [];
   if (!chans.length) {
-    root.appendChild(el("p", { class: "muted small", text: "还没有渠道。至少保留 QQ 或添加 Webhook。" }));
+    root.appendChild(el("p", {
+      class: "muted small",
+      text: "还没有通知渠道。请在上方选择消息平台并添加（全新安装不会自动创建渠道）。",
+    }));
     return;
   }
   chans.forEach((ch) => {
     const row = el("div", { class: "notify-row" });
     row.appendChild(el("button", {
       class: "switch " + (ch.enabled ? "on" : ""),
-      title: ch.enabled ? "点击停用" : "点击启用",
+      title: ch.enabled ? "点击停用（不影响连接健康显示）" : "点击启用",
       onclick: async () => {
         const r = await api("/api/notify/channels/enabled", {
           method: "POST",
@@ -4345,6 +4439,11 @@ async function loadNotifyChannels() {
     }));
     row.appendChild(el("div", { class: "name", text: ch.name }));
     const metaBits = [ch.kind_label || ch.kind];
+    // 健康与启用分离：独立徽章
+    const health = ch.health || {};
+    if (health.label) {
+      metaBits.push("连接：" + health.label);
+    }
     if (ch.kind === "qq" && ch.config && ch.config.target) metaBits.push(ch.config.target);
     if (ch.kind === "wecom") {
       const masked = (ch.config && (ch.config.webhook_masked || ch.config.url)) || "";

@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Ayana · 初始化注册</title>
+<style>
+:root {
+  --bg: #0f1115; --card: #1a1d24; --ink: #e8eaed; --dim: #8b919a;
+  --bad: #f07178; --acc: #6cb6ff; --line: rgba(255,255,255,.08);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif; background: var(--bg); color: var(--ink); min-height: 100vh; }
+.muted { color: var(--dim); }
+.small { font-size: 12px; }
+.error { color: var(--bad); min-height: 1.2em; margin-top: 8px; font-size: 13px; }
+.login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
+.login-card {
+  width: 100%; max-width: 400px; padding: 32px;
+  background: var(--card); border-radius: 14px; border: 1px solid var(--line);
+}
+.login-card h1 { font-size: 24px; margin: 6px 0 6px; }
+.login-card label { display: block; margin: 14px 0 0; font-size: 13px; color: var(--dim); }
+.login-card input {
+  width: 100%; margin-top: 6px; padding: 10px 12px; border-radius: 10px;
+  border: 1px solid var(--line); background: rgba(255,255,255,.04); color: var(--ink); font-size: 14px;
+}
+.login-card input::placeholder { color: rgba(139,145,154,.55); }
+.btn { padding: 8px 14px; border-radius: 10px; border: 1px solid var(--line); background: rgba(255,255,255,.04); color: var(--ink); cursor: pointer; font-size: 13px; }
+.btn.primary { background: rgba(108,182,255,.18); border-color: rgba(108,182,255,.4); }
+.form-row { margin-top: 14px; display: flex; gap: 8px; flex-wrap: wrap; }
+.brand-tag { text-align: center; font-size: 12px; letter-spacing: .12em; color: var(--dim); }
+.brand-tag b { color: var(--acc); letter-spacing: .04em; font-size: 14px; }
+code { font-family: ui-monospace, Consolas, monospace; font-size: 11px; color: var(--acc); }
+.hint { margin-top: 6px; line-height: 1.55; }
+</style>
+</head>
+<body>
+  <div class="login-wrap">
+    <form class="login-card" onsubmit="return false">
+      <div class="brand-tag"><b>Ayana</b> · 初始化</div>
+      <h1>注册管理员</h1>
+      <p class="muted small">首次安装请使用服务器上的一次性 Token 创建管理员账号。Token 用完即失效。</p>
+
+      <label>初始化 Token
+        <input type="text" placeholder="粘贴 setup-admin.token 内容" autocomplete="one-time-code">
+      </label>
+      <p class="muted small hint">
+        Token 文件：与数据库同目录的 <code>setup-admin.token</code>（权限 600）。<br>
+        系统安装通常为 <code>/var/lib/ayana/setup-admin.token</code>。
+      </p>
+
+      <label>用户名
+        <input type="text" placeholder="2–32 位字母/数字/._-" autocomplete="username">
+      </label>
+      <label>密码
+        <input type="password" placeholder="至少 10 位" autocomplete="new-password">
+      </label>
+      <label>确认密码
+        <input type="password" placeholder="再次输入密码" autocomplete="new-password">
+      </label>
+      <p class="muted small" style="margin-top:8px">密码至少 10 位。注册成功后直接进入控制台。</p>
+
+      <p class="error"></p>
+      <div class="form-row">
+        <button type="submit" class="btn primary">创建管理员并进入</button>
+      </div>
+    </form>
+  </div>
+</body>
+</html>

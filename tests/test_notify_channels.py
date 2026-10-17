@@ -26,12 +26,14 @@ class TestNotifyChannels(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_default_qq_seeded_once(self):
+        """全新安装零渠道：ensure_default_qq 不再预置 QQ。"""
         self.store.ensure_default_qq("user:123")
         self.store.ensure_default_qq("user:456")
         chans = self.store.list_meta()
-        self.assertEqual(len(chans), 1)
-        self.assertEqual(chans[0]["kind"], "qq")
-        self.assertEqual(chans[0]["config"]["target"], "user:123")
+        self.assertEqual(len(chans), 0)
+
+    def test_fresh_install_has_zero_channels(self):
+        self.assertEqual(self.store.list_meta(), [])
 
     def test_create_webhook_encrypts_secret(self):
         ch = self.store.create(
@@ -75,7 +77,13 @@ class TestNotifyChannels(unittest.TestCase):
             )
 
     def test_fanout_independent_rows(self):
-        self.store.ensure_default_qq("user:1")
+        # 用户主动添加渠道（不预置）
+        self.store.create(
+            name="qq",
+            kind="qq",
+            config={"target": "user:1"},
+            enabled=True,
+        )
         self.store.create(
             name="hook",
             kind="webhook",

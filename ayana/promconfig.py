@@ -573,22 +573,27 @@ class LocalConfigFS:
 
     async def write_text(self, rel: str, content: str) -> None:
         p = self._path(rel)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        # 同目录临时文件 + fsync + 原子替换 + 目录同步
-        tmp = p.with_name(p.name + f".tmp.{secrets.token_hex(4)}")
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, p)
         try:
-            dfd = os.open(str(p.parent), os.O_RDONLY)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            # 同目录临时文件 + fsync + 原子替换 + 目录同步
+            tmp = p.with_name(p.name + f".tmp.{secrets.token_hex(4)}")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, p)
             try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
-        except OSError:
-            pass
+                dfd = os.open(str(p.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass
+        except PermissionError as e:
+            raise PromConfigError("write_denied", f"{self.base}: {e}") from e
+        except OSError as e:
+            raise PromConfigError("write_failed", f"{rel}: {e}") from e
 
     async def list_dir(self, rel: str) -> list[str]:
         p = self._path(rel) if rel not in ("", ".") else self.base
@@ -1232,7 +1237,21 @@ class PromConfigService:
                 if self.require_promtool:
                     check = await self._run_promtool_check()
                     if not check.get("ok"):
-                        raise PromConfigError("promtool_failed", str(check)[:400])
+                        err = str(check.get("error") or "")
+                        detail = str(check)[:400]
+                        if "promtool_not_found" in err or "not_found" in (check.get("detail") or ""):
+                            raise PromConfigError(
+                                "promtool_not_found",
+                                "未安装 promtool，或配置了 require_promtool=true。"
+                                "请安装 Prometheus/promtool，或在 config.prometheus_config.require_promtool 设为 false。",
+                            )
+                        if "config_missing" in err:
+                            raise PromConfigError(
+                                "prom_config_missing",
+                                "未找到 prometheus.yml。请先准备 Prometheus 配置目录，"
+                                "或把 prometheus_config.local_dir / ssh_asset_id 指向真实 Prometheus。",
+                            )
+                        raise PromConfigError("promtool_failed", detail)
                 relr = await self._try_reload()
                 if not relr.get("ok"):
                     raise PromConfigError("reload_failed", str(relr)[:400])
@@ -2537,7 +2556,12 @@ def build_prom_config_service(
         base = Path(cfg.get("base_dir") or ".")
         path = Path(local_dir)
         if not path.is_absolute():
-            path = base / local_dir
+            # 优先写数据目录（服务用户可写）；/etc 配置目录通常只读
+            db_path = Path(str(cfg.get("db_path") or "")).expanduser()
+            if db_path.name:
+                path = db_path.parent / local_dir
+            else:
+                path = base / local_dir
         fs = LocalConfigFS(path)
     svc = PromConfigService(
         db,

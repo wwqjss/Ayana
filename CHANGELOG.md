@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.7.4 — 节点守望（心跳 + 可选旁路）
+
+### 新增
+
+- **节点守望**：实例间 HTTP 心跳（HMAC + nonce 防重放 + seq），发送/接收两开关独立
+- **失联调查**：心跳超时后并行探测已配置旁路（FRP/HTTP 健康口）；未配置 = 未配置，不算失败
+- **语义**：旁路仍通 → 「心跳通道异常」；全部失败或无旁路 → 「疑似失联」（网络不可达 ≠ 物理宕机）
+- **告警**：同一事件只告一次；有效心跳恢复后自动恢复通知
+- **API**：`POST /api/node-watch/heartbeat`、`GET /api/node-watch/status`、`POST /api/node-watch/send-test`
+- **配置**：`config.json` 的 `node_watch.send` / `node_watch.recv`；心跳直连对端地址，不走 FRP
+
+### 测试
+
+- 单测 9 项通过；KANATA→YOMI 公网心跳 200；FRP 旁路判定「通道异常」正确
+
+---
+
 ## v0.7.3 — 发布数据隔离与监控配置化（2026-10-14）
 
 ### 修复

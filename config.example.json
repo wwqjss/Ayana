@@ -13,5 +13,22 @@
   "admin_qq": "",
   "auto_remediation_enabled": false,
   "verify_window_sec": 90,
-  "verify_timeout_sec": 300
+  "verify_timeout_sec": 300,
+  "node_watch": {
+    "send": {
+      "enabled": false,
+      "node_id": "",
+      "target_url": "",
+      "shared_secret": "",
+      "interval_sec": 60
+    },
+    "recv": {
+      "enabled": false,
+      "shared_secret": "",
+      "allowed_nodes": [],
+      "timeout_sec": 180,
+      "probes": [],
+      "alert_channel_id": ""
+    }
+  }
 }

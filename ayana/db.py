@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 
 class MigrationError(RuntimeError):
@@ -740,6 +740,31 @@ def _migrate_v13_users_must_change_password(conn: sqlite3.Connection) -> None:
     ])
 
 
+def _migrate_v14_node_watch(conn: sqlite3.Connection) -> None:
+    """节点守望：心跳对端状态 + 防重放 nonce。"""
+    conn.executescript(
+        """
+CREATE TABLE IF NOT EXISTS node_watch_peers (
+  node_id TEXT PRIMARY KEY,
+  last_seq INTEGER NOT NULL DEFAULT 0,
+  last_ts REAL NOT NULL DEFAULT 0,
+  last_seen_at REAL,
+  last_payload TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'unknown',
+  incident_open INTEGER NOT NULL DEFAULT 0,
+  last_alert_at REAL,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS node_watch_nonces (
+  nonce TEXT PRIMARY KEY,
+  seen_at REAL NOT NULL
+);
+"""
+    )
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_v1_baseline,
     2: _migrate_v2_p0_p1_columns,
@@ -754,6 +779,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     11: _migrate_v11_checks,
     12: _migrate_v12_asset_host,
     13: _migrate_v13_users_must_change_password,
+    14: _migrate_v14_node_watch,
 }
 
 _MIGRATION_NAMES = {
@@ -769,6 +795,8 @@ _MIGRATION_NAMES = {
     10: "message_log",
     11: "checks",
     12: "asset_host",
+    13: "users_must_change_password",
+    14: "node_watch",
 }
 
 

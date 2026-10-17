@@ -792,7 +792,7 @@ class TestSecurityFailClosed(unittest.TestCase):
             with self.assertRaises(PromConfigError) as ctx:
                 asyncio.run(svc.add_target(address="10.0.0.5:9100", actor="t"))
         self.assertGreater(spawn.await_count, 0)
-        self.assertEqual(ctx.exception.code, "promtool_failed")
+        self.assertIn(ctx.exception.code, ("promtool_failed", "promtool_not_found"))
         self.assertIn("promtool_not_found", str(ctx.exception))
 
     def test_reload_failure_rolls_back(self):

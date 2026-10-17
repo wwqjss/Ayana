@@ -300,6 +300,37 @@ def _normalize_targets(raw: Any) -> list[str]:
     return out
 
 
+def _channel_health(kind: str, cfg: dict, meta: dict) -> dict[str, Any]:
+    """连接/配置健康，与 enabled 开关无关。"""
+    cfg = cfg or {}
+    label, level = "未检测", "unknown"
+    if kind == "qq":
+        target = str(cfg.get("target") or "").strip()
+        if not target:
+            label, level = "未配置目标", "bad"
+        elif meta.get("last_test_at"):
+            label = "测试通过" if meta.get("last_test_ok") else "测试失败"
+            level = "ok" if meta.get("last_test_ok") else "bad"
+        else:
+            label, level = "需 NapCat 在线", "warn"
+    elif kind in ("wecom", "webhook"):
+        if meta.get("last_test_at"):
+            label = "测试通过" if meta.get("last_test_ok") else "测试失败"
+            level = "ok" if meta.get("last_test_ok") else "bad"
+        else:
+            label, level = "未测试", "warn"
+    elif kind == "wecom_aibot":
+        tgts = cfg.get("targets") or []
+        if meta.get("last_test_at"):
+            label = "测试通过" if meta.get("last_test_ok") else "测试失败"
+            level = "ok" if meta.get("last_test_ok") else "bad"
+        elif not tgts:
+            label, level = "推送目标未配置", "warn"
+        else:
+            label, level = "未测试", "warn"
+    return {"label": label, "level": level}
+
+
 def _normalize(kind: str, config: dict) -> dict:
     if kind == "qq":
         target = str((config or {}).get("target") or "").strip()
@@ -533,27 +564,11 @@ class ChannelStore:
         return self.master_key
 
     def ensure_default_qq(self, admin_target: str = "") -> None:
-        """无渠道时补一条默认 QQ，保留现有通知链路。"""
-        row = self.db.query_one("SELECT COUNT(*) AS n FROM notify_channels")
-        if row and int(row["n"] or 0) > 0:
-            return
-        target = admin_target or ""
-        t = now()
-        self.db.execute(
-            "INSERT INTO notify_channels(id, name, kind, enabled, config_json, secret_enc,"
-            " created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
-            (
-                new_id("nch"),
-                "QQ 通知",
-                "qq",
-                1,
-                json.dumps({"target": target}, ensure_ascii=False),
-                b"",
-                t,
-                t,
-            ),
-        )
-        self.db.audit("system", "seed", "notify_channel_default_created", detail={"kind": "qq"})
+        """已废弃：全新安装不再自动创建 QQ 渠道。
+
+        保留方法以免外部调用报错；始终不写入。老实例已有渠道不受影响。
+        """
+        return
 
     def list_meta(self) -> list[dict[str, Any]]:
         rows = self.db.query(
@@ -572,6 +587,8 @@ class ChannelStore:
             d["config"] = _public_config(kind, cfg)
             d["kind_label"] = _KIND_LABEL.get(kind, kind)
             d["has_secret"] = self._has_secret(d["id"])
+            # 启用状态与连接/配置健康分离：health 仅描述能否真正送出
+            d["health"] = _channel_health(kind, cfg, d)
             out.append(d)
         return out
 

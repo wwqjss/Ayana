@@ -273,10 +273,10 @@ if [[ "$MODE" == "system" ]]; then
     ok "system user ayana exists"
   fi
   install -d -o root -g ayana -m 750 "$PREFIX"
-  install -d -o ayana -g ayana -m 750 "$DATA_DIR" "$DATA_DIR/log"
+  install -d -o ayana -g ayana -m 750 "$DATA_DIR" "$DATA_DIR/log" "$DATA_DIR/prometheus"
   install -d -o root -g ayana -m 750 "$CONF_DIR"
 else
-  install -d -m 700 "$PREFIX" "$DATA_DIR" "$DATA_DIR/log" "$CONF_DIR"
+  install -d -m 700 "$PREFIX" "$DATA_DIR" "$DATA_DIR/log" "$DATA_DIR/prometheus" "$CONF_DIR"
 fi
 
 # --- 代码（缺失才装；--force 才 --delete 同步）---

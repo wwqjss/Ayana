@@ -113,6 +113,7 @@ class WebApp:
         promconfig=None,
         checks=None,
         llm=None,
+        nodewatch=None,
     ):
         self.db = db
         self.auth = auth
@@ -139,6 +140,7 @@ class WebApp:
         self.llm = llm
         self.promconfig = promconfig
         self.checks = checks
+        self.nodewatch = nodewatch
 
     def build(self) -> web.Application:
         app = web.Application(client_max_size=2_000_000)
@@ -173,6 +175,8 @@ class WebApp:
         app.router.add_post("/api/setup/register", self.api_setup_register)
         app.router.add_get("/api/setup/monitor", self.api_setup_monitor_get)
         app.router.add_post("/api/setup/monitor", self.api_setup_monitor_post)
+        app.router.add_get("/api/settings/global", self.api_settings_global_get)
+        app.router.add_post("/api/settings/global", self.api_settings_global_post)
         app.router.add_get("/api/overview", self.api_overview)
         app.router.add_get("/api/assets", self.api_assets)
         app.router.add_get("/api/assets/{asset_id}", self.api_asset_detail)
@@ -246,6 +250,9 @@ class WebApp:
         app.router.add_post("/api/notify/channels/enabled", self.api_notify_channel_enabled)
         app.router.add_post("/api/notify/channels/test", self.api_notify_channel_test)
         app.router.add_get("/api/notify/outbox", self.api_notify_outbox)
+        app.router.add_post("/api/node-watch/heartbeat", self.api_node_watch_heartbeat)
+        app.router.add_get("/api/node-watch/status", self.api_node_watch_status)
+        app.router.add_post("/api/node-watch/send-test", self.api_node_watch_send_test)
         # 主机资源监控
         app.router.add_get("/api/monitor/hosts", self.api_monitor_hosts)
         app.router.add_get("/api/monitor/host/{asset_id}", self.api_monitor_host)
@@ -931,12 +938,139 @@ class WebApp:
         )
         if not hasattr(self, "cfg"):
             am_url = self._meta_get("alertmanager_url")
+        prom_ok, prom_err = await self._probe_prometheus()
         return _json(
             {
                 "ok": True,
                 "prometheus_url": prom_url,
                 "alertmanager_url": am_url,
+                "prometheus_ok": prom_ok,
+                "prometheus_error": prom_err,
+                "prometheus_hint": (
+                    ""
+                    if prom_ok
+                    else "未检测到可用的 Prometheus，请先安装并启动 Prometheus（或把 prometheus_url 指向已有实例）。"
+                ),
                 "is_admin": bool(sess.get("is_admin")),
+            }
+        )
+
+    async def _probe_prometheus(self) -> tuple[bool, str]:
+        """轻量探测 Prometheus 是否可用（供一键接入前置检查）。"""
+        if not getattr(self, "prom", None):
+            return False, "prom_client_missing"
+        try:
+            await self.prom.query("1")
+            return True, ""
+        except Exception as e:
+            return False, str(e)[:200]
+
+    def _mask_secret(self, value: str) -> str:
+        v = (value or "").strip()
+        if not v:
+            return ""
+        if len(v) <= 8:
+            return "****"
+        return v[:4] + "****" + v[-2:]
+
+    def _apply_llm_settings(self, base_url: str, model: str, api_key: str | None = None) -> None:
+        llm = getattr(self, "llm", None)
+        if not llm:
+            return
+        if base_url:
+            llm.base_url = base_url.rstrip("/")
+        if model:
+            llm.model = model
+        if api_key is not None and api_key != "":
+            llm.api_key = api_key
+
+    async def api_settings_global_get(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        llm = getattr(self, "llm", None)
+        prom_url = self._meta_get("prometheus_url") or getattr(self.prom, "base_url", "")
+        am_url = self._meta_get("alertmanager_url")
+        prom_ok, prom_err = await self._probe_prometheus()
+        return _json(
+            {
+                "ok": True,
+                "llm_base_url": getattr(llm, "base_url", "") if llm else "",
+                "llm_model": getattr(llm, "model", "") if llm else "",
+                "llm_api_key_set": bool(getattr(llm, "api_key", "")) if llm else False,
+                "llm_api_key_masked": self._mask_secret(getattr(llm, "api_key", "") if llm else ""),
+                "prometheus_url": prom_url,
+                "alertmanager_url": am_url,
+                "prometheus_ok": prom_ok,
+                "prometheus_error": prom_err,
+            }
+        )
+
+    async def api_settings_global_post(self, request: web.Request) -> web.Response:
+        """全局设置：AI 模型 / Prometheus。仅管理员；API Key 不回显。"""
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        try:
+            body = await request.json()
+        except Exception:
+            return _json({"ok": False, "error": "bad_json", "message": "请求体不是合法 JSON"}, 400)
+        if not isinstance(body, dict):
+            return _json({"ok": False, "error": "bad_json", "message": "请求体不是合法 JSON"}, 400)
+
+        llm_base = str(body.get("llm_base_url") or "").strip()
+        llm_model = str(body.get("llm_model") or "").strip()
+        llm_key = body.get("llm_api_key", None)
+        prom_url = str(body.get("prometheus_url") or "").strip()
+        am_url = str(body.get("alertmanager_url") or "").strip()
+
+        for label, url in (("prometheus_url", prom_url), ("alertmanager_url", am_url), ("llm_base_url", llm_base)):
+            if url and not re.fullmatch(r"https?://[^\s]+", url):
+                return _json(
+                    {"ok": False, "error": "bad_url", "message": f"{label} 必须是 http(s) 地址"},
+                    400,
+                )
+        if llm_key is not None and not isinstance(llm_key, str):
+            return _json({"ok": False, "error": "bad_api_key", "message": "API Key 格式不正确"}, 400)
+
+        # 持久化到 meta（不覆盖 secrets.json 文件，服务内生效）
+        if llm_base:
+            self._meta_set("llm_base_url", llm_base.rstrip("/"))
+        if llm_model:
+            self._meta_set("llm_model", llm_model)
+        if isinstance(llm_key, str) and llm_key.strip():
+            self._meta_set("llm_api_key", llm_key.strip())
+        if prom_url:
+            self._meta_set("prometheus_url", prom_url.rstrip("/"))
+            if getattr(self, "prom", None):
+                self.prom.base_url = prom_url.rstrip("/")
+                self.prom._fail_streak = 0
+                self.prom._open_until = 0.0
+        if am_url:
+            self._meta_set("alertmanager_url", am_url.rstrip("/"))
+
+        self._apply_llm_settings(llm_base, llm_model, llm_key if isinstance(llm_key, str) else None)
+        self.db.audit(
+            "web_user",
+            sess["username"],
+            "settings_global_updated",
+            detail={
+                "llm_base_url": bool(llm_base),
+                "llm_model": bool(llm_model),
+                "llm_api_key": bool(isinstance(llm_key, str) and llm_key.strip()),
+                "prometheus_url": bool(prom_url),
+            },
+        )
+        prom_ok, prom_err = await self._probe_prometheus()
+        llm = getattr(self, "llm", None)
+        return _json(
+            {
+                "ok": True,
+                "llm_base_url": getattr(llm, "base_url", "") if llm else "",
+                "llm_model": getattr(llm, "model", "") if llm else "",
+                "llm_api_key_set": bool(getattr(llm, "api_key", "")) if llm else False,
+                "llm_api_key_masked": self._mask_secret(getattr(llm, "api_key", "") if llm else ""),
+                "prometheus_url": getattr(self.prom, "base_url", "") if self.prom else "",
+                "alertmanager_url": am_url or self._meta_get("alertmanager_url"),
+                "prometheus_ok": prom_ok,
+                "prometheus_error": prom_err,
             }
         )
 
@@ -2474,6 +2608,34 @@ class WebApp:
         )
         failed = self.notifier.failed_summary() if self.notifier else []
         return _json({"ok": True, "outbox": rows, "failed": failed})
+
+    # ---- 节点守望 ----
+
+    async def api_node_watch_heartbeat(self, request: web.Request) -> web.Response:
+        """对端心跳入口：HMAC 自鉴权，不走管理员会话。"""
+        if not self.nodewatch:
+            return _json({"ok": False, "error": "disabled"}, 503)
+        try:
+            body = await request.json()
+        except Exception:
+            return _json({"ok": False, "error": "bad_json"}, 400)
+        if not isinstance(body, dict):
+            return _json({"ok": False, "error": "bad_json"}, 400)
+        res = self.nodewatch.handle_heartbeat(body)
+        return _json(res, 200 if res.get("ok") else 400)
+
+    async def api_node_watch_status(self, request: web.Request) -> web.Response:
+        self._require_admin(request)
+        if not self.nodewatch:
+            return _json({"ok": True, "enabled": False, "status": {}})
+        return _json({"ok": True, "enabled": True, "status": self.nodewatch.status()})
+
+    async def api_node_watch_send_test(self, request: web.Request) -> web.Response:
+        self._require_admin(request)
+        if not self.nodewatch:
+            return _json({"ok": False, "error": "disabled"}, 503)
+        res = await self.nodewatch.send_once()
+        return _json(res)
 
     # ---- 主机资源监控 ----
 

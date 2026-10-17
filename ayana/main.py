@@ -361,6 +361,38 @@ class App:
         self.mlog = MessageLog(self.db)
         self.channel_store.set_mlog(self.mlog)
         self.llm = make_llm(cfg)
+        # 节点守望：心跳收发 + 失联调查（默认关闭，配置后启用）
+        try:
+            from .nodewatch import NodeWatchService
+
+            self.nodewatch = NodeWatchService(
+                self.db,
+                config=cfg.get("node_watch") or {},
+                notifier=self.notifier,
+                channel_store=self.channel_store,
+            )
+        except Exception as e:
+            log.warning("nodewatch disabled: %s", e)
+            self.nodewatch = None
+        # 全局设置（DB meta）覆盖 secrets/env 中的 LLM 配置
+        try:
+            for _k in ("llm_base_url", "llm_model", "llm_api_key"):
+                _row = self.db.query_one("SELECT value FROM meta WHERE key=?", (_k,))
+                if _row and str(_row["value"] or "").strip():
+                    if _k == "llm_base_url":
+                        self.llm.base_url = str(_row["value"]).strip().rstrip("/")
+                    elif _k == "llm_model":
+                        self.llm.model = str(_row["value"]).strip()
+                    else:
+                        self.llm.api_key = str(_row["value"]).strip()
+            log.info(
+                "llm settings: model=%s base_set=%s key_set=%s",
+                self.llm.model,
+                bool(self.llm.base_url),
+                bool(self.llm.api_key),
+            )
+        except Exception as e:
+            log.warning("load llm meta failed: %s", e)
         self.investigation.llm = self.llm
         # S22: 优先读持久化 auto 开关，回退配置默认值
         _auto_row = self.db.query_one("SELECT value FROM meta WHERE key='agent_auto_enabled'")
@@ -424,6 +456,7 @@ class App:
             promconfig=self.promconfig,
             checks=self.checks,
             llm=self.llm,
+            nodewatch=getattr(self, "nodewatch", None),
         )
         self._stop = asyncio.Event()
         self._bg_tasks: list[asyncio.Task] = []
@@ -607,15 +640,21 @@ class App:
         self.wecom_bot = WeComBot(self.qq, self.aibot_manager, self.channel_store, self.mlog)
         self.qq.mlog = self.mlog
         self.aibot_manager._on_message = self.wecom_bot.on_channel_frame
-        try:
-            self.channel_store.ensure_default_qq(
-                f"user:{self.cfg['admin_qq']}" if self.cfg.get("admin_qq") else ""
-            )
-        except Exception:
-            log.exception("ensure_default_qq failed")
+        # 全新安装不预置任何通知渠道（含 QQ）；由用户主动添加。
+        # 老实例已有渠道原样保留，不做迁移/停用。
         # 启动已启用的企微智能机器人长连接
         self._bg_tasks.append(asyncio.create_task(self._bg_aibot()))
         self._bg_tasks.append(asyncio.create_task(self._bg_checks()))
+        if getattr(self, "nodewatch", None):
+            try:
+                self.nodewatch.start()
+                log.info(
+                    "node-watch started send=%s recv=%s",
+                    self.nodewatch.enabled_send(),
+                    self.nodewatch.enabled_recv(),
+                )
+            except Exception:
+                log.exception("node-watch start failed")
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -625,6 +664,11 @@ class App:
                 pass
         await self._stop.wait()
         log.info("shutting down")
+        if getattr(self, "nodewatch", None):
+            try:
+                await self.nodewatch.stop()
+            except Exception:
+                pass
         for t in self._bg_tasks:
             t.cancel()
         try:
