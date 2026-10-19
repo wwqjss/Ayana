@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 
 <html lang="zh-CN">
 
@@ -572,6 +572,78 @@
           <button data-sub="channels" class="subtab active">通知渠道</button>
           <button data-sub="messages" class="subtab">消息记录</button>
           <button data-sub="outbox" class="subtab">发送记录</button>
+          <button data-sub="nodewatch" class="subtab">节点守望</button>
+        </div>
+
+        <div id="notify-sub-nodewatch" class="subpanel hidden">
+          <div class="card">
+            <h2>节点守望 · 配对</h2>
+            <p class="muted small">
+              接收端生成邀请串（含地址 + 节点名 + 密钥），粘贴到发送端完成配对。
+              IP 只是路由，信任靠密钥指纹核对。密钥不回显明文。
+            </p>
+            <div class="form-row">
+              <label>本机角色
+                <select id="nw-role">
+                  <option value="recv">接收端（生成邀请串）</option>
+                  <option value="send">发送端（粘贴邀请串）</option>
+                </select>
+              </label>
+            </div>
+            <div id="nw-recv-box">
+              <div class="form-row">
+                <label>允许的对端节点名
+                  <input id="nw-node-id" placeholder="如 kanata" />
+                </label>
+                <label>心跳对外地址（可选）
+                  <input id="nw-url" placeholder="默认按当前访问地址推断" />
+                </label>
+              </div>
+              <div class="form-row">
+                <button id="nw-gen" class="primary">生成邀请串</button>
+                <button id="nw-gen-keep" type="button">复用现有密钥生成</button>
+              </div>
+              <div id="nw-invite-box" class="hidden">
+                <p class="small muted">指纹 <b id="nw-fp"></b> · 请与发送端核对 · 请在 10 分钟内完成粘贴</p>
+                <textarea id="nw-invite" rows="3" readonly></textarea>
+                <div class="form-row">
+                  <button id="nw-copy" type="button">复制邀请串</button>
+                </div>
+              </div>
+            </div>
+            <div id="nw-send-box" class="hidden">
+              <div class="form-row">
+                <label>心跳间隔（秒）
+                  <input id="nw-interval" type="number" min="10" step="1" placeholder="默认 60" />
+                </label>
+              </div>
+              <div class="form-row">
+                <label>粘贴邀请串
+                  <textarea id="nw-paste" rows="3" placeholder="AYANA-WATCH1...."></textarea>
+                </label>
+              </div>
+              <div class="form-row">
+                <button id="nw-parse" type="button">解析</button>
+              </div>
+              <div id="nw-parse-box" class="hidden">
+                <p class="small">目标 <b id="nw-p-url"></b></p>
+                <p class="small">节点 <b id="nw-p-node"></b></p>
+                <p class="small">指纹 <b id="nw-p-fp"></b> <span class="muted">（请与接收端核对）</span></p>
+                <div class="form-row">
+                  <label>核对指纹后确认
+                    <input id="nw-p-fp-in" placeholder="输入指纹确认" />
+                  </label>
+                  <button id="nw-apply" class="primary">保存并启用发送</button>
+                </div>
+              </div>
+            </div>
+            <div class="error" id="nw-err"></div>
+            <div class="form-row">
+              <button id="nw-refresh" type="button">刷新状态</button>
+              <button id="nw-save-interval" type="button">保存心跳周期</button>
+            </div>
+            <pre id="nw-status" class="small muted" style="white-space:pre-wrap"></pre>
+          </div>
         </div>
 
         <div id="notify-sub-channels" class="subpanel">

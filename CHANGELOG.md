@@ -1,19 +1,28 @@
 # Changelog
 
-## v0.7.4 — 节点守望（心跳 + 可选旁路）
+## v0.7.4 — 节点守望（配对 + 心跳 + 可选旁路）
 
 ### 新增
 
 - **节点守望**：实例间 HTTP 心跳（HMAC + nonce 防重放 + seq），发送/接收两开关独立
+- **邀请串配对**：接收端生成 `AYANA-WATCH1.<b64url(json)>`（url + node_id + key + 指纹 + 过期），发送端粘贴解析；密钥 SHA256 前 8 位指纹两边核对后才保存；默认 10 分钟有效
+- **心跳周期可配置**：发送端可自定义间隔（最低 10 秒）；配对时写入或事后 `POST /api/node-watch/settings` 修改
+- **首页总览状态卡**：展示角色、周期、对端在线情况与最近心跳；发送端显示目标地址与发送结果
 - **失联调查**：心跳超时后并行探测已配置旁路（FRP/HTTP 健康口）；未配置 = 未配置，不算失败
 - **语义**：旁路仍通 → 「心跳通道异常」；全部失败或无旁路 → 「疑似失联」（网络不可达 ≠ 物理宕机）
-- **告警**：同一事件只告一次；有效心跳恢复后自动恢复通知
-- **API**：`POST /api/node-watch/heartbeat`、`GET /api/node-watch/status`、`POST /api/node-watch/send-test`
+- **告警**：同一事件只告一次；有效心跳恢复后自动恢复通知；可绑定 `wecom_aibot` 长连接渠道推送
+- **API**：`POST /api/node-watch/heartbeat`（HMAC 自鉴权）、`GET /api/node-watch/status`、`POST /api/node-watch/send-test`、`POST /api/node-watch/invite/{generate,parse,apply}`、`POST /api/node-watch/settings`
 - **配置**：`config.json` 的 `node_watch.send` / `node_watch.recv`；心跳直连对端地址，不走 FRP
+
+### 安全
+
+- 管理端节点守望写操作补 CSRF 校验（与其它管理 API 一致）
+- 邀请串 TTL 夹紧到 30–3600 秒；心跳 URL 仅允许 http(s) 且禁止 userinfo
+- 日志只记指纹 `fp=`，不落明文密钥；状态接口不回显 `shared_secret`
 
 ### 测试
 
-- 单测 9 项通过；KANATA→YOMI 公网心跳 200；FRP 旁路判定「通道异常」正确
+- 单测 19 项通过；KANATA→YOMI 心跳 200；停服后自动超时告警并送达企微长连接渠道
 
 ---
 

@@ -253,6 +253,10 @@ class WebApp:
         app.router.add_post("/api/node-watch/heartbeat", self.api_node_watch_heartbeat)
         app.router.add_get("/api/node-watch/status", self.api_node_watch_status)
         app.router.add_post("/api/node-watch/send-test", self.api_node_watch_send_test)
+        app.router.add_post("/api/node-watch/invite/generate", self.api_node_watch_invite_generate)
+        app.router.add_post("/api/node-watch/invite/parse", self.api_node_watch_invite_parse)
+        app.router.add_post("/api/node-watch/invite/apply", self.api_node_watch_invite_apply)
+        app.router.add_post("/api/node-watch/settings", self.api_node_watch_settings)
         # 主机资源监控
         app.router.add_get("/api/monitor/hosts", self.api_monitor_hosts)
         app.router.add_get("/api/monitor/host/{asset_id}", self.api_monitor_host)
@@ -1242,6 +1246,7 @@ class WebApp:
             "sources": sources,
             "health_ratio": health_ratio,
             "quiet": quiet,
+            "node_watch": self.nodewatch.overview_summary() if self.nodewatch else {"level": "off", "peers": []},
         }
         self._overview_cache = {"at": time.time(), "visible": visible, "data": data}
         return _json(data)
@@ -2631,11 +2636,90 @@ class WebApp:
         return _json({"ok": True, "enabled": True, "status": self.nodewatch.status()})
 
     async def api_node_watch_send_test(self, request: web.Request) -> web.Response:
-        self._require_admin(request)
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
         if not self.nodewatch:
             return _json({"ok": False, "error": "disabled"}, 503)
         res = await self.nodewatch.send_once()
         return _json(res)
+
+    def _nw(self):
+        if not self.nodewatch:
+            raise web.HTTPNotFound(text="nodewatch not configured")
+        return self.nodewatch
+
+    async def api_node_watch_invite_generate(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        nw = self._nw()
+        body = await request.json() if request.can_read_body else {}
+        if not isinstance(body, dict):
+            body = {}
+        node_id = str(body.get("node_id") or "").strip()
+        url = str(body.get("url") or "").strip()
+        if not url:
+            # 默认用当前请求推断接收地址
+            url = f"http://{request.host}/api/node-watch/heartbeat"
+        try:
+            ttl = float(body.get("ttl_sec") or 600)
+        except (TypeError, ValueError):
+            ttl = 600.0
+        rotate = bool(body.get("rotate", True))
+        res = nw.generate_invite(node_id=node_id, url=url, ttl_sec=ttl, rotate=rotate)
+        code = 200 if res.get("ok") else 400
+        return _json(res, code)
+
+    async def api_node_watch_invite_parse(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        nw = self._nw()
+        body = await request.json()
+        res = nw.parse_invite_text(str((body or {}).get("invite") or ""))
+        return _json(res, 200 if res.get("ok") else 400)
+
+    async def api_node_watch_invite_apply(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        nw = self._nw()
+        body = await request.json()
+        if not isinstance(body, dict):
+            return _json({"ok": False, "error": "bad_json"}, 400)
+        interval_raw = body.get("interval_sec")
+        interval_sec = None
+        if interval_raw is not None and str(interval_raw).strip() != "":
+            try:
+                interval_sec = float(interval_raw)
+            except (TypeError, ValueError):
+                return _json({"ok": False, "error": "bad_interval_sec"}, 400)
+        res = nw.apply_invite(
+            str(body.get("invite") or ""),
+            expected_fp=str(body.get("fp") or ""),
+            interval_sec=interval_sec,
+        )
+        return _json(res, 200 if res.get("ok") else 400)
+
+    async def api_node_watch_settings(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        nw = self._nw()
+        body = await request.json() if request.can_read_body else {}
+        if not isinstance(body, dict):
+            return _json({"ok": False, "error": "bad_json"}, 400)
+        kwargs: dict = {}
+        if "interval_sec" in body and body.get("interval_sec") is not None:
+            try:
+                kwargs["interval_sec"] = float(body.get("interval_sec"))
+            except (TypeError, ValueError):
+                return _json({"ok": False, "error": "bad_interval_sec"}, 400)
+        if "timeout_sec" in body and body.get("timeout_sec") is not None:
+            try:
+                kwargs["timeout_sec"] = float(body.get("timeout_sec"))
+            except (TypeError, ValueError):
+                return _json({"ok": False, "error": "bad_timeout_sec"}, 400)
+        if "public_base_url" in body:
+            kwargs["public_base_url"] = body.get("public_base_url") or ""
+        res = nw.update_settings(**kwargs)
+        return _json(res, 200 if res.get("ok") else 400)
 
     # ---- 主机资源监控 ----
 

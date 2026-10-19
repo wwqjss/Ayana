@@ -846,7 +846,13 @@ class ChannelStore:
             if kind == "wecom":
                 return await self._send_wecom(sec, body)
             if kind == "wecom_aibot":
-                return await self._send_wecom_aibot(channel_id, sec, body, target)
+                chatid = str(target or "").strip()
+                if not chatid:
+                    tgts = [str(t).strip() for t in (cfg.get("targets") or []) if str(t).strip()]
+                    if not tgts and str(cfg.get("target") or "").strip():
+                        tgts = [str(cfg.get("target")).strip()]
+                    chatid = tgts[0] if tgts else ""
+                return await self._send_wecom_aibot(channel_id, sec, body, chatid)
             if kind == "webhook":
                 return await self._send_webhook(cfg, sec, body)
             return False, f"unknown_kind:{kind}"

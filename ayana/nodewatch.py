@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -28,9 +29,103 @@ STATUS_SUSPECT = "suspect"
 STATUS_DOWN = "down"
 STATUS_UNKNOWN = "unknown"
 
+# 邀请串前缀（接收端生成 → 发送端粘贴）
+INVITE_PREFIX = "AYANA-WATCH1."
+INVITE_DEFAULT_TTL_SEC = 600
+INVITE_MAX_TTL_SEC = 3600
+INVITE_MIN_TTL_SEC = 30
+
+
+def _safe_heartbeat_url(url: str) -> str:
+    """仅允许 http(s) 心跳地址，拒绝 userinfo / 非法 URL。"""
+    from urllib.parse import urlsplit
+
+    u = (url or "").strip()
+    try:
+        parts = urlsplit(u)
+    except ValueError as e:
+        raise ValueError("invalid_url") from e
+    if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+        raise ValueError("bad_url")
+    if parts.username or parts.password:
+        raise ValueError("bad_url")
+    return u
+
 
 def _now() -> float:
     return time.time()
+
+
+def fingerprint_secret(secret: str) -> str:
+    """密钥指纹（展示核对用，不参与验签）。"""
+    return hashlib.sha256((secret or "").encode("utf-8")).hexdigest()[:8]
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(s: str) -> bytes:
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+
+def build_invite(
+    *,
+    url: str,
+    node_id: str,
+    key: str,
+    exp: float | None = None,
+    ttl_sec: float = INVITE_DEFAULT_TTL_SEC,
+) -> str:
+    """接收端生成邀请串：含连接信息 + 身份 + 密钥 + 指纹 + 过期。"""
+    payload = {
+        "v": 1,
+        "url": (url or "").strip(),
+        "node_id": (node_id or "").strip(),
+        "key": key or "",
+        "fp": fingerprint_secret(key),
+        "exp": float(exp if exp is not None else _now() + ttl_sec),
+    }
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return INVITE_PREFIX + _b64url_encode(raw)
+
+
+def parse_invite(text: str) -> dict:
+    """解析邀请串。非法/过期返回 {ok:False,...}。"""
+    s = (text or "").strip()
+    if not s.startswith(INVITE_PREFIX):
+        return {"ok": False, "error": "bad_prefix"}
+    try:
+        raw = _b64url_decode(s[len(INVITE_PREFIX):])
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {"ok": False, "error": "bad_payload"}
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "bad_payload"}
+    if int(data.get("v") or 0) != 1:
+        return {"ok": False, "error": "bad_version"}
+    url = str(data.get("url") or "").strip()
+    node_id = str(data.get("node_id") or "").strip()
+    key = str(data.get("key") or "")
+    if not url or not node_id or not key:
+        return {"ok": False, "error": "missing_fields"}
+    try:
+        exp = float(data.get("exp") or 0)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "bad_exp"}
+    if exp and exp < _now():
+        return {"ok": False, "error": "expired"}
+    fp = str(data.get("fp") or "") or fingerprint_secret(key)
+    return {
+        "ok": True,
+        "url": url,
+        "node_id": node_id,
+        "key": key,
+        "fp": fp,
+        "exp": exp,
+        "invite_masked": INVITE_PREFIX + "****",
+    }
 
 
 def sign_payload(*, secret: str, node_id: str, ts: float, nonce: str, seq: int, payload: dict) -> str:
@@ -79,16 +174,35 @@ class NodeWatchService:
         config: dict | None = None,
         notifier: Any = None,
         channel_store: Any = None,
+        config_path: str = "",
     ):
         self.db = db
         self.cfg = dict(config or {})
         self.notifier = notifier
         self.channel_store = channel_store
+        self.config_path = str(config_path or "")
         self._send_task: asyncio.Task | None = None
         self._watch_task: asyncio.Task | None = None
         self._stopped = False
         self._last_send: dict[str, Any] = {}
         self._aiohttp: Any = None
+
+    def _persist(self) -> None:
+        """把 node_watch 写回 config.json（实验环境；密钥不进日志）。"""
+        if not self.config_path:
+            return
+        try:
+            from pathlib import Path
+
+            p = Path(self.config_path)
+            data = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+            data["node_watch"] = {
+                "send": dict(self.send_cfg),
+                "recv": dict(self.recv_cfg),
+            }
+            p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        except Exception:
+            log.exception("node-watch persist failed")
 
     # ---- config helpers ----
 
@@ -112,22 +226,186 @@ class NodeWatchService:
     def recv_secret(self) -> str:
         return str(self.recv_cfg.get("shared_secret") or self.send_secret() or "")
 
+    def public_base_url(self) -> str:
+        """接收端心跳地址：优先显式配置，否则用请求头推断。"""
+        return str(self.recv_cfg.get("public_base_url") or "").strip()
+
+    def generate_invite(
+        self,
+        *,
+        node_id: str,
+        url: str = "",
+        ttl_sec: float = INVITE_DEFAULT_TTL_SEC,
+        rotate: bool = True,
+    ) -> dict:
+        """接收端：生成/复用密钥，返回邀请串 + 指纹。"""
+        node_id = (node_id or "").strip()
+        if not node_id:
+            return {"ok": False, "error": "missing_node_id"}
+
+        secret = self.recv_secret() if not rotate else ""
+        if rotate or not secret:
+            secret = secrets.token_urlsafe(24)
+
+        target = (url or "").strip() or self.public_base_url()
+        if not target:
+            return {"ok": False, "error": "missing_url"}
+        try:
+            target = _safe_heartbeat_url(target)
+        except ValueError:
+            return {"ok": False, "error": "bad_url"}
+        try:
+            ttl_sec = float(ttl_sec)
+        except (TypeError, ValueError):
+            ttl_sec = INVITE_DEFAULT_TTL_SEC
+        ttl_sec = max(INVITE_MIN_TTL_SEC, min(INVITE_MAX_TTL_SEC, ttl_sec))
+
+        # 落库：密钥 + 白名单 + 开启接收
+        recv = dict(self.recv_cfg)
+        recv["enabled"] = True
+        recv["shared_secret"] = secret
+        allowed = {str(x) for x in (recv.get("allowed_nodes") or []) if str(x).strip()}
+        allowed.add(node_id)
+        recv["allowed_nodes"] = sorted(allowed)
+        self.cfg["recv"] = recv
+
+        # 状态：该节点进入等待
+        self.db.execute(
+            """
+            INSERT INTO node_watch_peers(
+              node_id, last_seq, last_ts, last_seen_at, last_payload,
+              status, incident_open, created_at, updated_at
+            ) VALUES(?,?,0,NULL,'{}','unknown',0,?,?)
+            ON CONFLICT(node_id) DO UPDATE SET updated_at=excluded.updated_at
+            """,
+            (node_id, 0, _now(), _now()),
+        )
+
+        invite = build_invite(url=target, node_id=node_id, key=secret, ttl_sec=ttl_sec)
+        fp = fingerprint_secret(secret)
+        self._persist()
+        log.info("node-watch invite generated node=%s fp=%s", node_id, fp)
+        return {
+            "ok": True,
+            "invite": invite,
+            "fp": fp,
+            "node_id": node_id,
+            "url": target,
+            "exp": _now() + ttl_sec,
+            "ttl_sec": ttl_sec,
+        }
+
+    def parse_invite_text(self, text: str) -> dict:
+        """发送端：解析邀请（不落库）。"""
+        res = parse_invite(text)
+        if not res.get("ok"):
+            return res
+        return {
+            "ok": True,
+            "url": res["url"],
+            "node_id": res["node_id"],
+            "fp": res["fp"],
+            "exp": res["exp"],
+            "invite_masked": res.get("invite_masked") or "",
+        }
+
+    def apply_invite(
+        self,
+        text: str,
+        *,
+        expected_fp: str = "",
+        interval_sec: float | None = None,
+    ) -> dict:
+        """发送端：粘贴邀请串，写入 send 配置。"""
+        res = parse_invite(text)
+        if not res.get("ok"):
+            return res
+        if expected_fp and expected_fp.strip() and expected_fp.strip() != res["fp"]:
+            return {"ok": False, "error": "fp_mismatch", "fp": res["fp"]}
+        try:
+            _safe_heartbeat_url(res["url"])
+        except ValueError:
+            return {"ok": False, "error": "bad_url"}
+
+        send = dict(self.send_cfg)
+        send["enabled"] = True
+        send["target_url"] = res["url"]
+        send["node_id"] = res["node_id"]
+        send["shared_secret"] = res["key"]
+        if interval_sec is not None:
+            send["interval_sec"] = self._norm_interval(interval_sec)
+        self.cfg["send"] = send
+        self._persist()
+
+        log.info(
+            "node-watch invite applied node=%s fp=%s url=%s",
+            res["node_id"],
+            res["fp"],
+            res["url"],
+        )
+        return {
+            "ok": True,
+            "url": res["url"],
+            "node_id": res["node_id"],
+            "fp": res["fp"],
+            "enabled": True,
+        }
+
     def allowed_nodes(self) -> set[str]:
         raw = self.recv_cfg.get("allowed_nodes") or []
         return {str(x).strip() for x in raw if str(x).strip()}
 
     def timeout_sec(self) -> float:
+        return self._norm_timeout(self.recv_cfg.get("timeout_sec"), 180.0)
+
+    @staticmethod
+    def _norm_interval(value: float | int | str | None, default: float = 60.0) -> float:
         try:
-            return float(self.recv_cfg.get("timeout_sec") or 180)
+            v = float(value if value is not None else default)
         except (TypeError, ValueError):
-            return 180.0
+            v = default
+        return max(10.0, round(v, 1))
+
+    @staticmethod
+    def _norm_timeout(value: float | int | str | None, default: float = 180.0) -> float:
+        try:
+            v = float(value if value is not None else default)
+        except (TypeError, ValueError):
+            v = default
+        return max(30.0, round(v, 1))
 
     def send_interval_sec(self) -> float:
-        try:
-            v = float(self.send_cfg.get("interval_sec") or 60)
-        except (TypeError, ValueError):
-            v = 60.0
-        return max(10.0, v)
+        return self._norm_interval(self.send_cfg.get("interval_sec"), 60.0)
+
+    def update_settings(
+        self,
+        *,
+        interval_sec: float | int | str | None = None,
+        timeout_sec: float | int | str | None = None,
+        public_base_url: str | None = None,
+    ) -> dict:
+        """改心跳周期 / 失联判定 / 接收地址，不碰密钥。"""
+        changed: dict[str, Any] = {}
+        if interval_sec is not None:
+            send = dict(self.send_cfg)
+            send["interval_sec"] = self._norm_interval(interval_sec)
+            self.cfg["send"] = send
+            changed["interval_sec"] = send["interval_sec"]
+        if timeout_sec is not None:
+            recv = dict(self.recv_cfg)
+            recv["timeout_sec"] = self._norm_timeout(timeout_sec)
+            self.cfg["recv"] = recv
+            changed["timeout_sec"] = recv["timeout_sec"]
+        if public_base_url is not None:
+            recv = dict(self.recv_cfg)
+            recv["public_base_url"] = str(public_base_url).strip()
+            self.cfg["recv"] = recv
+            changed["public_base_url"] = recv["public_base_url"]
+        if not changed:
+            return {"ok": False, "error": "nothing_to_update"}
+        self._persist()
+        log.info("node-watch settings updated %s", {k: changed[k] for k in changed if k.endswith("_sec")})
+        return {"ok": True, **changed}
 
     def probes(self) -> list[dict]:
         out = []
@@ -256,6 +534,10 @@ class NodeWatchService:
         secret = self.send_secret()
         if not url or not secret:
             return {"ok": False, "error": "send_not_configured"}
+        try:
+            url = _safe_heartbeat_url(url)
+        except ValueError:
+            return {"ok": False, "error": "bad_url"}
         row = self.db.query_one("SELECT value FROM meta WHERE key='node_watch_send_seq'")
         try:
             seq = int(row["value"] if row else 0) + 1
@@ -458,10 +740,33 @@ class NodeWatchService:
             return
         try:
             ch = str(self.recv_cfg.get("alert_channel_id") or "")
+            dedup_key = "nodewatch:" + hashlib.sha1(body.encode("utf-8")).hexdigest()[:16]
             if ch:
-                self.notifier.enqueue(None, body=body, channel_id=ch)
+                kind = "wecom_aibot"
+                targets = [""]
+                if self.channel_store:
+                    meta = self.channel_store.get_meta(ch) or {}
+                    kind = str(meta.get("kind") or kind)
+                    cfg = meta.get("config") or {}
+                    tgts = [str(t).strip() for t in (cfg.get("targets") or []) if str(t).strip()]
+                    if not tgts and str(cfg.get("target") or "").strip():
+                        tgts = [str(cfg.get("target")).strip()]
+                    if tgts:
+                        targets = tgts
+                for tgt in targets:
+                    self.notifier.enqueue(
+                        dedup_key=dedup_key,
+                        target=tgt,
+                        body=body,
+                        channel=kind,
+                        channel_id=ch,
+                    )
             else:
-                self.notifier.enqueue(None, body=body)
+                self.notifier.enqueue(
+                    dedup_key=dedup_key,
+                    target="",
+                    body=body,
+                )
         except Exception:
             log.exception("node-watch notify failed")
 
@@ -512,14 +817,68 @@ class NodeWatchService:
 
     # ---- admin/status ----
 
+    def overview_summary(self) -> dict[str, Any]:
+        """首页总览用的轻量状态（不含密钥）。"""
+        peers = []
+        for p in self.list_peers():
+            peers.append(
+                {
+                    "node_id": p.get("node_id"),
+                    "status": p.get("status") or "unknown",
+                    "incident_open": bool(p.get("incident_open")),
+                    "last_seen_at": p.get("last_seen_at"),
+                }
+            )
+        online = sum(1 for p in peers if p.get("status") == STATUS_ONLINE)
+        down = sum(1 for p in peers if p.get("status") == STATUS_DOWN)
+        last_send = self.last_send() or {}
+        send_enabled = self.enabled_send()
+        recv_enabled = self.enabled_recv()
+        if not (send_enabled or recv_enabled):
+            level = "off"
+        elif down or any(p.get("incident_open") for p in peers):
+            level = "bad"
+        elif send_enabled and last_send.get("ok") is False:
+            level = "bad"
+        elif peers:
+            level = "ok" if online == len(peers) else "warn"
+        elif send_enabled:
+            # 纯发送端：本地没有 peers 表，看发送结果
+            level = "ok" if last_send.get("ok") else "warn"
+        else:
+            level = "warn"
+        return {
+            "level": level,
+            "send_enabled": send_enabled,
+            "recv_enabled": recv_enabled,
+            "interval_sec": self.send_interval_sec() if send_enabled else None,
+            "timeout_sec": self.timeout_sec() if recv_enabled else None,
+            "send_target": (self.send_cfg.get("target_url") or "") if send_enabled else "",
+            "send_node_id": (self.send_cfg.get("node_id") or "") if send_enabled else "",
+            "last_send": {
+                "at": last_send.get("at"),
+                "ok": bool(last_send.get("ok")) if last_send else None,
+                "status": last_send.get("status"),
+            },
+            "peer_count": len(peers),
+            "online": online,
+            "down": down,
+            "peers": peers,
+        }
+
     def status(self) -> dict[str, Any]:
+        send = dict(self.send_cfg)
+        recv = dict(self.recv_cfg)
+        send.pop("shared_secret", None)
+        recv.pop("shared_secret", None)
         return {
             "send": {
                 "enabled": self.enabled_send(),
-                "node_id": self.send_cfg.get("node_id"),
-                "target_url": self.send_cfg.get("target_url"),
+                "node_id": send.get("node_id"),
+                "target_url": send.get("target_url"),
                 "interval_sec": self.send_interval_sec(),
                 "last_send": self.last_send(),
+                "fp": fingerprint_secret(self.send_secret()) if self.send_secret() else "",
             },
             "recv": {
                 "enabled": self.enabled_recv(),
@@ -527,6 +886,8 @@ class NodeWatchService:
                 "allowed_nodes": sorted(self.allowed_nodes()),
                 "probes_configured": len(self.probes()),
                 "probes": self.probes(),
+                "public_base_url": self.public_base_url(),
+                "fp": fingerprint_secret(self.recv_secret()) if self.recv_secret() else "",
             },
             "peers": self.list_peers(),
         }

@@ -370,6 +370,7 @@ class App:
                 config=cfg.get("node_watch") or {},
                 notifier=self.notifier,
                 channel_store=self.channel_store,
+                config_path=str(Path(cfg.get("base_dir") or ".") / "config.json"),
             )
         except Exception as e:
             log.warning("nodewatch disabled: %s", e)

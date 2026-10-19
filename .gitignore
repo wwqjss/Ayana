@@ -23,6 +23,8 @@ ayana-verify.png
 .playwright-cli/
 backups/
 _rt_*.py
+.deploy-nw/
+.deploy-stage/
 
 # 内部审查与运维脚本（不公开）
 docs/reviews/

@@ -744,7 +744,7 @@ function setNotifySub(sub) {
   document.querySelectorAll("#notify-subnav .subtab").forEach((b) => {
     b.classList.toggle("active", b.dataset.sub === sub);
   });
-  ["channels", "messages", "outbox"].forEach((k) => {
+  ["channels", "messages", "outbox", "nodewatch"].forEach((k) => {
     const el = document.getElementById("notify-sub-" + k);
     if (el) el.classList.toggle("hidden", k !== sub);
   });
@@ -768,6 +768,7 @@ document.addEventListener("click", (e) => {
     const b = $("notify-outbox-refresh");
     if (b) b.click();
   }
+  if (nav.id === "notify-subnav" && t.dataset.sub === "nodewatch") renderNodeWatch();
 });
 
 document.querySelectorAll(".tab").forEach((btn) => {
@@ -1060,6 +1061,9 @@ async function renderOverview() {
     if (businessTotals.total) stats.appendChild(mkStat("业务检查", String(businessTotals.total), businessTotals.failed ? "bad" : businessTotals.unknown ? "warn" : "ok"));
     g.appendChild(stats);
 
+    // 节点守望状态卡
+    g.appendChild(buildNodeWatchCard(res.node_watch));
+
     // 只列异常主机摘要（正常主机进「资源」）
     const openIncs = res.open_incidents || [];
     const badHosts = (res.assets || []).filter((a) => {
@@ -1103,6 +1107,69 @@ async function renderOverview() {
   } finally {
     state._overviewLoading = false;
   }
+}
+
+/** 节点守望总览卡：对端在线情况 + 心跳周期 */
+function buildNodeWatchCard(nw) {
+  const card = el("div", { class: "card", style: "margin-bottom:16px" });
+  card.appendChild(el("h2", { text: "节点守望" }));
+  const data = nw || { level: "off", peers: [] };
+  const levelCls = { ok: "ok", warn: "warn", bad: "bad", off: "dim" }[data.level] || "dim";
+  const roleBits = [];
+  if (data.send_enabled) roleBits.push(`发送 · 间隔 ${data.interval_sec ?? 60}s`);
+  if (data.recv_enabled) roleBits.push(`接收 · 超时 ${data.timeout_sec ?? 180}s`);
+  const roleText = roleBits.length ? roleBits.join(" / ") : "未启用";
+  card.appendChild(el("div", {
+    style: "display:flex;justify-content:space-between;align-items:center;margin-bottom:8px",
+  }, [
+    el("div", { class: "muted small", text: roleText }),
+    badge(data.level === "off" ? "未启用" : data.level === "ok" ? "在线" : data.level === "bad" ? "异常" : "关注", levelCls),
+  ]));
+
+  const peers = data.peers || [];
+  if (!peers.length && data.send_enabled) {
+    const last = data.last_send || {};
+    const okCls = last.ok === true ? "ok" : last.ok === false ? "bad" : "dim";
+    const okText = last.ok === true ? "发送正常" : last.ok === false ? "发送失败" : "等待首次发送";
+    card.appendChild(el("div", {
+      style: "display:flex;justify-content:space-between;align-items:center;padding:8px 0",
+    }, [
+      el("div", {}, [
+        el("div", { text: data.send_node_id || "对端", style: "font-size:14px" }),
+        el("div", { class: "muted small", text: data.send_target || "未设置目标地址" }),
+      ]),
+      badge(okText, okCls),
+    ]));
+  } else if (!peers.length) {
+    card.appendChild(el("p", {
+      class: "muted small",
+      text: data.level === "off" ? "尚未开启节点守望，可到「通知 → 节点守望」配对。" : "还没有对端记录，完成配对后会出现在这里。",
+    }));
+  } else {
+    peers.forEach((p) => {
+      const age = p.last_seen_at ? Math.max(0, Math.round(Date.now() / 1000 - Number(p.last_seen_at))) : null;
+      const statusCls = p.status === "online" ? "ok" : p.status === "down" || p.incident_open ? "bad" : "warn";
+      const statusText = p.status === "online" ? "在线" : p.status === "down" ? "失联" : p.status === "suspect" ? "可疑" : "未知";
+      card.appendChild(el("div", {
+        style: "display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--line);cursor:pointer",
+        onclick: () => {
+          activateTab("notify", "");
+          const btn = document.querySelector('[data-sub="nodewatch"]');
+          if (btn) btn.click();
+        },
+      }, [
+        el("div", {}, [
+          el("div", { text: String(p.node_id || "?"), style: "font-size:14px" }),
+          el("div", {
+            class: "muted small",
+            text: age == null ? "尚未收到心跳" : `最近心跳 ${age < 90 ? age + " 秒前" : Math.round(age / 60) + " 分钟前"}`,
+          }),
+        ]),
+        badge(statusText, statusCls),
+      ]));
+    });
+  }
+  return card;
 }
 
 /** 系统健康度卡片：唯一分数 + MAGI 三行分项拆解（非独立评分） */
@@ -6054,6 +6121,194 @@ async function prepareCheckSubmit() {
   }
 }
 on("chk-add", "click", prepareCheckSubmit);
+
+/* ---- 节点守望配对 ---- */
+function nwErr(msg) {
+  const el = $("nw-err");
+  if (el) el.textContent = msg || "";
+}
+
+function nwShowRole() {
+  const role = ($("nw-role") && $("nw-role").value) || "recv";
+  const r = $("nw-recv-box");
+  const s = $("nw-send-box");
+  if (r) r.classList.toggle("hidden", role !== "recv");
+  if (s) s.classList.toggle("hidden", role !== "send");
+}
+
+async function renderNodeWatch() {
+  nwErr("");
+  nwShowRole();
+  try {
+    const res = await api("/api/node-watch/status");
+    const st = (res && res.status) || {};
+    const intervalInput = $("nw-interval");
+    if (intervalInput && !intervalInput.dataset.touched && st.send && st.send.interval_sec != null) {
+      intervalInput.value = String(st.send.interval_sec);
+    }
+    const el = $("nw-status");
+    if (el) {
+      el.textContent = JSON.stringify(
+        {
+          send: st.send,
+          recv: {
+            enabled: st.recv && st.recv.enabled,
+            allowed_nodes: st.recv && st.recv.allowed_nodes,
+            timeout_sec: st.recv && st.recv.timeout_sec,
+            fp: st.recv && st.recv.fp,
+            public_base_url: st.recv && st.recv.public_base_url,
+            probes_configured: st.recv && st.recv.probes_configured,
+          },
+          peers: (st.peers || []).map((p) => ({
+            node_id: p.node_id,
+            status: p.status,
+            last_seen_at: p.last_seen_at,
+            incident_open: p.incident_open,
+          })),
+        },
+        null,
+        2
+      );
+    }
+  } catch (e) {
+    nwErr(String(e.message || e));
+  }
+}
+
+on("nw-role", "change", nwShowRole);
+on("nw-refresh", "click", renderNodeWatch);
+on("nw-interval", "input", () => {
+  const input = $("nw-interval");
+  if (input) input.dataset.touched = "1";
+});
+on("nw-save-interval", "click", async () => {
+  nwErr("");
+  try {
+    const raw = ($("nw-interval") && $("nw-interval").value.trim()) || "";
+    if (!raw) {
+      nwErr("请填写心跳间隔（秒）");
+      return;
+    }
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 10) {
+      nwErr("心跳间隔至少 10 秒");
+      return;
+    }
+    const res = await api("/api/node-watch/settings", {
+      method: "POST",
+      body: JSON.stringify({ interval_sec: n }),
+    });
+    if (!res.ok) {
+      nwErr(res.error || "save_failed");
+      return;
+    }
+    nwErr(`已保存：心跳间隔 ${res.interval_sec} 秒`);
+    await renderNodeWatch();
+  } catch (e) {
+    nwErr(String(e.message || e));
+  }
+});
+on("nw-gen", "click", async () => {
+  nwErr("");
+  try {
+    const body = {
+      node_id: ($("nw-node-id") && $("nw-node-id").value.trim()) || "",
+      url: ($("nw-url") && $("nw-url").value.trim()) || "",
+      rotate: true,
+    };
+    const res = await api("/api/node-watch/invite/generate", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      nwErr(res.error || "generate_failed");
+      return;
+    }
+    $("nw-invite-box").classList.remove("hidden");
+    $("nw-invite").value = res.invite || "";
+    $("nw-fp").textContent = res.fp || "";
+  } catch (e) {
+    nwErr(String(e.message || e));
+  }
+});
+on("nw-gen-keep", "click", async () => {
+  nwErr("");
+  try {
+    const body = {
+      node_id: ($("nw-node-id") && $("nw-node-id").value.trim()) || "",
+      url: ($("nw-url") && $("nw-url").value.trim()) || "",
+      rotate: false,
+    };
+    const res = await api("/api/node-watch/invite/generate", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      nwErr(res.error || "generate_failed");
+      return;
+    }
+    $("nw-invite-box").classList.remove("hidden");
+    $("nw-invite").value = res.invite || "";
+    $("nw-fp").textContent = res.fp || "";
+  } catch (e) {
+    nwErr(String(e.message || e));
+  }
+});
+on("nw-copy", "click", () => {
+  const t = $("nw-invite");
+  if (t) {
+    t.select();
+    try {
+      document.execCommand("copy");
+      nwErr("已复制");
+    } catch (e) {
+      nwErr("请手动复制");
+    }
+  }
+});
+on("nw-parse", "click", async () => {
+  nwErr("");
+  try {
+    const invite = ($("nw-paste") && $("nw-paste").value) || "";
+    const res = await api("/api/node-watch/invite/parse", {
+      method: "POST",
+      body: JSON.stringify({ invite }),
+    });
+    if (!res.ok) {
+      nwErr(res.error || "parse_failed");
+      return;
+    }
+    $("nw-parse-box").classList.remove("hidden");
+    $("nw-p-url").textContent = res.url || "";
+    $("nw-p-node").textContent = res.node_id || "";
+    $("nw-p-fp").textContent = res.fp || "";
+    $("nw-p-fp-in").value = res.fp || "";
+  } catch (e) {
+    nwErr(String(e.message || e));
+  }
+});
+on("nw-apply", "click", async () => {
+  nwErr("");
+  try {
+    const invite = ($("nw-paste") && $("nw-paste").value) || "";
+    const fp = ($("nw-p-fp-in") && $("nw-p-fp-in").value.trim()) || "";
+    const intervalRaw = ($("nw-interval") && $("nw-interval").value.trim()) || "";
+    const body = { invite, fp };
+    if (intervalRaw) body.interval_sec = Number(intervalRaw);
+    const res = await api("/api/node-watch/invite/apply", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      nwErr(res.error || "apply_failed");
+      return;
+    }
+    nwErr("已保存并启用发送");
+    await renderNodeWatch();
+  } catch (e) {
+    nwErr(String(e.message || e));
+  }
+});
 
 /* ---- init ---- */
 boot();

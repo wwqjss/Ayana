@@ -1,6 +1,6 @@
-﻿# Ayana 安装手册
+# Ayana 安装手册
 
-适用于 **Ayana v0.7.3**。本文只描述安装与运维，不含任何真实凭据。
+适用于 **Ayana v0.7.4**。本文只描述安装与运维，不含任何真实凭据。
 
 ---
 
@@ -25,7 +25,7 @@ git clone https://github.com/wwqjss/Ayana.git
 cd Ayana
 ```
 
-本地若另有 `ayana-v0.7.3-install.tar.gz` 发布包，可解压后同样进入目录安装；**以 GitHub 仓库为准**。
+本地若另有 `ayana-v0.7.4-install.tar.gz` 发布包，可解压后同样进入目录安装；**以 GitHub 仓库为准**。
 
 ---
 
@@ -49,7 +49,7 @@ bash bootstrap.sh --system          # root + systemd；缺啥装啥，全齐则�
 固定版本 / 钉死哈希（需要可复现时）：
 
 ```bash
-AYANA_VERSION=v0.7.3 AYANA_SHA256=<hash> bash bootstrap.sh --system
+AYANA_VERSION=v0.7.4 AYANA_SHA256=<hash> bash bootstrap.sh --system
 ```
 
 ### 3.2 已有源码/解压包
