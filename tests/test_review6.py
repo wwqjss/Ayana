@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -39,6 +40,9 @@ class TestLifecycleNotification(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         db = Database(Path(tmp.name) / "t.db")
         n = Notifier(db, default_target="user:1")
+        n.set_channel_store(SimpleNamespace(list_enabled=lambda: [
+            {"id": "c1", "kind": "qq", "targets": ["user:1"]},
+        ]))
         db.execute(
             "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
             ("inc1", now(), "incident_resolved", "resolved", "{}"),
@@ -51,6 +55,19 @@ class TestLifecycleNotification(unittest.TestCase):
         keys = {r["dedup_key"] for r in db.query("SELECT dedup_key FROM notification_outbox")}
         self.assertEqual(len(keys), 2)
         self.assertTrue(all(k.startswith("ev:") for k in keys))
+        db.close()
+        tmp.cleanup()
+
+    def test_lifecycle_event_without_channels_stays_in_ayana(self):
+        tmp = tempfile.TemporaryDirectory()
+        db = Database(Path(tmp.name) / "t.db")
+        n = Notifier(db, default_target="user:1")
+        db.execute(
+            "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
+            ("inc1", now(), "incident_opened", "opened", '{"body":"x"}'),
+        )
+        self.assertEqual(n.compensate_missing(), 0)
+        self.assertEqual(db.query_one("SELECT COUNT(*) n FROM notification_outbox")["n"], 0)
         db.close()
         tmp.cleanup()
 
@@ -94,16 +111,16 @@ class TestEmptyTargetRetry(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         db = Database(Path(tmp.name) / "t.db")
         n = Notifier(db, default_target="")
-        # 无默认目标 → failed / missing_target
-        ok = n.enqueue(dedup_key="k1", target="", body="hello")
+        # 无默认目标 → failed / missing_target（显式渠道行，测重试补目标）
+        ok = n.enqueue(
+            dedup_key="k1", target="", body="hello", channel="qq", channel_id="c-qq"
+        )
         self.assertFalse(ok)
         row = db.query_one("SELECT state, last_error, target FROM notification_outbox")
         self.assertEqual(row["state"], "failed")
         self.assertEqual(row["target"], "")
         # 配置默认目标后重试
         n.set_default_target("user:1")
-        retried = n.retry_failed("ntf") if False else 0
-        # 用真实 id
         rid = db.query_one("SELECT id FROM notification_outbox")["id"]
         retried = n.retry_failed(rid)
         self.assertEqual(retried, 1)

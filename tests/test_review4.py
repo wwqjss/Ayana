@@ -136,7 +136,8 @@ class TestStaleSamples(unittest.TestCase):
 
 
 class TestPendingVerificationProtectsIncident(unittest.TestCase):
-    def test_am_resolved_hold_while_verifying(self):
+    def test_am_resolved_closes_even_while_verifying(self):
+        # 目标已恢复即闭环，不因 pending verification 挂起
         tmp, db, policy = make_env()
         inc = IncidentService(db)
         db.execute(
@@ -162,10 +163,10 @@ class TestPendingVerificationProtectsIncident(unittest.TestCase):
             (now(), now()),
         )
         inc.on_episode_resolved("ep1")
-        row = db.query_one("SELECT status, stage, need_human FROM incidents WHERE id='inc1'")
-        # pending verification → 不得直接 resolved
-        self.assertEqual(row["status"], "open")
-        self.assertEqual(row["stage"], "watching")
+        row = db.query_one("SELECT status, outcome, close_reason FROM incidents WHERE id='inc1'")
+        self.assertEqual(row["status"], "resolved")
+        self.assertEqual(row["outcome"], "recovered")
+        self.assertEqual(row["close_reason"], "目标已恢复")
         db.close()
         tmp.cleanup()
 
@@ -217,7 +218,7 @@ class TestOutboxDueFilter(unittest.TestCase):
 
 
 class TestHoldIdempotent(unittest.TestCase):
-    def test_hold_not_duplicated(self):
+    def test_recover_not_duplicated(self):
         tmp, db, policy = make_env()
         inc = IncidentService(db)
         db.execute(
@@ -234,7 +235,7 @@ class TestHoldIdempotent(unittest.TestCase):
         for _ in range(3):
             inc.on_episode_resolved("ep1")
         n = db.query_one(
-            "SELECT COUNT(*) AS n FROM events WHERE incident_id='inc1' AND type='alert_resolved_hold'"
+            "SELECT COUNT(*) AS n FROM events WHERE incident_id='inc1' AND type='incident_resolved'"
         )
         self.assertEqual(n["n"], 1)
         db.close()

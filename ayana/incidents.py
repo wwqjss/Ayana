@@ -66,6 +66,7 @@ class IncidentService:
             self.db.event(
                 "episode_attached", f"{alertname} → incident",
                 incident_id=inc_id,
+                episode_id=episode_id,
                 payload={
                     "episode_id": episode_id,
                     "alertname": alertname,
@@ -86,7 +87,8 @@ class IncidentService:
                 conn.execute(
                     "UPDATE incidents SET status='open', resolved_at=NULL, updated_at=?,"
                     " stage='pending', generation=generation+1, outcome='',"
-                    " resolution_basis='', closed_at=NULL, close_reason=''"
+                    " resolution_basis='', closed_at=NULL, close_reason='',"
+                    " need_human=0, need_human_reason=''"
                     " WHERE id=?",
                     (now(), inc_id),
                 )
@@ -94,17 +96,33 @@ class IncidentService:
                     "SELECT generation FROM incidents WHERE id=?", (inc_id,)
                 ).fetchone()
                 gen = int(row["generation"] if row else 1)
+                try:
+                    from .fmt import fmt_incident_open
+
+                    body = fmt_incident_open(
+                        {
+                            "title": f"{asset_id or 'unknown'} / {object_id or alertname}: {alertname}",
+                            "asset_id": asset_id,
+                            "object_id": object_id,
+                            "created_at": now(),
+                        },
+                        at=now(),
+                        refire=True,
+                    )
+                except Exception:
+                    body = f"告警复发\n{asset_id}/{object_id}: {alertname}"
                 conn.execute(
                     "INSERT INTO events(incident_id, episode_id, at, type, title, payload_json)"
                     " VALUES(?,?,?,?,?,?)",
                     (inc_id, episode_id, now(), "incident_reopened",
-                     f"reopened gen={gen} from {alertname}",
+                     f"告警复发 {alertname}",
                      json.dumps(
                          {
                              "episode_id": episode_id,
                              "generation": gen,
                              "problem_family": problem_family,
                              "canonical_object": canonical,
+                             "body": body,
                          },
                          ensure_ascii=False,
                      )),
@@ -153,66 +171,120 @@ class IncidentService:
         if not ep or not ep["incident_id"]:
             return
         inc_id = ep["incident_id"]
-        firing = self.db.query_one(
+        if not self.episode_is_current(inc_id, dict(ep)):
+            return
+        # AM 明确 resolved 同一问题时，收敛仍挂在事件上的 not_seen 僵尸，
+        # 否则旧 not_seen 会一直占着 status=firing，把真实恢复卡住。
+        self.db.execute(
+            "UPDATE alert_episodes SET status='resolved', source_state='resolved', last_seen=?"
+            " WHERE incident_id=? AND status='firing' AND source_state='not_seen'"
+            " AND alertname=? AND asset_id=? AND COALESCE(object_id,'')=? AND first_seen<=?",
+            (now(), inc_id, ep["alertname"] or "", ep["asset_id"] or "", ep["object_id"] or "", ep["first_seen"]),
+        )
+        remaining = self.db.query_one(
             "SELECT COUNT(*) AS n FROM alert_episodes WHERE incident_id=? AND status='firing'",
             (inc_id,),
         )
-        if firing and firing["n"] > 0:
+        n_firing = int(remaining["n"] if remaining else 0)
+        if n_firing > 0:
+            # 同事件还有别的问题在响，先别闭环。
+            # 不要把 stage 打成 watching：那会把事件踢出 Agent 捞取窗口。
             return
-        blocked = self.db.query_one(
-            "SELECT COUNT(*) AS n FROM actions WHERE incident_id=?"
-            " AND (state IN ('unknown','dispatched')"
-            "  OR (state='success' AND id IN (SELECT action_id FROM verifications"
-            "      WHERE status='pending')))",
+        # 目标已恢复：直接闭环，理由=目标已恢复（不再被 need_human / 缺验证卡住）
+        self._force_recovered(inc_id, episode_id=episode_id)
+
+    def episode_is_current(self, inc_id: str, episode: dict) -> bool:
+        """旧代恢复补偿不能清理当前故障；首条 episode 由代次事件明确绑定。"""
+        generation = self.db.query_one(
+            "SELECT id,at,payload_json FROM events WHERE incident_id=? AND type IN"
+            " ('generation_bumped','incident_reopened','incident_opened') ORDER BY id DESC LIMIT 1",
             (inc_id,),
         )
-        need = self.db.query_one("SELECT need_human FROM incidents WHERE id=?", (inc_id,))
-        if (blocked and blocked["n"] > 0) or (need and need["need_human"]):
-            with self.db.tx() as conn:
-                conn.execute(
-                    "UPDATE incidents SET stage='watching', updated_at=? WHERE id=? AND status='open'",
-                    (now(), inc_id),
-                )
-                exists = conn.execute(
-                    "SELECT 1 FROM events WHERE incident_id=? AND type='alert_resolved_hold'"
-                    " AND payload_json LIKE ?",
-                    (inc_id, f"%{episode_id}%"),
-                ).fetchone()
-                if not exists:
-                    conn.execute(
-                        "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
-                        (inc_id, now(), "alert_resolved_hold",
-                         "alerts resolved but obligations remain",
-                         json.dumps({"episode_id": episode_id, "hold": True}, ensure_ascii=False)),
-                    )
-            return
-        res = self.reconcile(inc_id, resolution_basis="alert_resolved")
-        if res.get("status") == "resolved" and res.get("outcome") == "recovered":
-            # 自然恢复：取消不再必要的过时 proposal
-            self._cancel_pending_proposals(inc_id, "incident_recovered")
-            exists = self.db.query_one(
-                "SELECT 1 FROM events WHERE incident_id=? AND type='incident_resolved'"
-                " AND payload_json LIKE ?",
-                (inc_id, f"%{episode_id}%"),
+        if not generation:
+            return True  # 兼容尚未记录代次事件的旧库/人工事件。
+        payload = json.loads(generation["payload_json"] or "{}")
+        if payload.get("episode_id") == episode["id"]:
+            return True
+        attached = self.db.query_one(
+            "SELECT 1 FROM events WHERE incident_id=? AND episode_id=? AND type='episode_attached' AND id>?",
+            (inc_id, episode["id"], generation["id"]),
+        )
+        if attached:
+            return True
+        # 兼容旧版关联事件只在 payload 中记录 episode_id 的历史。
+        for event in self.db.query(
+            "SELECT payload_json FROM events WHERE incident_id=? AND type='episode_attached' AND id>?",
+            (inc_id, generation["id"]),
+        ):
+            if json.loads(event["payload_json"] or "{}").get("episode_id") == episode["id"]:
+                return True
+        return float(episode["first_seen"] or 0) >= float(generation["at"])
+
+    def ensure_recovery_event(self, inc_id: str, *, episode_id: str = "") -> int | None:
+        """已确认的恢复每代只记录一次；状态与事件应在同一外层事务提交。"""
+        with self.db.tx() as conn:
+            row = conn.execute("SELECT * FROM incidents WHERE id=?", (inc_id,)).fetchone()
+            if not row or row["status"] != "resolved" or row["outcome"] != "recovered":
+                return None
+            generation = conn.execute(
+                "SELECT id,at FROM events WHERE incident_id=? AND type IN"
+                " ('generation_bumped','incident_reopened','incident_opened') ORDER BY id DESC LIMIT 1",
+                (inc_id,),
+            ).fetchone()
+            previous = conn.execute(
+                "SELECT id,payload_json FROM events WHERE incident_id=? AND type='incident_resolved' AND id>?",
+                (inc_id, generation["id"] if generation else 0),
+            ).fetchall()
+            for event in previous:
+                payload = json.loads(event["payload_json"] or "{}")
+                if int(payload.get("generation") or row["generation"] or 1) == int(row["generation"] or 1):
+                    return event["id"]
+            from .fmt import fmt_incident_resolved
+            snapshot = dict(row)
+            if generation:
+                snapshot["created_at"] = generation["at"]
+            return self.db.event(
+                "incident_resolved", "目标已恢复", incident_id=inc_id, episode_id=episode_id,
+                payload={"episode_id": episode_id, "generation": int(row["generation"] or 1),
+                         "reason": "目标已恢复", "resolution_basis": row["resolution_basis"],
+                         "body": fmt_incident_resolved(snapshot)},
             )
-            if not exists:
-                self.db.event(
-                    "incident_resolved", "alerts resolved",
-                    incident_id=inc_id,
-                    payload={"episode_id": episode_id, "generation": res.get("generation")},
-                )
+
+    def _force_recovered(self, inc_id: str, *, episode_id: str = "") -> dict[str, Any]:
+        """目标已恢复即闭环：outcome=recovered，理由=目标已恢复。"""
+        t = now()
+        gen = 1
+        with self.db.tx() as conn:
+            row = conn.execute("SELECT * FROM incidents WHERE id=?", (inc_id,)).fetchone()
+            if not row:
+                return {"ok": False, "error": "not_found"}
+            if row["status"] in ("resolved", "closed"):
+                if row["status"] == "resolved":
+                    self.ensure_recovery_event(inc_id, episode_id=episode_id)
+                return {"ok": True, "status": row["status"], "outcome": row["outcome"] or ""}
+            gen = int(row["generation"] or 1)
+            conn.execute(
+                "UPDATE incidents SET status='resolved', stage='done', outcome='recovered',"
+                " resolution_basis='target_recovered', resolved_at=?, updated_at=?,"
+                " need_human=0, need_human_reason='', close_reason='目标已恢复'"
+                " WHERE id=?",
+                (t, t, inc_id),
+            )
+            self.ensure_recovery_event(inc_id, episode_id=episode_id)
+        self._cancel_pending_proposals(inc_id, "target_recovered")
+        return {"ok": True, "status": "resolved", "outcome": "recovered", "generation": gen}
 
     def _cancel_pending_proposals(self, inc_id: str, reason: str) -> int:
-        """不依赖 ActionService 的轻量取消（恢复路径兜底）。"""
+        """终态撤销尚未派发的操作；已批准也不能在恢复后继续执行。"""
         t = now()
         n = 0
         rows = self.db.query(
-            "SELECT id FROM actions WHERE incident_id=? AND state='proposed'", (inc_id,)
+            "SELECT id FROM actions WHERE incident_id=? AND state IN ('proposed','approved')", (inc_id,)
         )
         for r in rows:
             cur = self.db.execute(
                 "UPDATE actions SET state='cancelled', finished_at=?, result_detail=?"
-                " WHERE id=? AND state='proposed'",
+                " WHERE id=? AND state IN ('proposed','approved')",
                 (t, f"stale:{reason}", r["id"]),
             )
             if cur and cur.rowcount:
@@ -275,9 +347,9 @@ class IncidentService:
         # 兼容旧字段，同时保存并行义务；一次新的等待批准不能覆盖别的人工任务。
         with self.db.tx() as conn:
             row = conn.execute(
-                "SELECT need_human, need_human_reason FROM incidents WHERE id=?", (inc_id,)
+                "SELECT status, need_human, need_human_reason FROM incidents WHERE id=?", (inc_id,)
             ).fetchone()
-            if not row:
+            if not row or row["status"] != "open":
                 return
             reasons = [s for s in (row["need_human_reason"] or "").splitlines() if s]
             if row["need_human"] and not reasons:
@@ -285,7 +357,7 @@ class IncidentService:
             if reason and reason not in reasons:
                 reasons.append(reason)
             conn.execute(
-                "UPDATE incidents SET need_human=1, need_human_reason=?, updated_at=? WHERE id=?",
+                "UPDATE incidents SET need_human=1, need_human_reason=?, stage='need_human', updated_at=? WHERE id=?",
                 ("\n".join(reasons), now(), inc_id),
             )
         self.db.event("need_human", reason, incident_id=inc_id)
@@ -299,10 +371,13 @@ class IncidentService:
         )
 
     def clear_awaiting_approval(self, inc_id: str, action_id: str) -> None:
+        self.clear_action_obligation(inc_id, action_id)
+
+    def clear_action_obligation(self, inc_id: str, action_id: str, kind: str = "awaiting_approval") -> None:
         """只清除已经决定的这个提案的义务，保留其他人工处理原因。"""
         if not inc_id:
             return
-        prefix = f"awaiting_approval:{action_id}"
+        prefix = f"{kind}:{action_id}"
         with self.db.tx() as conn:
             row = conn.execute(
                 "SELECT need_human_reason, stage FROM incidents WHERE id=?", (inc_id,)
@@ -326,7 +401,8 @@ class IncidentService:
         """自动恢复的来源闸；无告警来源的人工事件仍可由其他契约约束。"""
         row = self.db.query_one(
             "SELECT id, source_state, source_health FROM alert_episodes WHERE incident_id=?"
-            " AND (source_state='quarantine' OR source_health!='ok') LIMIT 1",
+            " AND (source_state='quarantine' OR source_health!='ok')"
+            " ORDER BY (source_state='quarantine' OR source_health='quarantine') DESC LIMIT 1",
             (inc_id,),
         )
         if not row:
@@ -335,11 +411,99 @@ class IncidentService:
             return f"quarantined_source:{row['id']}"
         return f"unhealthy_source:{row['id']}:{row['source_health']}"
 
+    def has_blocking_obligations(self, inc_id: str, *, include_proposed: bool = False) -> bool:
+        """自动恢复阻塞判定单点（P1-2）。
+
+        以 incidents.reconcile 的阻塞集合为准：
+        - firing episodes
+        - actions: unknown/dispatched 或 success 且有待验证
+        - pending verifications
+        - need_human
+
+        include_proposed=True 时（exttx 语义）额外把 proposed/approved 也视为阻塞。
+        """
+        if not inc_id:
+            return False
+        row = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM alert_episodes WHERE incident_id=? AND status='firing'",
+            (inc_id,),
+        )
+        if row and int(row["n"] or 0) > 0:
+            return True
+        if include_proposed:
+            row = self.db.query_one(
+                "SELECT COUNT(*) AS n FROM actions WHERE incident_id=?"
+                " AND state IN ('unknown','dispatched','proposed','approved')",
+                (inc_id,),
+            )
+        else:
+            row = self.db.query_one(
+                "SELECT COUNT(*) AS n FROM actions WHERE incident_id=?"
+                " AND (state IN ('unknown','dispatched')"
+                "  OR (state='success' AND id IN (SELECT action_id FROM verifications"
+                "      WHERE status='pending')))",
+                (inc_id,),
+            )
+        if row and int(row["n"] or 0) > 0:
+            return True
+        row = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM verifications WHERE incident_id=? AND status='pending'",
+            (inc_id,),
+        )
+        if row and int(row["n"] or 0) > 0:
+            return True
+        inc = self.db.query_one("SELECT need_human FROM incidents WHERE id=?", (inc_id,))
+        return bool(inc and inc["need_human"])
+
+    def object_actions_locked(self, asset_id: str, object_id: str, *, exclude: str = "") -> bool:
+        """对象上是否存在未了结写操作（object lock / no-replay）。"""
+        row = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM actions"
+            " WHERE asset_id=? AND object_id=? AND id != ?"
+            " AND (state IN ('unknown','dispatched')"
+            "  OR (state='success' AND id IN (SELECT action_id FROM verifications"
+            "      WHERE status='pending')))",
+            (asset_id, object_id, exclude),
+        )
+        return bool(row and int(row["n"] or 0) > 0)
+
     def set_stage(self, inc_id: str, stage: str, note: str = "") -> None:
         self.db.execute(
             "UPDATE incidents SET stage=?, updated_at=? WHERE id=?", (stage, now(), inc_id)
         )
         self.db.event("stage_changed", note or stage, incident_id=inc_id, payload={"stage": stage})
+
+    def on_verification_finished(
+        self, inc_id: str, action_id: str, verification_id: str, generation: int, status: str,
+        *, reason: str = "",
+    ) -> dict[str, Any]:
+        """验证只提交本代证据；生命周期统一在这里收敛。
+
+        迟到结果保留在 verifications，不得污染新代次、人工关闭或来源确认的恢复。
+        当前代验证不通过仍需人工，避免对同一故障无限重启。
+        """
+        row = self.db.query_one("SELECT * FROM incidents WHERE id=?", (inc_id,))
+        if not row:
+            return {"ok": False, "error": "not_found"}
+        if int(row["generation"] or 1) != generation:
+            return {"ok": True, "skipped": "stale_generation"}
+        if row["status"] == "closed" or (
+            row["status"] == "resolved" and row["resolution_basis"] == "target_recovered"
+        ):
+            return {"ok": True, "skipped": "terminal_incident"}
+        if status in ("failed", "inconclusive", "unknown"):
+            self.db.execute(
+                "UPDATE incidents SET stage='need_human',"
+                " status=CASE WHEN status='resolved' THEN 'open' ELSE status END,"
+                " resolved_at=CASE WHEN status='resolved' THEN NULL ELSE resolved_at END,"
+                " outcome=CASE WHEN status='resolved' THEN 'unrecovered' ELSE outcome END,"
+                " updated_at=? WHERE id=?",
+                (now(), inc_id),
+            )
+            self.set_need_human(inc_id, reason or f"verify_{status}:{verification_id}")
+        elif status == "passed":
+            self.clear_awaiting_approval(inc_id, action_id)
+        return self.reconcile(inc_id, resolution_basis=f"verification:{verification_id}")
 
     # ---- 唯一收敛 ----
 
@@ -352,6 +516,11 @@ class IncidentService:
             return {"ok": False, "error": "not_found"}
         inc = dict(row)
         gen = int(inc.get("generation") or 1)
+        # 来源明确恢复是终态事实；普通 reconcile 不能改写它的依据。
+        # 新故障必须经 upsert_from_episode 进入新 generation。
+        if inc["status"] == "resolved" and inc.get("resolution_basis") == "target_recovered":
+            return {"ok": True, "status": "resolved", "stage": "done", "outcome": "recovered",
+                    "generation": gen, "blocked": [], "resolution_basis": "target_recovered"}
 
         # 兼容修复前遗留的等待批准标志，只用当前代次的决定/通过证据核销对应义务。
         generation = self.db.query_one(
@@ -460,6 +629,30 @@ class IncidentService:
         else:
             outcome = inc.get("outcome") or "unknown"
 
+        # 展示阶段由当前义务/操作事实推导，不能在动作已执行后仍显示“待调查”。
+        if status == "open":
+            from .actions import action_incident_block
+            current_states = {
+                action["state"] for action in self.db.query(
+                    "SELECT * FROM actions WHERE incident_id=? AND state IN"
+                    " ('proposed','approved','dispatched','success','unknown')", (inc_id,),
+                ) if not action_incident_block(self.db, action)
+            }
+            if need:
+                obligations = [r for r in (inc.get("need_human_reason") or "").splitlines() if r]
+                stage = "awaiting_approval" if (
+                    "proposed" in current_states and obligations
+                    and all(r.startswith("awaiting_approval:") for r in obligations)
+                ) else "need_human"
+            elif n_pending:
+                stage = "verifying"
+            elif "dispatched" in current_states or "approved" in current_states:
+                stage = "executing"
+            elif "proposed" in current_states:
+                stage = "awaiting_approval"
+            elif "success" in current_states or stage in ("executing", "verifying", "awaiting_approval"):
+                stage = "watching"
+
         # 迟到的旧 generation passed：只记历史，不改 outcome
         stale_passed = self.db.query_one(
             "SELECT COUNT(*) AS n FROM verifications WHERE incident_id=? AND status='passed'"
@@ -473,6 +666,8 @@ class IncidentService:
                 " resolved_at=?, updated_at=? WHERE id=?",
                 (status, stage, outcome, basis, resolved_at, now(), inc_id),
             )
+            if status == "resolved" and outcome == "recovered":
+                self.ensure_recovery_event(inc_id)
         return {
             "ok": True,
             "status": status,
@@ -584,12 +779,13 @@ class IncidentService:
         return out
 
     def summary_text(self, inc_id: str, *, for_qq: bool = False) -> str:
+        from .fmt import ZH_STATUS
+
         inc = self.get_incident(inc_id)
         if not inc:
             return "未找到事件"
-        zh_status = {"open": "处理中", "resolved": "已解决", "closed": "已关闭"}
         title = inc.get("title") or ""
-        status = zh_status.get(inc.get("status"), inc.get("status") or "")
+        status = ZH_STATUS.get(inc.get("status"), inc.get("status") or "")
         outcome = inc.get("outcome") or "-"
         gen = inc.get("generation") or 1
         if for_qq:

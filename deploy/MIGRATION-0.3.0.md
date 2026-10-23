@@ -11,7 +11,7 @@
 | 检查项 | 命令/方式 | 期望 |
 |--------|-----------|------|
 | 当前生产版本/进程 | `ps aux \| grep ayana` / `curl :6200/health` | 旧 setsid root 进程在跑 |
-| DB backup | `ayana.backup.create_backup` 或 `sqlite3 .backup` | 一致性备份成功并离线保存 |
+| DB backup | `python -m ayana.backup create ayana.db /root/backup/ayana-pre-0.3.db` | 一致性备份成功并离线保存 |
 | config/secrets 权限 | `ls -l /root/Ayana/secrets.json config.json` | secrets 600 |
 | SSH identity | NT describe / `known_hosts` | host_id 可核 |
 | astrbot-describe readiness | 远端 `astrbot-nt-command describe` | 返回 mode+host_id |
@@ -48,6 +48,23 @@
 ```
 
 **禁止**：迁移窗口内开启 auto remediation；禁止顺手改业务权限。
+
+---
+
+## 2.1 备份 CLI
+
+备份/恢复校验使用内置 CLI：
+
+```bash
+# 在线一致性备份
+python -m ayana.backup create /path/to/ayana.db /path/to/backup.db
+
+# 校验备份文件
+python -m ayana.backup validate /path/to/backup.db
+
+# 恢复到隔离临时库并校验（不覆盖生产）
+python -m ayana.backup restore-rehearsal /path/to/backup.db
+```
 
 ---
 

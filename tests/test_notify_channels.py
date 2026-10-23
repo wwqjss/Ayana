@@ -102,6 +102,41 @@ class TestNotifyChannels(unittest.TestCase):
         n.enqueue_for_event(1, body="hello")
         self.assertEqual(len(n.outbox_summary()), 2)
 
+    def test_legacy_enqueue_fans_out_to_enabled_channels(self):
+        """未指定 channel_id 的遗留 enqueue（Agent 升级等）也走启用渠道，不绑死 QQ。"""
+        qq = self.store.create(
+            name="qq",
+            kind="qq",
+            config={"target": "user:1"},
+            enabled=True,
+        )
+        self.store.create(
+            name="wecom",
+            kind="wecom_aibot",
+            config={"bot_id": "BOT1", "targets": ["wrh_x"]},
+            secret={"bot_id": "BOT1", "secret": "SEC1"},
+            enabled=True,
+        )
+        n = Notifier(self.db, default_target="user:1")
+        n.set_channel_store(self.store)
+        # 关闭 QQ 后仍应发到企微
+        self.store.set_enabled(qq["id"], False)
+        ok = n.enqueue(dedup_key="agent:esc:inc:1", target="", body="需要你处理")
+        self.assertTrue(ok)
+        rows = n.outbox_summary()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["channel"], "wecom_aibot")
+        self.assertEqual(rows[0]["target"], "wrh_x")
+        self.assertTrue(rows[0]["channel_id"])
+        self.assertEqual(rows[0]["state"], "pending")
+
+    def test_legacy_enqueue_without_channels_stays_in_ayana(self):
+        """未配置/全关：不发外部，也不回落 QQ。"""
+        n = Notifier(self.db, default_target="user:1")
+        ok = n.enqueue(dedup_key="agent:esc:inc:2", target="", body="hi")
+        self.assertFalse(ok)
+        self.assertEqual(n.outbox_summary(), [])
+
     def test_one_channel_fail_does_not_block_other(self):
         async def run():
             self.store.create(

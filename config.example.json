@@ -10,10 +10,27 @@
   "db_path": "ayana.db",
   "prometheus_url": "http://127.0.0.1:9090",
   "alertmanager_url": "http://127.0.0.1:9093",
+  "alertmanager_webhook_path": "/hooks/alertmanager",
   "admin_qq": "",
+  "admin_wecom_users": [],
   "auto_remediation_enabled": false,
+  "autonomous_agent": {
+    "enabled": false,
+    "budget_cny": 100,
+    "warning_ratio": 0.8,
+    "max_calls_per_incident": 60,
+    "max_calls_per_generation": 30,
+    "roles": {
+      "planner": {"provider": "mimo", "base_url": "https://api.xiaomimimo.com/v1", "model": "mimo-v2.6-pro", "timeout": 60, "retries": 0, "input_cny_per_million": null, "output_cny_per_million": null},
+      "reviewer_kimi": {"provider": "kimi", "base_url": "https://api.moonshot.cn/v1", "model": "kimi-k2.6", "timeout": 60, "retries": 0, "input_cny_per_million": null, "output_cny_per_million": null},
+      "reviewer_deepseek": {"provider": "deepseek", "base_url": "https://api.deepseek.com", "model": "deepseek-v4-pro", "timeout": 60, "retries": 0, "input_cny_per_million": null, "output_cny_per_million": null}
+    }
+  },
   "verify_window_sec": 90,
   "verify_timeout_sec": 300,
+  "required_checks": {},
+  "runbook_rules": [],
+  "prometheus_config": {},
   "node_watch": {
     "send": {
       "enabled": false,

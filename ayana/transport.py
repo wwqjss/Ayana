@@ -37,18 +37,6 @@ _SSRF_BLOCKED_HOSTNAMES = frozenset(
 )
 
 
-def _is_ip_literal(host: str) -> bool:
-    h = host.strip().lower()
-    if h.startswith("[") and h.endswith("]"):
-        h = h[1:-1]
-    # IPv4
-    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", h):
-        parts = [int(x) for x in h.split(".")]
-        return all(0 <= p <= 255 for p in parts) and len(parts) == 4
-    # 粗 IPv6
-    return ":" in h and re.fullmatch(r"[0-9a-f:]+", h) is not None
-
-
 def _normalize_host_ip(host: str) -> str | None:
     """规范化主机为 IP 字符串；无法解析为 IP 则返回 None。"""
     h = (host or "").strip().lower().strip("[]")
@@ -755,3 +743,39 @@ class SSHTransport:
 
 
 # NT 实现已移除。仅保留原生 SSH（Transport）。
+# LocalExecTransport 保留在 promconfig.py（node_exporter 本机安装/控制用），
+# 通道解析统一走 resolve_exec_channel，避免第三份实现。
+
+
+class ChannelUnavailable(Exception):
+    """资产既无 SSH 端点也不在 local_assets 集合。"""
+
+
+def resolve_exec_channel(
+    asset_id: str,
+    ssh_transport: Any | None,
+    *,
+    local_assets: set[str] | None = None,
+    role: str = "read",
+) -> Any:
+    """统一执行通道解析：有 SSH 端点用 SSH；仅本机登记资产才允许 LocalExec。
+
+    合并自 main._checks_transport 与 web._ne_transport 两处重复回落逻辑。
+    SSH 失败不得静默跨主机回退；找不到通道抛 ChannelUnavailable。
+    """
+    local_assets = local_assets or set()
+    store = getattr(ssh_transport, "store", None) if ssh_transport is not None else None
+    if store is not None:
+        try:
+            ep = store.get_endpoint(asset_id, role) or store.get_endpoint(
+                asset_id, "write" if role == "read" else "read"
+            )
+        except Exception:
+            ep = None
+        if ep and ep.get("enabled") and ssh_transport is not None:
+            return ssh_transport
+    if asset_id in local_assets:
+        from .promconfig import LocalExecTransport
+
+        return LocalExecTransport()
+    raise ChannelUnavailable(f"asset_channel_unavailable:{asset_id}")

@@ -11,14 +11,14 @@ import logging
 import time
 from typing import Any
 
-from .actions import ActionService
+from .actions import AUTO_RETRYABLE_BLOCKS, ActionError, ActionService, action_incident_block
 from .db import Database, now
 from .investigation import InvestigationService
 from .knowledge import KnowledgeBase
 from .llm import LLMClient
 from .notify import Notifier
 from .policy import Policy
-from .runbook import RunbookRule, match_runbook
+from .runbook import RunbookRule, auto_budget_state, match_runbook
 
 log = logging.getLogger("ayana.agent")
 
@@ -43,6 +43,7 @@ class AgentLoop:
         self.llm = llm
         self.notifier = notifier
         self.auto_enabled = auto_enabled
+        self.autonomy_enabled = lambda: False
         self.knowledge = knowledge or KnowledgeBase(db)
 
     def set_auto_enabled(self, enabled: bool) -> None:
@@ -68,26 +69,25 @@ class AgentLoop:
             return {"ok": True, "skipped": "not_open"}
         from .incidents import IncidentService
 
+        result: dict[str, Any] = {"incident_id": inc_id, "steps": []}
         blocked = IncidentService(self.db).source_block_reason(inc_id)
         if blocked:
-            self._escalate(inc_id, blocked, None)
+            if blocked.startswith("unhealthy_source:"):
+                return self._wait_for_preconditions(
+                    inc, None, result, {"blockers": ["source_health"], "reasons": [blocked]},
+                )
+            self._escalate(inc, blocked, None)
             return {"ok": True, "incident_id": inc_id, "action": "escalated_source", "reason": blocked}
 
-        result: dict[str, Any] = {"incident_id": inc_id, "steps": []}
-
-        # 本 generation 周期内已有 Action：交给人 / 验证 / reconcile，不重复调查提案
-        gen_ev = self.db.query_one(
-            "SELECT at FROM events WHERE incident_id=? AND type IN"
-            " ('generation_bumped','incident_reopened','incident_opened')"
-            " ORDER BY id DESC LIMIT 1",
-            (inc_id,),
-        )
-        cutoff = float(gen_ev["at"]) if gen_ev else 0.0
-        prior = self.db.query_one(
-            "SELECT id, state FROM actions WHERE incident_id=? AND created_at>=?"
-            " ORDER BY created_at DESC LIMIT 1",
-            (inc_id, cutoff),
-        )
+        # 本 generation 周期内已有有效 Action：交给人 / 验证 / reconcile，不重复调查提案。
+        # 过期/取消/失败的历史 action 不算，否则一代过期就永远不再自动处置。
+        rejected = self._current_rejection(inc_id)
+        if rejected:
+            result["action"] = "skipped_rejected"
+            result["action_id"] = rejected["id"]
+            return result
+        current_actions = self._current_actions(inc_id)
+        prior = current_actions[0] if current_actions else None
         if prior:
             result["steps"].append({
                 "step": "skip_prior_action",
@@ -97,6 +97,13 @@ class AgentLoop:
             })
             result["action"] = f"skipped_prior_{prior['state']}"
             result["action_id"] = prior["id"]
+            return result
+
+        waiting = self._waiting_state(inc)
+        if waiting and float(waiting.get("retry_at") or 0) > now():
+            result["action"] = "waiting_precondition"
+            result["retry_at"] = waiting["retry_at"]
+            result["reasons"] = waiting.get("reasons") or []
             return result
 
         # 0. 运维知识（Markdown）：主题正文 / 共同命中（含 extra_failures）
@@ -115,6 +122,7 @@ class AgentLoop:
         knowledge_text = knol.get("context_text") or ""
 
         # 1. 证据驱动有限循环只读调查（与自动写解耦）
+        evidence = []
         try:
             inv = await self.investigation.run_loop(
                 asset_id=inc["asset_id"],
@@ -124,6 +132,8 @@ class AgentLoop:
                 actor_id="agent",
                 extra_failures=extra_failures,
             )
+            if not self._incident_context_current(inc, result):
+                return result
             evidence = inv.get("evidence") or []
             result["steps"].append({
                 "step": "investigate",
@@ -148,10 +158,14 @@ class AgentLoop:
                 if not any(
                     (e.get("classification") == "observed") for e in evidence
                 ):
-                    self._escalate(inc_id, f"investigation_{inv.get('stop_reason')}", None)
-                    result["action"] = "escalated_investigation"
-                    return result
+                    return self._wait_for_preconditions(
+                        inc, None, result,
+                        {"reasons": [f"investigation_{inv.get('stop_reason')}"],
+                         "blockers": ["exec_channel"]},
+                    )
         except Exception as e:
+            if not self._incident_context_current(inc, result):
+                return result
             result["steps"].append({"step": "investigate", "ok": False, "error": str(e)})
             evidence_text = ""
 
@@ -173,6 +187,8 @@ class AgentLoop:
                 })
             except Exception as e:
                 result["steps"].append({"step": "llm_analyze", "ok": False, "error": str(e)})
+            if not self._incident_context_current(inc, result):
+                return result
 
         # 3. runbook 查表（零自由度）
         alertname = ""
@@ -199,12 +215,20 @@ class AgentLoop:
         })
 
         if not rule:
-            self._escalate(inc_id, "no_runbook_match", llm_result)
+            # A missing fast-path Runbook is not a human decision when the
+            # autonomous investigator is enabled. Its own durable notices
+            # handle model failures and manual adjudication.
+            if self.autonomy_enabled():
+                result["action"] = "delegated_autonomy"
+                return result
+            self._escalate(inc, "no_runbook_match", llm_result)
             result["action"] = "escalated"
             return result
 
         # 3b. 确定性前置判据（P0-03）
         pre = await self._precondition_context(inc, rule, evidence)
+        if not self._incident_context_current(inc, result):
+            return result
         pre_result = rule.check_preconditions(pre)
         result["steps"].append({
             "step": "preconditions",
@@ -237,29 +261,35 @@ class AgentLoop:
         result["decision"] = decision.get("decision")
 
         if decision.get("decision") == "forbidden" or not decision.get("allowed"):
-            self._escalate(inc_id, f"policy_denied:{decision.get('reason', '')}", llm_result)
+            self._escalate(inc, f"policy_denied:{decision.get('reason', '')}", llm_result)
             result["action"] = "escalated_policy"
             return result
 
-        # 5. 分支：automatic 且允许自动派发 → 执行；否则形成 proposal 等人
-        if decision.get("decision") == "automatic" and self.auto_enabled:
-            reasons = pre_result.get("reasons") or []
-            hard_stop = any(
-                ("global_pause" in r) or ("control_plane" in r) or ("verification_contract" in r)
-                for r in reasons
-            )
-            if pre_result.get("status") != "satisfied" and hard_stop:
+        # 前置失败不是权限审批：临时阻塞等待重检，缺少执行契约则找人处理。
+        # approval_required 的 policy blocker 只表示缺自动权，其他前置仍须满足。
+        blockers = pre_result.get("blockers") or [
+            r.split(":", 1)[0] for r in pre_result.get("reasons") or []
+        ]
+        runtime_blockers = [b for b in blockers if b != "policy"]
+        if runtime_blockers:
+            hard_stop = any(b in (
+                "control_plane_object", "verification_contract", "asset_match", "object_match",
+                "write_result_unknown",
+            ) for b in runtime_blockers)
+            if hard_stop:
                 self._escalate(
-                    inc_id,
-                    f"precondition_{pre_result.get('status')}:{';'.join(reasons)}",
+                    inc,
+                    f"precondition_{pre_result.get('status')}:{';'.join(pre_result.get('reasons') or [])}",
                     llm_result,
                 )
                 result["action"] = "escalated_precondition"
                 return result
+            return self._wait_for_preconditions(inc, rule, result, pre_result)
+
+        # 唯有真实自动执行权不足或自动开关关闭才请求单次人工批准。
+        if decision.get("decision") == "automatic" and self.auto_enabled:
             if pre_result.get("status") != "satisfied":
-                return self._propose_for_human(
-                    inc, rule, result, decision, pre_result, llm_result, evidence_text
-                )
+                return self._wait_for_preconditions(inc, rule, result, pre_result)
             return await self._auto_dispatch(inc, rule, result, decision, pre_result)
 
         return self._propose_for_human(
@@ -312,13 +342,12 @@ class AgentLoop:
         evidence_text: str,
     ) -> dict[str, Any]:
         """创建 proposed Action，等待人工批准。零自动派发。"""
+        if not self._incident_context_current(inc, result):
+            return result
         inc_id = inc["id"]
         # 避免重复提案：同一 incident 已有 proposed 则复用
-        existing = self.db.query_one(
-            "SELECT id, state FROM actions WHERE incident_id=? AND state='proposed'"
-            " AND runbook_id=? ORDER BY created_at DESC LIMIT 1",
-            (inc_id, rule.id),
-        )
+        existing = next((a for a in self._current_actions(inc_id)
+                         if a["state"] == "proposed" and a["runbook_id"] == rule.id), None)
         if existing:
             result["steps"].append({
                 "step": "propose",
@@ -355,25 +384,23 @@ class AgentLoop:
                 "UPDATE incidents SET stage='awaiting_approval', updated_at=? WHERE id=?",
                 (now(), inc_id),
             )
-            self.db.event(
-                "proposal_waiting",
-                f"proposal {action_id} awaiting human approval",
-                incident_id=inc_id,
-                payload={
-                    "action_id": action_id,
-                    "rule": rule.id,
-                    "decision": decision.get("decision"),
-                    "preconditions": pre_result.get("status"),
-                    "evidence_summary": (evidence_text or "")[:400],
-                },
-            )
             result["steps"].append({"step": "propose", "ok": True, "action_id": action_id})
             result["action"] = "awaiting_approval"
             result["action_id"] = action_id
-            self._notify_awaiting_approval(inc_id, action_id, rule, decision, pre_result)
+            self._notify_awaiting_approval(
+                inc_id, action_id, rule, decision, pre_result, evidence_text=evidence_text,
+            )
+        except ActionError as e:
+            if e.code == "object_locked":
+                return self._wait_for_preconditions(
+                    inc, rule, result, {"blockers": ["object_lock"], "reasons": [str(e)]},
+                )
+            result["steps"].append({"step": "propose", "ok": False, "error": str(e)})
+            self._escalate(inc, f"propose_error:{e}", llm_result)
+            result["action"] = "escalated_error"
         except Exception as e:
             result["steps"].append({"step": "propose", "ok": False, "error": str(e)})
-            self._escalate(inc_id, f"propose_error:{e}", llm_result)
+            self._escalate(inc, f"propose_error:{e}", llm_result)
             result["action"] = "escalated_error"
         return result
 
@@ -386,7 +413,10 @@ class AgentLoop:
         pre_result: dict,
     ) -> dict[str, Any]:
         """automatic + auto_enabled + 前置满足：唯一派发门内自动执行。"""
+        if not self._incident_context_current(inc, result):
+            return result
         inc_id = inc["id"]
+        action_id = ""
         try:
             obj = self.db.query_one(
                 "SELECT id FROM objects WHERE asset_id=? AND (id=? OR name=?)",
@@ -401,7 +431,7 @@ class AgentLoop:
             )
             if stuck:
                 self._escalate(
-                    inc_id, f"no_replay_unknown:{stuck['id']}", None
+                    inc, f"no_replay_unknown:{stuck['id']}", None
                 )
                 result["steps"].append(
                     {
@@ -451,25 +481,50 @@ class AgentLoop:
             self._record_usage(rule.id, inc["asset_id"], inc.get("object_id") or "")
 
             if exec_result.get("state") == "success":
-                self.db.event(
-                    "agent_auto_exec",
-                    f"runbook {rule.id} executed",
-                    incident_id=inc_id,
-                    payload={"action_id": action_id, "rule": rule.id},
-                )
                 from .fmt import fmt_agent_exec
 
                 inc_d = dict(self.db.query_one("SELECT * FROM incidents WHERE id=?", (inc_id,)) or {})
-                self.notifier.enqueue(
-                    dedup_key=f"agent:{inc_id}:{rule.id}:{int(now())}",
-                    target="",
-                    body=fmt_agent_exec(inc_d, rule.name, rule.capability),
+                body = fmt_agent_exec(inc_d, rule.name, rule.capability)
+                event_id = self.db.event(
+                    "agent_auto_exec",
+                    f"runbook {rule.id} executed",
+                    incident_id=inc_id,
+                    payload={"action_id": action_id, "rule": rule.id,
+                             "generation": int(inc.get("generation") or 1), "body": body},
                 )
+                self._notify_event(event_id, "agent_auto_exec", body)
             else:
-                self._escalate(inc_id, f"exec_{exec_result.get('state')}", None)
-        except Exception as e:
+                self._escalate(inc, f"exec_{exec_result.get('state')}", None)
+        except ActionError as e:
+            if not self._incident_context_current(inc, result):
+                return result
+            transient = {"cooldown": "budget", "budget_exhausted": "budget",
+                         "global_pause": "global_pause", "object_locked": "object_lock",
+                         "source_unavailable": "source_health"}
+            if e.code in AUTO_RETRYABLE_BLOCKS:
+                if action_id:
+                    if not self.actions.safe_cancel_pending_auto(action_id, reason=e.code):
+                        self._escalate(inc, f"no_replay_unknown:{action_id}", None)
+                        result["action"] = "escalated_no_replay"
+                        return result
+                    from .incidents import IncidentService
+
+                    service = IncidentService(self.db)
+                    for kind in ("source_unavailable", "source_unhealthy"):
+                        service.clear_action_obligation(inc_id, action_id, kind=kind)
+                budget = auto_budget_state(self.db, rule, inc["asset_id"], inc.get("object_id") or "", at=now())
+                return self._wait_for_preconditions(inc, rule, result, {
+                    "blockers": [transient[e.code]], "reasons": [f"{e.code}:{e}"],
+                    "budget_reason": budget["reason"], "retry_at": budget["retry_at"],
+                })
             result["steps"].append({"step": "execute", "ok": False, "error": str(e)})
-            self._escalate(inc_id, f"exec_error:{e}", None)
+            self._escalate(inc, f"exec_error:{e}", None)
+            result["action"] = "escalated_error"
+        except Exception as e:
+            if not self._incident_context_current(inc, result):
+                return result
+            result["steps"].append({"step": "execute", "ok": False, "error": str(e)})
+            self._escalate(inc, f"exec_error:{e}", None)
             result["action"] = "escalated_error"
         return result
 
@@ -480,8 +535,10 @@ class AgentLoop:
         rule: RunbookRule,
         decision: dict,
         pre_result: dict,
+        *,
+        evidence_text: str = "",
     ) -> None:
-        from .fmt import fmt_escalate
+        from .fmt import fmt_approve_request
 
         inc = self.db.query_one("SELECT * FROM incidents WHERE id=?", (inc_id,))
         inc_d = dict(inc) if inc else {"id": inc_id, "title": "", "asset_id": "", "object_id": ""}
@@ -497,12 +554,182 @@ class AgentLoop:
             "UPDATE incidents SET stage='awaiting_approval', updated_at=? WHERE id=?",
             (now(), inc_id),
         )
-        body = fmt_escalate(inc_d, reason, "")
-        self.notifier.enqueue(
-            dedup_key=f"agent:await:{inc_id}:{action_id}",
-            target="",
-            body=body,
+        action = self.db.query_one("SELECT * FROM actions WHERE id=?", (action_id,))
+        body = fmt_approve_request(inc_d, dict(action) if action else {
+            "capability": rule.capability, "object_id": inc_d.get("object_id") or "",
+        }, rule_name=rule.name)
+        event_id = None
+        payload = {}
+        for event in self.db.query(
+            "SELECT id,payload_json FROM events WHERE incident_id=? AND type='proposal_waiting'"
+            " ORDER BY id DESC", (inc_id,),
+        ):
+            candidate = json.loads(event["payload_json"] or "{}")
+            if candidate.get("action_id") == action_id:
+                event_id, payload = event["id"], candidate
+                break
+        payload.update({
+            "action_id": action_id, "rule": rule.id,
+            "generation": int(inc_d.get("generation") or 1), "body": body,
+            "decision": decision.get("decision"), "preconditions": pre_result.get("status"),
+            "evidence_summary": (evidence_text or "")[:400],
+        })
+        if event_id is None:
+            event_id = self.db.event(
+                "proposal_waiting", "等待人工授权", incident_id=inc_id, payload=payload,
+            )
+        else:
+            self.db.execute(
+                "UPDATE events SET payload_json=? WHERE id=?",
+                (json.dumps(payload, ensure_ascii=False), event_id),
+            )
+        self._notify_event(event_id, "proposal_waiting", body)
+
+    def _notify_event(self, event_id: int | None, typ: str, body: str) -> None:
+        """先落事件义务；发送异常由 outbox 补偿，不反向改变处置状态。"""
+        try:
+            if hasattr(self.notifier, "enqueue_for_event"):
+                self.notifier.enqueue_for_event(event_id, body=body, typ=typ)
+            else:
+                # 兼容只收集文案的轻量测试替身。
+                self.notifier.enqueue(dedup_key=f"ev:{event_id}", target="", body=body)
+        except Exception:
+            log.exception("agent notification deferred to compensation: %s", event_id)
+
+    def _generation_cutoff(self, inc_id: str) -> float:
+        row = self.db.query_one(
+            "SELECT at FROM events WHERE incident_id=? AND type IN"
+            " ('generation_bumped','incident_reopened','incident_opened')"
+            " ORDER BY id DESC LIMIT 1", (inc_id,),
         )
+        return float(row["at"]) if row else 0.0
+
+    def _incident_context_current(self, inc: dict, result: dict | None = None) -> bool:
+        """异步调查只属于启动时的故障代次，迟到上下文不能改写终态或新代。"""
+        current = self.db.query_one("SELECT status,generation FROM incidents WHERE id=?", (inc["id"],))
+        same = bool(current and current["status"] == "open"
+                    and int(current["generation"] or 1) == int(inc.get("generation") or 1))
+        if not same and result is not None:
+            result["action"] = "skipped_incident_changed"
+            result["skipped"] = "stale_generation" if current and (
+                int(current["generation"] or 1) != int(inc.get("generation") or 1)
+            ) else "not_open"
+        return same
+
+    def _current_actions(self, inc_id: str) -> list[Any]:
+        rows = self.db.query(
+            "SELECT * FROM actions WHERE incident_id=? AND created_at>=?"
+            " AND state IN ('proposed','approved','dispatched','success','unknown')"
+            " ORDER BY created_at DESC",
+            (inc_id, self._generation_cutoff(inc_id)),
+        )
+        return [row for row in rows if not action_incident_block(self.db, row)]
+
+    def _current_rejection(self, inc_id: str) -> Any | None:
+        cutoff = self._generation_cutoff(inc_id)
+        rows = self.db.query(
+            "SELECT a.* FROM actions a JOIN audit_log l ON l.action_id=a.id"
+            " WHERE a.incident_id=? AND a.created_at>=? AND l.at>=?"
+            " AND l.entry='action_rejected' ORDER BY l.at DESC",
+            (inc_id, cutoff, cutoff),
+        )
+        return next((row for row in rows if not action_incident_block(self.db, row)), None)
+
+    def _waiting_state(self, inc: dict) -> dict[str, Any] | None:
+        row = self.db.query_one(
+            "SELECT id,payload_json FROM events WHERE incident_id=? AND type='agent_waiting'"
+            " ORDER BY id DESC LIMIT 1", (inc["id"],),
+        )
+        if not row:
+            return None
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+            if int(payload.get("generation") or 1) == int(inc.get("generation") or 1):
+                payload["_event_id"] = row["id"]
+                return payload
+        except (TypeError, ValueError):
+            pass
+        return None
+
+    def ready_incident_ids(self, limit: int = 3) -> list[str]:
+        """跳过尚在等待的事件，避免冷却中的旧事件占满本轮处理名额。"""
+        ready: list[str] = []
+        rows = self.db.query(
+            "SELECT * FROM incidents WHERE status='open' AND need_human=0"
+            " AND stage IN ('pending','investigating','watching')"
+            " ORDER BY updated_at ASC, created_at ASC"
+        )
+        t = now()
+        for row in rows:
+            if self._current_actions(row["id"]) or self._current_rejection(row["id"]):
+                continue
+            waiting = self._waiting_state(dict(row))
+            if waiting and float(waiting.get("retry_at") or 0) > t:
+                continue
+            ready.append(row["id"])
+            if len(ready) >= limit:
+                break
+        return ready
+
+    def _wait_for_preconditions(
+        self, inc: dict, rule: RunbookRule | None, result: dict, pre_result: dict,
+    ) -> dict[str, Any]:
+        """确定性等待；不建 Action、不请求授权，也不把事件永久踢出 Agent。"""
+        from .fmt import fmt_auto_wait
+
+        if not self._incident_context_current(inc, result):
+            return result
+        blockers = pre_result.get("blockers") or [
+            r.split(":", 1)[0] for r in pre_result.get("reasons") or []
+        ]
+        labels = {
+            "fresh_failed_probe": "等待新鲜失败探测",
+            "service_state": "等待服务状态满足处置条件",
+            "exec_channel": "执行通道暂不可用，等待重试",
+            "global_pause": "全局自动执行已暂停，等待恢复",
+            "policy": "自动执行权限状态已变化，等待重新检查",
+            "object_lock": "等待对象上的操作完成",
+            "source_health": "告警来源暂不可用，等待恢复后重新检查",
+            "budget": pre_result.get("budget_reason") or "自动处置限速中",
+        }
+        reason = "；".join(dict.fromkeys(labels.get(b, "等待处置条件满足") for b in blockers))
+        retry_at = max(now() + 30, float(pre_result.get("retry_at") or 0))
+        previous = self._waiting_state(inc)
+        same_wait = bool(previous and previous.get("blockers") == blockers
+                         and previous.get("rule") == (rule.id if rule else ""))
+        payload = dict(previous) if same_wait else {}
+        event_id = payload.pop("_event_id", None)
+        body = fmt_auto_wait(inc, reason=reason, retry_at=retry_at)
+        payload.update({
+            "generation": int(inc.get("generation") or 1),
+            "rule": rule.id if rule else "",
+            "reasons": pre_result.get("reasons") or [],
+            "blockers": blockers,
+            "reason": reason,
+            "retry_at": retry_at,
+            "body": body,
+        })
+        self.db.execute(
+            "UPDATE incidents SET stage='watching', updated_at=? WHERE id=? AND need_human=0"
+            " AND status='open' AND generation=?",
+            (now(), inc["id"], int(inc.get("generation") or 1)),
+        )
+        if event_id is None:
+            event_id = self.db.event(
+                "agent_waiting", reason, incident_id=inc["id"], payload=payload,
+            )
+        else:
+            self.db.execute(
+                "UPDATE events SET payload_json=? WHERE id=?",
+                (json.dumps(payload, ensure_ascii=False), event_id),
+            )
+        # 同代次同一原因只通知一次；周期性重检仍记录准确的下次时间。
+        if not same_wait:
+            self._notify_event(event_id, "agent_waiting", body)
+        result["action"] = "waiting_precondition"
+        result["retry_at"] = retry_at
+        result["reasons"] = payload["reasons"]
+        return result
 
     async def _precondition_context(
         self, inc: dict, rule: Any, evidence: list
@@ -525,18 +752,27 @@ class AgentLoop:
                 asset_id, object_name or object_id, start=now() - 180
             )
             if samples:
-                probe_samples_ok = all(s.get("value") == 1 for s in samples)
-                probe_failed_recent = any(s.get("value") == 0 for s in samples) or not probe_samples_ok
-                # 要求「明确失败」：至少一条 value==0，或全非 1
-                if not any(s.get("value") == 0 for s in samples):
-                    if probe_samples_ok:
-                        probe_failed_recent = False  # 已恢复
-                    else:
-                        probe_failed_recent = None
+                # 最近样本已经恢复时，窗口里较早的失败不能触发重启。
+                latest = max(samples, key=lambda sample: float(sample.get("sample_at") or 0))
+                value = latest.get("value")
+                fresh = now() - 180 <= float(latest.get("sample_at") or 0) <= now() + 5
+                probe_samples_ok = fresh and value == 1
+                probe_failed_recent = (value == 0) if fresh and value in (0, 1) else None
             else:
                 probe_failed_recent = None
         except Exception:
             probe_failed_recent = None
+
+        service_state = None
+        for item in reversed(evidence or []):
+            if item.get("classification") != "observed":
+                continue
+            if item.get("object_id") not in (object_id, object_ref, object_name):
+                continue
+            observed = item.get("observed") or {}
+            if observed.get("service_state"):
+                service_state = observed["service_state"]
+                break
 
         # 调查证据是否全部运输失败（只看真实 transport 结果，不含 rejected gap）
         transport_evs = [
@@ -555,16 +791,13 @@ class AgentLoop:
             object_id=object_ref or "*",
             auto=True,
         )
-        budget_ok, _ = self._check_budget(rule, asset_id, object_id)
-        locked = self.db.query_one(
-            "SELECT COUNT(*) AS n FROM actions WHERE asset_id=? AND object_id=?"
-            " AND (state IN ('unknown','dispatched')"
-            "  OR (state='success' AND id IN (SELECT action_id FROM verifications"
-            "      WHERE status='pending')))",
-            (asset_id, object_id),
+        budget_ok, budget_reason, budget_retry_at = self._budget_state(rule, asset_id, object_id)
+        from .incidents import IncidentService as _ISvc
+        object_locked = _ISvc(self.db).object_actions_locked(asset_id, object_ref)
+        unknown_write = self.db.query_one(
+            "SELECT id FROM actions WHERE asset_id=? AND object_id=? AND state='unknown' LIMIT 1",
+            (asset_id, object_ref),
         )
-        # 本事件自身刚 propose 的不算
-        object_locked = bool(locked and locked["n"] > 0)
 
         from .verify_profiles import profile_for_action
         from .capabilities import resolve_object_name
@@ -580,36 +813,28 @@ class AgentLoop:
             "object_ref": object_ref,
             "probe_failed_recent": probe_failed_recent,
             "probe_samples_ok": probe_samples_ok,
-            "service_state": None,
+            "service_state": service_state,
             "exec_channel_ok": transport_ok if transport_ok is not None else True,
             "verification_ready": profile is not None,
             "global_pause": bool(stop and stop["enabled"]),
             "policy_allowed": policy.get("allowed") and bool(policy.get("auto_allowed")),
             "budget_ok": budget_ok,
+            "budget_reason": budget_reason,
+            "budget_retry_at": budget_retry_at,
             "object_locked": object_locked,
+            "write_result_unknown": bool(unknown_write),
             "control_plane": "ayana" in (object_name + object_ref).lower(),
         }
 
     def _check_budget(self, rule: RunbookRule, asset_id: str, object_id: str) -> tuple[bool, str]:
-        # 同对象 24h 内最多 N 次
-        since = now() - 86400
-        row = self.db.query_one(
-            "SELECT COUNT(*) AS n FROM audit_log"
-            " WHERE entry='agent_auto_exec' AND asset_id=? AND object_id=? AND at>?",
-            (asset_id, object_id, since),
-        )
-        count = int(row["n"] if row else 0)
-        if count >= rule.max_per_day:
-            return False, f"max_per_day {count}/{rule.max_per_day}"
-        # 冷却
-        last = self.db.query_one(
-            "SELECT at FROM audit_log WHERE entry='agent_auto_exec'"
-            " AND asset_id=? AND object_id=? ORDER BY at DESC LIMIT 1",
-            (asset_id, object_id),
-        )
-        if last and (now() - last["at"]) < rule.cooldown_sec:
-            return False, f"cooldown {int(now() - last['at'])}s < {rule.cooldown_sec}s"
-        return True, f"ok ({count}/{rule.max_per_day} today)"
+        ok, reason, _ = self._budget_state(rule, asset_id, object_id)
+        return ok, reason
+
+    def _budget_state(
+        self, rule: RunbookRule, asset_id: str, object_id: str,
+    ) -> tuple[bool, str, float | None]:
+        budget = auto_budget_state(self.db, rule, asset_id, object_id, at=now())
+        return budget["ok"], budget["reason"], budget["retry_at"]
 
     def _record_usage(self, rule_id: str, asset_id: str, object_id: str) -> None:
         self.db.audit(
@@ -617,15 +842,17 @@ class AgentLoop:
             f"agent:{rule_id}",
             "agent_auto_exec",
             asset_id=asset_id,
-            object_id=object_id,
+            object_id=(object_id or "").split(":")[-1],
             detail={"rule": rule_id},
         )
 
-    def _escalate(self, inc_id: str, reason: str, llm_result: dict | None = None) -> None:
+    def _escalate(self, inc: dict, reason: str, llm_result: dict | None = None) -> None:
         from .fmt import fmt_escalate
 
-        inc = self.db.query_one("SELECT * FROM incidents WHERE id=?", (inc_id,))
-        inc_d = dict(inc) if inc else {"id": inc_id, "title": "", "asset_id": "", "object_id": ""}
+        if not self._incident_context_current(inc):
+            return
+        inc_id = inc["id"]
+        inc_d = dict(inc)
         llm_summary = (llm_result or {}).get("summary", "")
         body = fmt_escalate(inc_d, reason, llm_summary)
         detail = reason
@@ -634,14 +861,11 @@ class AgentLoop:
         from .incidents import IncidentService
 
         IncidentService(self.db).set_need_human(inc_id, detail)
-        self.db.event(
+        event_id = self.db.event(
             "agent_escalated",
             f"escalate: {reason}",
             incident_id=inc_id,
-            payload={"reason": reason, "llm": llm_result},
+            payload={"reason": reason, "llm": llm_result, "body": body,
+                     "generation": int(inc_d.get("generation") or 1)},
         )
-        self.notifier.enqueue(
-            dedup_key=f"agent:esc:{inc_id}:{int(now())}",
-            target="",
-            body=body,
-        )
+        self._notify_event(event_id, "agent_escalated", body)

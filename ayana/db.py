@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 16
 
 
 class MigrationError(RuntimeError):
@@ -323,6 +323,7 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
   sent_at REAL
 );
 
+-- work_items: 无写入点，仅 web.py 一处 COUNT 读取；保留兼容旧库，勿写入
 CREATE TABLE IF NOT EXISTS work_items (
   id TEXT PRIMARY KEY,
   kind TEXT NOT NULL,
@@ -765,6 +766,156 @@ CREATE TABLE IF NOT EXISTS node_watch_nonces (
     )
 
 
+def _migrate_v15_ext_tasks(conn: sqlite3.Connection) -> None:
+    """v15：外部事务（接入配置 / Token / 执行记录 / 失联标记）。"""
+    conn.executescript(
+        """
+CREATE TABLE IF NOT EXISTS ext_transactions (
+  id TEXT PRIMARY KEY,
+  event_key TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  source_label TEXT NOT NULL DEFAULT '',
+  asset_id TEXT NOT NULL DEFAULT '',
+  object_id TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  watch_mode TEXT NOT NULL DEFAULT 'off',
+  grace_sec INTEGER NOT NULL DEFAULT 300,
+  expect_interval_sec INTEGER NOT NULL DEFAULT 0,
+  timeout_sec INTEGER NOT NULL DEFAULT 0,
+  schedule_json TEXT NOT NULL DEFAULT '{}',
+  alert_on_failure INTEGER NOT NULL DEFAULT 1,
+  alert_on_recovery INTEGER NOT NULL DEFAULT 1,
+  alert_on_timeout INTEGER NOT NULL DEFAULT 1,
+  alert_on_missing INTEGER NOT NULL DEFAULT 1,
+  alert_on_collector INTEGER NOT NULL DEFAULT 1,
+  resolve_delay_sec INTEGER NOT NULL DEFAULT 0,
+  pending_resolve_at REAL NOT NULL DEFAULT 0,
+  last_status TEXT NOT NULL DEFAULT 'unknown',
+  last_run_id TEXT NOT NULL DEFAULT '',
+  last_report_at REAL NOT NULL DEFAULT 0,
+  last_success_at REAL NOT NULL DEFAULT 0,
+  last_failure_at REAL NOT NULL DEFAULT 0,
+  open_incident_id TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ext_tokens (
+  id TEXT PRIMARY KEY,
+  transaction_id TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  token_hint TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL,
+  revoked_at REAL,
+  last_used_at REAL,
+  rotated_from TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS ext_runs (
+  id TEXT PRIMARY KEY,
+  transaction_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  severity TEXT NOT NULL DEFAULT 'warning',
+  message TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '',
+  report_kind TEXT NOT NULL DEFAULT 'run',
+  client_ts REAL,
+  reported_at REAL NOT NULL,
+  content_hash TEXT NOT NULL DEFAULT '',
+  episode_id TEXT NOT NULL DEFAULT '',
+  incident_id TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  UNIQUE(transaction_id, run_id)
+);
+
+CREATE TABLE IF NOT EXISTS ext_watch_marks (
+  transaction_id TEXT NOT NULL,
+  mark_key TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  PRIMARY KEY (transaction_id, mark_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ext_runs_tx ON ext_runs(transaction_id, reported_at);
+CREATE INDEX IF NOT EXISTS idx_ext_tokens_hash ON ext_tokens(token_hash);
+"""
+    )
+    # 兼容已建库：补齐防抖列
+    _add_columns(conn, "ext_transactions", [
+        ("resolve_delay_sec", "ALTER TABLE ext_transactions ADD COLUMN resolve_delay_sec INTEGER NOT NULL DEFAULT 0"),
+        ("pending_resolve_at", "ALTER TABLE ext_transactions ADD COLUMN pending_resolve_at REAL NOT NULL DEFAULT 0"),
+    ])
+
+
+def _migrate_v16_council(conn: sqlite3.Connection) -> None:
+    """Persist immutable plans, independent review receipts and single-use grants."""
+    conn.executescript("""
+CREATE TABLE IF NOT EXISTS council_goals (
+ id TEXT PRIMARY KEY, incident_id TEXT NOT NULL REFERENCES incidents(id), generation INTEGER NOT NULL,
+ asset_id TEXT NOT NULL, object_id TEXT NOT NULL, repair_goal TEXT NOT NULL,
+ consecutive_vetoes INTEGER NOT NULL DEFAULT 0, manual_required INTEGER NOT NULL DEFAULT 0,
+ manual_reason TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, updated_at REAL NOT NULL,
+ UNIQUE(incident_id,generation,asset_id,object_id,repair_goal)
+);
+CREATE TABLE IF NOT EXISTS council_plans (
+ id TEXT PRIMARY KEY, incident_id TEXT NOT NULL REFERENCES incidents(id), generation INTEGER NOT NULL,
+ goal_id TEXT NOT NULL REFERENCES council_goals(id), version INTEGER NOT NULL, digest TEXT NOT NULL,
+ asset_id TEXT NOT NULL, object_id TEXT NOT NULL, canonical_object TEXT NOT NULL,
+ plan_json TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'drafted',
+ created_at REAL NOT NULL, expires_at REAL NOT NULL,
+ UNIQUE(goal_id,version)
+);
+CREATE INDEX IF NOT EXISTS idx_council_plans_incident ON council_plans(incident_id,created_at);
+CREATE TABLE IF NOT EXISTS council_reviews (
+ id TEXT PRIMARY KEY, plan_id TEXT NOT NULL REFERENCES council_plans(id), plan_digest TEXT NOT NULL,
+ role TEXT NOT NULL CHECK(role IN ('reviewer_kimi','reviewer_deepseek')),
+ provider TEXT NOT NULL, model TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+ approve INTEGER, reason TEXT NOT NULL DEFAULT '', missing_json TEXT NOT NULL DEFAULT '[]',
+ suggested_revision TEXT NOT NULL DEFAULT '', requested_at REAL NOT NULL,
+ deadline_at REAL NOT NULL, finished_at REAL, UNIQUE(plan_id,role)
+);
+CREATE TABLE IF NOT EXISTS council_ballots (
+ id TEXT PRIMARY KEY, plan_id TEXT NOT NULL UNIQUE REFERENCES council_plans(id),
+ decision TEXT NOT NULL, reason TEXT NOT NULL, grant_id TEXT NOT NULL DEFAULT '', at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS council_grants (
+ id TEXT PRIMARY KEY, plan_id TEXT NOT NULL UNIQUE REFERENCES council_plans(id),
+ plan_digest TEXT NOT NULL, incident_id TEXT NOT NULL, generation INTEGER NOT NULL,
+ goal_id TEXT NOT NULL, asset_id TEXT NOT NULL, object_id TEXT NOT NULL,
+ state TEXT NOT NULL DEFAULT 'granted', created_at REAL NOT NULL, expires_at REAL NOT NULL,
+ claimed_at REAL, finished_at REAL, result_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS council_steps (
+ grant_id TEXT NOT NULL REFERENCES council_grants(id), ordinal INTEGER NOT NULL,
+ state TEXT NOT NULL DEFAULT 'pending', action_id TEXT NOT NULL DEFAULT '',
+ result_json TEXT NOT NULL DEFAULT '{}', claimed_at REAL, finished_at REAL,
+ PRIMARY KEY(grant_id,ordinal)
+);
+CREATE TRIGGER IF NOT EXISTS council_plan_immutable BEFORE UPDATE OF
+ incident_id,generation,goal_id,version,digest,asset_id,object_id,canonical_object,plan_json,created_at,expires_at
+ ON council_plans BEGIN SELECT RAISE(ABORT,'immutable council plan'); END;
+CREATE TRIGGER IF NOT EXISTS council_review_identity_immutable BEFORE UPDATE OF
+ plan_id,plan_digest,role,provider,model,requested_at,deadline_at ON council_reviews
+ BEGIN SELECT RAISE(ABORT,'immutable council review identity'); END;
+CREATE TRIGGER IF NOT EXISTS council_review_final_immutable BEFORE UPDATE ON council_reviews
+ WHEN OLD.state != 'pending' BEGIN SELECT RAISE(ABORT,'immutable council review result'); END;
+CREATE TRIGGER IF NOT EXISTS council_ballot_immutable BEFORE UPDATE ON council_ballots
+ BEGIN SELECT RAISE(ABORT,'immutable council ballot'); END;
+CREATE TRIGGER IF NOT EXISTS council_grant_binding_immutable BEFORE UPDATE OF
+ plan_id,plan_digest,incident_id,generation,goal_id,asset_id,object_id,created_at,expires_at ON council_grants
+ BEGIN SELECT RAISE(ABORT,'immutable council grant binding'); END;
+""")
+    _add_columns(conn, "actions", [
+        ("council_grant_id", "ALTER TABLE actions ADD COLUMN council_grant_id TEXT NOT NULL DEFAULT ''"),
+        ("council_step", "ALTER TABLE actions ADD COLUMN council_step INTEGER NOT NULL DEFAULT -1"),
+    ])
+    # Empty action IDs cannot share the UNIQUE index while a multi-step grant waits.
+    conn.execute("DROP INDEX IF EXISTS idx_council_step_action")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_council_step_action ON council_steps(action_id) WHERE action_id!=''")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_v1_baseline,
     2: _migrate_v2_p0_p1_columns,
@@ -780,6 +931,8 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     12: _migrate_v12_asset_host,
     13: _migrate_v13_users_must_change_password,
     14: _migrate_v14_node_watch,
+    15: _migrate_v15_ext_tasks,
+    16: _migrate_v16_council,
 }
 
 _MIGRATION_NAMES = {
@@ -797,6 +950,8 @@ _MIGRATION_NAMES = {
     12: "asset_host",
     13: "users_must_change_password",
     14: "node_watch",
+    15: "ext_tasks",
+    16: "council_plans_reviews_grants",
 }
 
 
@@ -996,8 +1151,9 @@ class Database:
         *,
         episode_id: str = "",
         source_state: str = "",
-    ) -> None:
-        self.execute(
+    ) -> int | None:
+        """写入事件并返回事件 id（enqueue_for_event 需要）。"""
+        cur = self.execute(
             "INSERT INTO events(incident_id, episode_id, at, type, title, payload_json,"
             " source_state) VALUES(?,?,?,?,?,?,?)",
             (
@@ -1010,6 +1166,7 @@ class Database:
                 source_state,
             ),
         )
+        return cur.lastrowid
 
     def snapshot_config(self, kind: str, payload: dict, created_by: str = "") -> None:
         self.execute(

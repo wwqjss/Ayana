@@ -874,10 +874,13 @@ class TestReplayPortBind(unittest.TestCase):
         """bind failure / stale process：启动命令成功 ≠ Web 已恢复。"""
         root = Path(__file__).resolve().parents[1] / "knowledge"
         kb = KnowledgeBase(db=None, root=root)
-        docs = kb.docs_for_object("kanata", "ayana")
-        self.assertTrue(any(d.id == "ayana-port-bind-failed" for d in docs), docs)
-        ctx = kb.investigation_context("kanata", "ayana")
-        self.assertIn("bind", ctx["context_text"].lower() + ctx["context_text"])
+        # 发行版文档 objects 为空，按 id 取回
+        d = kb.get("ayana-port-bind-failed")
+        self.assertIsNotNone(d)
+        self.assertEqual(d.type, "issue")
+        self.assertIn("bind", d.body.lower())
+        # 发行版知识不含个人对象绑定
+        self.assertEqual(d.objects, [])
 
         # 证据语义：transport 成功但业务未恢复
         from ayana.investigation import classify_evidence

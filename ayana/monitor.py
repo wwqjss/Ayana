@@ -14,7 +14,7 @@ import json
 import re
 from typing import Any
 
-from .prom import PromClient, PromError
+from .prom import PromClient, PromError, series_key
 
 # 时间范围（秒）→ 步长
 RANGES: dict[str, tuple[float, float]] = {
@@ -75,7 +75,7 @@ def _agg_sum_latest(samples: list[dict]) -> float | None:
     """按序列取最新再求和（多网卡/多挂载点）。"""
     by_series: dict[str, dict] = {}
     for s in samples:
-        key = json_key(s.get("metric") or {})
+        key = series_key(s.get("metric") or {})
         old = by_series.get(key)
         if not old or (s.get("sample_at") or 0) >= (old.get("sample_at") or 0):
             by_series[key] = s
@@ -87,17 +87,6 @@ def _agg_sum_latest(samples: list[dict]) -> float | None:
     if not nums:
         return None
     return sum(nums)
-
-
-def json_key(metric: dict) -> str:
-    import json
-
-    m = {k: v for k, v in (metric or {}).items() if not str(k).startswith("__")}
-    return json.dumps(m, sort_keys=True)
-
-
-def _pick_series(samples: list[dict], prefer: str = "") -> list[dict]:
-    return samples
 
 
 def asset_label_selector(asset_id: str, *aliases: str) -> str:

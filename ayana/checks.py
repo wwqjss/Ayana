@@ -16,11 +16,11 @@ import json
 import posixpath
 import re
 import time
-from dataclasses import dataclass
 from typing import Any, Callable
 
 from .db import Database, new_id, now
 from .formspec import UNIT_PATTERN
+from .readonly_commands import validate_probe_tokens
 
 MAX_ARGV_TOKENS = 8
 _TOKEN_BAD = re.compile(r"[ \t\n\r;|&$`\\'\"<>(){}\[\]*?~!#%^=+]")
@@ -126,7 +126,10 @@ def _is_http_url(value: str) -> bool:
 
 
 def _validate_probe_argv(prog: str, args: list[str]) -> None:
-    """B1: 每个程序的参数语法白名单；禁止文件输入与未授权外发。"""
+    """B1: 每个程序的参数语法白名单；禁止文件输入与未授权外发。
+
+    curl/ping/ss/ps 复用 readonly_commands.validate_probe_tokens（两处规则取更严）。
+    """
     if prog in {"true", "false"}:
         if args:
             raise CheckError("unsafe_command_option", "该程序不接受参数。")
@@ -137,25 +140,9 @@ def _validate_probe_argv(prog: str, args: list[str]) -> None:
             if a.startswith("-") or "://" in a or a.startswith("/"):
                 raise CheckError("unsafe_command_option", "echo 仅允许简单字面量。")
         return
-    if prog == "ping":
-        # ping [-c N] [-W N] hostname
-        i = 0
-        host = ""
-        while i < len(args):
-            a = args[i]
-            if a in {"-c", "-W", "-w"}:
-                i += 1
-                if i >= len(args) or not re.fullmatch(r"\d{1,5}", args[i]) or int(args[i]) <= 0:
-                    raise CheckError("unsafe_command_option", "ping 次数/超时必须为正整数。")
-            elif a.startswith("-"):
-                raise CheckError("unsafe_command_option", "ping 仅支持 -c/-W/-w。")
-            else:
-                if host:
-                    raise CheckError("unsafe_command_option", "ping 仅允许一个目标。")
-                host = a
-            i += 1
-        if not host or not _HOSTNAME_RE.match(host) or host.startswith("-"):
-            raise CheckError("unsafe_command_option", "ping 目标无效。")
+    if prog in {"ping", "ss", "ps", "curl"}:
+        if not validate_probe_tokens(prog, args):
+            raise CheckError("unsafe_command_option", f"{prog} 参数不符合只读探测语法。")
         return
     if prog == "nc":
         # 仅端口探测：nc -z [-w N] host port
@@ -187,36 +174,7 @@ def _validate_probe_argv(prog: str, args: list[str]) -> None:
         if not re.fullmatch(r"\d{1,5}", port) or not (1 <= int(port) <= 65535):
             raise CheckError("unsafe_command_option", "nc 端口无效。")
         return
-    if prog == "ss":
-        # 只允许查询类；显式禁止 -F/--filter（写诊断文件）与 -K（断开连接）
-        allowed = {
-            "-h", "-V", "-n", "-r", "-a", "-l", "-o", "-e", "-m", "-p", "-i",
-            "-s", "-b", "-E", "-Z", "-t", "-u", "-d", "-w", "-x", "-4", "-6",
-            "--help", "--version", "--numeric", "--resolve", "--all", "--listening",
-            "--tcp", "--udp", "--unix", "--no-header", "--oneline", "--processes",
-        }
-        banned = {"-K", "-F", "--kill", "--filter", "--summary", "--bpf", "--events",
-                  "--context", "--contexts", "--cgroup", "--inet-sockopt", "-N", "--net"}
-        for a in args:
-            if a in banned:
-                raise CheckError("unsafe_command_option", "连接状态检查禁止该参数。")
-            if a.startswith("--"):
-                if a not in allowed:
-                    raise CheckError("unsafe_command_option", "连接状态检查不支持该长参数。")
-            elif a.startswith("-"):
-                if len(a) < 2 or not set(a[1:]) <= set("hVnraloemipstux46"):
-                    raise CheckError("unsafe_command_option", "连接状态检查只支持查询参数。")
-            # 允许 sport=/:port 形式的过滤表达式（port 检查生成）
-        return
-    if prog == "ps":
-        for a in args:
-            if a.startswith("-"):
-                if not set(a[1:]) <= set("aeflwx"):
-                    raise CheckError("unsafe_command_option", "ps 仅支持常用查询参数。")
-            elif a not in {"aux", "ax", "u", "a", "x"}:
-                raise CheckError("unsafe_command_option", "ps 参数无效。")
-        return
-    if prog in {"curl", "wget"}:
+    if prog == "wget":
         _validate_readonly_options(prog, args)
         _validate_probe_urls(prog, args)
         return
@@ -286,20 +244,6 @@ def _validate_readonly_options(prog: str, args: list[str]) -> None:
         i += 1
     if prog == "wget" and not stdout_or_spider:
         raise CheckError("unsafe_command_option", "网页检查不能下载到文件，请使用 --spider 或 -O -。")
-
-
-@dataclass
-class CheckSpec:
-    id: str
-    asset_id: str
-    name: str
-    kind: str
-    params: dict
-    expect: dict
-    interval_sec: int
-    fail_threshold: int
-    severity: str
-    enabled: bool
 
 
 def build_tokens(kind: str, params: dict) -> list[list[str]]:
@@ -586,7 +530,7 @@ class CheckService:
 
     async def _raise_alert(self, check: dict[str, Any], *, detail: str, streak: int) -> None:
         """写入 alert_episodes 并收敛为 Incident，发通知。"""
-        from .alertmanager import fingerprint_of
+        from .alertmanager import fingerprint_of, upsert_episode
 
         alertname = f"CheckFailed_{check.get('kind')}"
         labels = {
@@ -599,29 +543,18 @@ class CheckService:
         }
         fp = fingerprint_of(labels)
         t = now()
-        ep_id = new_id("ep")
         try:
-            self.db.execute(
-                "INSERT INTO alert_episodes(id, source_id, fingerprint, starts_at_norm,"
-                " alertname, status, asset_id, object_id, first_seen, last_seen,"
-                " receive_count, labels_json, annotations_json, source_state)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    ep_id,
-                    "ayana_check",
-                    fp,
-                    str(int(t)),
-                    alertname,
-                    "firing",
-                    check.get("asset_id") or "",
-                    "",
-                    t,
-                    t,
-                    1,
-                    json.dumps(labels, ensure_ascii=False),
-                    json.dumps({"detail": detail, "check_id": check.get("id")}, ensure_ascii=False),
-                    "firing",
-                ),
+            ep_id, _created, _prev, _new = upsert_episode(
+                self.db,
+                source_id="ayana_check",
+                fingerprint=fp,
+                labels=labels,
+                annotations={"detail": detail, "check_id": check.get("id")},
+                status="firing",
+                source_state="firing",
+                t=t,
+                alertname=alertname,
+                asset_id=check.get("asset_id") or "",
             )
             inc_id = ""
             if self.incidents:
@@ -629,36 +562,31 @@ class CheckService:
                     inc_id = self.incidents.upsert_from_episode(ep_id) or ""
                 except Exception:
                     inc_id = ""
-            if self.notifier:
-                body = f"[{labels['severity']}] 检查失败 {labels['asset']}/{labels['check']}: {detail}"
-                try:
-                    self.notifier.enqueue(
-                        dedup_key=f"check:{check.get('id')}:{int(t // 60)}",
-                        target="",
-                        body=body,
-                        channel="qq",
-                    )
-                except Exception:
-                    pass
-            self.db.event(
+            ev_id = self.db.event(
                 "check_failed",
                 f"检查失败 {labels['asset']}/{labels['check']}",
                 incident_id=inc_id,
                 payload={"check_id": check.get("id"), "detail": detail, "streak": streak},
             )
+            if self.notifier and ev_id:
+                body = f"[{labels['severity']}] 检查失败 {labels['asset']}/{labels['check']}: {detail}"
+                try:
+                    self.notifier.enqueue_for_event(ev_id, body=body, typ="check_failed")
+                except Exception:
+                    pass
         except Exception:
             pass
 
     async def _resolve_alert(self, check: dict[str, Any]) -> None:
-        if not self.notifier:
-            return
         try:
-            self.notifier.enqueue(
-                dedup_key=f"check_ok:{check.get('id')}:{int(now() // 60)}",
-                target="",
-                body=f"[恢复] 检查通过 {check.get('asset_id')}/{check.get('name')}",
-                channel="qq",
+            body = f"[恢复] 检查通过 {check.get('asset_id')}/{check.get('name')}"
+            ev_id = self.db.event(
+                "check_recovered",
+                f"检查恢复 {check.get('asset_id')}/{check.get('name')}",
+                payload={"check_id": check.get("id"), "body": body},
             )
+            if self.notifier and ev_id:
+                self.notifier.enqueue_for_event(ev_id, body=body, typ="check_recovered")
         except Exception:
             pass
 

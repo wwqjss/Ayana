@@ -1,4 +1,4 @@
-﻿"""Phase B: P0-01/02/03 positive and negative dispatch-gate tests."""
+"""Phase B: P0-01/02/03 positive and negative dispatch-gate tests."""
 
 from __future__ import annotations
 
@@ -11,7 +11,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-if "aiohttp" not in sys.modules:
+try:
+    import aiohttp.web  # noqa: F401
+except Exception:
     _a = types.ModuleType("aiohttp")
 
     class _CT:
@@ -33,7 +35,13 @@ if "aiohttp" not in sys.modules:
 
     _a.ClientTimeout = _CT
     _a.ClientSession = _CS
+    _a.web = types.SimpleNamespace(
+        Application=type("Application", (), {"__init__": lambda self, **k: None}),
+        Response=type("Response", (), {"__init__": lambda self, *a, **k: None}),
+        json_response=lambda *a, **k: None,
+    )
     sys.modules["aiohttp"] = _a
+    sys.modules["aiohttp.web"] = _a.web
 
 from ayana.actions import ActionError, ActionService
 from ayana.agent import AgentLoop
@@ -43,7 +51,7 @@ from ayana.knowledge import KnowledgeBase
 from ayana.instance import acquire_single_instance_lock
 from ayana.ntsafe import AssetBinding, IdentityGate, NTResult
 from ayana.policy import Policy
-from ayana.runbook import RunbookRule, get_runbook_rule, match_runbook
+from ayana.runbook import RunbookRule, apply_runbook_rules, get_runbook_rule, match_runbook
 from ayana.prom import match_series
 
 
@@ -149,10 +157,18 @@ def make_env(describe_json=None, verified=True):
         db, nt, gate, policy, prom, action_ttl=1800, approval_ttl=900,
         verify_window=5, verify_timeout=1,
     )
+    # 注入测试本地 runbook 规则（发行版 RUNBOOK 为空）
+    apply_runbook_rules([{
+        "id": "rb_frps_down_restart", "name": "frps down restart",
+        "asset_id": "nerv", "object_name": "frps", "alertname": "TargetDown",
+        "capability": "service.restart", "reason": "restart frps",
+        "require_probe_fail": True,
+    }])
     return tmp, db, policy, nt, prom, gate, actions
 
 
 def close_env(tmp, db):
+    apply_runbook_rules([])
     try:
         db.close()
     except Exception:
@@ -363,6 +379,13 @@ class TestP003Preconditions(unittest.TestCase):
 
         agent = AgentLoop(db, inv, actions, policy, NoLLM(), NQ(), auto_enabled=True,
                           knowledge=KnowledgeBase(db))
+        # 注入测试本地 runbook 规则（发行版 RUNBOOK 为空）
+        apply_runbook_rules([{
+            "id": "rb_frps_down_restart", "name": "frps down restart",
+            "asset_id": "nerv", "object_name": "frps", "alertname": "TargetDown",
+            "capability": "service.restart", "reason": "restart frps",
+            "require_probe_fail": True,
+        }])
         return tmp, db, nt, actions, agent
 
     def test_global_pause_zero_auto_dispatch(self):
@@ -373,7 +396,13 @@ class TestP003Preconditions(unittest.TestCase):
         )
         res = asyncio.run(agent.handle_incident("inc1"))
         self.assertFalse(nt.exec_calls, res)
-        self.assertIn("escalated", (res.get("action") or ""))
+        self.assertEqual(res.get("action"), "waiting_precondition")
+        self.assertEqual(db.query_one("SELECT need_human FROM incidents WHERE id='inc1'")["need_human"], 0)
+        self.assertEqual(db.query_one("SELECT COUNT(*) n FROM actions")["n"], 0)
+        db.execute("UPDATE global_stops SET enabled=0 WHERE key='auto_dispatch'")
+        from unittest.mock import patch
+        with patch("ayana.agent.now", return_value=res["retry_at"] + 1):
+            self.assertIn("inc1", agent.ready_incident_ids())
 
     def test_budget_exhausted_zero_auto_dispatch(self):
         tmp, db, nt, actions, agent = self._agent_env(probe_value=0)
@@ -410,7 +439,15 @@ class TestP003Preconditions(unittest.TestCase):
         self.assertFalse(nt.exec_calls, res)
 
     def test_require_probe_fail_consumed(self):
+        apply_runbook_rules([{
+            "id": "rb_frps_down_restart", "name": "frps down restart",
+            "asset_id": "nerv", "object_name": "frps", "alertname": "TargetDown",
+            "capability": "service.restart", "reason": "restart frps",
+            "require_probe_fail": True,
+        }])
+        self.addCleanup(lambda: apply_runbook_rules([]))
         rule = get_runbook_rule("rb_frps_down_restart")
+        self.assertIsNotNone(rule)
         self.assertTrue(rule.require_probe_fail)
         pre = rule.check_preconditions(
             {

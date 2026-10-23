@@ -12,7 +12,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-if "aiohttp" not in sys.modules:
+try:
+    import aiohttp.web  # noqa: F401
+except Exception:
     _a = types.ModuleType("aiohttp")
 
     class _CT:
@@ -34,7 +36,13 @@ if "aiohttp" not in sys.modules:
 
     _a.ClientTimeout = _CT
     _a.ClientSession = _CS
+    _a.web = types.SimpleNamespace(
+        Application=type("Application", (), {"__init__": lambda self, **k: None}),
+        Response=type("Response", (), {"__init__": lambda self, *a, **k: None}),
+        json_response=lambda *a, **k: None,
+    )
     sys.modules["aiohttp"] = _a
+    sys.modules["aiohttp.web"] = _a.web
 
 from ayana.capabilities import build_probe_plans, get_capability
 from ayana.db import Database, now

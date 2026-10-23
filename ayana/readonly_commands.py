@@ -100,7 +100,8 @@ def readonly_command(tokens: list[str]) -> bool:
     if prog == "top":
         return _options(args, shorts="bHi", values={"-n": _number, "-d": lambda v: bool(_DECIMAL.fullmatch(v)), "-p": lambda v: bool(re.fullmatch(r"[0-9]+(?:,[0-9]+)*", v))}, maximum=0) and any(a == "-b" or a.startswith("-b") for a in args)
     if prog in {"ss", "netstat"}:
-        return _options(args, shorts=("hVnraloemipsbEZztudwx46" if prog == "ss" else "aenloprtuwx46"), flags={"--help", "--version", "--numeric", "--all", "--listening", "--tcp", "--udp", "--unix", "--processes", "--summary", "--no-header"}, maximum=0)
+        # --summary 与 checks.py 对齐为禁止（两处规则取更严，不扩大权限）
+        return _options(args, shorts=("hVnraloemipsbEZztudwx46" if prog == "ss" else "aenloprtuwx46"), flags={"--help", "--version", "--numeric", "--all", "--listening", "--tcp", "--udp", "--unix", "--processes", "--no-header"}, maximum=0)
     if prog == "journalctl":
         return _options(args, shorts="xebrk", flags={"--no-pager", "--quiet", "--utc", "--reverse", "--system", "--user", "--disk-usage", "--list-boots", "--help", "--version"}, values={"-u": _name, "--unit": _name, "-n": _number, "--lines": _number, "-p": lambda v: bool(re.fullmatch(r"[0-7]|emerg|alert|crit|err|warning|notice|info|debug", v)), "--priority": lambda v: bool(re.fullmatch(r"[0-7]|emerg|alert|crit|err|warning|notice|info|debug", v)), "-o": lambda v: v in {"short", "short-iso", "short-unix", "cat", "json", "json-pretty", "verbose"}, "--output": lambda v: v in {"short", "short-iso", "short-unix", "cat", "json", "json-pretty", "verbose"}}, operand=lambda v: bool(re.fullmatch(r"[A-Z_][A-Z_0-9]*=[A-Za-z0-9_.:@/-]+", v)))
     if prog == "curl":
@@ -131,4 +132,107 @@ def readonly_command(tokens: list[str]) -> bool:
             return _options(rest, shorts="t", flags={"--timestamps", "--details"}, values={"--tail": _number, "--since": _name, "--until": _name}, operand=_name, minimum=1, maximum=1)
         if verb == "stats":
             return "--no-stream" in rest and _options(rest, flags={"--no-stream", "--no-trunc", "--all"}, operand=_name)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# 共享探测程序校验（checks.py 与消息入口共用，取两处更严规则，不扩大权限）
+# ---------------------------------------------------------------------------
+
+_SS_BANNED = frozenset({
+    "-K", "-F", "--kill", "--filter", "--summary", "--bpf", "--events",
+    "--context", "--contexts", "--cgroup", "--inet-sockopt", "-N", "--net",
+})
+_SS_ALLOWED_LONG = frozenset({
+    "--help", "--version", "--numeric", "--resolve", "--all", "--listening",
+    "--tcp", "--udp", "--unix", "--no-header", "--oneline", "--processes",
+})
+_SS_SHORTS = "hVnraloemipstux46"
+
+
+def validate_ss_probe(args: list[str]) -> bool:
+    """ss 查询类参数；显式禁止写诊断/断开连接（与 checks.py 对齐，取更严）。"""
+    for a in args:
+        if a in _SS_BANNED:
+            return False
+        if a.startswith("--"):
+            if a not in _SS_ALLOWED_LONG:
+                return False
+        elif a.startswith("-"):
+            if len(a) < 2 or not set(a[1:]) <= set(_SS_SHORTS):
+                return False
+        # 允许 sport=/:port 形式的过滤表达式（port 检查生成）
+    return True
+
+
+def validate_ps_probe(args: list[str]) -> bool:
+    for a in args:
+        if a.startswith("-"):
+            if not set(a[1:]) <= set("aeflwx"):
+                return False
+        elif a not in {"aux", "ax", "u", "a", "x"}:
+            return False
+    return True
+
+
+def validate_ping_probe(args: list[str]) -> bool:
+    """ping [-c N] [-W N] [-w N] hostname（次数/超时必须为正整数）。"""
+    i = 0
+    host = ""
+    while i < len(args):
+        a = args[i]
+        if a in {"-c", "-W", "-w"}:
+            i += 1
+            if i >= len(args) or not re.fullmatch(r"\d{1,5}", args[i]) or int(args[i]) <= 0:
+                return False
+        elif a.startswith("-"):
+            return False
+        else:
+            if host:
+                return False
+            host = a
+        i += 1
+    return bool(host) and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.:-]*", host)) and not host.startswith("-")
+
+
+def validate_curl_probe(args: list[str]) -> bool:
+    """curl 必须以 -q/--disable 开头，只支持 GET/HEAD 与 http(s) URL。"""
+    if args in (["--help"], ["--version"], ["-h"], ["-V"]):
+        return True
+    if not args or args[0] not in {"-q", "--disable"}:
+        return False
+    return _options(
+        args,
+        shorts="qfsSIkiv46",
+        flags={"--disable", "--fail", "--fail-with-body", "--silent", "--show-error",
+               "--head", "--include", "--verbose", "--no-progress-meter", "--insecure"},
+        values={
+            "-X": lambda v: v in {"GET", "HEAD"},
+            "--request": lambda v: v in {"GET", "HEAD"},
+            "-m": lambda v: bool(_DECIMAL.fullmatch(v)) and float(v) > 0,
+            "--max-time": lambda v: bool(_DECIMAL.fullmatch(v)) and float(v) > 0,
+            "--connect-timeout": lambda v: bool(_DECIMAL.fullmatch(v)) and float(v) > 0,
+        },
+        operand=_http_url,
+        minimum=1,
+        maximum=1,
+    )
+
+
+def validate_probe_tokens(prog: str, args: list[str]) -> bool:
+    """共享探测程序参数校验入口（curl/ping/ss/ps）。
+
+    返回 True 表示通过。checks.py / 消息入口共用此实现，
+    语义以两处历史规则中更严者为准，不扩大命令执行权限。
+    """
+    if not safe_tokens([prog, *args] if args else [prog]):
+        return False
+    if prog == "ss":
+        return validate_ss_probe(args)
+    if prog == "ps":
+        return validate_ps_probe(args)
+    if prog == "ping":
+        return validate_ping_probe(args)
+    if prog == "curl":
+        return validate_curl_probe(args)
     return False

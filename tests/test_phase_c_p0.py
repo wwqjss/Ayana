@@ -11,7 +11,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-if "aiohttp" not in sys.modules:
+try:
+    import aiohttp.web  # noqa: F401
+except Exception:
     _a = types.ModuleType("aiohttp")
 
     class _CT:
@@ -33,7 +35,13 @@ if "aiohttp" not in sys.modules:
 
     _a.ClientTimeout = _CT
     _a.ClientSession = _CS
+    _a.web = types.SimpleNamespace(
+        Application=type("Application", (), {"__init__": lambda self, **k: None}),
+        Response=type("Response", (), {"__init__": lambda self, *a, **k: None}),
+        json_response=lambda *a, **k: None,
+    )
     sys.modules["aiohttp"] = _a
+    sys.modules["aiohttp.web"] = _a.web
 
 from ayana.actions import ActionService
 from ayana.db import Database, now
@@ -265,17 +273,19 @@ class TestP004Reconcile(unittest.TestCase):
 
 
 class TestP005Profile(unittest.TestCase):
-    def test_profile_for_frps(self):
+    def test_profile_for_service_restart(self):
+        """v0.7.3+ 去个人化：service.restart 解析到通用 svc.recover。"""
         p = profile_for_action(
-            capability="service.restart", asset_id="nerv", object_id="nerv:service:frps"
+            capability="service.restart", asset_id="demo", object_id="demo:service:svc-x"
         )
         self.assertIsNotNone(p)
-        self.assertEqual(p.id, "frps.recover")
+        self.assertEqual(p.id, "svc.recover")
         self.assertEqual(p.continuous_success_sec, 90.0)
 
     def test_unsupported_profile(self):
+        """不在 CAP_PROFILE 中的 capability 无 profile。"""
         p = profile_for_action(
-            capability="service.restart", asset_id="yomi", object_id="yomi:x"
+            capability="container.restart", asset_id="demo", object_id="demo:x"
         )
         self.assertIsNone(p)
 
@@ -323,8 +333,8 @@ class TestP005Profile(unittest.TestCase):
             "INSERT INTO actions(id, incident_id, asset_id, object_id, capability, params_json,"
             " state, mode, template_id, proposer_type, proposer_id, created_at, finished_at)"
             " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            ("act1", "", "yomi", "yomi:x", "service.restart",
-             '{"tokens":["systemctl","restart","x"]}', "success", "auto",
+            ("act1", "", "demo", "demo:x", "container.restart",
+             '{"tokens":["docker","restart","x"]}', "success", "auto",
              "", "web_user", "admin", t, t),
         )
         res = asyncio.run(actions.verify("act1"))

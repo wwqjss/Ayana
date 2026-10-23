@@ -3,6 +3,8 @@
 - 使用 sqlite3 backup API 做一致性备份，不复制 WAL 文件冒充
 - 恢复到隔离临时库，不覆盖生产
 - integrity_check + schema version + 关键表可读
+
+CLI: python -m ayana.backup {create,restore-rehearsal,validate} ...
 """
 
 from __future__ import annotations
@@ -211,3 +213,50 @@ def validate_backup_file(backup_path: str | Path) -> dict[str, Any]:
         }
     except Exception as e:
         return {"ok": False, "reasons": [str(e)]}
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI: python -m ayana.backup {create,restore-rehearsal,validate} ..."""
+    import argparse
+    import sys as _sys
+
+    parser = argparse.ArgumentParser(prog="ayana.backup", description="Ayana SQLite 备份/恢复校验")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_create = sub.add_parser("create", help="在线一致性备份")
+    p_create.add_argument("source", help="源数据库路径")
+    p_create.add_argument("dest", help="备份输出路径")
+    p_create.add_argument("--label", default="", help="备份来源标签")
+
+    p_restore = sub.add_parser("restore-rehearsal", help="恢复到隔离临时库并校验")
+    p_restore.add_argument("backup", help="备份文件路径")
+    p_restore.add_argument("--work-dir", default=None, help="隔离工作目录（默认临时目录）")
+    p_restore.add_argument("--expected-schema", type=int, default=None, help="期望 schema 版本")
+
+    p_validate = sub.add_parser("validate", help="快速校验备份文件")
+    p_validate.add_argument("backup", help="备份文件路径")
+
+    args = parser.parse_args(argv)
+    try:
+        if args.cmd == "create":
+            meta = create_backup(args.source, args.dest, source_label=args.label)
+            print(json.dumps(meta, ensure_ascii=False, indent=2))
+            return 0 if meta.get("ok") else 1
+        if args.cmd == "restore-rehearsal":
+            report = restore_rehearsal(
+                args.backup, work_dir=args.work_dir, expected_schema=args.expected_schema,
+            )
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0 if report.get("ok") else 1
+        if args.cmd == "validate":
+            report = validate_backup_file(args.backup)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0 if report.get("ok") else 1
+    except BackupError as e:
+        print(json.dumps({"ok": False, "code": e.code, "detail": e.detail}, ensure_ascii=False), file=_sys.stderr)
+        return 2
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

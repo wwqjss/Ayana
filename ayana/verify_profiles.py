@@ -82,12 +82,40 @@ PROFILES: dict[str, VerificationProfile] = {
         deadline_sec=60.0,
         expect="down",
     ),
+    "mysql.replica.recover": VerificationProfile(
+        id="mysql.replica.recover",
+        name="MySQL 复制恢复",
+        capability="mysql.replica.start",
+        object_kind="service",
+        checks=(
+            {
+                "kind": "prom_range",
+                "metric": "mysql_slave_status_replica_io_running",
+                "selector": {"asset": "*", "service": "*"},
+                "success_value": 1,
+            },
+            {
+                "kind": "prom_range",
+                "metric": "mysql_slave_status_replica_sql_running",
+                "selector": {"asset": "*", "service": "*"},
+                "success_value": 1,
+            },
+        ),
+        warmup_sec=15.0,
+        continuous_success_sec=30.0,
+        max_sample_gap_sec=30.0,
+        deadline_sec=120.0,
+        expect="up",
+    ),
 }
 
 # capability → 默认 profile（仅无歧义的通用能力）
 CAP_PROFILE = {
     "service.restart": "svc.recover",
+    "service.reset_failed": "svc.recover",
+    "service.reload": "svc.recover",
     "service.stop": "svc.stop",
+    "mysql.replica.start": "mysql.replica.recover",
 }
 
 
@@ -95,13 +123,26 @@ def get_profile(profile_id: str) -> VerificationProfile | None:
     return PROFILES.get(profile_id)
 
 
+def bound_contract(profile: VerificationProfile, *, asset_id: str, service: str) -> dict[str, Any]:
+    """Public contract with the exact labels used by Action's verifier.
+
+    The catalog's '*' marks a target placeholder, never a broad PromQL query.
+    Keep that implementation detail out of the immutable reviewed contract.
+    """
+    result = profile.to_public()
+    result["checks"] = []
+    for check in profile.checks:
+        bound = dict(check)
+        selector = dict(check.get("selector") or {})
+        selector.update(asset=asset_id, service=service)
+        bound["selector"] = selector
+        result["checks"].append(bound)
+    result["capability"] = profile.capability
+    return result
+
+
 def profile_for_action(*, capability: str, asset_id: str = "", object_id: str = "") -> VerificationProfile | None:
     """按 capability 解析通用 profile；未知返回 None（阻止自动）。"""
     if capability in CAP_PROFILE:
         return PROFILES.get(CAP_PROFILE[capability])
     return None
-
-
-def assert_supported(profile: VerificationProfile | None) -> None:
-    if profile is None:
-        raise ValueError("unsupported_verification_profile")

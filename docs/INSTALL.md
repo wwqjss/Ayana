@@ -180,6 +180,15 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 
 也可用环境变量 `AYANA_*` 覆盖（见 `ayana/config.py` 的 `SECRET_KEYS`）。
 
+**配置来源 2 层优先级**：
+
+| 层 | 来源 | 覆盖顺序 | 可写时机 |
+|---|---|---|---|
+| 启动态 | `DEFAULTS` → `config.json` → `secrets.json` → `AYANA_*` 环境变量 | 后者覆盖前者 | 部署时改文件 |
+| 运行态 | DB `meta` 表（Web 控制台「设置」页） | 启动后覆盖启动态同名键 | 运行时 UI |
+
+启动态由 `ayana/config.py:load_config` 合并；运行态 meta 键（如 `prometheus_url` / `alertmanager_url` / `llm_*`）在启动时回填并即时生效。秘密（token/密钥）只进 `secrets.json` 或 `AYANA_*` env，不进 DB meta。
+
 **注意**：
 
 - `web_auth_pepper` 用于口令哈希；**与 `onewbot_token` 隔离**。若历史库用旧 pepper，设置新 pepper 后旧口令仍可登录，并在登录成功后自动迁移到新 pepper。

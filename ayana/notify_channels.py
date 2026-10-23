@@ -153,6 +153,7 @@ CHANNEL_GUIDES: dict[str, dict[str, Any]] = {
             "在 Ayana 填写名称、Bot ID、Secret 后保存（推送目标可先留空，连接成功后再选）。",
             "等待连接状态变为「已认证」；在需要告警的群里 @机器人 发一条消息，该群会出现在「已发现的推送目标」。",
             "在「已发现的推送目标」勾选要推送的会话并保存，或手动填写 chatid/userid；然后点「发送测试消息」。",
+            "可选：点渠道的「管理员」，从已收到消息的成员 UserID 中勾选，或手动填写；留空不授予管理员资格。",
         ],
         "notes": [
             "一个机器人同一时间只能保持一条有效长连接；切换到「URL 回调」会使长连接失效。",
@@ -164,6 +165,7 @@ CHANNEL_GUIDES: dict[str, dict[str, Any]] = {
             "发送回执超时或断线时结果可能不确定，Ayana 不会盲目重发，避免重复推送；可在 outbox 手动重试。",
             "「URL 回调」方式需公网 HTTPS，与主动告警能力不同，当前版本不提供。",
             "用户命令权限走 Ayana Policy（主体 wecom_user），默认拒绝，需在「权限」页授权后才能调查/批准。",
+            "管理员名单仅允许该成员在本渠道批准「永久允许执行」，具体操作仍需已有执行权限；群 chatid 不是成员 UserID。",
         ],
         "docs": [
             {
@@ -258,6 +260,7 @@ def _public_config(kind: str, config: dict) -> dict:
         out["bot_id_masked"] = _mask_bot_id(str(config.get("bot_id_masked") or config.get("bot_id") or ""))
         out["targets"] = [str(t) for t in (config.get("targets") or []) if str(t).strip()]
         out["ws_url"] = str(config.get("ws_url") or "")
+        out["admin_user_ids"] = _normalize_admin_user_ids(config.get("admin_user_ids"))
     elif kind == "webhook":
         out["url"] = str(config.get("url") or "")
         out["method"] = str(config.get("method") or "POST").upper()
@@ -298,6 +301,16 @@ def _normalize_targets(raw: Any) -> list[str]:
             seen.add(s)
             out.append(s)
     return out
+
+
+def _normalize_admin_user_ids(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [value for value in re.split(r"[\s,;，；]+", raw) if value]
+    if not isinstance(raw, (list, tuple)) or any(not isinstance(value, str) for value in raw):
+        raise ChannelError("bad_admin_user_ids", "管理员必须填写成员 UserID 列表")
+    return list(dict.fromkeys(value.strip() for value in raw if value.strip()))
 
 
 def _channel_health(kind: str, cfg: dict, meta: dict) -> dict[str, Any]:
@@ -355,6 +368,7 @@ def _normalize(kind: str, config: dict) -> dict:
             "bot_id_masked": _mask_bot_id(bot_id),
             "targets": targets,
             "ws_url": ws_url,
+            "admin_user_ids": _normalize_admin_user_ids((config or {}).get("admin_user_ids")),
         }
     if kind == "webhook":
         url = str((config or {}).get("url") or "").strip()
@@ -523,6 +537,43 @@ class ChannelStore:
             )
             out.append(d)
         return out
+
+    def list_seen_users(self, channel_id: str) -> list[str]:
+        """候选身份只取已认证入站 sender，不把群会话 ID 当管理员。"""
+        users = {str(row["userid"]).strip() for row in self.db.query(
+            "SELECT DISTINCT userid FROM aibot_seen_targets WHERE channel_id=? AND userid!=''", (channel_id,),
+        )}
+        users.update(str(row["sender"]).strip() for row in self.db.query(
+            "SELECT DISTINCT sender FROM message_log WHERE channel_id=? AND direction='in'"
+            " AND platform='wecom' AND sender!='' LIMIT 500", (channel_id,),
+        ))
+        return sorted(user for user in users if user)
+
+    def is_aibot_admin(self, channel_id: str, user_id: str) -> bool:
+        row = self.get_raw(channel_id) if channel_id and user_id else None
+        if not row or row["kind"] != "wecom_aibot" or not row["enabled"]:
+            return False
+        try:
+            cfg = json.loads(row["config_json"] or "{}")
+            return user_id in _normalize_admin_user_ids(cfg.get("admin_user_ids"))
+        except (ValueError, TypeError, AttributeError, ChannelError):
+            return False
+
+    def set_admin_user_ids(self, channel_id: str, user_ids: Any, *, actor: str = "web") -> dict[str, Any]:
+        row = self.get_raw(channel_id)
+        if not row:
+            raise ChannelError("not_found", "消息渠道不存在")
+        if row["kind"] != "wecom_aibot":
+            raise ChannelError("bad_kind", "该消息渠道不支持成员管理员")
+        cfg = json.loads(row["config_json"] or "{}")
+        before = _normalize_admin_user_ids(cfg.get("admin_user_ids"))
+        cfg["admin_user_ids"] = _normalize_admin_user_ids(user_ids)
+        with self.db.tx():
+            self.db.execute("UPDATE notify_channels SET config_json=?,updated_at=? WHERE id=?",
+                            (json.dumps(cfg, ensure_ascii=False), now(), channel_id))
+            self.db.audit("web_user", actor, "notify_channel_admins_updated", channel="web",
+                          detail={"id": channel_id, "before": before, "after": cfg["admin_user_ids"]})
+        return self.get_meta(channel_id) or {"id": channel_id}
 
     def set_targets(self, channel_id: str, targets: list[str], actor: str = "web") -> dict[str, Any]:
         """保存/更新推送目标列表（手动填写 + 从发现列表勾选共用）。"""
@@ -723,6 +774,8 @@ class ChannelStore:
         except Exception:
             old_cfg = {}
         cfg = _normalize(kind, config) if config is not None else old_cfg
+        if kind == "wecom_aibot" and config is not None and "admin_user_ids" not in config:
+            cfg["admin_user_ids"] = _normalize_admin_user_ids(old_cfg.get("admin_user_ids"))
         t = now()
         sets = ["updated_at=?"]
         params: list[Any] = [t]
@@ -899,7 +952,8 @@ class ChannelStore:
                 channel_id, bot_id=bot_id, secret=secret, ws_url=ws_url
             )
         except Exception as e:
-            return False, f"unknown:ensure_failed:{str(e)[:80]}"
+            # ensure 只建立连接和认证，此处尚未调用发送业务消息。
+            return False, f"ensure_failed:{str(e)[:80]}"
         return await self._aibot_manager.send_text(channel_id, chatid, body)
 
     async def _send_wecom(self, sec: dict, body: str) -> tuple[bool, str]:

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 from typing import Any
 from urllib.parse import quote
@@ -224,6 +225,8 @@ class PromClient:
 
 
 def summarize_probe(data: dict[str, Any]) -> dict[str, Any]:
+    from .health import sample_state
+
     samples = data.get("result") or []
     if not samples:
         return {"state": "unknown", "reason": "no_samples", "value": None, "age_sec": None}
@@ -231,13 +234,16 @@ def summarize_probe(data: dict[str, Any]) -> dict[str, Any]:
     if not usable:
         return {"state": "unknown", "reason": "sample_time_unknown", "value": None, "age_sec": None}
     # 不得用最新样本掩盖稍旧失败（P0-06）
-    if any(s.get("value") == 0 for s in usable):
+    now_ts = time.time()
+    # summarize_probe 不做 freshness 收紧（窗口由 probe_success 界定）；判定走统一样本词表
+    states = [sample_state(s, math.inf, at=now_ts) for s in usable]
+    if "fail" in states:
         latest_fail = max(
-            (s for s in usable if s.get("value") == 0),
+            (s for s, st in zip(usable, states) if st == "fail"),
             key=lambda x: x.get("sample_at") or 0,
         )
         ts = latest_fail.get("sample_at")
-        age = (time.time() - ts) if ts else None
+        age = (now_ts - ts) if ts else None
         return {
             "state": "fail",
             "reason": "failure_sample_present",
@@ -248,16 +254,11 @@ def summarize_probe(data: dict[str, Any]) -> dict[str, Any]:
         }
     s = max(usable, key=lambda x: x.get("sample_at") or 0)
     ts = s.get("sample_at")
-    age = (time.time() - ts) if ts else None
+    age = (now_ts - ts) if ts else None
     val = s.get("value")
-    if val is None:
-        return {"state": "unknown", "reason": "no_value", "value": None, "age_sec": age}
-    if val == 1:
-        state = "ok"
-    elif val == 0:
-        state = "fail"
-    else:
-        state = "unknown"
+    st = sample_state(s, math.inf, at=now_ts)
+    # 对外保留历史词 unknown（= 统一词表 no_data）
+    state = {"ok": "ok", "fail": "fail", "stale": "stale", "no_data": "unknown"}.get(st, "unknown")
     return {
         "state": state,
         "reason": "",

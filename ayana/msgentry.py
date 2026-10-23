@@ -3,7 +3,7 @@
 路由：
 - `@Ayana /help` 等斜杠命令 → 现有业务分发
 - `@Ayana -c <host> <cmd...>` → 受控命令执行（跳过 Agent，禁止改写）
-- `@Ayana 查询 NERV 状态` → Agent 自然语言理解并调用工具
+- `@Ayana 查询 demo-01 状态` → Agent 自然语言理解并调用工具
 
 错误引导：
 - 缺目标 / 参数错 / 语法错 → 生成通用使用提示，不执行
@@ -65,7 +65,6 @@ _WRITE_VERBS = frozenset(
         "reset-failed",
         "rm",
         "rmi",
-        "kill",
     }
 )
 _WRITE_PROGRAMS = frozenset({"systemctl", "docker", "podman", "service"})
@@ -129,7 +128,7 @@ _READ_PROGRAMS = frozenset(
 class ParsedEntry:
     """解析结果。"""
 
-    kind: str  # slash | controlled | nl | empty | unknown | urgent | settings | watch_ping
+    kind: str  # slash | controlled | nl | approval | empty | unknown | urgent | settings | watch_ping
     text: str = ""
     slash_cmd: str = ""
     slash_args: list[str] = field(default_factory=list)
@@ -140,6 +139,7 @@ class ParsedEntry:
     error: str = ""
     error_hint: str = ""
     request_id: str = ""
+    approval_decision: str = ""
 
 
 def parse_entry(raw: str) -> ParsedEntry:
@@ -171,6 +171,12 @@ def parse_entry(raw: str) -> ParsedEntry:
         text = m.group(1).strip()
     if not text:
         return ParsedEntry(kind="empty")
+
+    # 授权答复必须整句匹配，不能把引用、否定或讨论文字误当指令。
+    from .approval import parse_approval_reply
+    decision = parse_approval_reply(text)
+    if decision:
+        return ParsedEntry(kind="approval", text=text, approval_decision=decision)
 
     # 斜杠命令
     if text.startswith("/"):
@@ -222,14 +228,13 @@ def _parse_controlled(text: str) -> ParsedEntry:
             error="missing_args",
             error_hint=f"用法: -c {PH_HOST} {PH_CMD}",
         )
-    # 令牌安全校验（禁止 shell 元字符）
-    for t in cmd_tokens:
-        if any(ch in t for ch in " ;|&$`\n\t<>()"):
-            return ParsedEntry(
-                kind="unknown",
-                error="unsafe_token",
-                error_hint=f"命令包含非法字符。\n用法: -c {PH_HOST} {PH_CMD}",
-            )
+    # 令牌安全校验（复用 readonly_commands.safe_tokens，禁止 shell 元字符）
+    if not safe_tokens(cmd_tokens):
+        return ParsedEntry(
+            kind="unknown",
+            error="unsafe_token",
+            error_hint=f"命令包含非法字符。\n用法: -c {PH_HOST} {PH_CMD}",
+        )
     is_write = classify_write(cmd_tokens)
     return ParsedEntry(
         kind="controlled",

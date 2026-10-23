@@ -23,7 +23,7 @@ from .db import Database, new_id, now
 
 MAX_ALERTS_PER_HOOK = 200
 
-# alertname → problem family（确定性、可解释）
+# alertname → problem family（确定性、可解释；不绑定特定环境业务名）
 PROBLEM_FAMILY = {
     "targetdown": "availability",
     "prometheusjobmissing": "availability",
@@ -33,8 +33,12 @@ PROBLEM_FAMILY = {
     "diskusagehigh": "capacity",
     "memorylow": "capacity",
     "cpuhog": "capacity",
-    "hysteria_proxy_down": "availability",
     "portbindfailed": "capacity",
+    "mysqldown": "availability",
+    "mysqlreplicationiorunning": "availability",
+    "mysqlreplicationsqlrunning": "availability",
+    "mysqlreplicationlag": "capacity",
+    "mysqlmetricsmissing": "availability",
 }
 DEFAULT_FAMILY = "other"
 
@@ -104,6 +108,134 @@ def normalize_starts_at(starts_at: str) -> tuple[str, str]:
         return f"invalid:{raw[:40]}", "invalid"
 
 
+def upsert_episode(
+    db,
+    *,
+    source_id: str,
+    fingerprint: str,
+    labels: dict | None = None,
+    annotations: dict | None = None,
+    status: str = "firing",
+    source_state: str = "firing",
+    t: float,
+    alertname: str = "",
+    asset_id: str = "",
+    object_id: str = "",
+    source_health: str = "ok",
+    problem_family: str = "",
+    canonical_object: str = "",
+    quarantine_reason: str = "",
+    silenced: int = 0,
+    inhibited: int = 0,
+    starts_at: str = "",
+    starts_at_norm: str = "",
+) -> tuple[str, bool, str, str]:
+    """统一 alert_episodes 写入入口（P1-1）。
+
+    幂等：同 fingerprint 未解决时更新而不是新建。
+    starts_at_norm 参与 UNIQUE(source_id, fingerprint, starts_at_norm)；
+    无现成行可更新时用退避序列插入以避免同秒冲突。
+
+    返回 (episode_id, created, prev_status, new_status)。
+    """
+    labels = dict(labels or {})
+    annotations = dict(annotations or {})
+    if not alertname:
+        alertname = labels.get("alertname") or "unknown"
+    if not asset_id:
+        asset_id = labels.get("asset") or ""
+    if not problem_family:
+        problem_family = problem_family_of(alertname, labels)
+    if not canonical_object:
+        canonical_object = object_id or labels.get("service") or ""
+
+    # starts_at_norm：仅当调用方显式传入时才做精确键命中（alertmanager 迟到告警场景）
+    explicit_norm = bool(starts_at_norm)
+    if not starts_at_norm:
+        if starts_at:
+            starts_at_norm, _st = normalize_starts_at(starts_at)
+        else:
+            starts_at_norm = str(int(t))
+
+    def _fetch_one(sql: str, params: tuple):
+        cur = db.execute(sql, params)
+        return cur.fetchone()
+
+    row = None
+    if explicit_norm:
+        # alertmanager 语义：精确唯一键命中（含 resolved → 不复活）
+        row = _fetch_one(
+            "SELECT * FROM alert_episodes WHERE source_id=? AND fingerprint=?"
+            " AND starts_at_norm=?",
+            (source_id, fingerprint, starts_at_norm),
+        )
+    else:
+        # exttx/checks 语义：同 fingerprint 未解决 → 幂等更新（不新建）
+        row = _fetch_one(
+            "SELECT * FROM alert_episodes WHERE source_id=? AND fingerprint=?"
+            " AND status='firing' ORDER BY first_seen DESC LIMIT 1",
+            (source_id, fingerprint),
+        )
+    if row:
+        row_d = dict(row)
+        new_status = status
+        # 已 resolved 的 episode 不因迟到 firing 自动复活
+        if row_d["status"] == "resolved" and status == "firing":
+            new_status = "resolved"
+        prev_status = row_d["status"]
+        db.execute(
+            "UPDATE alert_episodes SET last_seen=?, receive_count=receive_count+1,"
+            " status=?, source_state=?, annotations_json=?, labels_json=?,"
+            " last_reconciled_at=?, silenced=?, inhibited=?, source_health=?,"
+            " problem_family=?, canonical_object=?, quarantine_reason=?"
+            " WHERE id=?",
+            (
+                t, new_status, source_state,
+                json.dumps(annotations, ensure_ascii=False),
+                json.dumps(labels, ensure_ascii=False),
+                t, silenced, inhibited, source_health,
+                problem_family, canonical_object, quarantine_reason,
+                row_d["id"],
+            ),
+        )
+        return row_d["id"], False, prev_status, new_status
+
+    # 3) 新建：starts_at_norm 退避插入（同秒冲突时降级微秒 / 短后缀）
+    eid = new_id("ep")
+    insert_sql = (
+        "INSERT INTO alert_episodes(id, source_id, fingerprint, starts_at_norm,"
+        " alertname, status, asset_id, object_id, first_seen, last_seen,"
+        " receive_count, labels_json, annotations_json, source_state,"
+        " last_reconciled_at, silenced, inhibited, source_health, problem_family,"
+        " canonical_object, quarantine_reason)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    )
+    base_args = [
+        eid, source_id, fingerprint, starts_at_norm,
+        alertname, status, asset_id, object_id, t, t, 1,
+        json.dumps(labels, ensure_ascii=False),
+        json.dumps(annotations, ensure_ascii=False),
+        source_state, t, silenced, inhibited, source_health,
+        problem_family, canonical_object, quarantine_reason,
+    ]
+    candidates = [starts_at_norm]
+    if starts_at_norm == str(int(t)):
+        candidates += [f"{t:.6f}", f"{t:.6f}:{eid[-4:]}"]
+    else:
+        candidates += [str(int(t)), f"{t:.6f}", f"{t:.6f}:{eid[-4:]}"]
+    last_err: Exception | None = None
+    for cand in candidates:
+        args = list(base_args)
+        args[3] = cand
+        try:
+            db.execute(insert_sql, tuple(args))
+            return eid, True, "", status
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err if last_err else RuntimeError("episode_insert_failed")
+
+
 class AlertIngest:
     def __init__(self, db: Database, source_id: str = "alertmanager", incidents=None, notifier=None):
         self.db = db
@@ -151,8 +283,20 @@ class AlertIngest:
                     " AND asset_id=? AND object_id=?",
                     (ep.get("asset_id") or "", ep.get("object_id") or ""),
                 )
-                if inc_id and (not before_open or after_open["n"] > before_open["n"]):
-                    self._notify_incident(inc_id, "opened", episode_id=episode_id)
+                if inc_id:
+                    last_type = self.db.query_one(
+                        "SELECT type FROM events WHERE incident_id=? ORDER BY id DESC LIMIT 1",
+                        (inc_id,),
+                    )
+                    is_reopen = bool(last_type and last_type["type"] == "incident_reopened")
+                    if is_reopen:
+                        # 生命周期事件都交给 Notifier 判断静默窗口，补偿也遵守同一意图。
+                        self._notify_incident(inc_id, "reopened", episode_id=episode_id)
+                    elif not before_open or after_open["n"] > before_open["n"]:
+                        self._notify_incident(inc_id, "opened", episode_id=episode_id)
+                    elif self._quiet_elapsed(inc_id, episode_id=episode_id):
+                        # 并入已打开事件：安静满 1 小时后再响才推，避免同一事件刷屏
+                        self._notify_refire(inc_id, episode_id=episode_id)
             if ep.get("status") == "resolved" and ep.get("incident_id"):
                 before = self._row_dict(
                     self.db.query_one(
@@ -167,6 +311,41 @@ class AlertIngest:
                 )
                 if before.get("status") == "open" and after.get("status") == "resolved":
                     self._notify_incident(ep["incident_id"], "resolved", episode_id=episode_id)
+        except Exception:
+            pass
+
+    def _quiet_elapsed(self, inc_id: str, *, episode_id: str = "", window_sec: float = 3600.0) -> bool:
+        """事件安静超过 window 后，再次并入告警才值得推。"""
+        row = self.db.query_one(
+            "SELECT MAX(at) AS t FROM events WHERE incident_id=?"
+            " AND type IN ('incident_opened','incident_reopened','incident_resolved',"
+            " 'alert_fired','episode_attached','incident_refired')"
+            " AND (?='' OR COALESCE(episode_id,'')!=?)",
+            (inc_id, episode_id, episode_id),
+        )
+        last = float(row["t"] or 0) if row else 0.0
+        if last <= 0:
+            return True
+        return (now() - last) >= window_sec
+
+    def _notify_refire(self, inc_id: str, *, episode_id: str = "") -> None:
+        """安静后再响：补一条 refire 事件并推送。"""
+        try:
+            from .fmt import fmt_incident_open
+
+            inc = self._row_dict(
+                self.db.query_one("SELECT * FROM incidents WHERE id=?", (inc_id,))
+            )
+            if not inc:
+                return
+            ev_id = self.db.event(
+                "incident_refired",
+                "告警复发",
+                incident_id=inc_id,
+                payload={"episode_id": episode_id, "quiet_window_sec": 3600},
+            )
+            body = fmt_incident_open(inc, at=now(), refire=True)
+            self._notifier.enqueue_for_event(ev_id, body=body, typ="reopened")
         except Exception:
             pass
 
@@ -195,7 +374,11 @@ class AlertIngest:
             if typ == "resolved":
                 body = fmt_incident_resolved(inc)
             else:
-                body = fmt_incident_open(inc)
+                body = fmt_incident_open(
+                    inc,
+                    at=now(),
+                    refire=(typ == "reopened"),
+                )
             self._notifier.enqueue_for_event(ev["id"], body=body, typ=typ)
         except Exception:
             pass
@@ -209,8 +392,8 @@ class AlertIngest:
         source_state: str,
         status: str,
         source_health: str = "ok",
-    ) -> tuple[str, bool]:
-        """写入/更新 episode。返回 (episode_id, created)。"""
+    ) -> tuple[str, bool, str, str]:
+        """写入/更新 episode。返回 (episode_id, created, prev_status, new_status)。"""
         labels = a.get("labels") or {}
         annotations = a.get("annotations") or {}
         fp = labels.get("fingerprint") or fingerprint_of(labels)
@@ -237,75 +420,26 @@ class AlertIngest:
         elif starts_status == "unknown":
             quarantine_reason = "unknown_starts_at"
 
-        row = conn.execute(
-            "SELECT * FROM alert_episodes WHERE source_id=? AND fingerprint=?"
-            " AND starts_at_norm=?",
-            (self.source_id, fp, starts),
-        ).fetchone()
-        if row:
-            row_d = dict(row)
-            new_status = status
-            # 已 resolved 的 episode 不因迟到 firing 自动复活
-            if row_d["status"] == "resolved" and status == "firing":
-                new_status = "resolved"
-            prev_status = row_d["status"]
-            conn.execute(
-                "UPDATE alert_episodes SET last_seen=?, receive_count=receive_count+1,"
-                " status=?, source_state=?, annotations_json=?, labels_json=?,"
-                " last_reconciled_at=?, silenced=?, inhibited=?, source_health=?,"
-                " problem_family=?, canonical_object=?, quarantine_reason=?"
-                " WHERE id=?",
-                (
-                    t,
-                    new_status,
-                    source_state,
-                    json.dumps(annotations, ensure_ascii=False),
-                    json.dumps(labels, ensure_ascii=False),
-                    t,
-                    silenced,
-                    inhibited,
-                    source_health,
-                    family,
-                    obj_name,
-                    quarantine_reason,
-                    row_d["id"],
-                ),
-            )
-            return row_d["id"], False, prev_status, new_status
-
-        eid = new_id("ep")
-        conn.execute(
-            "INSERT INTO alert_episodes(id, source_id, fingerprint, starts_at_norm,"
-            " alertname, status, asset_id, object_id, first_seen, last_seen,"
-            " receive_count, labels_json, annotations_json, source_state,"
-            " last_reconciled_at, silenced, inhibited, source_health, problem_family,"
-            " canonical_object, quarantine_reason)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                eid,
-                self.source_id,
-                fp,
-                starts,
-                alertname,
-                status,
-                asset_id,
-                obj_name,
-                t,
-                t,
-                1,
-                json.dumps(labels, ensure_ascii=False),
-                json.dumps(annotations, ensure_ascii=False),
-                source_state,
-                t,
-                silenced,
-                inhibited,
-                source_health,
-                family,
-                obj_name,
-                quarantine_reason,
-            ),
+        return upsert_episode(
+            conn,
+            source_id=self.source_id,
+            fingerprint=fp,
+            labels=labels,
+            annotations=annotations,
+            status=status,
+            source_state=source_state,
+            t=t,
+            alertname=alertname,
+            asset_id=asset_id,
+            object_id=obj_name,
+            source_health=source_health,
+            problem_family=family,
+            canonical_object=obj_name,
+            quarantine_reason=quarantine_reason,
+            silenced=silenced,
+            inhibited=inhibited,
+            starts_at_norm=starts,
         )
-        return eid, True, "", status
 
     def ingest_webhook(self, payload: dict, *, received_at: float | None = None) -> dict[str, Any]:
         alerts = payload.get("alerts") or []

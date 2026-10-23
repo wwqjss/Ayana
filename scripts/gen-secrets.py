@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""生成 Ayana secrets.json（不覆盖已有文件）。"""
+"""生成 Ayana secrets.json（不覆盖已有文件）。
+
+与 ayana.config.SECRET_KEYS 对齐（P2-4）：只对需要随机值的秘密键生成；
+llm_* 为用户配置值（可留空由 env/meta 提供），不在此随机生成。
+"""
 from __future__ import annotations
 
 import argparse
@@ -9,6 +13,8 @@ import secrets
 import sys
 from pathlib import Path
 
+# 需要随机生成的秘密键。与 ayana.config.SECRET_KEYS 中的"真秘密"对齐；
+# llm_api_key/llm_base_url/llm_model 与预留项不在此列。
 KEYS = (
     "onewbot_token",
     "webhook_token",

@@ -72,6 +72,7 @@ function environment(customReply) {
     if (url.startsWith("/api/checks?")) return { ok: true, checks: [native] };
     if (url === "/api/checks/activity") return { ok: true, activity: [] };
     if (["/api/checks/run", "/api/checks/update", "/api/checks/delete"].includes(url)) return { ok: true };
+    if (url === "/api/setup/monitor") return { ok: true, prometheus_ok: true };
     if (url === "/api/promconfig/node-exporter/detect") return { ok: true, running: true, binary: "/usr/bin/node_exporter", port_9100: true };
     if (url === "/api/promconfig/node-exporter/adopt") return { ok: true, scrape: { has_metrics: true }, address: "10.0.0.1:9100" };
     throw new Error("Unexpected API request " + url);
@@ -321,6 +322,25 @@ test("failed onboarding resets its running state and permits a retry", async () 
   assert.equal(env.nodes.get("monitor-detect").disabled, false);
   await env.run("pcRunAdoptFlow('control')");
   assert.equal(env.calls.filter((call) => call.url === "/api/promconfig/node-exporter/detect").length, 2);
+});
+
+test("unavailable Prometheus stops onboarding before detection or changes and permits a retry", async () => {
+  let ready = false;
+  const env = environment(({ url }) => {
+    if (url === "/api/setup/monitor") return { ok: true, prometheus_ok: ready, prometheus_hint: "请先连接 Prometheus" };
+  });
+  env.state.tab = "overview";
+  env.run("monitorState.host = 'control'; syncMonitorOnboarding('control', true)");
+  await env.run("pcRunAdoptFlow('control')");
+  assert.equal(env.run("pcProgressByHost.control[0].status"), "fail");
+  assert.ok(env.nodes.get("monitor-install-box").textContent.includes("请先连接 Prometheus"));
+  assert.equal(env.run("pcRunningByHost.control"), false);
+  assert.equal(env.nodes.get("monitor-detect").disabled, false);
+  assert.ok(!env.calls.some((call) => call.url.startsWith("/api/promconfig/node-exporter/")));
+  ready = true;
+  await env.run("pcRunAdoptFlow('control')");
+  assert.equal(env.run("pcProgressByHost.control[3].status"), "ok");
+  assert.equal(env.calls.filter((call) => call.url === "/api/promconfig/node-exporter/detect").length, 1);
 });
 
 (async () => {

@@ -49,6 +49,7 @@ class RunbookRule:
                 self.category,
                 self.capability,
                 str(self.require_probe_fail),
+                self.require_service_state,
                 str(self.manual_only),
                 str(self.max_per_day),
                 str(self.cooldown_sec),
@@ -73,12 +74,14 @@ class RunbookRule:
           control_plane: bool | None
         """
         reasons: list[str] = []
+        blockers: list[str] = []
         status = "satisfied"
 
         def need(cond: Any, label: str, on_false: str = "unsatisfied") -> None:
             nonlocal status
             if cond is True:
                 return
+            blockers.append(label)
             if cond is None:
                 reasons.append(f"{label}: unknown")
                 if status == "satisfied":
@@ -95,6 +98,7 @@ class RunbookRule:
             return {
                 "status": "unsatisfied",
                 "reasons": ["control_plane_object: must not auto-remediate Ayana itself"],
+                "blockers": ["control_plane_object"],
             }
 
         need(ctx.get("asset_id") == self.asset_id or self.asset_id == "*", "asset_match", "mismatch")
@@ -107,7 +111,7 @@ class RunbookRule:
             need(ctx.get("probe_failed_recent"), "fresh_failed_probe", "missing or not failed")
         if self.require_service_state:
             need(
-                ctx.get("service_state") == self.require_service_state,
+                None if ctx.get("service_state") is None else ctx["service_state"] == self.require_service_state,
                 "service_state",
                 f"want {self.require_service_state}",
             )
@@ -117,8 +121,16 @@ class RunbookRule:
         need(ctx.get("policy_allowed"), "policy")
         need(ctx.get("budget_ok"), "budget")
         need(ctx.get("object_locked") is False, "object_lock", "locked")
+        if ctx.get("write_result_unknown"):
+            need(False, "write_result_unknown", "human adjudication required")
 
-        return {"status": status, "reasons": reasons}
+        return {
+            "status": status,
+            "reasons": reasons,
+            "blockers": blockers,
+            "budget_reason": ctx.get("budget_reason", ""),
+            "retry_at": ctx.get("budget_retry_at"),
+        }
 
 
 @dataclass
@@ -133,6 +145,62 @@ class ManualTemplate:
             self.rev = hashlib.sha256(
                 f"{self.id}|{self.name}|{self.capability}".encode("utf-8")
             ).hexdigest()[:12]
+
+
+def auto_budget_state(
+    store: Any,
+    rule: RunbookRule,
+    asset_id: str,
+    object_id: str,
+    *,
+    at: float,
+    exclude_action_id: str = "",
+) -> dict[str, Any]:
+    """Agent 预检与事务内派发门共用同一预算定义，以已派发操作为准。
+
+    store 可为 Database 或 sqlite Connection；事务调用者保留原子领取职责。
+    unknown 也占用预算；未派发的取消/拒绝/过期提案不消耗预算。
+    """
+    obj = store.execute(
+        "SELECT id,name FROM objects WHERE asset_id=? AND (id=? OR name=?)",
+        (asset_id, object_id, object_id),
+    ).fetchone()
+    object_ref = obj["id"] if obj else object_id
+    object_name = obj["name"] if obj else (object_id or "").split(":")[-1]
+    rows = store.execute(
+        "SELECT COALESCE(dispatched_at,created_at) AS at FROM actions"
+        " WHERE asset_id=? AND object_id IN (?,?) AND mode IN ('auto','reviewed') AND id!=?"
+        " AND (?='' OR capability=?)"
+        " AND state IN ('dispatched','success','failure','unknown')"
+        " ORDER BY at DESC",
+        (asset_id, object_ref, object_name, exclude_action_id, rule.capability, rule.capability),
+    ).fetchall()
+    times = [float(row["at"] or 0) for row in rows]
+    recent = [t for t in times if t > at - 86400]
+    reasons: list[str] = []
+    retry_at = 0.0
+    code = ""
+    # max_per_day=0 / cooldown_sec=0 表示不限制
+    if rule.max_per_day > 0 and len(recent) >= rule.max_per_day:
+        code = "budget_exhausted"
+        retry_at = recent[rule.max_per_day - 1] + 86400
+        reasons.append(f"已达24小时执行上限（{len(recent)}/{rule.max_per_day}次）")
+    if rule.cooldown_sec > 0 and times and at - times[0] < rule.cooldown_sec:
+        code = code or "cooldown"
+        retry_at = max(retry_at, times[0] + rule.cooldown_sec)
+        reasons.append("冷却中")
+    cap = (
+        f"{len(recent)}/{rule.max_per_day} today"
+        if rule.max_per_day > 0
+        else f"{len(recent)}/unlimited today"
+    )
+    return {
+        "ok": not reasons,
+        "reason": "；".join(reasons) if reasons else f"ok ({cap})",
+        "retry_at": retry_at or None,
+        "code": code,
+        "count": len(recent),
+    }
 
 
 # 人工-only 模板：显式登记，避免用“人工”绕过 runbook 交集
@@ -181,8 +249,17 @@ def apply_runbook_rules(cfg_rules: Any) -> list[RunbookRule]:
                     reason=str(raw.get("reason") or ""),
                     require_probe_fail=bool(raw.get("require_probe_fail", True)),
                     require_service_state=str(raw.get("require_service_state") or ""),
-                    max_per_day=int(raw.get("max_per_day") or 3),
-                    cooldown_sec=int(raw.get("cooldown_sec") or 1800),
+                    # 显式 0 = 不限制；缺省才回落默认 3 / 1800
+                    max_per_day=(
+                        3
+                        if raw.get("max_per_day") is None
+                        else int(raw.get("max_per_day"))
+                    ),
+                    cooldown_sec=(
+                        1800
+                        if raw.get("cooldown_sec") is None
+                        else int(raw.get("cooldown_sec"))
+                    ),
                     manual_only=bool(raw.get("manual_only", False)),
                 )
             )

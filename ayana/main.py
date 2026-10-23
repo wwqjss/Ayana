@@ -27,6 +27,9 @@ from .investigation import InvestigationService
 from .instance import acquire_single_instance_lock
 from .knowledge import KnowledgeBase
 from .llm import make_llm
+from .ai_providers import ProviderRegistry
+from .autonomy import AutonomyEngine
+from .council import CouncilService
 from .ntsafe import AssetBinding, IdentityGate, NTClient
 from .notify import Notifier
 from .notify_channels import ChannelStore
@@ -40,6 +43,7 @@ from .policy import Policy
 from .prom import PromClient
 from .promconfig import build_prom_config_service
 from .checks import CheckService
+from .exttx import ExtTxService
 from .qqbot import QQBot
 from .credentials import CredentialStore
 from .transport import SSHAssetStore, SSHTransport
@@ -288,20 +292,6 @@ class App:
                 self._ssh = ssh
                 self._store = store
 
-            def _use_ssh(self, asset_id: str, role: str) -> bool:
-                try:
-                    ep = self._store.get_endpoint(asset_id, role)
-                    if ep and ep.get("enabled"):
-                        return True
-                    for r in self._store.list_roles():
-                        if (role in ("read", "write") and r.get("kind") == role) or r.get("name") == role:
-                            ep = self._store.get_endpoint(asset_id, r["name"])
-                            if ep and ep.get("enabled"):
-                                return True
-                except Exception:
-                    return False
-                return False
-
             async def probe(self, asset_id, tokens, timeout=None):
                 return await self._ssh.probe(asset_id, tokens, timeout=timeout)
 
@@ -345,6 +335,7 @@ class App:
             master_key=cfg.get("notify_channel_key") or cfg.get("ssh_credential_key") or "",
         )
         self.notifier.set_channel_store(self.channel_store)
+        self._node_name = str(cfg.get("node_name") or "")
         self.host_monitor = HostMonitor(self.prom)
         try:
             self.promconfig = build_prom_config_service(
@@ -356,6 +347,12 @@ class App:
         self.checks = CheckService(self.db, self._checks_transport())
         self.checks.notifier = self.notifier
         self.checks.incidents = self.incidents
+        self.exttx = ExtTxService(
+            self.db,
+            incidents=self.incidents,
+            notifier=self.notifier,
+            pepper=cfg.get("web_auth_pepper") or "",
+        )
         self.aibot_manager = WeComAibotManager()
         self.channel_store.set_aibot_manager(self.aibot_manager)
         self.mlog = MessageLog(self.db)
@@ -407,6 +404,21 @@ class App:
             ),
             knowledge=self.knowledge,
         )
+        # Optional model configuration cannot prevent core monitoring startup.
+        self.providers = self.council = self.autonomy = None
+        try:
+            self.providers = ProviderRegistry(self.db, cfg)
+            self.council = CouncilService(self.db, self.actions)
+            self.autonomy = AutonomyEngine(
+                self.db, self.investigation, self.actions, self.policy,
+                self.providers, self.council, self.notifier,
+                runbook_auto_enabled=lambda: self.agent.auto_enabled,
+            )
+        except Exception as exc:
+            # Do not echo configuration, provider responses or credentials.
+            log.warning("autonomy unavailable during initialization (%s); core services remain enabled", type(exc).__name__)
+            self.autonomy = None
+        self.agent.autonomy_enabled = lambda: bool(self.autonomy is not None and self.autonomy.enabled)
         self.ob = OneBotServer(cfg["onewbot_token"], int(cfg.get("self_id") or 0))
         self.qq = QQBot(
             self.db,
@@ -417,6 +429,8 @@ class App:
             self.policy,
             self.notifier,
             admin_qq=str(cfg.get("admin_qq") or ""),
+            admin_wecom_users=cfg.get("admin_wecom_users") or [],
+            channel_store=self.channel_store,
             version=VERSION,
         )
         # 统一消息入口：Agent 查询 + 受控命令
@@ -457,68 +471,72 @@ class App:
             promconfig=self.promconfig,
             checks=self.checks,
             llm=self.llm,
+            providers=self.providers,
+            autonomy=self.autonomy,
             nodewatch=getattr(self, "nodewatch", None),
+            exttx=self.exttx,
+            alertmanager_webhook_path=cfg.get("alertmanager_webhook_path") or "/hooks/alertmanager",
         )
         self._stop = asyncio.Event()
         self._bg_tasks: list[asyncio.Task] = []
 
     def _checks_transport(self):
-        """检查通道：有 SSH 端点用 SSH；本机登记资产用 LocalExec；失败不跨主机回退。"""
-        from .promconfig import LocalExecTransport
+        """检查通道：统一走 transport.resolve_exec_channel（SSH 优先，仅本机资产 LocalExec）。"""
         from .ntsafe import NTResult
+        from .transport import ChannelUnavailable, resolve_exec_channel
 
         ssh = self.ssh_transport
-        local = LocalExecTransport()
-        local_assets = set()
+        local_assets: set[str] = set()
         try:
             pc = self.cfg.get("prometheus_config") or {}
             if isinstance(pc, dict):
-                local_assets = {str(x) for x in (pc.get("local_assets") or []) if str(x).strip()}
+                local_assets = {
+                    str(x) for x in (pc.get("local_assets") or []) if str(x).strip()
+                }
         except Exception:
             pass
-        store = getattr(ssh, "store", None) if ssh is not None else None
 
         class _T:
             async def probe(self, asset_id, tokens, timeout=None):
-                ep = None
-                if store is not None:
-                    try:
-                        ep = store.get_endpoint(asset_id, "read") or store.get_endpoint(asset_id, "write")
-                    except Exception:
-                        ep = None
-                if ep and ssh is not None:
-                    return await ssh.probe(asset_id, tokens, timeout=timeout)
-                if asset_id in local_assets:
-                    return await local.probe(asset_id, tokens, timeout=timeout)
-                return NTResult(ok=False, output="endpoint_missing: " + str(asset_id), returncode=255)
+                try:
+                    ch = resolve_exec_channel(
+                        asset_id, ssh, local_assets=local_assets, role="read"
+                    )
+                except ChannelUnavailable:
+                    return NTResult(
+                        ok=False,
+                        output="endpoint_missing: " + str(asset_id),
+                        returncode=255,
+                    )
+                return await ch.probe(asset_id, tokens, timeout=timeout)
 
             async def exec(self, asset_id, tokens, timeout=None):
-                ep = None
-                if store is not None:
-                    try:
-                        ep = store.get_endpoint(asset_id, "write")
-                    except Exception:
-                        ep = None
-                if ep and ssh is not None:
-                    return await ssh.exec(asset_id, tokens, timeout=timeout)
-                if asset_id in local_assets:
-                    return await local.exec(asset_id, tokens, timeout=timeout)
-                return NTResult(ok=False, output="endpoint_missing: " + str(asset_id), returncode=255)
+                try:
+                    ch = resolve_exec_channel(
+                        asset_id, ssh, local_assets=local_assets, role="write"
+                    )
+                except ChannelUnavailable:
+                    return NTResult(
+                        ok=False,
+                        output="endpoint_missing: " + str(asset_id),
+                        returncode=255,
+                    )
+                return await ch.exec(asset_id, tokens, timeout=timeout)
 
             async def send_file(self, asset_id, local_path, remote_path, *, timeout=60.0):
-                ep = None
-                if store is not None:
-                    try:
-                        ep = store.get_endpoint(asset_id, "write")
-                    except Exception:
-                        ep = None
-                if ep and ssh is not None and hasattr(ssh, "send_file"):
-                    return await ssh.send_file(asset_id, local_path, remote_path, timeout=timeout)
-                if asset_id in local_assets:
-                    return await local.send_file(asset_id, local_path, remote_path, timeout=timeout)
-                from .ntsafe import NTResult as _R
-
-                return _R(ok=False, output="endpoint_missing: " + str(asset_id), returncode=255)
+                try:
+                    ch = resolve_exec_channel(
+                        asset_id, ssh, local_assets=local_assets, role="write"
+                    )
+                except ChannelUnavailable:
+                    return NTResult(
+                        ok=False,
+                        output="endpoint_missing: " + str(asset_id),
+                        returncode=255,
+                    )
+                return await ch.send_file(
+                    asset_id, local_path, remote_path, timeout=timeout
+                )
 
         return _T()
 
@@ -590,6 +608,15 @@ class App:
         resumed = self.actions.resume_pending_verifications()
         if resumed:
             log.info("resumed %d pending verifications", resumed)
+        if self.autonomy is not None:
+            try:
+                self.autonomy.recover_inflight()
+            except Exception as exc:
+                # Recovery failure disables new autonomous writes; legacy
+                # unknown-write and verification recovery above still apply.
+                log.warning("autonomy recovery failed (%s); autonomous worker disabled", type(exc).__name__)
+                self.autonomy = None
+                self.webapp.autonomy = None
 
         # 一次性 Token 注册门闩：不单凭用户数=0 开放
         try:
@@ -631,6 +658,8 @@ class App:
         self._bg_tasks.append(asyncio.create_task(self._bg_reconcile()))
         self._bg_tasks.append(asyncio.create_task(self._bg_correlate()))
         self._bg_tasks.append(asyncio.create_task(self._bg_agent()))
+        if self.autonomy is not None:
+            self._bg_tasks.append(asyncio.create_task(self._bg_autonomy()))
 
         # 推送通道：QQ 走 OneBot；多渠道由 ChannelStore 路由
         async def _sender(target: str, body: str) -> bool:
@@ -638,7 +667,8 @@ class App:
 
         self.notifier.set_sender(_sender)
         self.channel_store.set_qq_sender(_sender)
-        self.wecom_bot = WeComBot(self.qq, self.aibot_manager, self.channel_store, self.mlog)
+        self.wecom_bot = WeComBot(self.qq, self.aibot_manager, self.channel_store, self.mlog,
+                                  node_name=str(getattr(self, "_node_name", "") or ""))
         self.qq.mlog = self.mlog
         self.aibot_manager._on_message = self.wecom_bot.on_channel_frame
         # 全新安装不预置任何通知渠道（含 QQ）；由用户主动添加。
@@ -646,6 +676,7 @@ class App:
         # 启动已启用的企微智能机器人长连接
         self._bg_tasks.append(asyncio.create_task(self._bg_aibot()))
         self._bg_tasks.append(asyncio.create_task(self._bg_checks()))
+        self._bg_tasks.append(asyncio.create_task(self._bg_ext_watch()))
         if getattr(self, "nodewatch", None):
             try:
                 self.nodewatch.start()
@@ -672,6 +703,7 @@ class App:
                 pass
         for t in self._bg_tasks:
             t.cancel()
+        await asyncio.gather(*(task for task in self._bg_tasks if isinstance(task, asyncio.Future)), return_exceptions=True)
         try:
             await self.aibot_manager.stop_all()
         except Exception:
@@ -688,6 +720,18 @@ class App:
                 log.warning("checks tick failed: %s", e)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _bg_ext_watch(self) -> None:
+        """外部事务：running 超时 + 心跳失联 + 计划漏跑。"""
+        while not self._stop.is_set():
+            try:
+                self.exttx.watch_tick()
+            except Exception:
+                log.exception("ext watch tick failed")
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=60)
             except asyncio.TimeoutError:
                 pass
 
@@ -772,18 +816,18 @@ class App:
         """Agent 闭环：只读调查 + 提案（始终）；自动派发仅 auto_enabled。"""
         while not self._stop.is_set():
             try:
-                rows = self.db.query(
-                    "SELECT id FROM incidents WHERE status='open' AND need_human=0"
-                    " AND stage IN ('pending','investigating')"
-                    " ORDER BY created_at ASC LIMIT 3"
-                )
-                for r in rows:
-                    await self.agent.handle_incident(r["id"])
+                for inc_id in self.agent.ready_incident_ids(limit=3):
+                    await self.agent.handle_incident(inc_id)
                 # 过期 proposal 清扫（TTL / approval_deadline）
                 try:
                     self.actions.expire_stale_proposals()
                 except Exception:
                     log.exception("expire proposals failed")
+                # 过期 permission_change 清扫
+                try:
+                    self.permission_changes.expire_stale()
+                except Exception:
+                    log.exception("expire permission_changes failed")
                 self.db.execute(
                     "INSERT OR REPLACE INTO meta(key, value) VALUES('worker_agent_last_ok', ?)",
                     (str(time.time()),),
@@ -792,17 +836,64 @@ class App:
                 log.exception("agent loop failed")
             await asyncio.sleep(15)
 
-    async def _bg_correlate(self) -> None:
-        """同步 episode→Incident。
+    async def _run_autonomy_incident(self, inc_id: str) -> None:
+        try:
+            await self.autonomy.tick(inc_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("autonomy incident failed id=%s (%s)", inc_id, type(exc).__name__)
 
-        只消费「未处理转换」：
+    async def _bg_autonomy(self) -> None:
+        """Bound model concurrency while independent core workers keep running.
+
+        Verification is polled on every pass, including while a model request
+        is awaiting its provider. An incident has at most one local task.
+        """
+        inflight: dict[str, asyncio.Task] = {}
+        try:
+            while not self._stop.is_set():
+                try:
+                    for inc_id, task in list(inflight.items()):
+                        if task.done():
+                            await asyncio.gather(task, return_exceptions=True)
+                            del inflight[inc_id]
+                    self.autonomy.poll_verifications()
+                    capacity = 3 - len(inflight)
+                    if capacity > 0:
+                        for inc_id in self.autonomy.ready_incident_ids(limit=3):
+                            if inc_id in inflight:
+                                continue
+                            inflight[inc_id] = asyncio.create_task(self._run_autonomy_incident(inc_id))
+                            capacity -= 1
+                            if capacity == 0:
+                                break
+                    self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('worker_autonomy_last_ok',?)", (str(time.time()),))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.warning("autonomy worker pass failed (%s)", type(exc).__name__)
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            for task in inflight.values():
+                task.cancel()
+            await asyncio.gather(*inflight.values(), return_exceptions=True)
+
+    async def _bg_correlate(self) -> None:
+        """同步 episode→Incident（孤儿修复）。
+
+        正向转换已由各写入点内联调用 upsert_from_episode；
+        本循环只做补偿（60s）：
         - incident_id='' 的 episode
         - episode=resolved 且对应 Incident 仍 open，且本 episode 无 hold 标记
         """
         while not self._stop.is_set():
             try:
                 rows = self.db.query(
-                    "SELECT e.id, e.status, e.incident_id FROM alert_episodes e"
+                    "SELECT e.* FROM alert_episodes e"
                     " LEFT JOIN incidents i ON i.id = e.incident_id"
                     " LEFT JOIN events h ON h.incident_id = e.incident_id"
                     "   AND h.type='alert_resolved_hold'"
@@ -811,23 +902,20 @@ class App:
                     " AND (e.incident_id=''"
                     "    OR (e.status='resolved' AND e.incident_id!=''"
                     "        AND (i.id IS NULL OR i.status='open') AND h.id IS NULL))"
-                    " ORDER BY e.first_seen ASC LIMIT 30"
+                    " ORDER BY e.first_seen ASC"
                 )
+                processed = 0
                 for r in rows:
-                    rid = r["id"]
-                    if not r["incident_id"]:
-                        inc_id = self.incidents.upsert_from_episode(rid)
-                        if inc_id:
-                            self.notifier.enqueue(
-                                dedup_key=f"ev:corr:{inc_id}:{rid}",
-                                target=f"user:{self.qq.admin_qq}" if self.qq.admin_qq else "",
-                                body=f"[Ayana] incident {inc_id} opened",
-                            )
-                    if r["status"] == "resolved" and r["incident_id"]:
-                        self.incidents.on_episode_resolved(rid)
+                    if r["incident_id"] and not self.incidents.episode_is_current(r["incident_id"], dict(r)):
+                        continue
+                    # 与实时入站共用关联/恢复/通知入口；旧代不占本轮处理名额。
+                    self.alert_ingest._sync_incident(r["id"])
+                    processed += 1
+                    if processed >= 30:
+                        break
             except Exception:
                 log.exception("correlate failed")
-            await asyncio.sleep(5)
+            await asyncio.sleep(60)
 
     def reload_gate(self) -> None:
         self.gate = IdentityGate(self.nt, load_bindings(self.db))

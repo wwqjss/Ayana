@@ -275,7 +275,14 @@ class ReviewWebNotifyTests(unittest.IsolatedAsyncioTestCase):
     def test_old_fallback_row_does_not_hide_missing_configured_channels(self):
         notifier = Notifier(self.db)
         event_id = self.event()
-        notifier.enqueue(dedup_key=f"ev:{event_id}", target="user:1", body="alert")
+        # 历史遗留行：无 channel_id 的 QQ 兜底（手动插入，模拟升级前数据）
+        self.db.execute(
+            "INSERT INTO notification_outbox(id, dedup_key, channel, target, body, state,"
+            " created_at, last_try_at, next_try_at, channel_id)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("ntf-legacy", f"ev:{event_id}", "qq", "user:1", "alert", "sent",
+             now(), 0, 0, ""),
+        )
         notifier.set_channel_store(self.routes())
         self.assertEqual(notifier.compensate_missing(), 1)
         self.assertEqual(len(notifier.outbox_summary()), 3)

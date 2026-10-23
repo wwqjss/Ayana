@@ -17,7 +17,7 @@ EXCLUDE_PATH_PREFIXES = (
     "docs/reviews/",
     "docs/evidence/",
 )
-EXCLUDE_NAME_PREFIX = ("_rt_", "patch_", "fix_", "ayana-deploy", "deploy-v", "ayana-review")
+EXCLUDE_NAME_PREFIX = ("_rt_", "patch_", "fix_", "ayana-deploy", "deploy-v", "ayana-review", "deploy_yomi")
 EXCLUDE_SUFFIX = (".tar", ".tar.gz", ".db", ".db-shm", ".db-wal", ".log", ".pyc", ".png")
 EXCLUDE_NAMES = {
     "secrets.json", "config.json",

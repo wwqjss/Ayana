@@ -136,12 +136,12 @@ class TestProtocolFrames(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_not_connected_is_unknown(self):
+    def test_not_connected_before_send_is_retryable(self):
         async def run():
             client = WeComAibotClient(bot_id="B", secret="S")
             ok, err = await client.send_text("C", "x")
             self.assertFalse(ok)
-            self.assertTrue(err.startswith("unknown:"), err)
+            self.assertEqual(err, "not_authenticated")
 
         asyncio.run(run())
 

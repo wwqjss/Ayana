@@ -228,6 +228,9 @@ def default_tools_for_object(obj: dict | None, asset_id: str) -> list[dict[str, 
     if kind == "service":
         out.append({"capability": "service.status", "object_id": name, "why": "service state"})
         out.append({"capability": "service.logs", "object_id": name, "why": "recent logs"})
+        if name in ("mysql", "mysqld", "mariadb") or "mysql" in name:
+            out.append({"capability": "mysql.replica.status", "object_id": name,
+                        "why": "replica IO/SQL threads; instance health is not replica health"})
         if obj.get("port"):
             out.append({"capability": "port.listen", "object_id": name, "why": "listening port"})
         if obj.get("external_probe"):

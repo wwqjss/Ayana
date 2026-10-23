@@ -12,6 +12,7 @@ import logging
 from typing import Any
 
 from .actions import ActionError, ActionService
+from .approval import ApprovalService
 from .alertmanager import AlertIngest
 from .agent_query import AgentQueryService
 from .controlled import ControlledExecutor
@@ -40,17 +41,8 @@ HELP = """Ayana 命令
 @Ayana /cancel <action_id> 取消操作
 """
 
-ZH_STATUS = {"open": "处理中", "resolved": "已解决", "closed": "已关闭"}
-ZH_STAGE = {
-    "pending": "待调查", "investigating": "调查中", "awaiting_approval": "待批准",
-    "executing": "执行中", "verifying": "验证中", "watching": "观察中",
-    "done": "完成", "need_human": "需人工",
-}
-ZH_STATE = {
-    "proposed": "已提案", "approved": "已批准", "dispatched": "已派发",
-    "success": "成功", "failure": "失败", "unknown": "结果未知",
-    "cancelled": "已取消", "expired": "已过期",
-}
+# 词表唯一来源：fmt.py（P2-3）
+from .fmt import ZH_STAGE, ZH_STATE, ZH_STATUS
 
 
 def _zstatus(s: str) -> str:
@@ -77,6 +69,8 @@ class QQBot:
         notifier: Notifier,
         *,
         admin_qq: str = "",
+        admin_wecom_users: list[str] | tuple[str, ...] = (),
+        channel_store=None,
         version: str = "0.2.0",
     ):
         self.db = db
@@ -87,6 +81,10 @@ class QQBot:
         self.policy = policy
         self.notifier = notifier
         self.admin_qq = admin_qq
+        self.channel_store = channel_store
+        self.admin_wecom_users = frozenset(
+            u.strip() for u in admin_wecom_users if isinstance(u, str) and u.strip()
+        ) if isinstance(admin_wecom_users, (list, tuple)) else frozenset()
         self.version = version
         self.mlog = None  # MessageLog | None
         self.agent_query: AgentQueryService | None = None
@@ -137,7 +135,9 @@ class QQBot:
             return
 
         try:
-            if entry.kind == "slash":
+            if entry.kind == "approval":
+                reply = await self._handle_approval(entry, user_id=user_id)
+            elif entry.kind == "slash":
                 reply = await self.dispatch(
                     entry.text, user_id=user_id, group_id=group_id
                 )
@@ -258,6 +258,41 @@ class QQBot:
                 pass
         return res.get("reply") or ""
 
+    async def _handle_approval(
+        self, entry, *, user_id: str, actor_type: str = "qq_user", channel: str = "qq", channel_id: str = "",
+    ) -> str:
+        """三句授权共用服务层；管理身份只能来自已配置的通道用户。"""
+        from .fmt import approval_error
+        try:
+            result = await ApprovalService(self.actions).decide(
+                entry.approval_decision,
+                actor_type=actor_type, actor_id=user_id, channel=channel,
+                is_admin=self._is_channel_admin(actor_type, user_id, channel_id),
+            )
+        except ActionError as e:
+            return approval_error(e.code)
+        if result.get("decision") == "reject":
+            return "已选择不执行，本次处置已跳过。"
+        prefix = "已允许以后自动执行。" if result.get("permanent_granted") else ""
+        if result.get("already"):
+            return prefix + "这条操作已经处理，没有重复执行。"
+        if result.get("executed"):
+            state = ZH_STATE.get(result.get("state"), "已提交")
+            return prefix + f"已批准本次处置，执行结果：{state}。"
+        return prefix + "已批准本次处置，执行尚未完成，请在事件详情查看。"
+
+    def _is_channel_admin(self, actor_type: str, actor_id: str, channel_id: str = "") -> bool:
+        if not actor_id:
+            return False
+        if actor_type == "qq_user":
+            return bool(self.admin_qq) and actor_id == str(self.admin_qq)
+        if actor_type != "wecom_user":
+            return False
+        if actor_id in self.admin_wecom_users:
+            return True
+        store = getattr(self, "channel_store", None)
+        return bool(store and channel_id and store.is_aibot_admin(channel_id, actor_id))
+
     async def _handle_nl(
         self, entry, *, user_id: str, group_id: str, log_id: str = "",
         actor_type: str = "qq_user",
@@ -314,6 +349,7 @@ class QQBot:
         group_id: str = "",
         actor_type: str = "qq_user",
         channel: str = "qq",
+        channel_id: str = "",
     ) -> str:
         parts = text.strip().split()
         cmd = parts[0].lower()
@@ -342,9 +378,9 @@ class QQBot:
             if cmd == "/actions":
                 return self._actions_text(actor_type, actor_id)
             if cmd == "/approve":
-                return await self._approve(args, actor_type, actor_id, channel=channel)
+                return await self._approve(args, actor_type, actor_id, channel=channel, channel_id=channel_id)
             if cmd == "/reject":
-                return self._reject(args, actor_type, actor_id, channel=channel)
+                return await self._reject(args, actor_type, actor_id, channel=channel)
             if cmd == "/cancel":
                 return self._cancel(args, actor_type, actor_id, channel=channel)
         except Exception as e:
@@ -462,17 +498,17 @@ class QQBot:
             )
         return "\n".join(lines) if lines else "无操作记录"
 
-    async def _approve(self, args: list[str], actor_type: str, actor_id: str, channel: str = "qq") -> str:
+    async def _approve(self, args: list[str], actor_type: str, actor_id: str, channel: str = "qq", channel_id: str = "") -> str:
         if not args:
             return "用法: /approve <action_id>"
         try:
-            # 与 Web 共用 approve_and_execute
-            res = await self.actions.approve_and_execute(
-                args[0],
+            res = await ApprovalService(self.actions).decide(
+                "execute_once", action_id=args[0],
                 actor_type=actor_type,
                 actor_id=actor_id,
                 channel=channel,
                 reason=f"{channel}_approve",
+                is_admin=self._is_channel_admin(actor_type, actor_id, channel_id),
             )
             if res.get("already"):
                 return f"{args[0]} 已是 {res.get('state')}，未重复派发"
@@ -485,13 +521,13 @@ class QQBot:
         except ActionError as e:
             return f"批准失败: {e}"
 
-    def _reject(self, args: list[str], actor_type: str, actor_id: str, channel: str = "qq") -> str:
+    async def _reject(self, args: list[str], actor_type: str, actor_id: str, channel: str = "qq") -> str:
         if not args:
             return "用法: /reject <action_id> [原因]"
         reason = " ".join(args[1:]) if len(args) > 1 else ""
         try:
-            res = self.actions.reject(
-                args[0],
+            res = await ApprovalService(self.actions).decide(
+                "reject", action_id=args[0],
                 actor_type=actor_type,
                 actor_id=actor_id,
                 channel=channel,

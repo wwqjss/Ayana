@@ -178,7 +178,43 @@
 
       <section id="tab-incidents" class="tab-panel hidden">
 
-        <div id="incidents-list"></div>
+        <div class="subnav" id="incidents-subnav">
+          <button data-sub="list" class="subtab active">事件列表</button>
+          <button data-sub="ext" class="subtab">外部事务</button>
+        </div>
+
+        <div id="incidents-sub-list" class="subpanel">
+          <div id="incidents-list"></div>
+        </div>
+
+        <div id="incidents-sub-ext" class="subpanel hidden">
+          <div class="card">
+            <h2>外部事务</h2>
+            <p class="muted small">外部脚本通过 API 上报执行状态，Ayana 统一记录、告警与通知。不与具体业务耦合。</p>
+            <div class="row-actions" style="margin-bottom:12px">
+              <button class="btn primary" id="ext-tx-create-btn" type="button">创建事务</button>
+              <button class="btn" id="ext-tx-refresh" type="button">刷新</button>
+            </div>
+            <div id="ext-tx-list"></div>
+          </div>
+          <div class="card hidden" id="ext-tx-detail-card">
+            <div class="row-actions" style="margin-bottom:8px">
+              <button class="btn small" id="ext-tx-back" type="button">返回列表</button>
+            </div>
+            <div id="ext-tx-detail"></div>
+          </div>
+          <div class="card hidden" id="ext-tx-form-card">
+            <h2 id="ext-tx-form-title">创建外部事务</h2>
+            <div id="ext-tx-form"></div>
+          </div>
+          <div class="card">
+            <details>
+              <summary>API 接入说明</summary>
+              <p class="muted small">在事务详情中生成 Token 后，用以下方式上报。Token 只能上报对应事务，不具备管理权限。</p>
+              <pre id="ext-api-sample" style="background:var(--bg2,#1c1f26);padding:12px;border-radius:8px;overflow:auto;font-size:12px"></pre>
+            </details>
+          </div>
+        </div>
 
       </section>
 
@@ -414,7 +450,7 @@
 
           <div class="form-row" id="host-add-form">
 
-            <label>主机 ID <input id="host-id" placeholder="例如 yomi / web-01"></label>
+            <label>主机 ID <input id="host-id" placeholder="例如 web-01"></label>
 
             <label>名称 <input id="host-name" placeholder="显示名"></label>
 
@@ -506,7 +542,7 @@
 
           <div class="form-row">
 
-            <label>名称 <input id="ssh-cred-name" placeholder="yomi-root"></label>
+            <label>名称 <input id="ssh-cred-name" placeholder="web-01-root"></label>
 
             <label>类型
 
@@ -593,7 +629,7 @@
             <div id="nw-recv-box">
               <div class="form-row">
                 <label>允许的对端节点名
-                  <input id="nw-node-id" placeholder="如 kanata" />
+                  <input id="nw-node-id" placeholder="如 node-1" />
                 </label>
                 <label>心跳对外地址（可选）
                   <input id="nw-url" placeholder="默认按当前访问地址推断" />
@@ -1132,7 +1168,7 @@
 
 <script src="/static/xterm/xterm-addon-fit.js"></script>
 
-<script src="/static/app.js?v=44"></script>
+<script src="/static/app.js?v=45"></script>
 
 </body>
 

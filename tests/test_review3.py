@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -240,12 +241,15 @@ class TestNotificationKeys(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         db = Database(Path(tmp.name) / "t.db")
         n = Notifier(db, default_target="user:1")
+        n.set_channel_store(SimpleNamespace(list_enabled=lambda: [
+            {"id": "c1", "kind": "qq", "targets": ["user:1"]},
+        ]))
         self.assertTrue(n.enqueue_for_event(1, body="x"))
         self.assertTrue(n.enqueue_for_event(2, body="y"))
         row = db.query_one("SELECT COUNT(*) AS n FROM notification_outbox")
         self.assertEqual(row["n"], 2)
         keys = {r["dedup_key"] for r in db.query("SELECT dedup_key FROM notification_outbox")}
-        self.assertEqual(keys, {"ev:1", "ev:2"})
+        self.assertEqual(keys, {"ev:1:c1:user:1", "ev:2:c1:user:1"})
         db.close()
         tmp.cleanup()
 

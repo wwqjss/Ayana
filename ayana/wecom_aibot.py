@@ -359,7 +359,8 @@ class WeComAibotClient:
         if len(raw) > MARKDOWN_MAX_BYTES:
             text = text.encode("utf-8")[: MARKDOWN_MAX_BYTES - 12].decode("utf-8", "ignore") + "\n…"
         if self._ws is None or self._ws.closed or not self._authenticated:
-            return False, "unknown:not_authenticated"
+            # 尚未构造或提交业务帧，可以等连接认证完成后安全重试。
+            return False, "not_authenticated"
         rid = _req_id("aibot_send_msg")
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
@@ -386,7 +387,10 @@ class WeComAibotClient:
             self._pending.pop(rid, None)
             return False, "unknown:ack_timeout"
         except WeComAibotError as e:
-            return False, str(e)[:160]
+            if e.code.startswith("send_"):
+                # 明确的非零回执证明服务端拒收；连接丢失则没有交付结论。
+                return False, str(e)[:160]
+            return False, f"unknown:{str(e)[:150]}"
         except Exception as e:
             self._pending.pop(rid, None)
             return False, f"unknown:{str(e)[:80]}"
@@ -450,7 +454,7 @@ class WeComAibotManager:
     async def send_text(self, channel_id: str, chatid: str, content: str) -> tuple[bool, str]:
         c = self._clients.get(channel_id)
         if not c:
-            return False, "unknown:client_not_running"
+            return False, "client_not_running"
         try:
             return await c.send_text(chatid, content)
         except Exception as e:

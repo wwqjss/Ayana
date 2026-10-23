@@ -108,6 +108,9 @@ def parse_front_matter(text: str) -> tuple[dict[str, Any], str]:
         if val == "":
             meta[key] = []
             current_list = key
+        elif val.strip() == "[]":
+            meta[key] = []
+            current_list = None
         else:
             meta[key] = _parse_scalar(val)
             current_list = None

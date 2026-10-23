@@ -7,6 +7,7 @@ Web 只渲染本模块结论。
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Any
 
@@ -40,6 +41,7 @@ def apply_required_checks(cfg_checks: Any) -> dict[str, list[dict[str, Any]]]:
                         "metric": str(item.get("metric") or "probe_success"),
                         "selector": dict(item.get("selector") or {}),
                         "freshness_sec": float(item.get("freshness_sec") or 120),
+                        "kind": str(item.get("kind") or "probe"),
                     }
                 )
             if cleaned:
@@ -49,20 +51,59 @@ def apply_required_checks(cfg_checks: Any) -> dict[str, list[dict[str, Any]]]:
     return out
 
 
-def _sample_state(sample: dict | None, freshness: float, *, expect_ok: bool = True) -> str:
-    if not sample:
-        return "unknown"
-    ts = sample.get("sample_at")
-    if ts is None:
-        return "unknown"
-    age = time.time() - float(ts)
-    if age > freshness:
+# ── 统一样本判定词表（P2-1）────────────────────────────────────
+# 单样本：ok / fail / stale / no_data
+# collect_error 由采集链路（查询失败等）在聚合层表达，不是样本本身的状态。
+# object_health 等对外仍映射到 healthy/unhealthy/... 兼容词，前端形状不变。
+
+SAMPLE_STATES = ("ok", "fail", "stale", "no_data", "collect_error")
+
+
+def sample_state(
+    sample: dict | None,
+    freshness: float,
+    *,
+    at: float | None = None,
+    expect_ok: bool = True,
+) -> str:
+    """单样本判定（唯一词表）：ok / fail / stale / no_data。
+
+    expect_ok=True 时 value==1 为 ok；False 时 value==0 为 ok（计数型指标）。
+    缺样本/缺时间/不可解析/非有限值 → no_data；过期 → stale；其余有限值 → fail。
+    """
+    if not sample or sample.get("sample_at") is None:
+        return "no_data"
+    try:
+        ts = float(sample["sample_at"])
+        raw = sample.get("value")
+        if raw is None:
+            return "no_data"
+        val = float(raw)
+    except (KeyError, TypeError, ValueError):
+        return "no_data"
+    if not (math.isfinite(ts) and math.isfinite(val)):
+        return "no_data"
+    if (time.time() if at is None else float(at)) - ts > float(freshness):
         return "stale"
-    val = sample.get("value")
-    if val is None:
-        return "unknown"
     ok = (val == 1) if expect_ok else (val == 0)
-    return "healthy" if ok else "unhealthy"
+    return "ok" if ok else "fail"
+
+
+# 对象健康对外词（API 兼容）；内核统一走 sample_state
+_OBJ_STATE_FROM_SAMPLE = {
+    "ok": "healthy",
+    "fail": "unhealthy",
+    "stale": "stale",
+    "no_data": "unknown",
+    "collect_error": "unknown",
+}
+
+
+def _sample_state(sample: dict | None, freshness: float, *, expect_ok: bool = True) -> str:
+    """object_health 兼容入口：统一词表 → 对象健康词。"""
+    return _OBJ_STATE_FROM_SAMPLE.get(
+        sample_state(sample, freshness, expect_ok=expect_ok), "unknown"
+    )
 
 
 def object_health(

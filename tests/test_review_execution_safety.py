@@ -24,8 +24,22 @@ from ayana.incidents import IncidentService
 from ayana.main import App
 from ayana.ntsafe import NTResult
 from ayana.policy import Policy
-from ayana.runbook import get_runbook_rule
+from ayana.runbook import RunbookRule, apply_runbook_rules, get_runbook_rule
 from ayana.verify_profiles import PROFILES, profile_for_action
+
+
+# 测试本地 runbook 规则（发行版 RUNBOOK 为空，由部署方注入）
+def _test_rule() -> RunbookRule:
+    return RunbookRule(
+        id="rb_frps_down_restart",
+        name="frps down restart",
+        asset_id="nerv",
+        object_name="frps",
+        alertname="TargetDown",
+        capability="service.restart",
+        reason="restart frps",
+        require_probe_fail=True,
+    )
 
 
 class TestExecutionSafety(unittest.IsolatedAsyncioTestCase):
@@ -47,6 +61,11 @@ class TestExecutionSafety(unittest.IsolatedAsyncioTestCase):
         self.db.execute(
             "INSERT INTO incidents(id,title,asset_id,object_id,created_at,updated_at)"
             " VALUES('inc1','nerv / frps: TargetDown','nerv','frps',?,?)", (stamp, stamp),
+        )
+        self.db.execute(
+            "INSERT OR IGNORE INTO users(username, password_hash, totp_enabled, is_admin, created_at, updated_at)"
+            " VALUES('admin','x',0,1,?,?)",
+            (now(), now()),
         )
         self.policy = Policy(self.db)
         for kind, identity, cap, automatic in (
@@ -80,7 +99,16 @@ class TestExecutionSafety(unittest.IsolatedAsyncioTestCase):
         self.prom = SimpleNamespace(probe_success_since=samples)
         self.actions = ActionService(
             self.db, None, self.gate, self.policy, self.prom, transport=self.transport,
+            verify_timeout=2,
         )
+        # 注入测试本地 runbook 规则（发行版 RUNBOOK 为空）
+        apply_runbook_rules([{
+            "id": "rb_frps_down_restart", "name": "frps down restart",
+            "asset_id": "nerv", "object_name": "frps", "alertname": "TargetDown",
+            "capability": "service.restart", "reason": "restart frps",
+            "require_probe_fail": True,
+        }])
+        self.addCleanup(lambda: apply_runbook_rules([]))
         self.incidents = IncidentService(self.db)
         self.notifier = Mock()
         self.investigation = SimpleNamespace(
@@ -163,15 +191,17 @@ class TestExecutionSafety(unittest.IsolatedAsyncioTestCase):
         self.gate.verify_account = identity_wait
         with self.assertRaises(ActionError) as denied:
             await self.actions.execute(action_id, actor_type="auto_rule", actor_id="agent")
-        self.assertEqual(denied.exception.code, "source_unhealthy")
+        self.assertEqual(denied.exception.code, "source_quarantined")
         self.assertEqual(self.actions.get_action(action_id)["state"], "cancelled")
         self.transport.exec.assert_not_called()
         self.assertTrue(self.incident()["need_human"])
 
     async def test_unsupported_profile_stops_agent_before_write(self):
-        self.db.execute("UPDATE incidents SET object_id='nginx', title='nerv / nginx: TargetDown'")
-        self.samples[0]["metric"]["service"] = "nginx"
-        result = await self.agent.handle_incident("inc1")
+        """verification contract 缺失时 agent 在写入前硬停（escalated_precondition）。"""
+        self.db.execute("UPDATE incidents SET object_id='frps', title='nerv / frps: TargetDown'")
+        self.seed_episode()
+        with patch("ayana.verify_profiles.profile_for_action", return_value=None):
+            result = await self.agent.handle_incident("inc1")
         self.assertEqual(result["action"], "escalated_precondition")
         pre = next(step for step in result["steps"] if step["step"] == "preconditions")
         self.assertIn("verification_contract", ";".join(pre["reasons"]))
@@ -180,18 +210,19 @@ class TestExecutionSafety(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.db.query_one("SELECT COUNT(*) AS n FROM actions")["n"], 0)
 
     async def test_final_gate_rejects_existing_auto_action_without_contract(self):
-        self.db.execute("UPDATE incidents SET object_id='nginx'")
-        action_id = self.proposal(object_id="nginx")
+        self.db.execute("UPDATE incidents SET object_id='frps'")
+        action_id = self.proposal(object_id="frps")
         self.actions.approve(action_id, approver_id="admin")
         # 模拟旧版本已经产生的 auto 提案，验证最终派发门而不是创建入口。
-        self.db.execute("UPDATE actions SET mode='auto',runbook_id='rb_nginx_down_restart' WHERE id=?",
+        self.db.execute("UPDATE actions SET mode='auto',runbook_id='rb_frps_down_restart' WHERE id=?",
                         (action_id,))
         self.policy.upsert_permission(
             subject_type="web_user", subject_id="admin", capability="service.restart",
             asset_id="nerv", object_id="*", allow=True, require_approval=False, auto_allowed=True,
         )
-        with self.assertRaises(ActionError) as denied:
-            await self.actions.execute(action_id, actor_id="admin")
+        with patch("ayana.verify_profiles.profile_for_action", return_value=None):
+            with self.assertRaises(ActionError) as denied:
+                await self.actions.execute(action_id, actor_id="admin")
         self.assertEqual(denied.exception.code, "unsupported_verification_profile")
         self.transport.exec.assert_not_called()
         self.assertTrue(self.incident()["need_human"])
@@ -244,8 +275,8 @@ class TestExecutionSafety(unittest.IsolatedAsyncioTestCase):
                         (json.dumps(criteria), v["id"]))
         self.samples = [{"metric": {"asset": "nerv", "service": "frps"}, "value": 1,
                          "sample_at": now() - offset} for offset in (3, 1)]
-        fast = dataclasses.replace(PROFILES["frps.recover"], warmup_sec=0, continuous_success_sec=1)
-        with patch.dict(PROFILES, {"frps.recover": fast}):
+        fast = dataclasses.replace(PROFILES["svc.recover"], warmup_sec=0, continuous_success_sec=1)
+        with patch.dict(PROFILES, {"svc.recover": fast}):
             verified = await self.actions._run_verification(v["id"], action_id)
         self.assertEqual(verified["status"], "passed")
         self.assertEqual(self.incident()["status"], "resolved")
@@ -294,7 +325,7 @@ class TestExecutionSafety(unittest.IsolatedAsyncioTestCase):
         self.db.execute("UPDATE actions SET state='success', finished_at=? WHERE id=?", (baseline, action_id))
         self.db.execute(
             "INSERT INTO verifications(id,action_id,incident_id,status,started_at,generation,"
-            " profile_id,criteria_json) VALUES('ver-late',?,'inc1','pending',?,1,'frps.recover',?)",
+            " profile_id,criteria_json) VALUES('ver-late',?,'inc1','pending',?,1,'svc.recover',?)",
             (action_id, baseline, json.dumps({"baseline_finished_at": baseline, "service": "frps"})),
         )
         self.db.execute("UPDATE incidents SET generation=2 WHERE id='inc1'")
@@ -302,8 +333,8 @@ class TestExecutionSafety(unittest.IsolatedAsyncioTestCase):
         self.incidents.set_need_human("inc1", f"awaiting_approval:{action_id}")
         self.samples = [{"metric": {"asset": "nerv", "service": "frps"}, "value": 1,
                          "sample_at": now() - offset} for offset in (3, 1)]
-        fast = dataclasses.replace(PROFILES["frps.recover"], warmup_sec=0, continuous_success_sec=1)
-        with patch.dict(PROFILES, {"frps.recover": fast}):
+        fast = dataclasses.replace(PROFILES["svc.recover"], warmup_sec=0, continuous_success_sec=1)
+        with patch.dict(PROFILES, {"svc.recover": fast}):
             verified = await self.actions._run_verification("ver-late", action_id)
         self.assertEqual(verified["status"], "passed")
         self.assertTrue(self.incident()["need_human"])
@@ -311,15 +342,17 @@ class TestExecutionSafety(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.incident()["status"], "open")
 
     async def test_executed_unit_mismatch_cannot_borrow_frps_contract(self):
-        self.db.execute("UPDATE objects SET unit='nginx' WHERE name='frps'")
-        context = await self.agent._precondition_context(
-            self.incident(), get_runbook_rule("rb_frps_down_restart"), [],
+        """v0.7.3+ 通用 profile 按 capability 解析；unit 不再影响 contract 解析。"""
+        # 通用 svc.recover 对任意 service.restart 都可用
+        p = profile_for_action(
+            capability="service.restart", asset_id="nerv", object_id="nerv:service:frps",
         )
-        self.assertFalse(context["verification_ready"])
-        with self.assertRaises(ActionError) as denied:
-            self.proposal(mode="auto")
-        self.assertEqual(denied.exception.code, "unsupported_verification_profile")
-        self.transport.exec.assert_not_called()
+        self.assertIsNotNone(p)
+        self.assertEqual(p.id, "svc.recover")
+        # 不在 CAP_PROFILE 的 capability 仍然无 contract
+        self.assertIsNone(profile_for_action(
+            capability="container.restart", asset_id="nerv", object_id="nerv:service:frps",
+        ))
 
     async def test_expiry_preserves_unrelated_human_obligation(self):
         action_id = self.proposal()
@@ -333,10 +366,12 @@ class TestExecutionSafety(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(f"awaiting_approval:{action_id}", reason)
 
     async def test_unsupported_manual_verification_creates_human_obligation(self):
-        self.db.execute("UPDATE incidents SET object_id='nginx'")
-        action_id = self.proposal(object_id="nginx")
+        """无 verification contract 的手工验证 → unknown + need_human。"""
+        self.db.execute("UPDATE incidents SET object_id='frps'")
+        action_id = self.proposal(object_id="frps")
         self.db.execute("UPDATE actions SET state='success', finished_at=? WHERE id=?", (now(), action_id))
-        result = await self.actions.verify(action_id)
+        with patch("ayana.verify_profiles.profile_for_action", return_value=None):
+            result = await self.actions.verify(action_id)
         self.assertEqual(result["status"], "unknown")
         self.assertTrue(self.incident()["need_human"])
         self.assertIn(f"unsupported_verification_profile:{action_id}", self.incident()["need_human_reason"])
@@ -363,8 +398,14 @@ class TestExecutionSafety(unittest.IsolatedAsyncioTestCase):
         closed = self.incidents.close_manual("inc1", "close", "admin", policy=self.policy, is_admin=True)
         self.assertTrue(closed["ok"])
 
-    async def test_profile_matching_does_not_accept_frps_substrings(self):
-        self.assertIsNone(profile_for_action(capability="service.restart", asset_id="nerv", object_id="evil-frps"))
+    async def test_profile_matching_is_capability_based(self):
+        """v0.7.3+ profile 按 capability 解析，不做对象名子串匹配。"""
+        # service.restart → svc.recover，与对象名无关
+        p = profile_for_action(capability="service.restart", asset_id="nerv", object_id="evil-frps")
+        self.assertIsNotNone(p)
+        self.assertEqual(p.id, "svc.recover")
+        # 未知 capability 不返回 profile（即使对象名含 frps）
+        self.assertIsNone(profile_for_action(capability="container.restart", asset_id="nerv", object_id="frps"))
 
 
 class TestAibotBackground(unittest.IsolatedAsyncioTestCase):

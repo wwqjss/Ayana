@@ -32,8 +32,18 @@ class ObjectBindingError(ValueError):
 
 def resolve_object_name(obj: dict) -> str:
     """只认登记对象；禁止 params 覆盖。"""
-    name = (obj.get("unit") or obj.get("container") or obj.get("name") or "").strip()
-    if not name or any(ch in name for ch in " ;|&$`\n\t") or len(name) > 64:
+    return _bounded_target_name(obj.get("unit") or obj.get("container") or obj.get("name") or "")
+
+
+def _bounded_target_name(value: Any) -> str:
+    # systemctl interprets options and unit globs even when shell-quoted.
+    # A registered target must designate exactly one object, never --all or *.
+    if not isinstance(value, str):
+        raise ObjectBindingError("invalid registered object name")
+    name = value.strip()
+    if (not name or name.startswith("-") or len(name) > 64
+            or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127
+                   or ch in ";|&$`*?[]/\\" for ch in name)):
         raise ObjectBindingError("invalid registered object name")
     return name
 
@@ -43,10 +53,7 @@ def _obj_name(obj: dict) -> str:
 
 
 def _obj_container(obj: dict) -> str:
-    name = (obj.get("container") or obj.get("name") or "").strip()
-    if not name or any(ch in name for ch in " ;|&$`\n\t") or len(name) > 64:
-        raise ObjectBindingError("invalid container name")
-    return name
+    return _bounded_target_name(obj.get("container") or obj.get("name") or "")
 
 
 CAPABILITIES: dict[str, Capability] = {}
@@ -118,6 +125,21 @@ _reg(
         max_output=6000,
     )
 )
+
+# 有界配置/进程观察；不接受文件路径或任意参数，不读取 Environment 的秘密值。
+_reg(Capability(
+    name="service.config", kind="read", object_kinds=("service",), risk="read",
+    description="登记服务的运行配置、启动与重载能力、单元及覆盖文件位置（无命令行秘密）",
+    probe_tokens=lambda o: [["systemctl", "show", _obj_name(o),
+                            "--property=FragmentPath,DropInPaths,Restart,User,Group,Type,LoadState,UnitFileState,CanStart,CanReload", "--no-pager"]],
+    max_output=6000,
+))
+_reg(Capability(
+    name="service.process", kind="read", object_kinds=("service",), risk="read",
+    description="登记服务的进程、退出码、任务数和资源使用",
+    probe_tokens=lambda o: [["systemctl", "show", _obj_name(o),
+                            "--property=MainPID,ExecMainCode,ExecMainStatus,TasksCurrent,MemoryCurrent,CPUUsageNSec", "--no-pager"]],
+))
 
 def _port_listen_tokens(o: dict) -> list[list[str]]:
     proto = (o.get("protocol") or "tcp").lower()
@@ -213,14 +235,53 @@ _reg(
     )
 )
 
+# 新修复思路仍需独立 Policy 授权；不通过改变 restart 字符串逃避重启预算。
+_reg(Capability(
+    name="service.reset_failed", kind="write", object_kinds=("service",), risk="write",
+    description="清除登记服务的 systemd 失败及启动速率限制状态",
+    write_tokens=lambda o: ["systemctl", "reset-failed", _obj_name(o)],
+    auto_allowed=True, verify_capability="probe.status",
+))
+_reg(Capability(
+    name="service.reload", kind="write", object_kinds=("service",), risk="write",
+    description="通过登记服务原有 ExecReload 重载服务配置",
+    write_tokens=lambda o: ["systemctl", "reload", _obj_name(o)],
+    auto_allowed=True, verify_capability="probe.status",
+))
+
 _reg(
     Capability(
         name="service.stop",
         kind="write",
         object_kinds=("service",),
         risk="write",
-        description="登记业务服务停止（人工）",
+        description="登记业务服务停止",
         write_tokens=lambda o: ["systemctl", "stop", _obj_name(o)],
+        auto_allowed=True,
+    )
+)
+
+_reg(
+    Capability(
+        name="mysql.replica.start",
+        kind="write",
+        object_kinds=("service",),
+        risk="write",
+        description="恢复登记 MySQL 从库复制（仅 START REPLICA）",
+        write_tokens=lambda o: ["mysql", "-NBe", "START REPLICA"],
+        auto_allowed=True,
+        verify_capability="probe.status",
+    )
+)
+
+_reg(
+    Capability(
+        name="mysql.replica.status",
+        kind="read",
+        object_kinds=("service",),
+        risk="read",
+        description="登记 MySQL 从库复制线程状态（只读 SHOW REPLICA STATUS）",
+        probe_tokens=lambda o: [["mysql", "-NBe", "SHOW REPLICA STATUS"]],
     )
 )
 
@@ -383,15 +444,21 @@ def build_write_tokens(capability: str, obj: dict) -> list[str]:
     tokens = c.write_tokens(obj)
     if not tokens or not all(isinstance(t, str) and t for t in tokens):
         raise ValueError("empty write tokens")
+    if c.name in {"mysql.replica.start", "mysql.replica.stop"}:
+        expected = ["mysql", "-NBe", "START REPLICA" if c.name.endswith("start") else "STOP REPLICA"]
+        if tokens != expected:
+            raise ValueError("mysql replica tokens locked")
+        return tokens
     if tokens[0] not in ("systemctl", "docker"):
         raise ValueError("program not allowed")
-    if tokens[1] not in ("start", "stop", "restart"):
+    if tokens[1] not in ("start", "stop", "restart", "reset-failed", "reload"):
         raise ValueError("verb not allowed")
+    if tokens[1] in ("reset-failed", "reload") and tokens[0] != "systemctl":
+        raise ValueError("verb requires systemctl")
     if len(tokens) != 3:
         raise ValueError("exactly one name argument required")
     name = tokens[2]
-    if not name or any(ch in name for ch in " ;|&$`\n\t") or len(name) > 64:
-        raise ValueError("bad name")
+    _bounded_target_name(name)
     # 二次确认：目标名必须等于登记对象解析结果
     if name != resolve_object_name(obj) and name != (obj.get("container") or ""):
         raise ObjectBindingError("write target diverges from registered object")
@@ -407,6 +474,12 @@ def build_probe_plans(capability: str, obj: dict) -> list[list[str]]:
     out = []
     for tokens in plans:
         if not tokens:
+            continue
+        if c.name == "mysql.replica.status":
+            expected = ["mysql", "-NBe", "SHOW REPLICA STATUS"]
+            if tokens != expected:
+                raise ValueError("mysql replica status tokens locked")
+            out.append(tokens)
             continue
         if not all(isinstance(t, str) and t and not any(ch in t for ch in " ;|&$`\n") for t in tokens):
             raise ValueError("unsafe probe tokens")

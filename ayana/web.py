@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import inspect
 import json
 import logging
 import re
@@ -15,6 +16,7 @@ from urllib.parse import urlsplit
 from aiohttp import web
 
 from .actions import ActionError, ActionService
+from .approval import ApprovalService
 from .auth import AuthError, AuthService
 from .db import Database, now
 from .incidents import IncidentService
@@ -114,6 +116,10 @@ class WebApp:
         checks=None,
         llm=None,
         nodewatch=None,
+        exttx=None,
+        autonomy=None,
+        providers=None,
+        alertmanager_webhook_path: str = "/hooks/alertmanager",
     ):
         self.db = db
         self.auth = auth
@@ -141,6 +147,11 @@ class WebApp:
         self.promconfig = promconfig
         self.checks = checks
         self.nodewatch = nodewatch
+        self.exttx = exttx
+        self.autonomy = autonomy
+        self.providers = providers
+        # P2-4: 死键修复 — 路由读取 config.alertmanager_webhook_path
+        self.alertmanager_webhook_path = alertmanager_webhook_path or "/hooks/alertmanager"
 
     def build(self) -> web.Application:
         app = web.Application(client_max_size=2_000_000)
@@ -186,12 +197,19 @@ class WebApp:
         app.router.add_post("/api/assets/{asset_id}/investigate", self.api_investigate)
         app.router.add_get("/api/incidents", self.api_incidents)
         app.router.add_get("/api/incidents/{inc_id}", self.api_incident_detail)
+        app.router.add_get("/api/incidents/{inc_id}/council", self.api_incident_council)
+        app.router.add_post("/api/incidents/{inc_id}/council/review", self.api_council_manual_review)
+        app.router.add_get("/api/autonomy/providers", self.api_autonomy_providers)
+        app.router.add_post("/api/autonomy/providers", self.api_autonomy_providers_save)
+        app.router.add_post("/api/autonomy/providers/verify", self.api_autonomy_provider_verify)
+        app.router.add_get("/api/autonomy/usage", self.api_autonomy_usage)
         app.router.add_get("/api/loops", self.api_loops)
         app.router.add_post("/api/incidents/{inc_id}/close", self.api_incident_close)
         app.router.add_get("/api/actions", self.api_actions)
         app.router.add_get("/api/actions/{aid}", self.api_action_detail)
         app.router.add_post("/api/actions", self.api_action_propose)
         app.router.add_post("/api/actions/{aid}/approve", self.api_action_approve)
+        app.router.add_post("/api/actions/{aid}/decision", self.api_action_decision)
         app.router.add_post("/api/actions/{aid}/reject", self.api_action_reject)
         app.router.add_post("/api/actions/{aid}/cancel", self.api_action_cancel)
         app.router.add_post("/api/actions/{aid}/execute", self.api_action_execute)
@@ -237,6 +255,8 @@ class WebApp:
         app.router.add_post("/api/notifications/retry", self.api_notifications_retry)
         # 多消息渠道
         app.router.add_get("/api/notify/channels", self.api_notify_channels)
+        app.router.add_get("/api/notify/aibot/admins", self.api_notify_aibot_admins)
+        app.router.add_post("/api/notify/aibot/admins", self.api_notify_aibot_admins_save)
         app.router.add_get("/api/notify/kinds", self.api_notify_kinds)
         app.router.add_get("/api/notify/platforms", self.api_notify_platforms)
         app.router.add_get("/api/notify/aibot/status", self.api_notify_aibot_status)
@@ -293,7 +313,18 @@ class WebApp:
         app.router.add_post("/api/promconfig/node-exporter/install", self.api_promconfig_node_install)
         app.router.add_post("/api/promconfig/validate", self.api_promconfig_validate)
         app.router.add_post("/api/promconfig/rollback", self.api_promconfig_rollback)
-        app.router.add_post("/hooks/alertmanager", self.hook_alertmanager)
+        app.router.add_post(self.alertmanager_webhook_path, self.hook_alertmanager)
+        # 外部事务
+        app.router.add_post("/api/ext/report", self.api_ext_report)
+        app.router.add_get("/api/ext/transactions", self.api_ext_transactions)
+        app.router.add_post("/api/ext/transactions", self.api_ext_transaction_create)
+        app.router.add_post("/api/ext/transactions/{tid}/update", self.api_ext_transaction_update)
+        app.router.add_post("/api/ext/transactions/{tid}/enabled", self.api_ext_transaction_enabled)
+        app.router.add_delete("/api/ext/transactions/{tid}", self.api_ext_transaction_delete)
+        app.router.add_post("/api/ext/transactions/{tid}/tokens", self.api_ext_token_issue)
+        app.router.add_post("/api/ext/transactions/{tid}/rotate", self.api_ext_token_rotate)
+        app.router.add_post("/api/ext/tokens/{token_id}/revoke", self.api_ext_token_revoke)
+        app.router.add_get("/api/ext/transactions/{tid}/runs", self.api_ext_runs)
         return app
 
     async def api_assist_form(self, request: web.Request) -> web.Response:
@@ -1142,8 +1173,7 @@ class WebApp:
 
     async def api_overview(self, request: web.Request) -> web.Response:
         sess = self._require_auth(request)
-        from .health import host_health
-        from .business import required_health, native_check_items
+        from .business import host_health_view, native_check_items
 
         # 短缓存：避免前端连点/轮询把 Prom 探测打满（Windows 连接拒绝约 2s/次）
         now_ts = time.time()
@@ -1178,21 +1208,18 @@ class WebApp:
             ]
             prom_items = business_map.get(a["id"], [])
             native = [item for item in native_items if item["asset_id"] == a["id"]]
-            required_state = required_health(prom_items)
-            state_names = {"ok": "healthy", "fail": "unhealthy", "stale": "stale", "no_data": "unknown", "collect_error": "unknown"}
-            health = {"state": required_state or "unknown", "coverage": f"required {sum(bool(item.get('required')) for item in prom_items)}",
-                      "objects": [{"object": item["name"], "state": state_names.get(item["state"], "unknown")}
-                                  for item in prom_items if item.get("required")]}
-            d["health"] = health
             metric = host_map.get(a["id"], {})
-            d["health_dot"] = host_health(metric_state=metric.get("state", ""), metric_error=metric.get("error", ""),
-                                            required_state=required_state,
-                                            check_states=[item["state"] for item in native + prom_items if not item.get("required")],
-                                            firing_severities=firing_by_asset.get(a["id"], []))
-            states = [item["state"] for item in prom_items + native]
-            d["business_summary"] = {"total": len(states), "healthy": states.count("ok"),
-                                      "failed": states.count("fail"), "unknown": sum(state not in ("ok", "fail") for state in states)}
-            d["probe"] = {"state": health.get("state", "unknown")}
+            view = host_health_view(
+                prom_items=prom_items,
+                native_states=[item["state"] for item in native],
+                metric_state=metric.get("state", ""),
+                metric_error=metric.get("error", ""),
+                firing_severities=firing_by_asset.get(a["id"], []),
+            )
+            d["health"] = view["health"]
+            d["health_dot"] = view["health_dot"]
+            d["business_summary"] = view["business_summary"]
+            d["probe"] = {"state": view["health"].get("state", "unknown")}
             assets.append(d)
         need = [i for i in open_inc if i.get("need_human")]
         actions = [action for action in self.actions.list_actions(limit=50)
@@ -1313,7 +1340,12 @@ class WebApp:
             host = str(asset.get(key) or "").strip()
             if host:
                 return host
-        store = self.ssh_store or self._ssh_store()
+        store = self.ssh_store
+        if store is None:
+            try:
+                store = self._ssh_store()
+            except Exception:
+                store = None
         if endpoints is None:
             endpoints = store.list_endpoints(asset["id"]) if store else []
         preference = {"write": 0, "read": 1}
@@ -1652,14 +1684,143 @@ class WebApp:
             "incident": inc,
             "summary": summary,
             "disposition": disposition,
+            "council": await self._council_snapshot(inc_id),
         })
+
+    async def _council_snapshot(self, inc_id: str) -> dict:
+        if self.autonomy is None:
+            return {"enabled": False, "status": "disabled", "phase": "received"}
+        try:
+            snapshot = self.autonomy.snapshot(inc_id)
+            if inspect.isawaitable(snapshot):
+                snapshot = await snapshot
+            if not isinstance(snapshot, dict):
+                raise ValueError("invalid snapshot")
+            return snapshot
+        except Exception:
+            # Optional AI services must never break the existing incident UI.
+            log.warning("autonomy snapshot unavailable for incident %s", inc_id)
+            return {"enabled": False, "status": "unavailable", "error": "autonomy_unavailable"}
+
+    def _council_visible_incident(self, request: web.Request, sess: dict) -> dict | web.Response:
+        inc = self.incidents.get_incident(request.match_info["inc_id"])
+        if not inc:
+            return _json({"ok": False, "error": "not_found"}, 404)
+        if inc.get("asset_id") not in self._visible_asset_ids(sess):
+            return _json({"ok": False, "error": "permission_denied"}, 403)
+        return inc
+
+    async def api_incident_council(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        inc = self._council_visible_incident(request, sess)
+        if isinstance(inc, web.Response):
+            return inc
+        return _json({"ok": True, "council": await self._council_snapshot(inc["id"])})
+
+    async def api_autonomy_providers(self, request: web.Request) -> web.Response:
+        self._require_admin(request)
+        if self.providers is None:
+            return _json({"ok": True, "config": {"enabled": False, "budget_cny": 100, "roles": {}}, "available": False})
+        return _json({"ok": True, "config": self.providers.public_config(), "available": True})
+
+    async def api_autonomy_providers_save(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        if self.providers is None:
+            return _json({"ok": False, "error": "autonomy_unavailable"}, 503)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return _json({"ok": False, "error": "invalid_json"}, 400)
+        if not isinstance(body, dict):
+            return _json({"ok": False, "error": "invalid_config"}, 400)
+        totp_error = self._sensitive_totp(sess, body)
+        if totp_error:
+            return _json(totp_error, 403)
+        patch = {key: value for key, value in body.items() if key not in {"totp", "totp_code"}}
+        try:
+            self.providers.update_config(patch, actor=sess["username"])
+        except ValueError as exc:
+            # Configuration errors may contain supplied secrets; return only a known-safe code.
+            code = str(getattr(exc, "code", "invalid_config"))
+            if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):
+                code = "invalid_config"
+            return _json({"ok": False, "error": code, "message": "配置未保存，请检查地址、模型、价格及账户验证状态。"}, 400)
+        return _json({"ok": True, "config": self.providers.public_config()})
+
+    async def api_autonomy_usage(self, request: web.Request) -> web.Response:
+        self._require_admin(request)
+        if self.providers is None:
+            return _json({"ok": True, "usage": {"budget_cny": 100, "cost_cny": None, "status": "disabled"}})
+        return _json({"ok": True, "usage": self.providers.usage_summary()})
+
+    async def api_autonomy_provider_verify(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        if self.providers is None:
+            return _json({"ok": False, "error": "autonomy_unavailable"}, 503)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return _json({"ok": False, "error": "invalid_json"}, 400)
+        if not isinstance(body, dict) or not isinstance(body.get("role"), str) or body.get("role") not in {"planner", "reviewer_kimi", "reviewer_deepseek"} or set(body) - {"role", "totp", "totp_code"}:
+            return _json({"ok": False, "error": "invalid_role"}, 400)
+        totp_error = self._sensitive_totp(sess, body)
+        if totp_error:
+            return _json(totp_error, 403)
+        try:
+            result = await self.providers.verify_account(body["role"])
+        except ValueError as exc:
+            code = str(getattr(exc, "code", "verification_failed"))
+            if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):
+                code = "verification_failed"
+            return _json({"ok": False, "error": code, "message": "账户模型核验未通过，请检查独立 API 凭据、模型及服务状态。"}, 400)
+        if not isinstance(result, dict):
+            result = {"ok": False, "error": "verification_failed"}
+        ok = result.get("ok") is True
+        self.db.audit("web_user", sess["username"], "ai_provider_account_verified", detail={"role": body["role"], "ok": ok, "error": result.get("error", "")}, channel="web")
+        return _json({"ok": ok, "result": result, "error": "" if ok else result.get("error", "verification_failed"), "config": self.providers.public_config()}, 200 if ok else 400)
+
+    async def api_council_manual_review(self, request: web.Request) -> web.Response:
+        from .council import CouncilError
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        inc = self._council_visible_incident(request, sess)
+        if isinstance(inc, web.Response):
+            return inc
+        if self.autonomy is None:
+            return _json({"ok": False, "error": "autonomy_unavailable"}, 503)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return _json({"ok": False, "error": "invalid_json"}, 400)
+        if not isinstance(body, dict) or not isinstance(body.get("goal_id"), str) or not body["goal_id"].strip():
+            return _json({"ok": False, "error": "goal_required"}, 400)
+        if set(body) - {"goal_id", "totp", "totp_code"}:
+            return _json({"ok": False, "error": "invalid_fields"}, 400)
+        totp_error = self._sensitive_totp(sess, body)
+        if totp_error:
+            return _json(totp_error, 403)
+        try:
+            result = self.autonomy.release_manual_barrier(inc["id"], body["goal_id"], actor=sess["username"])
+            if inspect.isawaitable(result):
+                result = await result
+        except CouncilError as exc:
+            return _json({"ok": False, "error": exc.code}, 409)
+        except ValueError:
+            return _json({"ok": False, "error": "manual_review_conflict"}, 409)
+        if isinstance(result, dict) and result.get("ok") is False:
+            return _json({"ok": False, "error": "manual_review_conflict"}, 409)
+        # This endpoint only reopens deliberation; it cannot approve a plan or execute an Action.
+        return _json({"ok": True, "result": result, "message": "已允许该目标重新拟案，新方案仍须两位委员重新审议。"})
 
     def _incident_disposition(self, inc: dict) -> dict:
         """P1-01：事件详情处置上下文（服务端求值，前端不重算 Policy）。"""
         from .fmt import ZH_CAP
 
         actions_list = inc.get("actions") or []
-        pending = [a for a in actions_list if a.get("state") in ("proposed", "approved")]
+        pending = [a for a in actions_list if a.get("state") in ("proposed", "approved")
+                   and a.get("mode") != "reviewed" and not a.get("council_grant_id")]
         invs = inc.get("investigations") or []
         last_inv = invs[-1] if invs else None
         evidence_summary = ""
@@ -1751,50 +1912,22 @@ class WebApp:
         }
 
     def _incident_human_summary(self, inc: dict, action: dict | None) -> dict:
-        from .fmt import ZH_CAP, ZH_STAGE, ZH_STATE, alert_name
+        from .fmt import ZH_CAP, ZH_EVENT, ZH_STAGE, ZH_STATE, ZH_STATUS, alert_name, readable_reason
 
         timeline = []
-        zh_event = {
-            "incident_opened": "发现异常",
-            "alert_fired": "告警触发",
-            "alert_resolved": "告警恢复",
-            "alert_resolved_hold": "告警恢复但义务未清",
-            "episode_attached": "告警并入事件",
-            "investigation": "完成调查",
-            "action_proposed": "提出处置",
-            "proposal_waiting": "等待人工确认",
-            "action_approved": "批准处置",
-            "action_rejected": "拒绝处置",
-            "action_cancelled": "取消处置",
-            "action_expired": "提案过期",
-            "action_dispatched": "派发执行",
-            "action_success": "处置完成",
-            "action_failure": "处置失败",
-            "action_unknown": "处置结果未知",
-            "verified_recovered": "验证通过",
-            "verify_not_passed": "验证未通过",
-            "agent_auto_exec": "自动处置",
-            "agent_escalated": "转人工",
-            "incident_resolved": "事件解决",
-            "incident_reopened": "事件复发",
-            "incident_closed": "事件关闭",
-            "reconcile_not_seen": "对账未见",
-            "reconcile_observed": "对账观察",
-            "generation_bumped": "轮次递增",
-        }
         # 默认优先保证最新事件可见（接口 desc 返回，此处取最新 8 条再正序展示）
         events = list(inc.get("events") or [])
         latest = events[:8] if events else []
         for e in reversed(latest):
             timeline.append({
                 "time": e.get("at"),
-                "label": zh_event.get(e.get("type", ""), e.get("title", "")),
+                "label": ZH_EVENT.get(e.get("type", ""), e.get("title", "")),
                 "type": e.get("type", ""),
             })
 
         what = alert_name(inc.get("title", ""))
         why_human = inc.get("need_human_reason", "")
-        zh_reason = why_human
+        zh_reason = readable_reason(why_human) if why_human else ""
         for en, cn in (
             ("no_runbook_match", "没有匹配的自动处置规则"),
             ("policy_denied", "没有自动处置权限"),
@@ -1818,17 +1951,35 @@ class WebApp:
                 suggestion = "手动处理或添加处置规则/权限"
             elif "budget" in why_human:
                 suggestion = "等待冷却期结束或手动处置"
+            elif "action_rejected" in why_human:
+                suggestion = "本轮已跳过处置；目标恢复或开始新一轮故障后重新评估"
             else:
                 suggestion = "查看详情后决定下一步"
         elif inc.get("status") == "open":
             suggestion = "系统正在处理，稍候刷新"
 
+        automation_wait = None
+        if inc.get("status") == "open" and inc.get("stage") == "watching" and not inc.get("need_human"):
+            last_created = max((float(a.get("created_at") or 0) for a in inc.get("actions") or []), default=0)
+            for event in events:
+                if event.get("type") != "agent_waiting" or float(event.get("at") or 0) < last_created:
+                    continue
+                try:
+                    waiting = json.loads(event.get("payload_json") or "{}")
+                    if int(waiting.get("generation") or 1) != int(inc.get("generation") or 1):
+                        continue
+                    automation_wait = {"reason": readable_reason(str(waiting.get("reason") or "")), "retry_at": waiting.get("retry_at")}
+                except (TypeError, ValueError, AttributeError):
+                    pass
+                break
+
         return {
             "title": what,
-            "status_zh": {"open": "处理中", "resolved": "已解决", "closed": "已关闭"}.get(inc.get("status"), inc.get("status")),
+            "status_zh": ZH_STATUS.get(inc.get("status"), inc.get("status")),
             "stage_zh": ZH_STAGE.get(inc.get("stage"), inc.get("stage")),
             "why_human": zh_reason if inc.get("need_human") else "",
             "suggestion": suggestion,
+            "automation_wait": automation_wait,
             "timeline": timeline,
             "last_action": {
                 "capability_zh": ZH_CAP.get(cap, cap),
@@ -1928,6 +2079,34 @@ class WebApp:
         self.db.audit("web_user", username, "sensitive_totp_ok")
         return None
 
+    async def api_action_decision(self, request: web.Request) -> web.Response:
+        """事件详情三选项；一次授权与长期授权共享对象和权限校验。"""
+        from .fmt import approval_error
+        sess = self._require_auth(request)
+        self._check_csrf(request, sess)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return _json({"ok": False, "error": "invalid_json", "message": "请求格式错误"}, 400)
+        if not isinstance(body, dict):
+            return _json({"ok": False, "error": "invalid_json", "message": "请求格式错误"}, 400)
+        decision = body.get("decision")
+        if decision not in ("execute_once", "reject", "allow_always"):
+            return _json({"ok": False, "error": "invalid_decision", "message": "请选择执行一次、不执行或永久允许执行"}, 400)
+        if decision != "reject":
+            mfa_err = self._sensitive_totp(sess, body)
+            if mfa_err:
+                return _json(mfa_err, 401)
+        try:
+            result = await ApprovalService(self.actions).decide(
+                decision, action_id=request.match_info["aid"],
+                actor_type="web_user", actor_id=sess["username"], channel="web",
+                is_admin=bool(sess.get("is_admin")), reason=str(body.get("reason") or ""),
+            )
+        except ActionError as e:
+            return _json({"ok": False, "error": e.code, "message": approval_error(e.code)}, 400)
+        return _json({"ok": True, **result})
+
     async def api_action_approve(self, request: web.Request) -> web.Response:
         sess = self._require_auth(request)
         self._check_csrf(request, sess)
@@ -1943,8 +2122,8 @@ class WebApp:
         reason = body.get("reason", "") or ""
         try:
             if execute:
-                res = await self.actions.approve_and_execute(
-                    request.match_info["aid"],
+                res = await ApprovalService(self.actions).decide(
+                    "execute_once", action_id=request.match_info["aid"],
                     actor_type="web_user",
                     actor_id=sess["username"],
                     channel="web",
@@ -1973,8 +2152,8 @@ class WebApp:
             body = {}
         reason = body.get("reason", "") or ""
         try:
-            res = self.actions.reject(
-                request.match_info["aid"],
+            res = await ApprovalService(self.actions).decide(
+                "reject", action_id=request.match_info["aid"],
                 actor_type="web_user",
                 actor_id=sess["username"],
                 channel="web",
@@ -2445,6 +2624,30 @@ class WebApp:
             return _json({"ok": False, "error": getattr(e, "code", str(e))}, 400)
         return _json({"ok": True, "channel": ch})
 
+    async def api_notify_aibot_admins(self, request: web.Request) -> web.Response:
+        self._require_admin(request)
+        cid = str(request.rel_url.query.get("channel_id") or "")
+        store = self._channels()
+        channel = store.get_meta(cid)
+        if not channel or channel.get("kind") != "wecom_aibot":
+            return _json({"ok": False, "error": "not_found", "detail": "智能机器人渠道不存在"}, 404)
+        return _json({"ok": True, "users": store.list_seen_users(cid),
+                      "selected": channel.get("config", {}).get("admin_user_ids") or []})
+
+    async def api_notify_aibot_admins_save(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("admin_user_ids"), list):
+            return _json({"ok": False, "error": "bad_admin_user_ids", "detail": "请选择成员 UserID，或留空"}, 400)
+        try:
+            channel = self._channels().set_admin_user_ids(
+                str(body.get("id") or ""), body["admin_user_ids"], actor=sess["username"],
+            )
+        except Exception as exc:
+            return _json({"ok": False, "error": getattr(exc, "code", "error"), "detail": str(exc)}, 400)
+        return _json({"ok": True, "channel": channel})
+
     # ---- 消息记录 ----
 
     async def api_messages(self, request: web.Request) -> web.Response:
@@ -2790,8 +2993,7 @@ class WebApp:
 
     async def api_monitor_hosts(self, request: web.Request) -> web.Response:
         sess = self._require_auth(request)
-        from .health import host_health
-        from .business import required_health
+        from .business import host_health_view
 
         rows = self.db.query(
             "SELECT id, display_name, prom_asset, enabled FROM assets ORDER BY id ASC"
@@ -2822,27 +3024,22 @@ class WebApp:
             metric_error = item.get("error") or ""
 
             prom_items, _ = await self._prom_business_items(a)
-            required_state = required_health(prom_items)
-
-            # 业务检查
-            check_states = [item["state"] for item in prom_items if not item.get("required")]
             try:
-                check_states.extend(self._native_business_states(aid))
+                native_states = self._native_business_states(aid)
             except Exception:
-                pass
-
-            hh = host_health(
+                native_states = []
+            view = host_health_view(
+                prom_items=prom_items,
+                native_states=native_states,
                 metric_state=metric_state,
                 metric_error=metric_error,
-                required_state=required_state,
-                check_states=check_states,
                 firing_severities=firing_by_asset.get(aid, []),
-                collect_error=metric_error if metric_state == "collect_error" else "",
             )
+            hh = view["health_dot"]
             item["health"] = hh
             item["metric_state"] = metric_state
             item["state"] = hh["state"]  # 对外五态
-            item["firing"] = firing_by_asset.get(aid, [])
+            item["firing"] = view["firing"]
             item["host"] = a.get("host") or ""
             item["sample"] = self._is_sample_asset(a)
             out.append(item)
@@ -2876,14 +3073,21 @@ class WebApp:
             history = await self._monitor().host_history(prom_asset, range_key)
         except Exception as e:
             return _json({"ok": False, "error": str(e)}, 502)
-        from .business import required_health
-        from .health import host_health
+        from .business import host_health_view
 
         prom_items, _ = await self._prom_business_items(dict(row))
-        health = host_health(metric_state=overview.get("state", ""), metric_error=overview.get("error", ""),
-                             required_state=required_health(prom_items),
-                             check_states=[item["state"] for item in prom_items if not item.get("required")] + self._native_business_states(asset_id),
-                             firing_severities=self._monitor_firing().get(asset_id, []))
+        try:
+            native_states = self._native_business_states(asset_id)
+        except Exception:
+            native_states = []
+        view = host_health_view(
+            prom_items=prom_items,
+            native_states=native_states,
+            metric_state=overview.get("state", ""),
+            metric_error=overview.get("error", ""),
+            firing_severities=self._monitor_firing().get(asset_id, []),
+        )
+        health = view["health_dot"]
         # 示例资产 / 未接入监控：明确区分，不伪装成采集故障
         sample = self._is_sample_asset(row)
         not_onboarded = self._monitor_not_onboarded(overview)
@@ -2903,9 +3107,21 @@ class WebApp:
     # ---- SSH 资产 / 凭据（v0.4.1）----
 
     def _ssh_store(self):
-        if not self.ssh_store:
+        # 统一入口：优先显式 ssh_store，回退 transport 内嵌 store；都没有则 None。
+        # （原先此处与文件末尾各有一份同名方法，后者遮蔽前者，已合并为「可空返回」语义，
+        #   与合并前实际生效版本一致；需要 404 的调用方用 _require_ssh_store。）
+        if self.ssh_store is not None:
+            return self.ssh_store
+        store = getattr(self.transport, "store", None)
+        if store is None:
+            store = getattr(self.transport, "_store", None)
+        return store
+
+    def _require_ssh_store(self):
+        store = self._ssh_store()
+        if store is None:
             raise web.HTTPNotFound(text="ssh_store not configured")
-        return self.ssh_store
+        return store
 
     def _cred_store(self):
         if not self.cred_store:
@@ -2914,14 +3130,14 @@ class WebApp:
 
     async def api_ssh_roles(self, request: web.Request) -> web.Response:
         self._require_auth(request)
-        return _json({"ok": True, "roles": self._ssh_store().list_roles()})
+        return _json({"ok": True, "roles": self._require_ssh_store().list_roles()})
 
     async def api_ssh_role_add(self, request: web.Request) -> web.Response:
         sess = self._require_admin(request)
         self._check_csrf(request, sess)
         body = await request.json()
         try:
-            role = self._ssh_store().add_role(
+            role = self._require_ssh_store().add_role(
                 name=body["name"],
                 kind=body.get("kind") or "read",
                 label=body.get("label") or "",
@@ -2937,7 +3153,7 @@ class WebApp:
         visible = self._visible_asset_ids(sess)
         if asset_id and asset_id not in visible:
             return _json({"ok": False, "error": "permission_denied"}, 403)
-        endpoints = [ep for ep in self._ssh_store().list_endpoints(asset_id)
+        endpoints = [ep for ep in self._require_ssh_store().list_endpoints(asset_id)
                      if ep.get("asset_id") in visible]
         return _json({"ok": True, "endpoints": endpoints})
 
@@ -2946,7 +3162,7 @@ class WebApp:
         self._check_csrf(request, sess)
         body = await request.json()
         try:
-            ep = self._ssh_store().upsert_endpoint(
+            ep = self._require_ssh_store().upsert_endpoint(
                 asset_id=body["asset_id"],
                 role=body.get("role") or "read",
                 host=body["host"],
@@ -2979,7 +3195,7 @@ class WebApp:
         self._check_csrf(request, sess)
         body = await request.json()
         try:
-            ep = self._ssh_store().trust_host_key(
+            ep = self._require_ssh_store().trust_host_key(
                 body["asset_id"],
                 body.get("role") or "read",
                 body["host_key_sha256"],
@@ -2995,7 +3211,7 @@ class WebApp:
         self._check_csrf(request, sess)
         body = await request.json()
         try:
-            self._ssh_store().delete_endpoint(
+            self._require_ssh_store().delete_endpoint(
                 body["asset_id"], body.get("role") or "read", actor=sess["username"]
             )
         except Exception as e:
@@ -3263,7 +3479,7 @@ class WebApp:
 
         steps: list[str] = []
         try:
-            eps = self._ssh_store().list_endpoints(asset_id)
+            eps = self._require_ssh_store().list_endpoints(asset_id)
         except Exception as e:
             return _json({"ok": False, "error": f"endpoints: {e}"}, 400)
         ep = next((e for e in eps if e.get("role") == role and e.get("enabled")), None)
@@ -3328,7 +3544,7 @@ class WebApp:
                 actor=sess["username"],
                 key_line=scanned.get("key_line") or "",
             )
-            ep = self._ssh_store().get_endpoint(asset_id, role) or ep
+            ep = self._require_ssh_store().get_endpoint(asset_id, role) or ep
             steps.append("host_key_trusted")
             trusted = True
 
@@ -3389,7 +3605,7 @@ class WebApp:
                 actor=sess["username"],
             )
             try:
-                tr = SSHTransport(self._ssh_store(), self._cred_store())
+                tr = SSHTransport(self._require_ssh_store(), self._cred_store())
                 verify = await tr.test_connection(ep["asset_id"], "write")
             except Exception as e:
                 verify = {"ok": False, "error": str(e)[:300]}
@@ -3810,39 +4026,97 @@ class WebApp:
             raise web.HTTPNotFound(text=json.dumps({"error": "checks_not_configured"}))
         return self.checks
 
-    def _check_read(self, request: web.Request) -> dict[str, Any]:
-        sess = self._require_auth(request)
+    def _require_cap(
+        self,
+        sess: dict[str, Any],
+        capability: str,
+        *,
+        admin: bool = False,
+        respect_deny: bool = True,
+        no_approval: bool = True,
+        asset_id: str = "*",
+        object_id: str = "*",
+        deny_body: dict | None = None,
+        admin_body: dict | None = None,
+        approval_body: dict | None = None,
+    ) -> dict[str, Any]:
+        """统一能力门（P2-2）。
+
+        admin=True          → 必须管理员（否则 admin_required）
+        respect_deny=True   → 显式 deny 不因 admin 绕过（promconfig 语义）
+        respect_deny=False  → admin 可读绕过 deny（checks.read 历史语义）
+        no_approval=True    → require_approval 视为不可直接提交
+        返回 policy 判定；失败抛 HTTPForbidden。不得放宽权限。
+        """
+        if admin and not sess.get("is_admin"):
+            raise web.HTTPForbidden(
+                text=json.dumps(admin_body or {"error": "admin_required"}),
+                content_type="application/json",
+            )
         d = self.policy.effective_decision(
             subject_type="web_user",
             subject_id=sess["username"],
-            capability="checks.read",
-            asset_id="*",
-            object_id="*",
+            capability=capability,
+            asset_id=asset_id,
+            object_id=object_id,
         )
-        # admin 拥有管理台读权限；其余用户需显式 checks.read
-        if not d["allowed"] and not sess.get("is_admin"):
+        if not d["allowed"]:
+            # respect_deny=True：显式 deny 连 admin 也不绕过
+            # respect_deny=False：admin 可读（历史 _check_read 语义）
+            if respect_deny or not sess.get("is_admin"):
+                body = deny_body or {"error": "denied", "reason": d.get("reason")}
+                raise web.HTTPForbidden(
+                    text=json.dumps(body), content_type="application/json"
+                )
+            return d
+        if no_approval and d.get("require_approval"):
+            body = approval_body or {
+                "error": "approval_required",
+                "require_approval": True,
+            }
             raise web.HTTPForbidden(
-                text=json.dumps({"ok": False, "error": "denied", "message": "当前账户没有查看业务检查的权限，请联系管理员授权。"}),
-                content_type="application/json",
+                text=json.dumps(body), content_type="application/json"
             )
+        return d
+
+    def _check_read(self, request: web.Request) -> dict[str, Any]:
+        sess = self._require_auth(request)
+        # admin 拥有管理台读权限；其余用户需显式 checks.read
+        self._require_cap(
+            sess,
+            "checks.read",
+            admin=False,
+            respect_deny=False,
+            deny_body={
+                "ok": False,
+                "error": "denied",
+                "message": "当前账户没有查看业务检查的权限，请联系管理员授权。",
+            },
+        )
         return sess
 
     def _check_write(self, request: web.Request) -> dict[str, Any]:
         sess = self._require_auth(request)
         self._check_csrf(request, sess)
-        if not sess.get("is_admin"):
-            raise web.HTTPForbidden(text=json.dumps({"error": "admin_required", "message": "创建或修改业务检查需要管理员权限。"}))
-        d = self.policy.effective_decision(
-            subject_type="web_user",
-            subject_id=sess["username"],
-            capability="checks.write",
-            asset_id="*",
-            object_id="*",
+        self._require_cap(
+            sess,
+            "checks.write",
+            admin=True,
+            respect_deny=True,
+            no_approval=True,
+            admin_body={
+                "error": "admin_required",
+                "message": "创建或修改业务检查需要管理员权限。",
+            },
+            deny_body={
+                "error": "denied",
+                "message": "当前策略禁止修改业务检查，请先调整授权。",
+            },
+            approval_body={
+                "error": "approval_required",
+                "message": "修改业务检查需要审批，当前页面不能直接提交。",
+            },
         )
-        if not d["allowed"]:
-            raise web.HTTPForbidden(text=json.dumps({"error": "denied", "message": "当前策略禁止修改业务检查，请先调整授权。"}))
-        if d.get("require_approval"):
-            raise web.HTTPForbidden(text=json.dumps({"error": "approval_required", "message": "修改业务检查需要审批，当前页面不能直接提交。"}))
         return sess
 
     @staticmethod
@@ -3980,23 +4254,26 @@ class WebApp:
     def _check_prom_write(self, request: web.Request, *, asset_id: str = "*") -> dict[str, Any]:
         sess = self._require_auth(request)
         self._check_csrf(request, sess)
-        if not sess.get("is_admin"):
-            raise web.HTTPForbidden(text=json.dumps({"error": "admin_required"}))
-        decision = self._policy_for(sess, "promconfig.write", asset_id=asset_id)
-        if not decision["allowed"]:
-            raise web.HTTPForbidden(text=json.dumps({"error": "denied", "reason": decision.get("reason")}))
-        if decision.get("require_approval"):
-            raise web.HTTPForbidden(
-                text=json.dumps({"error": "approval_required", "require_approval": True})
-            )
+        self._require_cap(
+            sess,
+            "promconfig.write",
+            admin=True,
+            respect_deny=True,
+            no_approval=True,
+            asset_id=asset_id,
+        )
         return sess
 
     def _check_prom_read(self, request: web.Request) -> dict[str, Any]:
         sess = self._require_auth(request)
-        decision = self._policy_for(sess, "promconfig.read")
-        if not decision["allowed"]:
-            # 尊重显式 deny，不因 admin 绕过
-            raise web.HTTPForbidden(text=json.dumps({"error": "denied", "reason": decision.get("reason")}))
+        # 尊重显式 deny，不因 admin 绕过
+        self._require_cap(
+            sess,
+            "promconfig.read",
+            admin=False,
+            respect_deny=True,
+            no_approval=False,
+        )
         return sess
 
     async def api_promconfig_overview(self, request: web.Request) -> web.Response:
@@ -4127,14 +4404,6 @@ class WebApp:
             return _json({"ok": True, "status": data})
         except Exception as e:
             return _json({"ok": False, "error": str(e)}, 502)
-
-    def _ssh_store(self):
-        if self.ssh_store is not None:
-            return self.ssh_store
-        store = getattr(self.transport, "store", None)
-        if store is None:
-            store = getattr(self.transport, "_store", None)
-        return store
 
     def _ne_transport(self, asset_id: str):
         """Node Exporter 通道：有 SSH 端点用 SSH；仅本机资产才允许 LocalExec。SSH 失败不得回退。"""
@@ -4355,3 +4624,170 @@ class WebApp:
             return _json({"ok": False, "error": str(e)}, 400)
         # 接收成功以 DB 为准；QQ 失败不改变接收事实
         return _json({"ok": True, **res})
+
+    # ---- 外部事务 ----
+
+    def _ext(self):
+        if not self.exttx:
+            raise web.HTTPNotFound(text=json.dumps({"error": "exttx_disabled"}))
+        return self.exttx
+
+    async def api_ext_report(self, request: web.Request) -> web.Response:
+        """外部上报入口：独立 Token，无会话权限。"""
+        from .exttx import ExtTxError
+
+        svc = self._ext()
+        auth = request.headers.get("Authorization", "")
+        raw = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        if not raw:
+            raw = request.headers.get("X-Ext-Token", "").strip()
+        try:
+            who = svc.authenticate_token(raw)
+        except ExtTxError as e:
+            return _json({"ok": False, "error": e.code}, 401)
+        try:
+            body = await request.json()
+        except Exception:
+            return _json({"ok": False, "error": "bad_json"}, 400)
+        if not isinstance(body, dict):
+            return _json({"ok": False, "error": "bad_json"}, 400)
+        body_key = str(body.get("event_key") or "").strip()
+        if body_key and body_key != who["event_key"]:
+            self.db.audit(
+                "ext_token", who["token_id"], "ext_report_denied",
+                detail={"event_key": body_key[:40], "hint": who.get("token_hint", "")},
+            )
+            return _json({"ok": False, "error": "event_key_mismatch"}, 403)
+        try:
+            res = svc.report(
+                body,
+                token_hint=who.get("token_hint", ""),
+                received_at=now(),
+            )
+        except ExtTxError as e:
+            return _json({"ok": False, "error": e.code, "detail": e.detail}, 400)
+        return _json(res)
+
+    async def api_ext_transactions(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        return _json({"ok": True, "transactions": self._ext().list_transactions()})
+
+    async def api_ext_transaction_create(self, request: web.Request) -> web.Response:
+        from .exttx import ExtTxError
+
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json() if request.can_read_body else {}
+        if not isinstance(body, dict):
+            body = {}
+        try:
+            tx = self._ext().create_transaction(body, actor=sess.get("username", ""))
+        except ExtTxError as e:
+            return _json({"ok": False, "error": e.code, "detail": e.detail}, 400)
+        return _json({"ok": True, "transaction": tx})
+
+    async def api_ext_transaction_update(self, request: web.Request) -> web.Response:
+        from .exttx import ExtTxError
+
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json() if request.can_read_body else {}
+        if not isinstance(body, dict):
+            body = {}
+        try:
+            tx = self._ext().update_transaction(
+                request.match_info["tid"], body, actor=sess.get("username", "")
+            )
+        except ExtTxError as e:
+            code = 404 if e.code == "not_found" else 400
+            return _json({"ok": False, "error": e.code, "detail": e.detail}, code)
+        return _json({"ok": True, "transaction": tx})
+
+    async def api_ext_transaction_enabled(self, request: web.Request) -> web.Response:
+        from .exttx import ExtTxError
+
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json() if request.can_read_body else {}
+        if not isinstance(body, dict):
+            body = {}
+        try:
+            tx = self._ext().set_enabled(
+                request.match_info["tid"],
+                bool(body.get("enabled", True)),
+                actor=sess.get("username", ""),
+            )
+        except ExtTxError as e:
+            code = 404 if e.code == "not_found" else 400
+            return _json({"ok": False, "error": e.code, "detail": e.detail}, code)
+        return _json({"ok": True, "transaction": tx})
+
+    async def api_ext_transaction_delete(self, request: web.Request) -> web.Response:
+        from .exttx import ExtTxError
+
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        try:
+            res = self._ext().delete_transaction(
+                request.match_info["tid"], actor=sess.get("username", "")
+            )
+        except ExtTxError as e:
+            code = 404 if e.code == "not_found" else 400
+            return _json({"ok": False, "error": e.code, "detail": e.detail}, code)
+        return _json(res)
+
+    async def api_ext_token_issue(self, request: web.Request) -> web.Response:
+        from .exttx import ExtTxError
+
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        try:
+            res = self._ext().issue_token(
+                request.match_info["tid"], actor=sess.get("username", "")
+            )
+        except ExtTxError as e:
+            code = 404 if e.code == "not_found" else 400
+            return _json({"ok": False, "error": e.code, "detail": e.detail}, code)
+        return _json(res)
+
+    async def api_ext_token_rotate(self, request: web.Request) -> web.Response:
+        from .exttx import ExtTxError
+
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json() if request.can_read_body else {}
+        if not isinstance(body, dict):
+            body = {}
+        old_id = str(body.get("old_token_id") or "").strip()
+        try:
+            res = self._ext().rotate_token(
+                request.match_info["tid"], old_id, actor=sess.get("username", "")
+            )
+        except ExtTxError as e:
+            code = 404 if e.code == "not_found" else 400
+            return _json({"ok": False, "error": e.code, "detail": e.detail}, code)
+        return _json(res)
+
+    async def api_ext_token_revoke(self, request: web.Request) -> web.Response:
+        from .exttx import ExtTxError
+
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        try:
+            res = self._ext().revoke_token(
+                request.match_info["token_id"], actor=sess.get("username", "")
+            )
+        except ExtTxError as e:
+            code = 404 if e.code == "not_found" else 400
+            return _json({"ok": False, "error": e.code, "detail": e.detail}, code)
+        return _json(res)
+
+    async def api_ext_runs(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        q = request.rel_url.query
+        try:
+            limit = int(q.get("limit", "50"))
+        except ValueError:
+            limit = 50
+        runs = self._ext().list_runs(request.match_info["tid"], limit=limit)
+        return _json({"ok": True, "runs": runs})

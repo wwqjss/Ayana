@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.8.0 — 三省制自治 Agent 与 MySQL 监控增强
+
+### 新增
+
+- **三省制自治 Agent**（默认关闭）：事件驱动「调查 → 拟案 → 双席独立审议 → 一次性授权 → 受控执行 → 独立验证」
+  - **中书省 Planner**（MiMo）：对象级只读调查与具体修复方案；无 SSH 写、无 Action 写工具
+  - **门下省双委员**（Kimi + DeepSeek）：并行读取同一不可变方案版本，输出严格 JSON 审议（approve / reason / missing_evidence / suggested_revision）
+  - **投票箱**（Python 确定性）：仅两票均同意才签发单次逐步授权；否决、超时、非法 JSON、身份不符均失败关闭
+  - **数据模型**：council_goals / plans / reviews / ballots / grants / steps（DB migration 16）
+- **独立 AI Provider 注册表**（`ai_providers.py`）：三角色隔离客户端、AES-GCM 密钥、账户 `/models` 核验、usage×单价费用账本、预算与调用上限熔断
+- **一次性细粒度授权**：方案签名绑定目标与固定 argv；派发前复核 Policy、双开关、Agent ceiling、SSH 身份；unknown 不自动重放
+- **人工屏障**：同目标三轮封驳或 Planner 请求人工时持久 `manual_required`；管理员可精确解除单一目标
+- **能力目录扩展**：
+  - `service.reload` / `service.reset_failed`（write）
+  - `mysql.replica.start`（write，令牌锁定为 `START REPLICA`）
+  - `mysql.replica.status`（read，复制 IO/SQL 线程；实例健康 ≠ 复制健康）
+- **MySQL 监控可见性**：业务状态自动展示「MySQL 实例 / 复制 IO / 复制 SQL」
+- **告警规则** `ayana-mysql-alerts`：MySQLDown、复制 IO/SQL 停止、复制延迟、指标采集丢失（仅告警，不自动修复）
+- **证据治理**：Agent 上下文使用摘要与故障相关摘录；原始证据保留 investigation 可追溯入口；按失败指纹去重并限量
+
+### 修复
+
+- 资源页主机红点抬升来源可在业务列表对照（复制线程停时不再「红但无相关监控」）
+- 方案校验剥离 identity 回显 params，仍拒绝真正的写参数覆盖
+- 调查链路放开只读能力（promconfig.read / checks.read / node_exporter.status / disk / memory 等），写权限边界不变
+
+### 安全
+
+- 写通道仍仅 ActionService；能力只映射登记对象固定命令，不接受任意 shell
+- `mysql.replica.*` 令牌写死，不可改命令字符串绕过预算
+- Provider Key 只写入、加密存储、UI 不回读；价格未知不发起收费调用
+- Runbook 与会审共用冷却/次数账本；两票不覆盖人工审批、全局暂停与控制面保护
+
+### 测试
+
+- Python 回归 1188 项 OK（2 skip）；council / approval / security / channel_admins UI 全过
+- 自治专项：双票、封驳、三轮人工、重启恢复、费用熔断、复制能力边界
+
+### 配置
+
+- `config.example.json` 增加 `autonomous_agent`（roles / budget / 调用上限）
+- 详见 `docs/autonomous-agent.md`、`docs/ai-providers.md`、`docs/council-security.md`
+- 旧 `llm_*` 分析设置保留；`auto_remediation_enabled` 与自治总开关独立
+
+---
+
 ## v0.7.4 — 节点守望（配对 + 心跳 + 可选旁路）
 
 ### 新增

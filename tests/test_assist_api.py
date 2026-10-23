@@ -497,7 +497,8 @@ class AssistAPITest(unittest.IsolatedAsyncioTestCase):
         cases = (
             {"asset_id": "romi", "kind": "service", "name": "服务检查", "params.unit": "nginx"},
             {"asset_id": "romi", "kind": "port", "name": "监听检查", "params.port": 8443, "params.proto": "tcp"},
-            {"asset_id": "romi", "kind": "command", "name": "健康检查", "params.cmd": "curl -f http://127.0.0.1/health", "expect.mode": "contains", "expect.value": "healthy"},
+            # B1: command 检查仅允许 exit0 期望（contains/not_contains 已禁用）；curl 必须 -q/--disable 开头
+            {"asset_id": "romi", "kind": "command", "name": "健康检查", "params.cmd": "curl -q -f http://127.0.0.1/health", "expect.mode": "exit0"},
         )
         for fields in cases:
             with self.subTest(kind=fields["kind"]):

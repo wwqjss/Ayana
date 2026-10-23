@@ -58,10 +58,64 @@ WRITE_NO_REPLAY_STATES = frozenset(
     {"unknown", "dispatched", "success", "failure", "cancelled", "expired", "rejected"}
 )
 
+# These stop automatic dispatch temporarily; Agent owns the wait/retry path.
+AUTO_RETRYABLE_BLOCKS = frozenset({
+    "cooldown", "budget_exhausted", "global_pause", "object_locked", "source_unavailable",
+})
+
+
+def _source_block_code(reason: str) -> str:
+    return "source_quarantined" if reason.startswith("quarantined_source:") else "source_unavailable"
+
 
 def write_may_dispatch(state: str) -> bool:
     """仅 approved 可进入派发；其余（含 unknown）一律不可。"""
     return state == "approved"
+
+
+def action_incident_block(store: Any, action: Any) -> tuple[str, str] | None:
+    """Current incident validity for approval and the final dispatch claim.
+
+    store may be Database or the caller's SQLite transaction. A generation
+    change during identity verification must invalidate the old action.
+    """
+    row = dict(action)
+    incident_id = row.get("incident_id") or ""
+    if not incident_id:
+        return None
+    incident = store.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
+    if not incident:
+        return ("incident_not_found", "关联事件不存在")
+    if incident["status"] != "open":
+        return ("incident_not_open", "关联事件已恢复或关闭")
+    if incident["asset_id"] and incident["asset_id"] != row["asset_id"]:
+        return ("incident_mismatch", "关联事件的资产已改变")
+    obj = store.execute(
+        "SELECT id,name FROM objects WHERE asset_id=? AND (id=? OR name=?)",
+        (row["asset_id"], row["object_id"], row["object_id"]),
+    ).fetchone()
+    expected = (incident["object_id"] or "").strip()
+    if expected and obj and expected not in (obj["id"], obj["name"]):
+        return ("incident_mismatch", "关联事件的对象已改变")
+    generation = store.execute(
+        "SELECT id,at FROM events WHERE incident_id=? AND type IN"
+        " ('generation_bumped','incident_reopened','incident_opened') ORDER BY id DESC LIMIT 1",
+        (incident_id,),
+    ).fetchone()
+    if generation:
+        proposed = store.execute(
+            "SELECT id FROM events WHERE incident_id=? AND type='action_proposed'"
+            " AND json_valid(payload_json) AND json_extract(payload_json,'$.action_id')=?"
+            " ORDER BY id DESC LIMIT 1", (incident_id, row["id"]),
+        ).fetchone()
+        # Event ordering disambiguates equal clock timestamps (common on
+        # Windows); old imported actions without an event use the cutoff.
+        stale = (int(proposed["id"]) < int(generation["id"])) if proposed else (
+            float(row["created_at"]) < float(generation["at"])
+        )
+        if stale:
+            return ("stale_generation", "此操作属于上次故障，请处理当前故障的操作")
+    return None
 
 
 class ActionService:
@@ -80,7 +134,7 @@ class ActionService:
         verify_timeout: int = 300,
     ):
         self.db = db
-        self.nt = nt
+        # self.nt 未使用；nt 仅作 transport 回退（见下行）
         self.gate = gate
         self.policy = policy
         self.prom = prom
@@ -117,12 +171,18 @@ class ActionService:
         runbook_id: str = "",
         runbook_rev: str = "",
         template_id: str = "",
+        council_grant_id: str = "",
+        council_step: int = -1,
     ) -> dict[str, Any]:
         cap = get_capability(capability)
         if cap.kind != "write":
             raise ActionError("not_a_write_capability")
-        if mode not in ("manual", "auto"):
+        if mode not in ("manual", "auto", "reviewed"):
             raise ActionError("bad_mode", mode)
+        if mode != "reviewed" and council_grant_id:
+            raise ActionError("council_grant_invalid", "grant linkage requires reviewed mode")
+        if mode == "reviewed" and (not council_grant_id or proposer_type != "auto_rule" or proposer_id != "agent"):
+            raise ActionError("council_grant_required")
         # 自动必须带 runbook；人工必须带 template 或 runbook（显式契约）
         if mode == "auto" and not runbook_id:
             raise ActionError("runbook_required", "auto mode requires runbook_id")
@@ -163,21 +223,21 @@ class ActionService:
             capability=capability,
             asset_id=asset_id,
             object_id=obj["id"],
-            auto=(mode == "auto"),
+            auto=(mode in ("auto", "reviewed")),
         )
         if decision.get("decision") == "forbidden" or not decision["allowed"]:
             if mode == "auto" and decision.get("reason") == "auto_not_allowed":
                 raise ActionError("auto_not_allowed", decision.get("reason", ""))
             raise ActionError("denied", decision.get("reason") or "forbidden")
-        if mode == "auto" and decision.get("decision") != "automatic":
+        if mode in ("auto", "reviewed") and decision.get("decision") != "automatic":
             raise ActionError("auto_not_allowed", decision.get("reason", ""))
-        if mode == "auto":
+        if mode in ("auto", "reviewed"):
             from .incidents import IncidentService
             from .verify_profiles import profile_for_action
 
             blocked = IncidentService(self.db).source_block_reason(incident_id) if incident_id else ""
             if blocked:
-                raise ActionError("source_unhealthy", blocked)
+                raise ActionError(_source_block_code(blocked), blocked)
             if profile_for_action(
                 capability=capability, asset_id=asset_id, object_id=resolve_object_name(obj),
             ) is None:
@@ -187,7 +247,7 @@ class ActionService:
                     )
                 raise ActionError("unsupported_verification_profile")
 
-        if self._object_locked(asset_id, obj["id"]):
+        if self._object_locked(asset_id, obj["id"], council_grant_id=council_grant_id):
             raise ActionError("object_locked", f"{asset_id}/{obj['id']}")
 
         aid = new_id("act")
@@ -205,6 +265,26 @@ class ActionService:
         }
         approval_deadline = now() + float(self.action_ttl)
         with self.db.tx() as conn:
+            if mode == "reviewed":
+                from .council import current_plan_block
+                grant = conn.execute("SELECT * FROM council_grants WHERE id=?", (council_grant_id,)).fetchone()
+                if not grant or grant["state"] != "executing" or not grant["claimed_at"] or now() >= grant["expires_at"]:
+                    raise ActionError("council_grant_invalid")
+                plan = conn.execute("SELECT * FROM council_plans WHERE id=?", (grant["plan_id"],)).fetchone()
+                blocked = current_plan_block(conn, plan) if plan else ("council_grant_invalid", "plan missing")
+                if blocked:
+                    raise ActionError(*blocked)
+                steps = json.loads(plan["plan_json"])["steps"]
+                if type(council_step) is not int or not 0 <= council_step < len(steps):
+                    raise ActionError("council_step_invalid")
+                step = steps[council_step]
+                if (plan["incident_id"] != incident_id or plan["asset_id"] != asset_id or plan["object_id"] != obj["id"]
+                        or step["capability"] != capability or step["params"] != (params or {}) or step["tokens"] != tokens):
+                    raise ActionError("council_step_mismatch")
+                cur = conn.execute("UPDATE council_steps SET state='prepared',action_id=? WHERE grant_id=? AND ordinal=? AND state='pending' AND action_id=''",
+                                   (aid, council_grant_id, council_step))
+                if cur.rowcount != 1:
+                    raise ActionError("council_step_consumed")
             conn.execute(
                 "INSERT INTO actions(id, incident_id, asset_id, object_id, capability,"
                 " params_json, reason, state, proposer_type, proposer_id, created_at,"
@@ -233,6 +313,8 @@ class ActionService:
                     approval_deadline,
                 ),
             )
+            if mode == "reviewed":
+                conn.execute("UPDATE actions SET council_grant_id=?,council_step=? WHERE id=?", (council_grant_id, council_step, aid))
             conn.execute(
                 "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
                 (
@@ -288,6 +370,8 @@ class ActionService:
         inc = self.db.query_one("SELECT * FROM incidents WHERE id=?", (incident_id,))
         if not inc:
             raise ActionError("incident_not_found", incident_id)
+        if inc["status"] != "open":
+            raise ActionError("incident_not_open", "关联事件已恢复或关闭")
         if inc["asset_id"] and inc["asset_id"] != asset_id:
             raise ActionError(
                 "incident_mismatch",
@@ -295,11 +379,36 @@ class ActionService:
             )
         inc_obj = (inc["object_id"] or "").strip()
         action_obj = (obj.get("name") or "").strip()
-        if inc_obj and action_obj and inc_obj != action_obj:
+        if inc_obj and action_obj and inc_obj not in (obj["id"], action_obj):
             raise ActionError(
                 "incident_mismatch",
                 f"incident object={inc_obj} action object={action_obj}",
             )
+
+    def authorize_reviewed(self, action_id: str, *, grant_id: str, ordinal: int) -> dict:
+        """Backend-only grant consumption; ordinary human/model approval cannot use it."""
+        from .council import reviewed_action_block
+        with self.db.tx() as conn:
+            row = conn.execute("SELECT * FROM actions WHERE id=?", (action_id,)).fetchone()
+            if (not row or row["state"] != "proposed" or row["mode"] != "reviewed"
+                    or row["council_grant_id"] != grant_id or row["council_step"] != ordinal):
+                raise ActionError("council_step_invalid")
+            blocked = reviewed_action_block(conn, row)
+            if blocked:
+                raise ActionError(*blocked)
+            decision = self.policy.effective_decision(subject_type="auto_rule", subject_id="agent",
+                capability=row["capability"], asset_id=row["asset_id"], object_id=row["object_id"], auto=True)
+            if not decision.get("allowed") or decision.get("decision") != "automatic":
+                raise ActionError("policy_revoked")
+            conn.execute("UPDATE actions SET state='approved',approver_type='auto_rule',approver_id='agent',approved_at=?,"
+                " decision_channel='council',decision_reason='two_independent_reviews',decided_at=?,decision_id=?,decision_snapshot_json=? WHERE id=? AND state='proposed'",
+                (now(), now(), grant_id, json.dumps(decision, ensure_ascii=False, default=str), action_id))
+            self.db.audit("system", "council", "action_approved", action_id=action_id, incident_id=row["incident_id"],
+                asset_id=row["asset_id"], object_id=row["object_id"], decision_id=grant_id, channel="council",
+                detail={"grant_id": grant_id, "ordinal": ordinal, "tokens": json.loads(row["params_json"])["tokens"]})
+            self.db.event("action_approved", "双委员授权已绑定精确操作", incident_id=row["incident_id"],
+                payload={"action_id": action_id, "grant_id": grant_id, "ordinal": ordinal})
+        return {"id": action_id, "state": "approved", "decision_id": grant_id}
 
     # ------------------------------------------------------------------
     # 批准 / 拒绝 / 取消（Web / QQ 共用；幂等）
@@ -316,6 +425,8 @@ class ActionService:
     ) -> dict[str, Any]:
         """批准提案。幂等：已批准/已派发不重复产生第二次 dispatch。"""
         row = self._get(action_id)
+        if row.get("mode") == "reviewed":
+            raise ActionError("council_approval_required", "reviewed action requires its exact council grant")
         state = row["state"]
         if state in ("approved", "dispatched", "success", "failure", "unknown"):
             return {
@@ -334,6 +445,16 @@ class ActionService:
                 (now(), action_id),
             )
             raise ActionError("expired")
+
+        blocked = action_incident_block(self.db, row)
+        if blocked:
+            self.db.audit(
+                approver_type, approver_id, "action_approve_denied",
+                asset_id=row["asset_id"], object_id=row["object_id"], action_id=action_id,
+                incident_id=row.get("incident_id") or "", channel=channel,
+                detail={"reason": blocked[0], "channel": channel},
+            )
+            raise ActionError(*blocked)
 
         # B2: 职责分离——同一人类主体不得自批；admin web / auto_rule 自动链除外
         HUMAN_TYPES = {"web_user", "qq_user", "wecom_user"}
@@ -590,6 +711,12 @@ class ActionService:
                     ),
                 ),
             )
+            if row.get("incident_id"):
+                from .incidents import IncidentService
+
+                incidents = IncidentService(self.db)
+                incidents.clear_awaiting_approval(row["incident_id"], action_id)
+                incidents.set_need_human(row["incident_id"], f"action_rejected:{action_id}")
         return {"id": action_id, "state": "cancelled", "idempotent": False, "decision_id": decision_id}
 
     async def approve_and_execute(
@@ -767,14 +894,14 @@ class ActionService:
         t = now()
         n = 0
         rows = self.db.query(
-            "SELECT id FROM actions WHERE incident_id=? AND state='proposed'",
+            "SELECT id FROM actions WHERE incident_id=? AND state IN ('proposed','approved')",
             (incident_id,),
         )
         for r in rows:
             with self.db.tx() as conn:
                 cur = conn.execute(
                     "UPDATE actions SET state='cancelled', finished_at=?, result_detail=?"
-                    " WHERE id=? AND state='proposed'",
+                    " WHERE id=? AND state IN ('proposed','approved')",
                     (t, f"stale:{reason}", r["id"]),
                 )
                 if cur.rowcount:
@@ -801,6 +928,44 @@ class ActionService:
                     )
         return n
 
+    def safe_cancel_pending_auto(self, action_id: str, reason: str = "") -> bool:
+        """Retire an unclaimed Agent auto proposal before scheduling a retry.
+
+        A dispatched or uncertain operation must never be converted back into
+        a retryable proposal, even when a caller observed an earlier state.
+        """
+        with self.db.tx() as conn:
+            row = conn.execute("SELECT * FROM actions WHERE id=?", (action_id,)).fetchone()
+            if (not row or row["mode"] != "auto" or row["proposer_type"] != "auto_rule"
+                    or row["proposer_id"] != "agent" or row["dispatched_at"] is not None
+                    or row["state"] not in ("proposed", "approved", "cancelled")):
+                return False
+            if row["state"] != "cancelled":
+                cur = conn.execute(
+                    "UPDATE actions SET state='cancelled',finished_at=?,result_detail=?"
+                    " WHERE id=? AND mode='auto' AND proposer_type='auto_rule' AND proposer_id='agent'"
+                    " AND state IN ('proposed','approved') AND dispatched_at IS NULL",
+                    (now(), f"auto_wait:{reason}", action_id),
+                )
+                if cur.rowcount != 1:
+                    return False
+                self.db.audit(
+                    "auto_rule", "agent", "action_cancelled_for_retry", action_id=action_id,
+                    asset_id=row["asset_id"], object_id=row["object_id"],
+                    incident_id=row["incident_id"] or "", channel="system", detail={"reason": reason},
+                )
+                self.db.event(
+                    "action_cancelled", "自动处置暂缓，等待条件恢复", incident_id=row["incident_id"] or "",
+                    payload={"action_id": action_id, "reason": reason, "retryable": True},
+                )
+            if row["incident_id"]:
+                from .incidents import IncidentService
+
+                IncidentService(self.db).clear_action_obligation(
+                    row["incident_id"], action_id, kind="execution_blocked",
+                )
+            return True
+
     # ------------------------------------------------------------------
     # 执行
     # ------------------------------------------------------------------
@@ -814,9 +979,24 @@ class ActionService:
         is_admin: bool = False,
     ) -> dict[str, Any]:
         async with self._exec_lock:
-            return await self._execute_locked(
-                action_id, actor_type=actor_type, actor_id=actor_id, is_admin=is_admin
-            )
+            try:
+                return await self._execute_locked(
+                    action_id, actor_type=actor_type, actor_id=actor_id, is_admin=is_admin
+                )
+            except ActionError as exc:
+                row = self._get(action_id)
+                retryable_auto = row.get("mode") == "auto" and exc.code in AUTO_RETRYABLE_BLOCKS
+                if row["state"] == "approved" and not retryable_auto and not action_incident_block(self.db, row):
+                    with self.db.tx():
+                        self._mark_need_human(row.get("incident_id") or "", f"execution_blocked:{action_id}")
+                        self.db.audit(
+                            actor_type, actor_id, "action_execution_blocked", action_id=action_id,
+                            asset_id=row["asset_id"], object_id=row["object_id"],
+                            incident_id=row.get("incident_id") or "",
+                            channel=row.get("decision_channel") or "system",
+                            detail={"reason": exc.code, "state": "approved"},
+                        )
+                raise
 
     async def _execute_locked(
         self,
@@ -891,11 +1071,15 @@ class ActionService:
             if not fresh or fresh["state"] != "approved":
                 raise ActionError("bad_state", "not_approved")
 
+            reject = action_incident_block(conn, fresh)
+
             # 资产当前登记 vs 核验时快照
             asset_row = conn.execute(
                 "SELECT * FROM assets WHERE id=?", (fresh["asset_id"],)
             ).fetchone()
-            if not asset_row or not asset_row["enabled"]:
+            if reject is not None:
+                pass
+            elif not asset_row or not asset_row["enabled"]:
                 reject = ("asset_disabled", "asset missing or disabled")
             elif ssh_ep is not None:
                 # SSH：host key 信任快照比对
@@ -923,12 +1107,15 @@ class ActionService:
 
             # 唯一派发门：当前 Policy 复查（P0-02）
             action_mode = (fresh["mode"] or "manual") if "mode" in fresh.keys() else "manual"
-            if reject is None and action_mode == "auto" and fresh["incident_id"]:
+            if reject is None and action_mode == "reviewed":
+                from .council import reviewed_action_block, reviewed_runtime_block
+                reject = reviewed_runtime_block(conn) or reviewed_action_block(conn, fresh)
+            if reject is None and action_mode in ("auto", "reviewed") and fresh["incident_id"]:
                 from .incidents import IncidentService
 
                 blocked = IncidentService(self.db).source_block_reason(fresh["incident_id"])
                 if blocked:
-                    reject = ("source_unhealthy", blocked)
+                    reject = (_source_block_code(blocked), blocked)
             if reject is None:
                 for subject_type, subject_id in (
                     (fresh["proposer_type"] or "web_user", fresh["proposer_id"] or "system"),
@@ -942,12 +1129,12 @@ class ActionService:
                         capability=fresh["capability"],
                         asset_id=fresh["asset_id"],
                         object_id=fresh["object_id"],
-                        auto=(action_mode == "auto"),
+                        auto=(action_mode in ("auto", "reviewed")),
                     )
                     if not decision["allowed"]:
                         reject = ("policy_revoked", f"{subject_type}:{subject_id}")
                         break
-                    if action_mode == "auto" and not decision.get("auto_allowed"):
+                    if action_mode in ("auto", "reviewed") and (not decision.get("auto_allowed") or decision.get("decision") != "automatic"):
                         reject = ("auto_revoked", f"{subject_type}:{subject_id}")
                         break
 
@@ -968,7 +1155,7 @@ class ActionService:
                     tmpl = get_manual_template(tmpl_id)
                     if not tmpl:
                         reject = ("template_missing", tmpl_id)
-                else:
+                elif action_mode != "reviewed":
                     reject = ("template_required", "no runbook/template on action")
 
             # 实际派发人必须具备该能力（非管理员）
@@ -979,9 +1166,9 @@ class ActionService:
                     capability=fresh["capability"],
                     asset_id=fresh["asset_id"],
                     object_id=fresh["object_id"],
-                    auto=(action_mode == "auto"),
+                    auto=(action_mode in ("auto", "reviewed")),
                 )
-                if not d["allowed"] or (action_mode == "auto" and not d.get("auto_allowed")):
+                if not d["allowed"] or (action_mode in ("auto", "reviewed") and not d.get("auto_allowed")):
                     reject = ("dispatcher_denied", f"{actor_type}:{actor_id}")
 
             # 全局暂停（P0-03）
@@ -989,7 +1176,7 @@ class ActionService:
                 stop = conn.execute(
                     "SELECT enabled FROM global_stops WHERE key='auto_dispatch'"
                 ).fetchone()
-                if stop and stop["enabled"] and action_mode == "auto":
+                if stop and stop["enabled"] and action_mode in ("auto", "reviewed"):
                     reject = ("global_pause", "auto_dispatch paused")
 
             if reject is None:
@@ -1001,10 +1188,14 @@ class ActionService:
                     reject = ("object_missing", fresh["object_id"])
                 else:
                     obj_d = dict(obj)
-                    if action_mode == "auto":
+                    if action_mode in ("auto", "reviewed"):
+                        from .runbook import CONTROL_PLANE_MARKERS
                         from .verify_profiles import profile_for_action
 
-                        if profile_for_action(
+                        names = " ".join(str(obj_d.get(k) or "") for k in ("id", "name", "unit", "container"))
+                        if any(marker in names.lower() for marker in CONTROL_PLANE_MARKERS):
+                            reject = ("control_plane_forbidden", "控制面对象不能自动执行")
+                        elif profile_for_action(
                             capability=fresh["capability"], asset_id=fresh["asset_id"],
                             object_id=resolve_object_name(obj_d),
                         ) is None:
@@ -1021,46 +1212,34 @@ class ActionService:
                             reject = ("token_mismatch", "declared tokens diverge")
 
             if reject is None:
-                locked = conn.execute(
-                    "SELECT COUNT(*) AS n FROM actions"
-                    " WHERE asset_id=? AND object_id=? AND id != ?"
-                    " AND (state IN ('unknown','dispatched')"
-                    "  OR (state='success' AND id IN (SELECT action_id FROM verifications"
-                    "      WHERE status='pending')))",
-                    (fresh["asset_id"], fresh["object_id"], action_id),
-                ).fetchone()
-                if locked and locked["n"] > 0:
+                if self._object_locked(
+                    fresh["asset_id"], fresh["object_id"], exclude=action_id,
+                    council_grant_id=fresh["council_grant_id"] if action_mode == "reviewed" else "",
+                ):
                     reject = ("object_locked", fresh["object_id"])
 
             # 预算：派发前原子占用（P0-03）；unknown 也计数
-            if reject is None and action_mode == "auto":
+            if reject is None and action_mode in ("auto", "reviewed"):
                 rb_id_b = (fresh["runbook_id"] or "") if "runbook_id" in fresh.keys() else ""
-                from .runbook import get_runbook_rule
+                from .runbook import RunbookRule, auto_budget_state, get_runbook_rule
 
                 rule = get_runbook_rule(rb_id_b) if rb_id_b else None
-                max_day = rule.max_per_day if rule else 3
-                cooldown = rule.cooldown_sec if rule else 1800
-                since = now() - 86400
-                used = conn.execute(
-                    "SELECT COUNT(*) AS n FROM actions"
-                    " WHERE asset_id=? AND object_id=? AND mode='auto'"
-                    " AND state IN ('dispatched','success','failure','unknown')"
-                    " AND created_at > ?",
-                    (fresh["asset_id"], fresh["object_id"], since),
-                ).fetchone()
-                n_used = int(used["n"] if used else 0)
-                if n_used >= max_day:
-                    reject = ("budget_exhausted", f"max_per_day {n_used}/{max_day}")
-                else:
-                    last = conn.execute(
-                        "SELECT COALESCE(dispatched_at, created_at) AS at FROM actions"
-                        " WHERE asset_id=? AND object_id=? AND mode='auto'"
-                        " AND state IN ('dispatched','success','failure','unknown')"
-                        " AND id != ? ORDER BY at DESC LIMIT 1",
-                        (fresh["asset_id"], fresh["object_id"], action_id),
-                    ).fetchone()
-                    if last and (now() - float(last["at"] or 0)) < cooldown:
-                        reject = ("cooldown", f"{int(now() - float(last['at']))}s < {cooldown}s")
+                rules = [rule or RunbookRule(id="", name="")]
+                if action_mode == "reviewed":
+                    from .runbook import RUNBOOK
+                    object_name = resolve_object_name(dict(obj))
+                    rules = [r for r in RUNBOOK if r.capability == fresh["capability"]
+                             and r.asset_id in ("*", fresh["asset_id"])
+                             and r.object_name in ("*", object_name)]
+                    rules = rules or [RunbookRule(id="council_default", name="Council operation limit", capability=fresh["capability"])]
+                for operation_rule in rules:
+                    budget = auto_budget_state(
+                        conn, operation_rule,
+                        fresh["asset_id"], fresh["object_id"], at=now(), exclude_action_id=action_id,
+                    )
+                    if not budget["ok"]:
+                        reject = (budget["code"], budget["reason"])
+                        break
 
             if reject is not None:
                 code, detail = reject
@@ -1107,9 +1286,15 @@ class ActionService:
                         " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                         _aud,
                     )
-                if code in ("source_unhealthy", "unsupported_verification_profile"):
+                if code in ("source_quarantined", "unsupported_verification_profile"):
                     self._mark_need_human(fresh_d.get("incident_id") or "", f"{code}:{action_id}")
             else:
+                if action_mode == "reviewed":
+                    step_claim = conn.execute("UPDATE council_steps SET state='dispatched',claimed_at=?"
+                        " WHERE grant_id=? AND ordinal=? AND state='prepared' AND action_id=?",
+                        (now(), fresh["council_grant_id"], fresh["council_step"], action_id))
+                    if step_claim.rowcount != 1:
+                        raise ActionError("council_step_consumed")
                 cur = conn.execute(
                     "UPDATE actions SET state='dispatched', dispatched_at=?, exec_account=?,"
                     " budget_claimed_at=? WHERE id=? AND state='approved'",
@@ -1118,6 +1303,12 @@ class ActionService:
                 if cur.rowcount != 1:
                     reject = ("claim_failed", "")
                 else:
+                    if fresh["incident_id"]:
+                        from .incidents import IncidentService
+
+                        IncidentService(self.db).clear_action_obligation(
+                            fresh["incident_id"], action_id, kind="execution_blocked",
+                        )
                     conn.execute(
                         "INSERT INTO jobs(kind, payload_json, state, due_at, created_at, updated_at)"
                         " VALUES(?,?,?,?,?,?)",
@@ -1140,6 +1331,10 @@ class ActionService:
         if reject is not None:
             code, detail = reject
             raise ActionError(code, detail)
+
+        if row.get("incident_id"):
+            from .incidents import IncidentService
+            IncidentService(self.db).reconcile(row["incident_id"], resolution_basis="action_dispatched")
 
         # 网络：真正执行。S14: Transport 异常须收敛，不能卡在 dispatched
         try:
@@ -1273,7 +1468,7 @@ class ActionService:
             except Exception:
                 pass
 
-        if state == "success" and vid:
+        if state == "success" and vid and row.get("mode") != "reviewed":
             try:
                 asyncio.create_task(self._run_verification(vid, action_id))
             except RuntimeError:
@@ -1315,6 +1510,21 @@ class ActionService:
             "baseline_finished_at": row.get("finished_at") or now(),
             "profile_id": _prof.id if _prof else "",
         }
+        # 补验证沿用动作所属代次，不能硬编码 1，也不能借用当前新故障的代次。
+        prior_verification = self.db.query_one(
+            "SELECT generation FROM verifications WHERE action_id=? AND generation IS NOT NULL"
+            " ORDER BY started_at DESC LIMIT 1", (action_id,),
+        )
+        action_generation = int(prior_verification["generation"] or 1) if prior_verification else 1
+        if not prior_verification and row.get("incident_id"):
+            generation_event = self.db.query_one(
+                "SELECT type,payload_json FROM events WHERE incident_id=? AND at<=? AND type IN"
+                " ('incident_opened','incident_reopened','generation_bumped') ORDER BY id DESC LIMIT 1",
+                (row["incident_id"], row["created_at"]),
+            )
+            if generation_event:
+                generation_payload = json.loads(generation_event["payload_json"] or "{}")
+                action_generation = int(generation_payload.get("generation") or 1)
         self.db.execute(
             "INSERT INTO verifications(id, action_id, incident_id, status, criteria_json,"
             " started_at, profile_id, generation) VALUES(?,?,?,?,?,?,?,?)",
@@ -1326,7 +1536,7 @@ class ActionService:
                 json.dumps(criteria, ensure_ascii=False),
                 now(),
                 _prof.id if _prof else "",
-                1,
+                action_generation,
             ),
         )
         return await self._run_verification(vid, action_id)
@@ -1355,9 +1565,13 @@ class ActionService:
             # unsupported：不得退回通用 probe_success 猜测
             with self.db.tx():
                 self._finish_verification(vid, "unknown", {}, "unsupported_verification_profile")
-                self._mark_need_human(
-                    row.get("incident_id") or "", f"unsupported_verification_profile:{action_id}",
-                )
+                if row.get("incident_id"):
+                    from .incidents import IncidentService
+                    IncidentService(self.db).on_verification_finished(
+                        row["incident_id"], action_id, vid,
+                        int((vrow["generation"] if vrow else 1) or 1), "unknown",
+                        reason=f"unsupported_verification_profile:{action_id}",
+                    )
             return {"id": vid, "status": "unknown", "note": "unsupported_verification_profile"}
 
         # 固定 deadline：不因重试重新开始
@@ -1504,35 +1718,12 @@ class ActionService:
                 ),
             )
             inc_id = a_now["incident_id"]
-            # 非 passed：标记需人工；若已 resolved 则重开（不得假 recovered）
-            if status in ("failed", "inconclusive", "unknown") and inc_id:
-                self._mark_need_human(inc_id, f"verify_{status}:{vid}")
-                conn.execute(
-                    "UPDATE incidents SET"
-                    " status=CASE WHEN status='resolved' THEN 'open' ELSE status END,"
-                    " resolved_at=CASE WHEN status='resolved' THEN NULL ELSE resolved_at END,"
-                    " outcome=CASE WHEN status='resolved' THEN 'unrecovered' ELSE outcome END,"
-                    " updated_at=? WHERE id=?",
-                    (now(), inc_id),
-                )
-            elif status == "passed" and inc_id:
-                current_incident = conn.execute(
-                    "SELECT generation FROM incidents WHERE id=?", (inc_id,)
-                ).fetchone()
-                if current_incident and int(current_incident["generation"] or 1) == gen:
-                    from .incidents import IncidentService
-
-                    IncidentService(self.db).clear_awaiting_approval(inc_id, action_id)
-            # 统一收敛：passed 不单独 recovered
             if inc_id:
-                try:
-                    from .incidents import IncidentService
+                from .incidents import IncidentService
 
-                    IncidentService(self.db).reconcile(
-                        inc_id, resolution_basis=f"verification:{vid}"
-                    )
-                except Exception:
-                    pass
+                IncidentService(self.db).on_verification_finished(
+                    inc_id, action_id, vid, gen, status,
+                )
         return {"id": vid, "status": status, "note": note, "profile": profile.id}
     def _finish_verification(self, vid: str, status: str, evidence: Any, note: str) -> None:
         self.db.execute(
@@ -1815,16 +2006,23 @@ class ActionService:
             "adjudication": outcome,
         }
 
-    def _object_locked(self, asset_id: str, object_id: str, exclude: str = "") -> bool:
-        sql = (
-            "SELECT COUNT(*) AS n FROM actions"
-            " WHERE asset_id=? AND object_id=? AND id != ?"
-            " AND (state IN ('unknown','dispatched')"
-            "  OR (state='success' AND id IN (SELECT action_id FROM verifications"
-            "      WHERE status='pending')))"
+    def _object_locked(self, asset_id: str, object_id: str, exclude: str = "", *, council_grant_id: str = "") -> bool:
+        if council_grant_id:
+            # Earlier steps in this exact claimed multi-step grant retain their
+            # verification locks for everyone except their remaining exact steps.
+            # Pending manual approvals also block autonomous writes.
+            row = self.db.query_one(
+                "SELECT COUNT(*) AS n FROM actions WHERE asset_id=? AND object_id=? AND id!=?"
+                " AND (state IN ('unknown','dispatched','proposed','approved')"
+                " OR (state='success' AND council_grant_id!=? AND id IN"
+                " (SELECT action_id FROM verifications WHERE status='pending')))",
+                (asset_id, object_id, exclude, council_grant_id),
+            )
+            return bool(row and row["n"])
+        from .incidents import IncidentService
+        return IncidentService(self.db).object_actions_locked(
+            asset_id, object_id, exclude=exclude
         )
-        row = self.db.query_one(sql, (asset_id, object_id, exclude))
-        return bool(row and row["n"] > 0)
 
     def _registered_service_label(self, row: dict) -> str:
         obj = self._object(row["asset_id"], row["object_id"])

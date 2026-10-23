@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -54,6 +55,9 @@ class TestNotificationCompensation(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         db = Database(Path(tmp.name) / "t.db")
         n = Notifier(db, default_target="user:1")
+        n.set_channel_store(SimpleNamespace(list_enabled=lambda: [
+            {"id": "c1", "kind": "qq", "targets": ["user:1"]},
+        ]))
         # 模拟：生命周期 Event 已写但 outbox 入队失败
         db.execute(
             "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",

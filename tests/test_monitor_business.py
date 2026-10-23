@@ -15,6 +15,7 @@ from aiohttp import web
 from ayana.business import native_check_items, prometheus_checks, required_health
 from ayana.checks import CheckService
 from ayana.db import Database
+from ayana.health import apply_required_checks
 from ayana.monitor import HostMonitor
 from ayana.prom import PromError
 from ayana.web import WebApp
@@ -23,7 +24,7 @@ from ayana.web import WebApp
 AT = 1_800_000_000.0
 
 
-def sample(metric="probe_success", *, asset="kanata", service="harbor", value=1.0, age=15, **labels):
+def sample(metric="probe_success", *, asset="demo", service="svc-a", value=1.0, age=15, **labels):
     return {"metric": {"__name__": metric, "asset": asset, "service": service, **labels},
             "sample_at": AT - age, "value": value}
 
@@ -65,19 +66,24 @@ class PrometheusBusinessTest(unittest.IsolatedAsyncioTestCase):
         clock = patch("ayana.business.time.time", return_value=AT)
         clock.start()
         self.addCleanup(clock.stop)
+        # 发行版 REQUIRED_CHECKS 为空，测试本地注入
+        apply_required_checks({})
+        self.addCleanup(lambda: apply_required_checks({}))
 
     async def test_declared_object_uses_real_selector_and_is_not_duplicated(self):
-        prom = CatalogProm([sample(), sample(service="another-service", value=0)])
-        rows, errors = await prometheus_checks(prom, {"id": "kanata", "prom_asset": "kanata"})
+        apply_required_checks({"demo": [{"object": "svc-a", "metric": "probe_success",
+                                          "selector": {"service": "svc-a"}, "freshness_sec": 120}]})
+        prom = CatalogProm([sample(), sample(service="svc-b", value=0)])
+        rows, errors = await prometheus_checks(prom, {"id": "demo", "prom_asset": "demo"})
         self.assertEqual(errors, [])
         required = [row for row in rows if row["required"]]
         self.assertEqual(len(required), 1)
-        self.assertEqual(required[0]["name"], "harbor-core")
-        self.assertEqual(required[0]["labels"]["service"], "harbor")
+        self.assertEqual(required[0]["name"], "svc-a")
+        self.assertEqual(required[0]["labels"]["service"], "svc-a")
         self.assertEqual(required[0]["state"], "ok")
         self.assertEqual(required[0]["last_at"], AT - 15)
-        self.assertEqual(sum(row["labels"].get("service") == "harbor" for row in rows), 1)
-        other = next(row for row in rows if row["labels"].get("service") == "another-service")
+        self.assertEqual(sum(row["labels"].get("service") == "svc-a" for row in rows), 1)
+        other = next(row for row in rows if row["labels"].get("service") == "svc-b")
         self.assertFalse(other["required"])
         self.assertEqual(other["state"], "fail")
         self.assertEqual(required_health(rows), "healthy")
@@ -101,15 +107,21 @@ class PrometheusBusinessTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({row["name"] for row in rows}, {"legacy-app", "new-app"})
 
     async def test_fresh_zero_value_is_failed_business_observation(self):
-        rows, errors = await prometheus_checks(CatalogProm([sample(asset="nerv", service="frps", value=0),
-                                                            sample(asset="nerv", service="nginx", value=1)]), {"id": "nerv"})
+        apply_required_checks({"demo": [
+            {"object": "svc-a", "metric": "probe_success", "selector": {"service": "svc-a"}, "freshness_sec": 120},
+            {"object": "svc-b", "metric": "probe_success", "selector": {"service": "svc-b"}, "freshness_sec": 120},
+        ]})
+        rows, errors = await prometheus_checks(CatalogProm([sample(asset="demo", service="svc-a", value=0),
+                                                            sample(asset="demo", service="svc-b", value=1)]), {"id": "demo"})
         self.assertEqual(errors, [])
         states = {row["name"]: row["state"] for row in rows}
-        self.assertEqual(states, {"frps": "fail", "nginx": "ok"})
+        self.assertEqual(states, {"svc-a": "fail", "svc-b": "ok"})
         self.assertEqual(required_health(rows), "unhealthy")
 
     async def test_declared_missing_probe_remains_an_unobserved_row(self):
-        rows, errors = await prometheus_checks(CatalogProm(), {"id": "kanata"})
+        apply_required_checks({"demo": [{"object": "svc-a", "metric": "probe_success",
+                                          "selector": {"service": "svc-a"}, "freshness_sec": 120}]})
+        rows, errors = await prometheus_checks(CatalogProm(), {"id": "demo"})
         self.assertEqual(errors, [])
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["state"], "no_data")
@@ -118,32 +130,42 @@ class PrometheusBusinessTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_latest_actual_sample_restores_probe_without_historical_failure_stickiness(self):
         prom = CatalogProm([sample(value=0, age=100), sample(value=1, age=15)])
-        rows, errors = await prometheus_checks(prom, {"id": "kanata"})
+        rows, errors = await prometheus_checks(prom, {"id": "demo"})
         self.assertEqual(errors, [])
         self.assertEqual(rows[0]["state"], "ok")
         self.assertEqual(rows[0]["value"], 1)
         self.assertEqual(rows[0]["last_at"], AT - 15)
 
     async def test_proxy_samples_use_real_time_and_remain_separate_from_missing_service_probe(self):
-        prom = CatalogProm([sample("hysteria_proxy_up", asset="sora", service="hysteria", target="google"),
-                            sample("hysteria_proxy_up", asset="sora", service="hysteria", target="youtube")])
-        rows, errors = await prometheus_checks(prom, {"id": "sora"})
+        apply_required_checks({"demo": [
+            {"object": "svc-proxy", "metric": "proxy_up", "selector": {"service": "svc-proxy"},
+             "freshness_sec": 120, "kind": "proxy"},
+            {"object": "svc-a", "metric": "probe_success", "selector": {"service": "svc-a"},
+             "freshness_sec": 120},
+        ]})
+        prom = CatalogProm([sample("proxy_up", asset="demo", service="svc-proxy", target="target-a"),
+                            sample("proxy_up", asset="demo", service="svc-proxy", target="target-b")])
+        rows, errors = await prometheus_checks(prom, {"id": "demo"})
         self.assertEqual(errors, [])
         states = {row["name"]: row["state"] for row in rows}
-        self.assertEqual(states, {"google": "ok", "youtube": "ok", "hysteria-server": "no_data"})
-        self.assertTrue(all(row["kind"] == "proxy" for row in rows if row["metric"] == "hysteria_proxy_up"))
+        self.assertEqual(states, {"svc-proxy": "ok", "svc-a": "no_data"})
+        self.assertTrue(all(row["kind"] == "proxy" for row in rows if row["metric"] == "proxy_up"))
         self.assertEqual(required_health(rows), "unknown")
 
     async def test_proxy_target_name_does_not_cross_registered_asset_boundary(self):
-        prom = CatalogProm([sample("hysteria_proxy_up", asset="sora", target="google", value=1),
-                            sample("hysteria_proxy_up", asset="another-asset", target="google", value=0, age=5)])
-        rows, _ = await prometheus_checks(prom, {"id": "sora"})
-        google = next(row for row in rows if row["name"] == "google")
-        self.assertEqual(google["state"], "ok")
-        self.assertEqual(google["labels"]["asset"], "sora")
+        apply_required_checks({"demo": [{"object": "svc-proxy", "metric": "proxy_up",
+                                          "selector": {"service": "svc-proxy"}, "freshness_sec": 120, "kind": "proxy"}]})
+        prom = CatalogProm([sample("proxy_up", asset="demo", service="svc-proxy", target="target-a", value=1),
+                            sample("proxy_up", asset="other-asset", service="svc-proxy", target="target-a", value=0, age=5)])
+        rows, _ = await prometheus_checks(prom, {"id": "demo"})
+        target_a = next(row for row in rows if row["name"] == "svc-proxy")
+        self.assertEqual(target_a["state"], "ok")
+        self.assertEqual(target_a["labels"]["asset"], "demo")
 
     async def test_stale_probe_is_not_freshened_by_query_evaluation(self):
-        rows, _ = await prometheus_checks(CatalogProm([sample(age=240)]), {"id": "kanata"})
+        apply_required_checks({"demo": [{"object": "svc-a", "metric": "probe_success",
+                                          "selector": {"service": "svc-a"}, "freshness_sec": 120}]})
+        rows, _ = await prometheus_checks(CatalogProm([sample(age=240)]), {"id": "demo"})
         self.assertEqual(rows[0]["state"], "stale")
         self.assertEqual(rows[0]["last_at"], AT - 240)
         self.assertEqual(required_health(rows), "stale")
@@ -154,16 +176,22 @@ class PrometheusBusinessTest(unittest.IsolatedAsyncioTestCase):
             with self.subTest(value=value, timestamp=timestamp):
                 row = sample(value=value)
                 row["sample_at"] = timestamp
-                rows, errors = await prometheus_checks(CatalogProm([row]), {"id": "kanata"})
+                rows, errors = await prometheus_checks(CatalogProm([row]), {"id": "demo"})
                 self.assertEqual(rows[0]["state"], "no_data")
                 json.dumps({"items": rows, "errors": errors}, allow_nan=False)
 
     async def test_failed_metric_does_not_hide_other_available_proxy_observations(self):
-        prom = CatalogProm([sample("hysteria_proxy_up", asset="sora", target="google"),
-                            sample("hysteria_proxy_up", asset="sora", target="youtube")], failures=["probe_success"])
-        rows, errors = await prometheus_checks(prom, {"id": "sora"})
+        apply_required_checks({"demo": [
+            {"object": "svc-proxy", "metric": "proxy_up", "selector": {"service": "svc-proxy"},
+             "freshness_sec": 120, "kind": "proxy"},
+            {"object": "svc-a", "metric": "probe_success", "selector": {"service": "svc-a"},
+             "freshness_sec": 120},
+        ]})
+        prom = CatalogProm([sample("proxy_up", asset="demo", service="svc-proxy", target="target-a"),
+                            sample("proxy_up", asset="demo", service="svc-proxy", target="target-b")], failures=["probe_success"])
+        rows, errors = await prometheus_checks(prom, {"id": "demo"})
         self.assertEqual({row["name"]: row["state"] for row in rows},
-                         {"google": "ok", "youtube": "ok", "hysteria-server": "collect_error"})
+                         {"svc-proxy": "ok", "svc-a": "collect_error"})
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]["source"], "prometheus")
         self.assertTrue(errors[0]["message"])
@@ -196,7 +224,9 @@ class BusinessAPITest(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.tmp.cleanup)
         self.db = Database(Path(self.tmp.name) / "test.db")
         self.addCleanup(self.db.close)
-        for identifier in ("control", "kanata", "sora", "private"):
+        apply_required_checks({})
+        self.addCleanup(lambda: apply_required_checks({}))
+        for identifier in ("control", "asset-a", "asset-b", "private"):
             self.db.execute("INSERT INTO assets(id,display_name,prom_asset,read_alias,write_alias,enabled,created_at,updated_at) VALUES(?,?,?,?,?,1,1,1)",
                             (identifier, identifier.upper(), identifier, identifier, identifier + "-exec"))
         self.db.execute("INSERT INTO checks(id,asset_id,name,kind,params_json,interval_sec,last_state,last_at,created_at,updated_at) VALUES('chk_control','control','任务运行程序','service','{\"unit\":\"worker.service\"}',60,'ok',?,1,1)", (AT - 15,))
@@ -204,7 +234,7 @@ class BusinessAPITest(unittest.IsolatedAsyncioTestCase):
         self.policy = Mock()
         self.policy.check.return_value = {"allowed": True}
         self.session = {"username": "reader", "is_admin": False}
-        self.prom = CatalogProm([sample()])
+        self.prom = CatalogProm([sample(asset="asset-a", service="svc-a")])
         self.incidents = Mock()
         self.incidents.list_incidents.return_value = []
         self.actions = Mock()
@@ -217,7 +247,7 @@ class BusinessAPITest(unittest.IsolatedAsyncioTestCase):
         self.app = WebApp(self.db, None, self.policy, self.incidents, None, self.actions, self.prom,
                           static_dir=Path(self.tmp.name), checks=CheckService(self.db, self.transport), host_monitor=self.monitor)
         self.app._require_auth = Mock(return_value=self.session)
-        self.app._visible_asset_ids = Mock(return_value={"control", "kanata"})
+        self.app._visible_asset_ids = Mock(return_value={"control", "asset-a"})
         self.app._check_read = Mock(return_value=self.session)
         clock = patch("ayana.business.time.time", return_value=AT)
         clock.start()
@@ -279,7 +309,7 @@ class BusinessAPITest(unittest.IsolatedAsyncioTestCase):
     async def test_native_permission_failure_does_not_hide_prometheus_source(self):
         self.app._check_read.side_effect = web.HTTPForbidden()
         before = self.snapshot()
-        _, payload = await self.get("kanata")
+        _, payload = await self.get("asset-a")
         self.assertEqual([row["source"] for row in payload["items"]], ["prometheus"])
         self.assertEqual(payload["items"][0]["state"], "ok")
         self.assertEqual(payload["errors"][0]["source"], "ayana")
@@ -300,7 +330,7 @@ class BusinessAPITest(unittest.IsolatedAsyncioTestCase):
 
     async def test_harbor_selector_restores_same_green_state_across_all_views(self):
         before = self.snapshot()
-        strip, detail, home, _ = await self.observed_states("kanata")
+        strip, detail, home, _ = await self.observed_states("asset-a")
         self.assertEqual(strip["metric_state"], "ok")
         self.assertEqual(strip["health"]["state"], "ok")
         self.assertEqual(detail["health"]["state"], "ok")
@@ -323,21 +353,28 @@ class BusinessAPITest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.snapshot(), before)
 
     async def test_proxy_sample_times_and_missing_service_have_consistent_all_view_states(self):
-        self.app._visible_asset_ids.return_value = {"sora"}
-        proxy = [sample("hysteria_proxy_up", asset="sora", service="hysteria", target="google"),
-                 sample("hysteria_proxy_up", asset="sora", service="hysteria", target="youtube")]
+        self.app._visible_asset_ids.return_value = {"asset-b"}
+        apply_required_checks({"asset-b": [
+            {"object": "svc-proxy", "metric": "proxy_up", "selector": {"service": "svc-proxy"},
+             "freshness_sec": 120, "kind": "proxy"},
+            {"object": "svc-a", "metric": "probe_success", "selector": {"service": "svc-a"},
+             "freshness_sec": 120},
+        ]})
+        self.addCleanup(lambda: apply_required_checks({}))
+        proxy = [sample("proxy_up", asset="asset-b", service="svc-proxy", target="target-a"),
+                 sample("proxy_up", asset="asset-b", service="svc-proxy", target="target-b")]
         for observed_service, expected in ((True, "ok"), (False, "warn")):
             with self.subTest(observed_service=observed_service):
-                self.prom.samples = proxy + ([sample(asset="sora", service="hysteria")] if observed_service else [])
+                self.prom.samples = proxy + ([sample(asset="asset-b", service="svc-a")] if observed_service else [])
                 self.app._business_cache = {}
                 self.app._overview_cache = None
                 before = self.snapshot()
-                _, business = await self.get("sora")
-                strip, detail, home, _ = await self.observed_states("sora")
+                _, business = await self.get("asset-b")
+                strip, detail, home, _ = await self.observed_states("asset-b")
                 self.assertEqual(strip["health"]["state"], expected)
                 self.assertEqual(detail["health"]["state"], expected)
                 self.assertEqual(home["health_dot"]["state"], expected)
-                self.assertEqual(home["business_summary"]["healthy"], 3 if observed_service else 2)
+                self.assertEqual(home["business_summary"]["healthy"], 2 if observed_service else 1)
                 for row in business["items"]:
                     if row["kind"] == "proxy":
                         self.assertEqual(row["state"], "ok")
@@ -364,10 +401,10 @@ class BusinessAPITest(unittest.IsolatedAsyncioTestCase):
         before = self.snapshot()
         self.app._visible_asset_ids.return_value = {"control"}
         first = json.loads((await self.app.api_overview(SimpleNamespace())).body)
-        self.app._visible_asset_ids.return_value = {"kanata"}
+        self.app._visible_asset_ids.return_value = {"asset-a"}
         second = json.loads((await self.app.api_overview(SimpleNamespace())).body)
         self.assertEqual({asset["id"] for asset in first["assets"]}, {"control"})
-        self.assertEqual({asset["id"] for asset in second["assets"]}, {"kanata"})
+        self.assertEqual({asset["id"] for asset in second["assets"]}, {"asset-a"})
         self.assertNotIn("control", json.dumps(second["assets"]))
         self.assertEqual(self.snapshot(), before)
 

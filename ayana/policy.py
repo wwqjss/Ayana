@@ -535,6 +535,74 @@ class Policy:
             }
         return self.agent_ceiling.effective(capability)
 
+    def _evaluate(
+        self,
+        *,
+        subject_type: str,
+        subject_id: str,
+        capability: str,
+        asset_id: str = "",
+        object_id: str = "",
+    ) -> dict[str, Any]:
+        """核心授权判定（P2-2 唯一实现）：ceiling → match → three_state。
+
+        check() 与 effective_decision() 共用本方法，不得再写平行判定。
+        返回核心字段 + cap/ceil/raw_rule；auto 门与读视图由调用方叠加。
+        """
+        cap = get_capability(capability)
+        ceil = self._agent_ceiling_gate(subject_type, capability)
+        rule = self._match_rule(
+            subject_type=subject_type,
+            subject_id=subject_id,
+            capability=capability,
+            asset_id=asset_id,
+            object_id=object_id,
+        )
+        if ceil is not None and not ceil["allowed"]:
+            return {
+                "allowed": False,
+                "reason": "denied_by_agent_ceiling",
+                "require_approval": True,
+                "auto_allowed": False,
+                "decision": "forbidden",
+                "cap": cap,
+                "ceil": ceil,
+                "raw_rule": rule,
+                # check() 历史形状：ceiling 拦截时 rule 置空
+                "rule": None,
+            }
+        if not rule or not rule["allow"]:
+            return {
+                "allowed": False,
+                "reason": "denied_by_policy",
+                "require_approval": True,
+                "auto_allowed": False,
+                "decision": "forbidden",
+                "cap": cap,
+                "ceil": ceil,
+                "raw_rule": rule,
+                "rule": rule,
+            }
+        require_approval = bool(rule["require_approval"])
+        auto_allowed = bool(rule["auto_allowed"]) and cap.auto_allowed
+        if ceil is not None:
+            # 用户上限不得宽于策略/目录
+            auto_allowed = auto_allowed and bool(ceil["allow_auto"])
+        decision = self._three_state(
+            allow=True, require_approval=require_approval, auto_allowed=auto_allowed
+        )
+        return {
+            "allowed": True,
+            "reason": "ok",
+            "require_approval": require_approval,
+            "auto_allowed": auto_allowed,
+            "decision": decision,
+            "cap": cap,
+            "ceil": ceil,
+            "raw_rule": rule,
+            "rule": rule,
+        }
+
     def check(
         self,
         *,
@@ -548,40 +616,31 @@ class Policy:
         """默认拒绝。返回是否允许、是否需批准、命中的规则。
 
         Agent 主体额外受 agent ceiling 约束（后端强制，非前端展示）。
+        核心判定走 _evaluate；此处只叠加 auto 派发门。
         """
-        cap = get_capability(capability)
-        ceil = self._agent_ceiling_gate(subject_type, capability)
-        if ceil is not None and not ceil["allowed"]:
-            return {
-                "allowed": False,
-                "reason": "denied_by_agent_ceiling",
-                "require_approval": True,
-                "auto_allowed": False,
-                "rule": None,
-                "decision": "forbidden",
-                "agent_ceiling": ceil,
-            }
-        rule = self._match_rule(
+        core = self._evaluate(
             subject_type=subject_type,
             subject_id=subject_id,
             capability=capability,
             asset_id=asset_id,
             object_id=object_id,
         )
-        if not rule or not rule["allow"]:
+        ceil = core["ceil"]
+        rule = core["rule"]
+        if not core["allowed"]:
             return {
                 "allowed": False,
-                "reason": "denied_by_policy",
+                "reason": core["reason"],
                 "require_approval": True,
                 "auto_allowed": False,
                 "rule": rule,
                 "decision": "forbidden",
+                "agent_ceiling": ceil,
+                "raw_rule": core["raw_rule"],
             }
-        require_approval = bool(rule["require_approval"])
-        auto_allowed = bool(rule["auto_allowed"]) and cap.auto_allowed
-        if ceil is not None:
-            # 用户上限不得宽于策略/目录
-            auto_allowed = auto_allowed and bool(ceil["allow_auto"])
+        require_approval = core["require_approval"]
+        auto_allowed = core["auto_allowed"]
+        decision = core["decision"]
         if auto and not auto_allowed:
             return {
                 "allowed": False,
@@ -591,12 +650,9 @@ class Policy:
                 "rule": rule,
                 "decision": "forbidden",
                 "agent_ceiling": ceil,
+                "raw_rule": core["raw_rule"],
             }
         # S08: 不因 auto=True 隐藏 require_approval；派发门须看到真实审批要求
-        decision = self._three_state(
-            allow=True, require_approval=require_approval, auto_allowed=auto_allowed
-        )
-        # auto 模式下若仍需审批，拒绝自动派发
         if auto and decision != "automatic":
             return {
                 "allowed": False,
@@ -606,6 +662,7 @@ class Policy:
                 "rule": rule,
                 "decision": decision,
                 "agent_ceiling": ceil,
+                "raw_rule": core["raw_rule"],
             }
         return {
             "allowed": True,
@@ -615,6 +672,7 @@ class Policy:
             "rule": rule,
             "decision": decision,
             "agent_ceiling": ceil,
+            "raw_rule": core["raw_rule"],
         }
 
     @staticmethod
@@ -641,43 +699,35 @@ class Policy:
         object_id: str = "",
         auto: bool = False,
     ) -> dict[str, Any]:
-        """服务端权威三态 + reason / matched rule。前端不得自行求优先级。"""
-        cap = get_capability(capability)
-        is_write = cap.kind == "write"
-        ceil = self._agent_ceiling_gate(subject_type, capability)
-        rule = self._match_rule(
+        """服务端权威三态 + reason / matched rule。前端不得自行求优先级。
+
+        内部复用 check() 的核心判定（P2-2），只叠加：
+        - effective 的 auto 语义（三态收紧，保留 allowed 表达规则是否允许）
+        - 读能力视图（读只允许/禁止，不伪装成可批准写）
+        - 展示字段（matched_rule / kind / readable / subject / target）
+        """
+        base = self.check(
             subject_type=subject_type,
             subject_id=subject_id,
             capability=capability,
             asset_id=asset_id,
             object_id=object_id,
+            auto=False,
         )
-        if ceil is not None and not ceil["allowed"]:
+        cap = get_capability(capability)
+        is_write = cap.kind == "write"
+        # raw_rule：ceiling 拦截时 check.rule 为 None，展示层仍需命中规则
+        rule = base.get("raw_rule") or base.get("rule")
+        ceil = base.get("agent_ceiling")
+        allowed = base["allowed"]
+        decision = base["decision"]
+        reason = base["reason"]
+        require_approval = base["require_approval"]
+        auto_allowed = base["auto_allowed"]
+        # effective 的 auto 语义：规则仍算 allowed，但三态收紧为 forbidden
+        if auto and allowed and decision != "automatic":
             decision = "forbidden"
-            reason = "denied_by_agent_ceiling"
-            require_approval = True
-            auto_allowed = False
-            allowed = False
-        elif not rule or not rule["allow"]:
-            decision = "forbidden"
-            reason = "denied_by_policy"
-            require_approval = True
-            auto_allowed = False
-            allowed = False
-        else:
-            require_approval = bool(rule["require_approval"])
-            auto_allowed = bool(rule["auto_allowed"]) and cap.auto_allowed
-            if ceil is not None:
-                auto_allowed = auto_allowed and bool(ceil["allow_auto"])
-            decision = self._three_state(
-                allow=True, require_approval=require_approval, auto_allowed=auto_allowed
-            )
-            if auto and decision != "automatic":
-                decision = "forbidden"
-                reason = "auto_not_allowed"
-            else:
-                reason = "ok"
-            allowed = True
+            reason = "auto_not_allowed"
         # 读能力：只表达 允许读取 / 禁止，不伪装成可批准写操作
         if not is_write:
             if ceil is not None and not ceil["allowed"]:

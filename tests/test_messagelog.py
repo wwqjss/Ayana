@@ -51,7 +51,12 @@ class TestMessageLog(unittest.TestCase):
         self.assertEqual(item["replied"], 1)
 
     def test_outbox_not_duplicated(self):
-        self.store.ensure_default_qq("user:1")
+        self.store.create(
+            name="qq",
+            kind="qq",
+            config={"target": "user:1"},
+            enabled=True,
+        )
         n = Notifier(self.db, default_target="user:1")
         n.set_channel_store(self.store)
         n.enqueue_for_event(1, body="hello notify")

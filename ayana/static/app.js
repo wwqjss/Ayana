@@ -5,6 +5,7 @@ const state = {
   tab: "overview",
   monitorSub: "metrics",
   notifySub: "channels",
+  incidentsSub: "list",
   assets: [],
   caps: [],
   knowledge: [],
@@ -158,7 +159,7 @@ const ZH_CAP = {
 const ZH = {
   // status
   open: "处理中",
-  resolved: "已解决",
+  resolved: "已恢复",
   closed: "已关闭",
   // stage
   pending: "待调查",
@@ -409,6 +410,99 @@ on("pw-change-form", "submit", async (e) => {
 
 on("chg-pw-btn", "click", () => showPasswordChange(false));
 
+/* ---- 三省制 Provider settings, on the existing settings surface ---- */
+async function openAutonomySettings() {
+  const [settings, usageReply] = await Promise.all([api("/api/autonomy/providers"), api("/api/autonomy/usage")]);
+  if (!settings.ok) { showModal("三省制 Agent", [el("p", { class: "error", text: settings.message || settings.error || "配置加载失败" })]); return; }
+  const config = settings.config || {};
+  const wrap = el("div", { class: "form-col" });
+  wrap.appendChild(el("p", { class: "muted small", text: "中书省拟案，两位门下省委员独立审议；两票同意后仍由现有 Policy、Action 与独立验证控制执行。" }));
+  wrap.appendChild(el("p", { class: "muted small", text: "自治 Agent 使用单独获许可的 API 凭据，不能填入 MiMo Token Plan Key。密钥只写入，不回显；留空保留原值。费用按 API usage 和配置单价计算，未获得实际账单时不代表账户扣费。" }));
+  const enabled = el("input", { type: "checkbox" }); enabled.checked = !!config.enabled;
+  wrap.appendChild(el("label", { text: "启用自治 Agent" }, [enabled]));
+  const field = (label, value, type = "number") => {
+    const input = el("input", { type, value: value == null ? "" : String(value), step: "any" });
+    wrap.appendChild(el("label", { text: label }, [input])); return input;
+  };
+  const budget = field("总预算（元）", config.budget_cny ?? 100);
+  const warning = field("预算预警比例（0–1）", config.warning_ratio ?? 0.8);
+  const incidentLimit = field("每事件最多模型调用次数", config.max_calls_per_incident ?? 60);
+  const generationLimit = field("每轮故障最多模型调用次数", config.max_calls_per_generation ?? 30);
+  const roleFields = {};
+  [["planner", "中书省 · MiMo"], ["reviewer_kimi", "门下省 A · Kimi"], ["reviewer_deepseek", "门下省 B · DeepSeek"]].forEach(([role, title]) => {
+    const conf = (config.roles || {})[role] || {};
+    wrap.appendChild(el("h4", { text: title, style: "margin:16px 0 4px" }));
+    const verificationMessage = el("p", { class: "muted small", text: `${conf.key_configured ? "API 凭据已配置" : "API 凭据未配置"} · ${conf.account_verified ? "已核验账户支持该模型" : "该账户与模型尚未验证"}${conf.verification_error ? " · " + conf.verification_error : ""}` });
+    wrap.appendChild(verificationMessage);
+    const fields = {
+      base_url: field("Base URL", conf.base_url || "", "url"),
+      model: field("模型 ID（按账户实际支持填写）", conf.model || "", "text"),
+      timeout: field("单次超时（秒）", conf.timeout ?? 60),
+      retries: field("失败重试次数（0–2）", conf.retries ?? 0),
+      input_cny_per_million: field("输入单价（元 / 百万 Token，未知留空）", conf.input_cny_per_million),
+      output_cny_per_million: field("输出单价（元 / 百万 Token，未知留空）", conf.output_cny_per_million),
+      api_key: field("独立 API Key（留空不更改）", "", "password"),
+    };
+    fields.api_key.setAttribute("autocomplete", "new-password");
+    fields.clear_api_key = el("input", { type: "checkbox" });
+    wrap.appendChild(el("label", { text: "清除此角色已保存的 API Key" }, [fields.clear_api_key]));
+    let verifying = false;
+    const verifyButton = el("button", { class: "btn small", text: "核验已保存的账户与模型", onclick: async () => {
+      if (verifying) return;
+      const totp = prompt("动态验证码（若账号已启用 2FA，否则留空）:", ""); if (totp === null) return;
+      verifying = true; verifyButton.disabled = true;
+      verificationMessage.textContent = "正在通过官方模型列表核验已保存配置…";
+      try {
+        const result = await api("/api/autonomy/providers/verify", { method: "POST", body: JSON.stringify({ role, totp }) });
+        const error = result.error || (result.result || {}).error || "verification_failed";
+        const reasons = { provider_unconfigured: "未配置独立 API 凭据", model_not_available: "该账户的模型列表不包含此模型", llm_timeout: "服务响应超时", llm_http_error: "服务拒绝请求，请检查账户与凭据", llm_connection_error: "无法连接模型服务", llm_blocked_endpoint: "服务地址不在允许的官方地址内", totp_required: "请输入动态验证码", totp_invalid: "动态验证码不正确" };
+        verificationMessage.textContent = result.ok && (result.result || {}).ok ? "已核验：已保存的账户支持该模型。" : "核验未通过：" + (reasons[error] || error);
+      } catch (_) { verificationMessage.textContent = "核验未完成，请检查网络后重试。"; }
+      finally { verifying = false; verifyButton.disabled = false; }
+    } });
+    if (settings.available === false) verifyButton.disabled = true;
+    wrap.appendChild(verifyButton);
+    if (conf.model_source) wrap.appendChild(el("a", { text: "官方模型与 API 资料", href: conf.model_source, target: "_blank", rel: "noopener noreferrer", class: "small" }));
+    roleFields[role] = fields;
+  });
+  const usage = usageReply.ok ? usageReply.usage || {} : {};
+  const totals = usage.overall || usage;
+  const budgetView = usage.budget || usage;
+  wrap.appendChild(el("h4", { text: "模型费用与预算", style: "margin:16px 0 4px" }));
+  wrap.appendChild(el("p", { class: "muted small", text: `已统计费用：${councilMoney(totals.complete === false ? null : (totals.cost_cny ?? totals.total_cost_cny))} · 预算：${councilMoney(budgetView.budget_cny ?? config.budget_cny)} · 可用预算：${councilMoney(budgetView.remaining_cny)} · 账户余额：${councilMoney(budgetView.account_balance_cny)}` }));
+  Object.entries(usage.by_role || {}).forEach(([role, row]) => wrap.appendChild(el("p", { class: "small", text: `${{planner: "中书省", reviewer_kimi: "Kimi 委员", reviewer_deepseek: "DeepSeek 委员"}[role] || role} · 输入 ${row.input_tokens ?? "未知"} / 输出 ${row.output_tokens ?? "未知"} Token · 费用 ${councilMoney(row.complete === false ? null : row.cost_cny)}` })));
+  if (totals.complete === false) wrap.appendChild(el("p", { class: "muted small", text: `存在未知费用调用；已知部分小计 ${councilMoney(totals.cost_cny)}，不代表完整费用或实际扣费。` }));
+  if (budgetView.warning || usage.budget_warning) wrap.appendChild(el("p", { class: "error", text: "模型预算已触发预警，请检查费用明细。" }));
+  if (budgetView.exhausted || usage.blocked || usage.circuit_open) wrap.appendChild(el("p", { class: "error", text: "模型调用已熔断；告警接收、只读监控、人工处置和已有 Runbook 继续运行。" }));
+  if (usageReply.ok) wrap.appendChild(councilObjectDetails("按角色、Provider 与事件查看 Token 和费用", usage));
+  const message = el("p", { class: "error" });
+  wrap.appendChild(message);
+  let submitting = false;
+  const save = el("button", { class: "btn primary", text: "保存 Agent 配置", onclick: async () => {
+    if (submitting) return;
+    const totp = prompt("动态验证码（若账号已启用 2FA，否则留空）:", ""); if (totp === null) return;
+    const payload = { enabled: enabled.checked, budget_cny: Number(budget.value), warning_ratio: Number(warning.value), max_calls_per_incident: Number(incidentLimit.value), max_calls_per_generation: Number(generationLimit.value), roles: {}, totp };
+    Object.entries(roleFields).forEach(([role, fields]) => {
+      const out = { base_url: fields.base_url.value.trim(), model: fields.model.value.trim(), timeout: Number(fields.timeout.value), retries: Number(fields.retries.value) };
+      ["input_cny_per_million", "output_cny_per_million"].forEach((key) => { out[key] = fields[key].value.trim() === "" ? null : Number(fields[key].value); });
+      if (fields.api_key.value.trim()) out.api_key = fields.api_key.value.trim();
+      if (fields.clear_api_key.checked) out.clear_api_key = true;
+      payload.roles[role] = out;
+    });
+    submitting = true; save.disabled = true;
+    try {
+      const result = await api("/api/autonomy/providers", { method: "POST", body: JSON.stringify(payload) });
+      if (!result.ok) { message.textContent = result.message || result.error || "配置保存失败"; return; }
+      Object.values(roleFields).forEach((fields) => { fields.api_key.value = ""; fields.clear_api_key.checked = false; });
+      message.textContent = "已保存。模型与凭据将在下一次调用时生效。";
+    } catch (_) { message.textContent = "请求未完成，请重新加载确认配置。"; }
+    finally { submitting = false; save.disabled = false; }
+  } });
+  if (settings.available === false) save.disabled = true;
+  wrap.appendChild(save);
+  showModal("三省制 Agent · 模型与预算", [wrap]);
+}
+
 /* ---- 全局设置（用户名旁） ---- */
 on("settings-btn", "click", async () => {
   const res = await api("/api/settings/global");
@@ -454,6 +548,9 @@ on("settings-btn", "click", async () => {
     ? "Prometheus：可用"
     : "Prometheus：不可用（" + (res.prometheus_error || "未连接") + "）。安装后一键接入才能验证指标。";
   form.appendChild(el("p", { class: "muted small", text: promSt }));
+  if (state.user && state.user.is_admin) form.appendChild(el("button", {
+    class: "btn", text: "三省制 Agent · 模型与预算", type: "button", onclick: openAutonomySettings,
+  }));
   wrap.appendChild(form);
   const msg = el("p", { class: "error" });
   wrap.appendChild(msg);
@@ -750,12 +847,32 @@ function setNotifySub(sub) {
   });
 }
 
+function setIncidentsSub(sub) {
+  if (!sub) return;
+  state.incidentsSub = sub;
+  document.querySelectorAll("#incidents-subnav .subtab").forEach((b) => {
+    b.classList.toggle("active", b.dataset.sub === sub);
+  });
+  ["list", "ext"].forEach((k) => {
+    const el = document.getElementById("incidents-sub-" + k);
+    if (el) el.classList.toggle("hidden", k !== sub);
+  });
+}
+
 document.addEventListener("click", (e) => {
   const t = e.target.closest(".subtab");
   if (!t) return;
-  const nav = t.closest("#monitor-subnav") || t.closest("#notify-subnav");
+  const nav = t.closest("#monitor-subnav") || t.closest("#notify-subnav") || t.closest("#incidents-subnav");
   if (!nav) return;
   if (nav.id === "monitor-subnav") setMonitorSub(t.dataset.sub);
+  else if (nav.id === "incidents-subnav") {
+    setIncidentsSub(t.dataset.sub);
+    if (t.dataset.sub === "ext") {
+      if (typeof initExtFormDom === "function") initExtFormDom();
+      renderExtTransactions();
+    }
+    return;
+  }
   else setNotifySub(t.dataset.sub);
   if (nav.id === "monitor-subnav" && t.dataset.sub === "prom") renderPromConfig();
   if (nav.id === "monitor-subnav" && t.dataset.sub === "checks") {
@@ -849,7 +966,10 @@ function fillSelect(id, opts) {
 async function refreshTab() {
   if (state.tab === "overview") await renderOverview();
   if (state.tab === "assets") await renderAssets();
-  if (state.tab === "incidents") await renderIncidents();
+  if (state.tab === "incidents") {
+    if (state.incidentsSub === "ext") await renderExtTransactions();
+    else await renderIncidents();
+  }
   if (state.tab === "monitor") {
     if (state.monitorSub === "prom") await renderPromConfig();
     else if (state.monitorSub === "checks") {
@@ -897,8 +1017,6 @@ function computeAssetHealth(asset, openIncs) {
     coverage: h.coverage || "无探测项",
     coverageCls: h.state === "healthy" ? "ok" : "warn",
     probeState: dot.state || h.state,
-    hysteriaState: "",
-    hysteriaTargets: [],
   };
 }
 
@@ -914,7 +1032,7 @@ function computeObjectStatus(obj, assetId, incByObj) {
   return { label: "未观测", cls: "warn", inc: null };
 }
 
-/** 标准对象行：登记对象 + 外部探测（google/youtube 等）统一成表格行 */
+/** 标准对象行：登记对象 + 外部探测统一成表格行 */
 function buildMonitorRows(asset, incByObj) {
   const rows = [];
   (asset.objects || []).forEach((o) => {
@@ -927,19 +1045,6 @@ function buildMonitorRows(asset, incByObj) {
       label: st.label,
       cls: st.cls,
       inc: st.inc,
-    });
-  });
-  // hysteria 代理探测 → 标准行（不使用 badge、不单列「外部探测」）
-  const hysteria = asset.hysteria_proxy || {};
-  (hysteria.targets || []).forEach((t) => {
-    const ok = t.value === 1;
-    rows.push({
-      name: t.target,
-      kind: "probe",
-      cfg: "hysteria_proxy",
-      label: ok ? "正常" : "异常",
-      cls: ok ? "ok" : "bad",
-      inc: null,
     });
   });
   // 黑盒 probe 汇总（未对应登记对象且有明确状态时补一行）
@@ -1453,7 +1558,9 @@ async function renderIncidents() {
     card.appendChild(el("p", {
       class: "muted small",
       text: `${inc.id} · ${zh(inc.status)} · ${zh(inc.stage)}`
-        + ` · 发现 ${fmtTime(inc.created_at)}`
+        + ((inc.generation || 1) > 1
+          ? ` · 首次 ${fmtTime(inc.created_at)} · 本次复发 ${fmtTime(inc.updated_at)}`
+          : ` · 发现 ${fmtTime(inc.created_at)}`)
         + (inc.resolved_at ? ` · 解决 ${fmtTime(inc.resolved_at)}` : ""),
     }));
     card.appendChild(renderLoopSteps(loop, inc));
@@ -1482,7 +1589,9 @@ async function openIncidentDetail(incId) {
   body.appendChild(el("p", {
     class: "muted small",
     text: `状态: ${sum.status_zh || ""} · 阶段: ${sum.stage_zh || ""}`
-      + ` · 发现 ${fmtTime(inc.created_at)}`
+      + ((inc.generation || 1) > 1
+        ? ` · 首次 ${fmtTime(inc.created_at)} · 本次复发 ${fmtTime(inc.updated_at)}`
+        : ` · 发现 ${fmtTime(inc.created_at)}`)
       + (inc.resolved_at ? ` · 解决 ${fmtTime(inc.resolved_at)}` : ""),
   }));
 
@@ -1500,6 +1609,13 @@ async function openIncidentDetail(incId) {
   }
 
   // 处置上下文（P1-01：证据 / 理由 / 权限 / 验证 / 批准拒绝）
+  if (sum.automation_wait) {
+    body.appendChild(el("p", {
+      class: "muted small",
+      text: `自动处置暂缓: ${sum.automation_wait.reason}`
+        + (sum.automation_wait.retry_at ? ` · 下次自动检查: ${fmtTime(sum.automation_wait.retry_at)}` : ""),
+    }));
+  }
   if ((disp.proposals || []).length || disp.evidence_summary) {
     body.appendChild(el("h3", { text: "处置上下文", style: "margin:16px 0 8px;font-size:14px" }));
     if (disp.evidence_summary) {
@@ -1528,26 +1644,27 @@ async function openIncidentDetail(incId) {
       ].filter(Boolean).forEach((t) => box.appendChild(el("div", { class: "muted small", text: t })));
       box.appendChild(el("div", { class: "row-actions", style: "margin-top:10px" }, [
         el("button", {
-          class: "btn", text: "批准并执行",
+          class: "btn", text: p.state === "approved" ? "继续执行" : "批准并执行",
           onclick: async () => {
             const reason = prompt("批准原因（可空）:", "");
             if (reason === null) return;
             // P1-09: 启用 2FA 的用户需要动态码；失败不得静默关窗
             const totp = prompt("动态验证码（若账号已启用 2FA，否则留空）:", "") || "";
-            const res = await api(`/api/actions/${p.action_id}/approve`, {
+            const res = await api(`/api/actions/${p.action_id}/${p.state === "approved" ? "execute" : "approve"}`, {
               method: "POST",
-              body: JSON.stringify({ execute: true, reason, totp }),
+              body: JSON.stringify({ execute: true, reason, ...(totp ? { totp } : {}) }),
             });
             if (!res.ok) {
               alert(res.message || res.error || "批准失败，请检查动态码或权限");
               return;
             }
+            if (res.executed === false) alert("操作已批准，执行尚未完成。请在关联操作中查看状态或继续执行。");
             $("modal").classList.add("hidden");
             openIncidentDetail(incId);
           },
         }),
         el("button", {
-          class: "btn danger", text: "拒绝",
+          class: "btn danger", text: "拒绝", disabled: p.state === "approved",
           onclick: async () => {
             const reason = prompt("拒绝原因:", "");
             if (reason === null) return;
@@ -1578,11 +1695,56 @@ async function openIncidentDetail(incId) {
   }
 
   // 故障闭环：问题 → 处置 → 验证 → 恢复
+  if (d.council) body.appendChild(renderCouncilPanel(d.council, incId));
   const loop = loopOutcome(inc);
   body.appendChild(el("h3", { text: "故障闭环", style: "margin:16px 0 8px;font-size:14px" }));
   body.appendChild(renderLoopSteps(loop, inc));
 
   // 关联操作（含验证）
+  const approvalButtons = (a) => {
+    const controls = el("div", { class: "row-actions", style: "margin-top:8px" });
+    let submitting = false;
+    const choices = a.state === "approved" ? [["resume_execution", "继续执行"]] : [
+      ["execute_once", "执行一次"],
+      ["reject", "不执行"],
+      ["allow_always", "永久允许执行"],
+    ];
+    choices.forEach(([decision, label]) => controls.appendChild(el("button", {
+      class: decision === "reject" ? "btn danger" : "btn", text: label,
+      onclick: async (event) => {
+        if (event && event.stopPropagation) event.stopPropagation();
+        if (submitting) return;
+        const reason = prompt(decision === "allow_always"
+          ? "永久允许此目标的同类处置，以后自动执行。授权原因（可空）:"
+          : `${label}的原因（可空）:`, "");
+        if (reason === null) return;
+        let totp = "";
+        if (decision !== "reject") {
+          totp = prompt("动态验证码（若账号已启用 2FA，否则留空）:", "");
+          if (totp === null) return;
+        }
+        submitting = true;
+        controls.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+        try {
+          const result = await api(`/api/actions/${encodeURIComponent(a.id)}/${decision === "resume_execution" ? "execute" : "decision"}`, {
+            method: "POST", body: JSON.stringify(decision === "resume_execution" ? { totp } : { decision, reason, totp }),
+          });
+          if (!result.ok) {
+            alert(result.message || "授权未完成，请检查权限或动态验证码");
+            return;
+          }
+          if (result.executed === false) alert("操作已批准，执行尚未完成。请在关联操作中查看状态或继续执行。");
+          await openIncidentDetail(incId);
+        } catch (_) {
+          alert("请求未完成，请刷新事件详情确认操作状态后重试。");
+        } finally {
+          submitting = false;
+          controls.querySelectorAll("button").forEach((button) => { button.disabled = false; });
+        }
+      },
+    })));
+    return controls;
+  };
   const relatedActions = inc.actions || [];
   if (relatedActions.length) {
     body.appendChild(el("h3", { text: "关联操作", style: "margin:16px 0 8px;font-size:14px" }));
@@ -1611,6 +1773,7 @@ async function openIncidentDetail(incId) {
           badge(zh(st), cls),
         ]),
       ]);
+      if ((st === "proposed" || st === "approved") && a.mode !== "reviewed" && !a.council_grant_id) row.appendChild(approvalButtons(a));
       body.appendChild(row);
     });
   }
@@ -1655,6 +1818,92 @@ async function openIncidentDetail(incId) {
 
   showModal("", [body]);
   $("modal-title").textContent = "事件详情";
+}
+
+function councilMoney(value) {
+  return value == null || value === "" || !Number.isFinite(Number(value)) ? "未知" : "¥" + Number(value).toFixed(4);
+}
+
+function councilObjectDetails(title, value) {
+  return el("details", { style: "margin:8px 0" }, [
+    el("summary", { text: title }),
+    el("pre", { text: JSON.stringify(value, null, 2), style: "max-height:280px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere" }),
+  ]);
+}
+
+function renderCouncilPanel(council, incId) {
+  const wrap = el("section", { class: "card", style: "margin:16px 0" });
+  wrap.appendChild(el("h3", { text: "三省制 · 自治处置" }));
+  if (council.status === "unavailable" || council.error) {
+    wrap.appendChild(el("p", { class: "error", text: "自治处置状态暂时不可用，告警与现有处置记录仍可查看。" }));
+    return wrap;
+  }
+  const phaseNames = { received: "接奏", investigating: "调查", planning: "拟旨", drafting: "拟旨", reviewing: "会审", approved: "准奏", vetoed: "封驳", rejected: "封驳", executing: "奉旨执行", verifying: "验证", reporting: "回奏", done: "结案", closed: "结案", manual: "等待人工裁决", need_human: "等待人工裁决", waiting: "等待重试", watching: "持续观察", provider_unavailable: "模型暂不可用", budget_blocked: "费用熔断", disabled: "未启用" };
+  const phase = council.phase || council.status || "received";
+  wrap.appendChild(el("p", { class: "muted small", text: "接奏 → 调查 → 拟旨 → 会审 → 准奏/封驳 → 奉旨执行 → 验证 → 回奏 → 结案" }));
+  wrap.appendChild(badge(council.enabled === false ? "未启用" : (phaseNames[phase] || phase), council.manual_required ? "warn" : "dim"));
+  if (council.enabled === false) wrap.appendChild(el("p", { class: "muted small", text: "新自治 Agent 尚未启用；现有监控、人工处置和已授权 Runbook 继续按原有规则运行。" }));
+  if (council.next_retry_at) wrap.appendChild(el("p", { class: "muted small", text: "下次调查：" + fmtTime(council.next_retry_at) }));
+  if (council.last_error) wrap.appendChild(el("p", { class: "error small", text: "当前阻碍：" + (typeof council.last_error === "string" ? council.last_error : JSON.stringify(council.last_error)) }));
+  const evidence = council.evidence || [];
+  if (evidence.length) wrap.appendChild(councilObjectDetails("中书省调查证据 · " + evidence.length + " 项", evidence));
+  if (council.draft) wrap.appendChild(councilObjectDetails("当前拟案 · 尚不代表获得执行授权", council.draft));
+  if ((council.feedback || []).length) wrap.appendChild(councilObjectDetails("封驳、执行失败与验证反馈", council.feedback));
+  const plans = council.plans || [];
+  plans.forEach((record) => {
+    const plan = record.plan || {};
+    const card = el("div", { style: "border-top:1px solid var(--line);padding-top:10px;margin-top:10px" });
+    card.appendChild(el("h4", { text: `方案 ${record.version == null ? "" : "v" + record.version} · ${plan.repair_goal || record.repair_goal || record.goal_id || "待补充目标"}` }));
+    card.appendChild(el("p", { class: "muted small", text: `第 ${record.generation || 1} 轮故障 · ${record.asset_id || ""}/${record.object_id || ""} · ${phaseNames[record.state] || record.state || "待审议"}` }));
+    if (plan.rationale) card.appendChild(el("p", { text: plan.rationale }));
+    (plan.steps || []).forEach((step, index) => card.appendChild(el("p", { class: "small", text: `${index + 1}. ${step.capability || "操作"} · ${(step.tokens || []).join(" ") || JSON.stringify(step.params || {})}` })));
+    if (plan.scope) card.appendChild(el("p", { class: "muted small", text: "影响范围：" + (typeof plan.scope === "string" ? plan.scope : JSON.stringify(plan.scope)) }));
+    if (plan.rollback) card.appendChild(councilObjectDetails("恢复手段", plan.rollback));
+    if (plan.verification) card.appendChild(councilObjectDetails("独立验证要求", plan.verification));
+    const reviews = record.reviews || [];
+    ["reviewer_kimi", "reviewer_deepseek"].forEach((role) => {
+      const review = reviews.find((item) => item.role === role);
+      const label = role === "reviewer_kimi" ? "门下省 A · Kimi" : "门下省 B · DeepSeek";
+      const verdict = !review ? "等待审议" : review.approve === true ? "同意" : review.approve === false ? "否决" : "未取得有效意见";
+      card.appendChild(el("p", { class: review && review.approve === false ? "error small" : "small", text: label + "：" + verdict + (review && review.reason ? " · " + review.reason : "") }));
+      if (review && (review.missing_evidence || []).length) card.appendChild(el("p", { class: "muted small", text: "缺失证据：" + review.missing_evidence.join("；") }));
+      if (review && review.suggested_revision) card.appendChild(el("p", { class: "muted small", text: "修改建议：" + review.suggested_revision }));
+    });
+    const ballot = record.ballot;
+    if (ballot) card.appendChild(el("p", { class: "small", text: "投票箱：" + ({ approved: "准奏", vetoed: "封驳", failed: "审议失败", pending: "等待两票", stale: "方案已失效" }[ballot.decision] || ballot.decision) + (ballot.reason ? " · " + ballot.reason : "") }));
+    if (record.grant) card.appendChild(councilObjectDetails("一次性授权与 Action 执行记录 · " + (record.grant.state || ""), record.grant));
+    card.appendChild(councilObjectDetails("不可变方案版本与完整审议记录", record));
+    wrap.appendChild(card);
+  });
+  if ((council.verifications || []).length) wrap.appendChild(councilObjectDetails("Verification 独立验证证据", council.verifications));
+  if ((council.attempts || []).length) wrap.appendChild(councilObjectDetails("调查、执行与验证轮次", council.attempts));
+  const usage = council.usage || {};
+  const totals = usage.overall || usage;
+  wrap.appendChild(el("p", { class: "muted small", text: `本事件模型费用：${councilMoney(totals.complete === false ? null : (totals.cost_cny ?? totals.total_cost_cny))} · 输入 Token：${totals.input_tokens ?? "未知"} · 输出 Token：${totals.output_tokens ?? "未知"}` }));
+  if (Object.keys(usage).length) wrap.appendChild(councilObjectDetails("Token 与费用明细", usage));
+  const goals = (council.goals || []).filter((goal) => goal.manual_required &&
+    (council.current_generation == null || goal.generation == null || Number(goal.generation) === Number(council.current_generation)));
+  if (council.manual_required) wrap.appendChild(el("p", { class: "error", text: "等待人工裁决；只读调查和监控继续。新方案必须重新经过双委员审议。" }));
+  goals.forEach((goal) => {
+    wrap.appendChild(el("p", { class: "small", text: `修复目标：${goal.repair_goal || goal.id} · 连续封驳 ${goal.consecutive_vetoes || 0} 次${goal.manual_reason ? " · " + goal.manual_reason : ""}` }));
+    if (!(state.user && state.user.is_admin)) return;
+    const message = el("p", { class: "muted small" });
+    let submitting = false;
+    const button = el("button", { class: "btn", text: "允许此目标重新拟案", onclick: async () => {
+      if (submitting || !confirm("允许该修复目标重新拟案？新方案仍须两位委员重新同意。")) return;
+      const totp = prompt("动态验证码（若账号已启用 2FA，否则留空）:", "");
+      if (totp === null) return;
+      submitting = true; button.disabled = true;
+      try {
+        const result = await api(`/api/incidents/${encodeURIComponent(incId)}/council/review`, { method: "POST", body: JSON.stringify({ goal_id: goal.id, totp }) });
+        if (!result.ok) { message.textContent = result.message || result.error || "裁决未保存"; return; }
+        await openIncidentDetail(incId);
+      } catch (_) { message.textContent = "请求未完成，请刷新确认裁决状态。"; }
+      finally { submitting = false; button.disabled = false; }
+    } });
+    wrap.appendChild(button); wrap.appendChild(message);
+  });
+  return wrap;
 }
 
 function openActionDetail(a) {
@@ -4199,7 +4448,7 @@ function renderMonitorBusiness(res, assetId) {
     ]));
     table.appendChild(el("tr", {}, [
       el("td", { class: "small" }, [el("div", { text: item.name || "业务检查" }), el("div", {
-        class: "muted small", text: native ? checkTypeLabel(item) : item.kind === "proxy" ? "代理连通性" : "服务探测",
+        class: "muted small", text: native ? checkTypeLabel(item) : item.kind === "proxy" ? "代理连通性" : item.kind === "mysql" ? "MySQL 状态" : "服务探测",
       })]),
       el("td", {}, [badge(native ? "Ayana 原生" : "Prometheus", "dim")]),
       el("td", {}, [badge(native && businessCheckState(item) === "no_data" && !item.last_at && item.enabled ? "等待首次检查" : status.label, status.cls)]),
@@ -4471,6 +4720,47 @@ async function openAibotTargets(ch) {
   actions.insertBefore(saveBtn, actions.firstChild);
 }
 
+async function openAibotAdmins(ch) {
+  const res = await api("/api/notify/aibot/admins?channel_id=" + encodeURIComponent(ch.id));
+  if (!res.ok) { alert(res.detail || "管理员配置暂时无法读取"); return; }
+  const selected = new Set(res.selected || []);
+  const candidates = [...new Set([...(res.users || []), ...selected])];
+  const wrap = el("div");
+  wrap.appendChild(el("p", { class: "muted small", text: "可选配置：勾选成员 UserID，或手动填写。名单仅对本消息渠道有效；留空不授予管理员资格。" }));
+  wrap.appendChild(el("p", { class: "muted small", text: "管理员可批准「永久允许执行」，具体操作仍需已有执行权限。请填写成员 UserID，群会话 ID 不能代表成员身份。" }));
+  const choices = candidates.map((userId) => {
+    const check = el("input", { type: "checkbox" });
+    check.checked = selected.has(userId);
+    wrap.appendChild(el("label", { style: "display:flex;gap:8px;padding:6px 0" }, [check, el("span", { text: userId })]));
+    return { userId, check };
+  });
+  if (!candidates.length) wrap.appendChild(el("p", { class: "muted small", text: "尚未收到成员消息，可直接手动填写 UserID。" }));
+  const manual = el("input", { placeholder: "手动添加成员 UserID，逗号分隔", style: "width:100%;margin:10px 0" });
+  wrap.appendChild(manual);
+  const status = el("p", { class: "muted small" });
+  wrap.appendChild(status);
+  let saving = false;
+  const save = el("button", { class: "btn primary", text: "保存管理员", onclick: async () => {
+    if (saving) return;
+    const picked = choices.filter((item) => item.check.checked).map((item) => item.userId);
+    const extra = (manual.value || "").split(/[\s,;，；]+/).filter(Boolean);
+    saving = true; save.disabled = true;
+    try {
+      const result = await api("/api/notify/aibot/admins", {
+        method: "POST", body: JSON.stringify({ id: ch.id, admin_user_ids: [...new Set([...picked, ...extra])] }),
+      });
+      status.textContent = result.ok ? "管理员配置已保存" : (result.detail || "保存失败");
+      if (result.ok) {
+        $("modal").classList.add("hidden");
+        loadNotifyChannels();
+      }
+    } catch (_) { status.textContent = "保存失败，请稍后重试"; }
+    finally { saving = false; save.disabled = false; }
+  } });
+  wrap.appendChild(save);
+  showModal("管理员 · " + ch.name, [wrap]);
+}
+
 async function loadNotifyChannels() {
   const root = $("notify-list");
   if (!root) return;
@@ -4602,6 +4892,9 @@ async function loadNotifyChannels() {
       }));
     }
     if (ch.kind === "wecom_aibot") {
+      ops.appendChild(el("button", {
+        class: "btn small", text: "管理员（可选）", onclick: () => openAibotAdmins(ch),
+      }));
       ops.appendChild(el("button", {
         class: "btn small primary",
         text: "推送目标",
@@ -6309,6 +6602,337 @@ on("nw-apply", "click", async () => {
     nwErr(String(e.message || e));
   }
 });
+
+/* ---- 外部事务 ---- */
+const extState = { txs: [], editingId: "" };
+
+function extStatusBadge(s) {
+  const map = {
+    success: "ok", running: "warn", failure: "bad", timeout: "bad", unknown: "muted",
+  };
+  return el("span", { class: "badge " + (map[s] || "muted"), text: s || "unknown" });
+}
+
+async function renderExtTransactions() {
+  const root = $("ext-tx-list");
+  const formCard = $("ext-tx-form-card");
+  const detailCard = $("ext-tx-detail-card");
+  if (!root) return;
+  if (formCard) formCard.classList.add("hidden");
+  if (detailCard) detailCard.classList.add("hidden");
+  root.innerHTML = "";
+  const res = await api("/api/ext/transactions");
+  if (!res.ok) {
+    root.appendChild(el("div", { class: "card muted", text: res.error || "加载失败" }));
+    return;
+  }
+  extState.txs = res.transactions || [];
+  if (!extState.txs.length) {
+    root.appendChild(el("div", { class: "card muted", text: "尚无外部事务。点击「创建事务」接入备份、证书等外部任务。" }));
+    return;
+  }
+  const table = el("table", { class: "table", style: "width:100%;font-size:13px" });
+  table.appendChild(el("thead", {}, [el("tr", {}, [
+    el("th", { text: "名称" }), el("th", { text: "event_key" }),
+    el("th", { text: "状态" }), el("th", { text: "最后上报" }),
+    el("th", { text: "最后成功" }), el("th", { text: "告警" }),
+    el("th", { text: "操作" }),
+  ])]));
+  const tb = el("tbody");
+  extState.txs.forEach((tx) => {
+    const alerts = [];
+    if (tx.alert_on_failure) alerts.push("失败");
+    if (tx.alert_on_timeout) alerts.push("超时");
+    if (tx.alert_on_missing) alerts.push("漏跑");
+    if (tx.alert_on_recovery) alerts.push("恢复");
+    if (tx.alert_on_collector) alerts.push("采集");
+    const tr = el("tr", {}, [
+      el("td", { text: tx.name + (tx.enabled ? "" : "（已禁用）") }),
+      el("td", { text: tx.event_key }),
+      el("td", {}, [extStatusBadge(tx.last_status)]),
+      el("td", { text: tx.last_report_at ? fmtTime(tx.last_report_at) : "—" }),
+      el("td", { text: tx.last_success_at ? fmtTime(tx.last_success_at) : "—" }),
+      el("td", { text: alerts.join("、") || "—" }),
+      el("td", {}, [el("button", {
+        class: "btn small", text: "详情",
+        onclick: () => openExtDetail(tx.id),
+      })]),
+    ]);
+    tb.appendChild(tr);
+  });
+  table.appendChild(tb);
+  root.appendChild(table);
+}
+
+function extFillForm(tx) {
+  const set = (id, v) => { const n = $(id); if (n) n.value = v == null ? "" : String(v); };
+  set("ext-f-key", tx.event_key || "");
+  set("ext-f-name", tx.name || "");
+  set("ext-f-desc", tx.description || "");
+  set("ext-f-source", tx.source_label || "");
+  set("ext-f-asset", tx.asset_id || "");
+  set("ext-f-watch", tx.watch_mode || "off");
+  set("ext-f-grace", tx.grace_sec != null ? tx.grace_sec : 300);
+  set("ext-f-interval", tx.expect_interval_sec || 0);
+  set("ext-f-timeout", tx.timeout_sec || 0);
+  set("ext-f-delay", tx.resolve_delay_sec != null ? tx.resolve_delay_sec : 0);
+  const sched = tx.schedule || {};
+  set("ext-f-cron", sched.kind === "cron" ? sched.expr : (sched.expr || ""));
+  set("ext-f-tz", sched.kind === "cron" ? (sched.tz || "UTC") : "UTC");
+  const chk = (id, v) => { const n = $(id); if (n) n.checked = !!v; };
+  chk("ext-f-alert-fail", tx.alert_on_failure !== false);
+  chk("ext-f-alert-rec", tx.alert_on_recovery !== false);
+  chk("ext-f-alert-to", tx.alert_on_timeout !== false);
+  chk("ext-f-alert-miss", tx.alert_on_missing !== false);
+  chk("ext-f-alert-col", tx.alert_on_collector !== false);
+}
+
+function extReadForm() {
+  const get = (id) => { const n = $(id); return n ? n.value.trim() : ""; };
+  const num = (id, d) => { const v = get(id); return v === "" ? d : Number(v); };
+  const chk = (id) => { const n = $(id); return n ? !!n.checked : true; };
+  const cron = get("ext-f-cron");
+  const body = {
+    event_key: get("ext-f-key"),
+    name: get("ext-f-name"),
+    description: get("ext-f-desc"),
+    source_label: get("ext-f-source"),
+    asset_id: get("ext-f-asset"),
+    watch_mode: get("ext-f-watch") || "off",
+    grace_sec: num("ext-f-grace", 300),
+    expect_interval_sec: num("ext-f-interval", 0),
+    timeout_sec: num("ext-f-timeout", 0),
+    resolve_delay_sec: num("ext-f-delay", 0),
+    alert_on_failure: chk("ext-f-alert-fail"),
+    alert_on_recovery: chk("ext-f-alert-rec"),
+    alert_on_timeout: chk("ext-f-alert-to"),
+    alert_on_missing: chk("ext-f-alert-miss"),
+    alert_on_collector: chk("ext-f-alert-col"),
+  };
+  if (cron) {
+    body.schedule = { kind: "cron", expr: cron, tz: get("ext-f-tz") || "UTC" };
+  }
+  return body;
+}
+
+function showExtForm(tx) {
+  const card = $("ext-tx-form-card");
+  const list = $("ext-tx-list");
+  const detail = $("ext-tx-detail-card");
+  if (list) list.classList.add("hidden");
+  if (detail) detail.classList.add("hidden");
+  if (!card) return;
+  card.classList.remove("hidden");
+  const title = $("ext-tx-form-title");
+  if (title) title.textContent = tx && tx.id ? "编辑外部事务" : "创建外部事务";
+  extState.editingId = (tx && tx.id) || "";
+  extFillForm(tx || {});
+  const err = $("ext-tx-form-err");
+  if (err) err.textContent = "";
+}
+
+async function openExtDetail(tid) {
+  const card = $("ext-tx-detail-card");
+  const list = $("ext-tx-list");
+  const form = $("ext-tx-form-card");
+  if (list) list.classList.add("hidden");
+  if (form) form.classList.add("hidden");
+  if (!card) return;
+  card.classList.remove("hidden");
+  const box = $("ext-tx-detail");
+  if (!box) return;
+  box.innerHTML = "";
+  const res = await api("/api/ext/transactions");
+  const tx = (res.transactions || []).find((x) => x.id === tid);
+  if (!tx) {
+    box.appendChild(el("div", { class: "muted", text: "未找到事务" }));
+    return;
+  }
+  box.appendChild(el("h2", { text: tx.name, style: "margin:0 0 6px" }));
+  box.appendChild(el("p", {
+    class: "muted small",
+    text: `${tx.event_key} · 来源 ${tx.source_label || "—"} · 模式 ${tx.watch_mode}`
+      + (tx.resolve_delay_sec ? ` · 恢复防抖 ${tx.resolve_delay_sec}s` : ""),
+  }));
+  box.appendChild(el("p", { class: "muted small" }, [
+    el("span", { text: "最新状态：" }),
+    extStatusBadge(tx.last_status),
+    el("span", {
+      text: `　最后上报 ${tx.last_report_at ? fmtTime(tx.last_report_at) : "—"}`
+        + `　最后成功 ${tx.last_success_at ? fmtTime(tx.last_success_at) : "—"}`
+        + `　open_incident ${tx.open_incident_id || "无"}`,
+    }),
+  ]));
+
+  // Token
+  const tokBox = el("div", { class: "card", style: "margin:12px 0;background:var(--bg2,transparent)" });
+  tokBox.appendChild(el("h3", { text: "API Token", style: "margin:0 0 8px;font-size:14px" }));
+  (tx.tokens || []).forEach((t) => {
+    tokBox.appendChild(el("div", {
+      class: "muted small",
+      text: `…${t.token_hint} · ${t.active ? "有效" : "已吊销"} · 创建 ${fmtTime(t.created_at)}`
+        + (t.last_used_at ? ` · 最近使用 ${fmtTime(t.last_used_at)}` : ""),
+    }));
+  });
+  const tokMsg = el("div", { class: "small", style: "margin:8px 0;color:var(--warn,#c90)" });
+  tokBox.appendChild(tokMsg);
+  tokBox.appendChild(el("div", { class: "row-actions" }, [
+    el("button", {
+      class: "btn small primary", text: "生成 Token",
+      onclick: async () => {
+        const r = await api(`/api/ext/transactions/${tid}/tokens`, { method: "POST", body: "{}" });
+        if (r.ok && r.token) {
+          tokMsg.textContent = "新 Token（只显示一次）：" + r.token;
+        } else {
+          tokMsg.textContent = r.error || "生成失败";
+        }
+      },
+    }),
+    el("button", {
+      class: "btn small", text: "编辑",
+      onclick: () => showExtForm(tx),
+    }),
+    el("button", {
+      class: "btn small", text: tx.enabled ? "禁用" : "启用",
+      onclick: async () => {
+        await api(`/api/ext/transactions/${tid}/enabled`, {
+          method: "POST", body: JSON.stringify({ enabled: !tx.enabled }),
+        });
+        openExtDetail(tid);
+      },
+    }),
+    el("button", {
+      class: "btn small", text: "返回列表",
+      onclick: () => renderExtTransactions(),
+    }),
+  ]));
+  box.appendChild(tokBox);
+
+  // Runs
+  const runsRes = await api(`/api/ext/transactions/${tid}/runs?limit=30`);
+  const runs = (runsRes && runsRes.runs) || [];
+  const runBox = el("div");
+  runBox.appendChild(el("h3", { text: "执行历史", style: "margin:12px 0 8px;font-size:14px" }));
+  if (!runs.length) {
+    runBox.appendChild(el("div", { class: "muted small", text: "暂无执行记录" }));
+  } else {
+    const t2 = el("table", { class: "table", style: "width:100%;font-size:12px" });
+    t2.appendChild(el("thead", {}, [el("tr", {}, [
+      el("th", { text: "run_id" }), el("th", { text: "状态" }),
+      el("th", { text: "kind" }), el("th", { text: "接收时间" }),
+      el("th", { text: "消息" }),
+    ])]));
+    const tb = el("tbody");
+    runs.forEach((r) => {
+      tb.appendChild(el("tr", {}, [
+        el("td", { text: r.run_id }),
+        el("td", {}, [extStatusBadge(r.status)]),
+        el("td", { text: r.report_kind || "run" }),
+        el("td", { text: fmtTime(r.reported_at) }),
+        el("td", { text: (r.message || r.detail || "").slice(0, 80) }),
+      ]));
+    });
+    t2.appendChild(tb);
+    runBox.appendChild(t2);
+  }
+  box.appendChild(runBox);
+}
+
+function extFormHtml() {
+  return `
+    <div id="ext-tx-form-err" class="small" style="color:var(--bad,#c33);margin-bottom:8px"></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <label>event_key <input id="ext-f-key" placeholder="mysqlbk.cloud_backup"></label>
+      <label>名称 <input id="ext-f-name" placeholder="云盘备份"></label>
+      <label>描述 <input id="ext-f-desc"></label>
+      <label>来源标识 <input id="ext-f-source" placeholder="backup-agent"></label>
+      <label>资产 ID（可选） <input id="ext-f-asset"></label>
+      <label>监测模式
+        <select id="ext-f-watch">
+          <option value="off">不检查漏跑</option>
+          <option value="heartbeat">心跳（周期）</option>
+          <option value="schedule">计划任务（cron）</option>
+        </select>
+      </label>
+      <label>宽限秒 <input id="ext-f-grace" type="number" value="300"></label>
+      <label>心跳周期秒 <input id="ext-f-interval" type="number" value="0"></label>
+      <label>执行超时秒 <input id="ext-f-timeout" type="number" value="0"></label>
+      <label>恢复防抖秒 <input id="ext-f-delay" type="number" value="0"></label>
+      <label>cron 表达式（五段） <input id="ext-f-cron" placeholder="0 0 * * 1"></label>
+      <label>时区 <input id="ext-f-tz" value="UTC"></label>
+    </div>
+    <div style="margin:12px 0;display:flex;gap:16px;flex-wrap:wrap">
+      <label><input type="checkbox" id="ext-f-alert-fail" checked> 失败告警</label>
+      <label><input type="checkbox" id="ext-f-alert-rec" checked> 恢复通知</label>
+      <label><input type="checkbox" id="ext-f-alert-to" checked> 超时告警</label>
+      <label><input type="checkbox" id="ext-f-alert-miss" checked> 漏跑告警</label>
+      <label><input type="checkbox" id="ext-f-alert-col" checked> 采集异常告警</label>
+    </div>
+    <div class="row-actions">
+      <button class="btn primary" id="ext-tx-save" type="button">保存</button>
+      <button class="btn" id="ext-tx-cancel" type="button">取消</button>
+    </div>`;
+}
+
+function initExtFormDom() {
+  const form = $("ext-tx-form");
+  if (!form) return;
+  form.innerHTML = extFormHtml();
+  on("ext-tx-create-btn", "click", () => showExtForm(null));
+  on("ext-tx-refresh", "click", () => renderExtTransactions());
+  on("ext-tx-back", "click", () => renderExtTransactions());
+  on("ext-tx-cancel", "click", () => renderExtTransactions());
+  on("ext-tx-save", "click", async () => {
+    const err = $("ext-tx-form-err");
+    const body = extReadForm();
+    if (!body.event_key || !body.name) {
+      if (err) err.textContent = "event_key 与名称必填";
+      return;
+    }
+    let res;
+    if (extState.editingId) {
+      res = await api(`/api/ext/transactions/${extState.editingId}/update`, {
+        method: "POST", body: JSON.stringify(body),
+      });
+    } else {
+      res = await api("/api/ext/transactions", {
+        method: "POST", body: JSON.stringify(body),
+      });
+    }
+    if (!res.ok) {
+      if (err) err.textContent = (res.error || "保存失败") + (res.detail ? "：" + res.detail : "");
+      return;
+    }
+    await renderExtTransactions();
+    if (res.transaction && res.transaction.id) openExtDetail(res.transaction.id);
+  });
+  // API 示例
+  const sample = $("ext-api-sample");
+  if (sample) {
+    sample.textContent = [
+      "# 在事务详情中生成 Token 后：",
+      "curl -X POST http://<ayana-host>:6200/api/ext/report \\",
+      "  -H 'Authorization: Bearer ext_<token>' \\",
+      "  -H 'Content-Type: application/json' \\",
+      "  -d '{",
+      "    \"event_key\": \"mysqlbk.cloud_backup\",",
+      "    \"status\": \"failure\",",
+      "    \"severity\": \"warning\",",
+      "    \"message\": \"阿里云盘备份失败\",",
+      "    \"detail\": \"RefreshTokenExpired\",",
+      "    \"run_id\": \"backup-20261019-0000\",",
+      "    \"timestamp\": \"2026-10-19T00:00:00+08:00\"",
+      "  }'",
+      "",
+      "# status: running|success|failure|timeout|unknown",
+      "# report_kind: run（默认业务）| collector（采集异常，不记业务失败）",
+      "# 计划任务漏跑用 schedule=cron 五段表达式；心跳用 expect_interval_sec",
+    ].join("\n");
+  }
+}
+
+// 表单 DOM 在加载时注入一次
+initExtFormDom();
 
 /* ---- init ---- */
 boot();

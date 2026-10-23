@@ -1,4 +1,4 @@
-﻿"""Phase A: P0-01..06 defect reproduction baseline (Astra 0.3.0 review).
+"""Phase A: P0-01..06 defect reproduction baseline (Astra 0.3.0 review).
 
 These cases assert CORRECT behavior. They are expected to FAIL while the
 defect remains, proving the issue is still present.
@@ -20,7 +20,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # llm.py imports aiohttp at module level; stub when offline
-if "aiohttp" not in sys.modules:
+try:
+    import aiohttp.web  # noqa: F401
+except Exception:
     _aiohttp = types.ModuleType("aiohttp")
 
     class _ClientTimeout:
@@ -42,7 +44,13 @@ if "aiohttp" not in sys.modules:
 
     _aiohttp.ClientTimeout = _ClientTimeout
     _aiohttp.ClientSession = _ClientSession
+    _aiohttp.web = types.SimpleNamespace(
+        Application=type("Application", (), {"__init__": lambda self, **k: None}),
+        Response=type("Response", (), {"__init__": lambda self, *a, **k: None}),
+        json_response=lambda *a, **k: None,
+    )
     sys.modules["aiohttp"] = _aiohttp
+    sys.modules["aiohttp.web"] = _aiohttp.web
 
 from ayana.actions import ActionError, ActionService
 from ayana.agent import AgentLoop
@@ -336,7 +344,15 @@ class TestP002IdentityAndAuthz(unittest.TestCase):
             asset_id="nerv", object_id="*", allow=True, require_approval=False,
             auto_allowed=True, actor="test",
         )
-        from ayana.runbook import get_runbook_rule as _grr
+        from ayana.runbook import apply_runbook_rules, get_runbook_rule as _grr
+
+        apply_runbook_rules([{
+            "id": "rb_frps_down_restart", "name": "frps down restart",
+            "asset_id": "nerv", "object_name": "frps", "alertname": "TargetDown",
+            "capability": "service.restart", "reason": "restart frps",
+            "require_probe_fail": True,
+        }])
+        self.addCleanup(lambda: apply_runbook_rules([]))
 
         rule_rev = _grr("rb_frps_down_restart").rev
         prop = actions.propose(

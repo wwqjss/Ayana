@@ -11,7 +11,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-if "aiohttp" not in sys.modules:
+try:
+    import aiohttp.web  # noqa: F401
+except Exception:
     _a = types.ModuleType("aiohttp")
 
     class _CT:
@@ -33,7 +35,13 @@ if "aiohttp" not in sys.modules:
 
     _a.ClientTimeout = _CT
     _a.ClientSession = _CS
+    _a.web = types.SimpleNamespace(
+        Application=type("Application", (), {"__init__": lambda self, **k: None}),
+        Response=type("Response", (), {"__init__": lambda self, *a, **k: None}),
+        json_response=lambda *a, **k: None,
+    )
     sys.modules["aiohttp"] = _a
+    sys.modules["aiohttp.web"] = _a.web
 
 from ayana.actions import ActionError, ActionService
 from ayana.agent import AgentLoop
@@ -48,7 +56,7 @@ from ayana.investigation import InvestigationService
 from ayana.knowledge import KnowledgeBase
 from ayana.ntsafe import AssetBinding, IdentityGate, NTResult
 from ayana.policy import Policy
-from ayana.runbook import RunbookRule, match_runbook
+from ayana.runbook import RunbookRule, apply_runbook_rules, match_runbook
 
 
 class FakeNT:
@@ -204,10 +212,19 @@ def make_env(
     agent = AgentLoop(db, inv, actions, policy, NoLLM(), NQ(), auto_enabled=auto_enabled,
                       knowledge=KnowledgeBase(db))
     incidents = IncidentService(db)
+    # 注入测试本地 runbook 规则（发行版 RUNBOOK 为空）
+    rule = seed_runbook_rule()
+    apply_runbook_rules([{
+        "id": rule.id, "name": rule.name, "asset_id": rule.asset_id,
+        "object_name": rule.object_name, "alertname": rule.alertname,
+        "capability": rule.capability, "reason": rule.reason,
+        "require_probe_fail": rule.require_probe_fail,
+    }])
     return tmp, db, policy, nt, prom, gate, actions, agent, incidents
 
 
 def close_env(tmp, db):
+    apply_runbook_rules([])
     try:
         db.close()
     except Exception:
@@ -563,11 +580,12 @@ class TestP103Reconcile(unittest.TestCase):
         ingest.ingest_webhook({"alerts": [am_alert()]})
         inc = db.query_one("SELECT * FROM incidents")
         inc_id = inc["id"]
-        # 仅 AM 显式 resolved、无业务验证证据 → 不伪造 recovered
+        # AM 明确报告目标恢复即闭环；不同于 source unavailable/not_seen。
         ingest.ingest_webhook({"alerts": [am_alert(status="resolved")]})
         mid = incidents.reconcile(inc_id, resolution_basis="alert_only")
-        self.assertNotEqual(mid.get("outcome"), "recovered")
-        # 有 passed verification → 允许 recovered
+        self.assertEqual(mid.get("outcome"), "recovered")
+        self.assertEqual(mid.get("resolution_basis"), "target_recovered")
+        # 后到的 passed verification 不改写目标恢复事实。
         db.execute(
             "INSERT INTO actions(id, incident_id, asset_id, object_id, capability,"
             " params_json, state, created_at, finished_at)"
@@ -583,6 +601,7 @@ class TestP103Reconcile(unittest.TestCase):
         res = incidents.reconcile(inc_id, resolution_basis="fresh_recovery")
         self.assertEqual(res["status"], "resolved")
         self.assertEqual(res["outcome"], "recovered")
+        self.assertEqual(res["resolution_basis"], "target_recovered")
 
     def test_event_bound_to_episode_and_incident(self):
         tmp, db, ingest, incidents = self._env()

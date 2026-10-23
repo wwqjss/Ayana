@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import socket
 import time
 import uuid
 from typing import Any
@@ -30,11 +31,13 @@ class WeComBot:
     - 发现：群聊记 chatid，单聊记 userid；可在 Web「已发现的推送目标」勾选保存
     """
 
-    def __init__(self, qqbot: QQBot, aibot_manager: Any, channel_store: Any = None, mlog: Any = None):
+    def __init__(self, qqbot: QQBot, aibot_manager: Any, channel_store: Any = None, mlog: Any = None,
+                 node_name: str = ""):
         self.qqbot = qqbot
         self.aibot = aibot_manager
         self.channel_store = channel_store
         self.mlog = mlog
+        self.node_name = node_name or socket.gethostname()
 
     def _discover(self, channel_id: str, body: dict) -> None:
         if not self.channel_store:
@@ -159,7 +162,7 @@ class WeComBot:
             if entry.kind == "watch_ping":
                 reply = (
                     f"AYANA-WATCH-PONG {entry.request_id} "
-                    f"ts={int(time.time())} node=kanata"
+                    f"ts={int(time.time())} node={self.node_name}"
                 )
             elif entry.kind == "urgent":
                 rid = uuid.uuid4().hex[:12]
@@ -178,6 +181,11 @@ class WeComBot:
                     "· AYANA-WATCH-PING <request_id>\n"
                     "也可继续使用 @Ayana /help、@Ayana -c …"
                 )
+            elif entry.kind == "approval":
+                reply = await self.qqbot._handle_approval(
+                    entry, user_id=user_id, actor_type="wecom_user", channel="wecom_aibot",
+                    channel_id=channel_id,
+                )
             elif entry.kind == "slash":
                 reply = await self.qqbot.dispatch(
                     entry.text,
@@ -185,6 +193,7 @@ class WeComBot:
                     group_id=group_id,
                     actor_type="wecom_user",
                     channel="wecom_aibot",
+                    channel_id=channel_id,
                 )
             elif entry.kind == "controlled":
                 reply = await self.qqbot._handle_controlled(
