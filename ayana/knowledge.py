@@ -76,6 +76,17 @@ def _parse_scalar(raw: str) -> str:
     return v
 
 
+def _parse_inline_list(val: str) -> list[str] | None:
+    """解析 [a, b] / [kanata:mysql] 行内列表；不是列表则返回 None。"""
+    v = val.strip()
+    if not (v.startswith("[") and v.endswith("]")):
+        return None
+    inner = v[1:-1].strip()
+    if not inner:
+        return []
+    return [_parse_scalar(p) for p in inner.split(",") if p.strip()]
+
+
 def parse_front_matter(text: str) -> tuple[dict[str, Any], str]:
     """解析 YAML front matter（仅覆盖 id/title/status/type/objects/tags 列表）。"""
     if not text.startswith("---"):
@@ -112,7 +123,8 @@ def parse_front_matter(text: str) -> tuple[dict[str, Any], str]:
             meta[key] = []
             current_list = None
         else:
-            meta[key] = _parse_scalar(val)
+            inline = _parse_inline_list(val)
+            meta[key] = inline if inline is not None else _parse_scalar(val)
             current_list = None
     body = "\n".join(lines[i + 1 :]) if i + 1 <= len(lines) else ""
     return meta, body.lstrip("\n")

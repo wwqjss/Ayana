@@ -203,6 +203,15 @@ class Transport(Protocol):
 
     async def exec(self, asset_id: str, cmd_tokens: list[str], timeout: float | None = None) -> NTResult: ...
 
+    async def exec_shell(
+        self,
+        asset_id: str,
+        command: str,
+        timeout: float | None = None,
+        *,
+        channel: str = "write",
+    ) -> NTResult: ...
+
 
 @dataclass
 class SSHEndpoint:
@@ -480,6 +489,26 @@ class SSHTransport:
     async def exec(self, asset_id: str, cmd_tokens: list[str], timeout: float | None = None) -> NTResult:
         return await self._run(asset_id, "write", cmd_tokens, timeout)
 
+    async def exec_shell(
+        self,
+        asset_id: str,
+        command: str,
+        timeout: float | None = None,
+        *,
+        channel: str = "write",
+    ) -> NTResult:
+        """通用 shell 入口：绕过 cmd_tokens 元字符检查，其余校验照旧。
+
+        权限半径 = 目标机 SSH 账户。host key / 用户校验 / 超时 / 输出截断与 probe/exec 一致。
+        channel: write（默认）| read，决定走写/读端点。
+        """
+        if not isinstance(command, str) or not command.strip():
+            raise TransportError("bad_command")
+        if "\x00" in command:
+            raise TransportError("unsafe_command", "null byte")
+        kind = "read" if channel == "read" else "write"
+        return await self._run_command(asset_id, kind, command, timeout)
+
     async def _run(
         self, asset_id: str, kind: str, cmd_tokens: list[str], timeout: float | None = None
     ) -> NTResult:
@@ -488,6 +517,12 @@ class SSHTransport:
         for t in cmd_tokens:
             if any(ch in t for ch in " \t\n;|&$`"):
                 raise TransportError("unsafe_token", t)
+        remote = shlex.join(cmd_tokens)
+        return await self._run_command(asset_id, kind, remote, timeout)
+
+    async def _run_command(
+        self, asset_id: str, kind: str, remote: str, timeout: float | None = None
+    ) -> NTResult:
         ep = self._endpoint_for_channel(asset_id, "write" if kind == "write" else "read")
         # 首次未信任：不要求用户手工粘贴；由上层 fetch_host_key + 信任后再连
         if not ep.host_key_sha256 or not ep.host_key_trusted_at:
@@ -510,7 +545,6 @@ class SSHTransport:
                 )
         known_line = ep.host_key_line or ""
 
-        remote = shlex.join(cmd_tokens)
         t = max(3.0, float(timeout or self.default_timeout))
         workdir = tempfile.mkdtemp(prefix="ayana-ssh-")
         try:
