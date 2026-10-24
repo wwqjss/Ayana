@@ -21,6 +21,7 @@ class IncidentService:
     def __init__(self, db: Database):
         self.db = db
         self.session_bridge = None  # P2 薄桥，可选注入；不引入新自治
+        self.auto_investigator = None  # P4.3 只读调查，可选注入
 
     def _touch_session(self, inc_id: str, generation: int | None = None) -> None:
         """挂上调查 Session（P2）。桥缺失/失败不影响事件主流程。"""
@@ -30,6 +31,12 @@ class IncidentService:
             self.session_bridge.ensure_session(inc_id, generation=generation)
         except Exception:
             pass
+        # P4.3：只读调查排队（非阻塞、失败不影响告警）
+        if self.auto_investigator is not None:
+            try:
+                self.auto_investigator.offer(inc_id, generation=generation)
+            except Exception:
+                pass
 
     def upsert_from_episode(self, episode_id: str) -> str:
         ep = self.db.query_one("SELECT * FROM alert_episodes WHERE id=?", (episode_id,))

@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 
 class MigrationError(RuntimeError):
@@ -973,6 +973,25 @@ def _migrate_v19_write_ops_unknown_lease(conn: sqlite3.Connection) -> None:
             pass
 
 
+def _migrate_v20_investigation_jobs(conn: sqlite3.Connection) -> None:
+    """P4.3 无人值守只读调查任务台账（重启恢复/防重复）。"""
+    conn.executescript("""
+CREATE TABLE IF NOT EXISTS investigation_jobs (
+  incident_id TEXT PRIMARY KEY,
+  generation INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'queued',
+  rounds INTEGER NOT NULL DEFAULT 0,
+  lease_expires_at REAL NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  last_result_status TEXT NOT NULL DEFAULT '',
+  last_conclusion_json TEXT NOT NULL DEFAULT '',
+  updated_at REAL NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_investigation_jobs_status ON investigation_jobs(status);
+""")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_v1_baseline,
     2: _migrate_v2_p0_p1_columns,
@@ -993,6 +1012,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     17: _migrate_v17_incident_session,
     18: _migrate_v18_mimo_remote_session,
     19: _migrate_v19_write_ops_unknown_lease,
+    20: _migrate_v20_investigation_jobs,
 }
 
 _MIGRATION_NAMES = {
@@ -1015,6 +1035,7 @@ _MIGRATION_NAMES = {
     17: "incident_session_bridge",
     18: "mimo_remote_session",
     19: "write_ops_unknown_lease",
+    20: "investigation_jobs",
 }
 
 

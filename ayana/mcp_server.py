@@ -58,6 +58,7 @@ def build_ops_context(cfg: dict[str, Any]) -> OpsContext:
             mimo_bin=os.environ.get("AYANA_MIMO_BIN") or "mimo",
             model=os.environ.get("AYANA_MIMO_MODEL") or "",
         )
+    readonly = str(os.environ.get("AYANA_MCP_READONLY") or "").strip() in ("1", "true", "yes", "on")
     bridge = SessionBridge(db, knowledge=knowledge, mimo=mimo)
     incidents.session_bridge = bridge
     return OpsContext(
@@ -67,6 +68,7 @@ def build_ops_context(cfg: dict[str, Any]) -> OpsContext:
         knowledge=knowledge,
         db=db,
         session_bridge=bridge,
+        readonly=readonly,
     )
 
 

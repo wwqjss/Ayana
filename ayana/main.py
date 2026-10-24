@@ -23,6 +23,7 @@ from .config import load_config
 from .controlled import ControlledExecutor
 from .db import Database, now
 from .incidents import IncidentService
+from .auto_investigate import AutoInvestigator, InvestConfig
 from .session_bridge import SessionBridge
 from .investigation import InvestigationService
 from .instance import acquire_single_instance_lock
@@ -283,6 +284,35 @@ class App:
         # P2 薄桥：只做映射/复用/幂等，不做自动处置（旧自治仍禁用）
         self.session_bridge = SessionBridge(self.db, knowledge=self.knowledge)
         self.incidents.session_bridge = self.session_bridge
+        # P4.3：无人值守只读调查（默认关）
+        self.auto_investigator = None
+        _ai_cfg = InvestConfig.from_dict(cfg.get("auto_investigate") or {})
+        if _ai_cfg.enabled:
+            from .mimo_session import MimoSessionClient as _MSC
+            from .session_bridge import SessionBridge as _SB
+
+            _ai_client = _MSC(
+                mimo_bin=_ai_cfg.mimo_bin or "mimo",
+                model=_ai_cfg.mimo_model or "",
+                readonly_env=True,
+                default_timeout=_ai_cfg.timeout_sec,
+            )
+            _ai_bridge = _SB(self.db, knowledge=self.knowledge, mimo=_ai_client)
+            self.auto_investigator = AutoInvestigator(
+                self.db,
+                knowledge=self.knowledge,
+                mimo=_ai_client,
+                bridge=_ai_bridge,
+                config=_ai_cfg,
+            )
+            self.incidents.auto_investigator = self.auto_investigator
+            log.info(
+                "auto_investigate enabled max_concurrent=%s timeout=%s",
+                _ai_cfg.max_concurrent,
+                _ai_cfg.timeout_sec,
+            )
+        else:
+            log.info("auto_investigate disabled")
         # SSH：凭据加密 + 端点；有端点用原生 SSH，否则回落 NT（迁移期）
         self.creds = CredentialStore(self.db, master_key=cfg.get("ssh_credential_key") or "")
         self.ssh_store = SSHAssetStore(self.db)
@@ -678,6 +708,9 @@ class App:
         self._bg_tasks.append(asyncio.create_task(self._bg_outbox()))
         self._bg_tasks.append(asyncio.create_task(self._bg_reconcile()))
         self._bg_tasks.append(asyncio.create_task(self._bg_correlate()))
+        # P4.3：只读调查 worker（独立于旧自治）
+        if self.auto_investigator is not None:
+            self._bg_tasks.append(asyncio.create_task(self.auto_investigator.run_forever()))
         # P4.0：旧自治后台链默认不启动（legacy_agent_loop 显式开启才跑）
         if self.legacy_agent_loop:
             self._bg_tasks.append(asyncio.create_task(self._bg_agent()))

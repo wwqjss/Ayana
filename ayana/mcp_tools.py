@@ -48,6 +48,8 @@ class OpsContext:
     db: Any = None
     notifier: Any = None
     session_bridge: Any = None
+    # P4.3：只读模式（自动调查用）——执行层拒写，不靠提示词
+    readonly: bool = False
 
 
 TOOL_SPECS: list[dict[str, Any]] = [
@@ -301,12 +303,25 @@ class OpsTools:
             raise McpToolError("bad_request", "timeout_sec must be a number") from e
 
         cls = classify_shell_command(command)
+        # P4.3 只读模式：执行层拒绝任何写/未知命令，并审计
+        if getattr(self.ctx, "readonly", False) and cls != "read":
+            self._audit_write(asset_id, command, "rejected_readonly", cls)
+            raise McpToolError(
+                "readonly_mode_rejects_write",
+                f"auto-investigation is read-only; classified={cls}",
+            )
         # read 通道不得跑写/未知命令，防 shell 包装绕过
         if channel == "read" and cls != "read":
             raise McpToolError(
                 "write_not_allowed_on_read_channel",
                 f"classified={cls}; use channel=write for controlled execution",
             )
+        # 只读模式：只要分类是 read 就走读通道，不进写台账
+        if getattr(self.ctx, "readonly", False):
+            res = await self.ctx.transport.exec_shell(
+                asset_id, command, timeout_f, channel="read"
+            )
+            return {**_result_payload(res), "classified": cls, "readonly": True}
         # write 通道或未知类别的写 → 受控执行（台账+审计+unknown 语义）
         if channel == "write" or cls != "read":
             return await self._controlled_write(
@@ -531,6 +546,9 @@ class OpsTools:
         return {"ok": True, "event_id": ev_id, "incident_id": inc_id}
 
     async def incident_close(self, args: dict[str, Any]) -> dict[str, Any]:
+        if getattr(self.ctx, "readonly", False):
+            self._audit_write("", str(args.get("incident_id") or ""), "rejected_readonly", "incident.close")
+            raise McpToolError("readonly_mode_rejects_write", "incident.close disabled in readonly mode")
         inc_id = str(args.get("incident_id") or "").strip()
         reason = str(args.get("reason") or "").strip()
         if not reason:
@@ -600,6 +618,9 @@ class OpsTools:
         return {"ok": True, "knowledge": doc.to_public()}
 
     async def knowledge_upsert(self, args: dict[str, Any]) -> dict[str, Any]:
+        if getattr(self.ctx, "readonly", False):
+            self._audit_write("", str(args.get("title") or "")[:80], "rejected_readonly", "knowledge.upsert")
+            raise McpToolError("readonly_mode_rejects_write", "knowledge.upsert disabled in readonly mode")
         title = str(args.get("title") or "").strip()
         objects = args.get("objects") or []
         if isinstance(objects, str):

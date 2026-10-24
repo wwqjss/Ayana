@@ -53,11 +53,14 @@ class MimoSessionClient:
         model: str = "",
         cwd: str | None = None,
         default_timeout: float = 120.0,
+        readonly_env: bool = False,
     ):
         self.mimo_bin = mimo_bin
         self.model = model or os.environ.get("AYANA_MIMO_MODEL", "")
         self.cwd = str(cwd) if cwd else None
         self.default_timeout = default_timeout
+        # P4.3：只读调查会话向子进程注入 AYANA_MCP_READONLY=1
+        self.readonly_env = readonly_env
 
     def _argv(self, extra: list[str]) -> list[str]:
         argv = [self.mimo_bin, "run", "--format", "json"]
@@ -67,6 +70,9 @@ class MimoSessionClient:
         return argv
 
     def _run(self, extra: list[str], timeout: float) -> tuple[int, str, str]:
+        env = {**os.environ}
+        if self.readonly_env:
+            env["AYANA_MCP_READONLY"] = "1"
         try:
             proc = subprocess.run(
                 self._argv(extra),
@@ -76,7 +82,7 @@ class MimoSessionClient:
                 errors="replace",
                 timeout=timeout,
                 cwd=self.cwd,
-                env={**os.environ},
+                env=env,
             )
             return proc.returncode, proc.stdout or "", proc.stderr or ""
         except subprocess.TimeoutExpired as e:

@@ -247,18 +247,18 @@ class SessionBridge:
 
         self._set_remote(
             incident_id,
-            remote_session_id=remote.remote_session_id,
-            status=remote.status or "active",
-            model=remote.model or "",
-            last_error=remote.last_error or "",
+            remote_session_id=getattr(remote, "remote_session_id", "") or "",
+            status=getattr(remote, "status", "") or "active",
+            model=getattr(remote, "model", "") or "",
+            last_error=getattr(remote, "last_error", "") or "",
         )
         return {
             **base,
             "ok": True,
             "action": "created",
-            "remote_session_id": remote.remote_session_id,
-            "remote_status": remote.status,
-            "text": remote.text[:500],
+            "remote_session_id": getattr(remote, "remote_session_id", ""),
+            "remote_status": getattr(remote, "status", ""),
+            "text": (getattr(remote, "text", "") or "")[:500],
         }
 
     def prompt_remote(
@@ -291,16 +291,16 @@ class SessionBridge:
             return {"ok": False, "error": code, "message": str(e)}
         self._set_remote(
             incident_id,
-            remote_session_id=remote.remote_session_id,
-            status=remote.status or "active",
-            model=remote.model or "",
-            last_error=remote.last_error or "",
+            remote_session_id=getattr(remote, "remote_session_id", "") or rid,
+            status=getattr(remote, "status", "") or "active",
+            model=getattr(remote, "model", "") or "",
+            last_error=getattr(remote, "last_error", "") or "",
         )
         return {
             "ok": True,
-            "remote_session_id": remote.remote_session_id,
-            "text": remote.text[:2000],
-            "remote_status": remote.status,
+            "remote_session_id": getattr(remote, "remote_session_id", "") or rid,
+            "text": (getattr(remote, "text", "") or "")[:2000],
+            "remote_status": getattr(remote, "status", ""),
         }
 
     # ---- Prompt ----

@@ -45,6 +45,18 @@ DEFAULTS: dict[str, Any] = {
     # P4.0 总闸：旧自治后台链（AgentLoop / AutonomyEngine）默认关闭。
     # 仅显式开启才启动；Web 不能绕过本开关重新启用。
     "legacy_agent_loop": False,
+    # P4.3 无人值守只读调查（默认关；验收后可开）
+    "auto_investigate": {
+        "enabled": False,
+        "max_concurrent": 2,
+        "per_incident_concurrent": 1,
+        "timeout_sec": 300,
+        "max_rounds": 3,
+        "cooldown_sec": 60,
+        "mimo_model": "",
+        "mimo_bin": "mimo",
+        "lease_ttl_sec": 600,
+    },
     # 新自治 Agent 使用独立按量 API 凭据；不复用旧 LLM / Token Plan Key。
     "autonomous_agent": {"enabled": False, "budget_cny": 100.0},
     # Prometheus 配置管理（可选）：ssh_asset_id 为空则用本地目录
