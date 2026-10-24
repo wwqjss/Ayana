@@ -109,6 +109,7 @@ class TestMcpTools(unittest.TestCase):
                 "incident.close",
                 "knowledge.query",
                 "knowledge.get",
+                "knowledge.upsert",
                 "asset.list",
             },
         )
@@ -211,7 +212,7 @@ class TestMcpServer(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(init["result"]["serverInfo"]["name"], "ayana-mcp")
         lst = await srv.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-        self.assertEqual(len(lst["result"]["tools"]), 9)
+        self.assertEqual(len(lst["result"]["tools"]), 10)
         call = await srv.handle(
             {
                 "jsonrpc": "2.0",

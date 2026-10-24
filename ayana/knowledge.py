@@ -20,6 +20,8 @@ from typing import Any
 # type: system | issue | procedure
 VALID_STATUS = {"active", "draft", "deprecated", "historical", "invalid"}
 VALID_TYPE = {"system", "issue", "procedure", "note"}
+# verified: result=恢复已验证 | speculation=纯推测（不进自动上下文）| none=未标注
+VALID_VERIFIED = {"result", "speculation", "none"}
 # 仅 active 进入 Investigation 当前依据
 USABLE_STATUS = {"active"}
 
@@ -36,6 +38,11 @@ class KnowledgeDoc:
     path: str = ""
     hash: str = ""
     depends_on: list[str] = field(default_factory=list)
+    verified: str = "none"  # result | speculation | none
+    root_cause: str = ""  # 可 unknown；空=未记录
+    source_incident: str = ""
+    verified_at: str = ""
+    revision: int = 1
 
     def to_public(self) -> dict[str, Any]:
         return {
@@ -49,7 +56,16 @@ class KnowledgeDoc:
             "path": self.path,
             "hash": self.hash,
             "depends_on": list(self.depends_on),
+            "verified": self.verified,
+            "root_cause": self.root_cause,
+            "source_incident": self.source_incident,
+            "verified_at": self.verified_at,
+            "revision": self.revision,
         }
+
+    def usable_for_context(self) -> bool:
+        """active 且非纯推测，才可作为自动调查依据。"""
+        return self.status in USABLE_STATUS and self.verified != "speculation"
 
     def ref(self) -> dict[str, Any]:
         """Investigation 固定记录用：doc_id + hash + status。"""
@@ -151,6 +167,16 @@ def parse_doc(path: Path, text: str | None = None) -> KnowledgeDoc:
     depends = meta.get("depends_on") or meta.get("depends") or []
     if isinstance(depends, str):
         depends = [depends]
+    verified = str(meta.get("verified") or "none").lower()
+    if verified not in VALID_VERIFIED:
+        verified = "none"
+    root_cause = str(meta.get("root_cause") or "")
+    source_incident = str(meta.get("source_incident") or "")
+    verified_at = str(meta.get("verified_at") or "")
+    try:
+        revision = int(meta.get("revision") or 1)
+    except (TypeError, ValueError):
+        revision = 1
     return KnowledgeDoc(
         id=doc_id,
         title=title,
@@ -162,6 +188,11 @@ def parse_doc(path: Path, text: str | None = None) -> KnowledgeDoc:
         path=str(path),
         hash=hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16],
         depends_on=[str(x) for x in depends],
+        verified=verified,
+        root_cause=root_cause,
+        source_incident=source_incident,
+        verified_at=verified_at,
+        revision=max(1, revision),
     )
 
 
@@ -263,8 +294,8 @@ class KnowledgeBase:
         ]
         if include_inactive:
             return hits
-        # 仅 active 进入当前调查依据；draft/deprecated/historical/invalid 一律排除
-        return [d for d in hits if d.status in USABLE_STATUS]
+        # 仅 active 且非纯推测进入当前调查依据
+        return [d for d in hits if d.usable_for_context()]
 
     def docs_for_objects(
         self, pairs: list[tuple[str, str]], *, include_inactive: bool = False
@@ -378,3 +409,207 @@ class KnowledgeBase:
                 o.startswith(asset_id + ":") or o == asset_id for o in d.objects
             )
         ]
+
+    # ---- 写入 / 相似合并（SpeedSupreme P1）----
+
+    def _similarity(self, a: KnowledgeDoc, b: KnowledgeDoc) -> float:
+        """词面相似度：type + objects 交集 + tags 重叠 + 标题/首段词。0–1。"""
+        if a.type != b.type:
+            return 0.0
+        objs_a = {o.strip().lower() for o in a.objects if o.strip()}
+        objs_b = {o.strip().lower() for o in b.objects if o.strip()}
+        tags_a = {t.strip().lower() for t in a.tags if t.strip()}
+        tags_b = {t.strip().lower() for t in b.tags if t.strip()}
+        if not objs_a or not objs_b or not (objs_a & objs_b):
+            return 0.0
+        score = 0.35  # 同 type 且 objects 有交集
+        if tags_a & tags_b:
+            score += 0.25
+        words_a = _content_words(a.title + " " + a.body[:200])
+        words_b = _content_words(b.title + " " + b.body[:200])
+        if words_a and words_b:
+            overlap = len(words_a & words_b) / max(1, len(words_a | words_b))
+            score += 0.4 * overlap
+        return min(1.0, score)
+
+    def find_similar(
+        self, *, type: str, objects: list[str], tags: list[str], title: str, body: str = "",
+        threshold: float = 0.45,
+    ) -> KnowledgeDoc | None:
+        """找相似知识；无命中返回 None。阈值见 _similarity。"""
+        probe = KnowledgeDoc(
+            id="_probe_",
+            title=title,
+            type=type if type in VALID_TYPE else "issue",
+            objects=list(objects),
+            tags=list(tags),
+            body=body or title,
+        )
+        best: KnowledgeDoc | None = None
+        best_score = threshold
+        for d in self._docs:
+            if d.status in ("invalid",):
+                continue
+            s = self._similarity(probe, d)
+            if s >= best_score:
+                best_score = s
+                best = d
+        return best
+
+    def upsert(
+        self,
+        *,
+        title: str,
+        type: str = "issue",
+        objects: list[str] | None = None,
+        tags: list[str] | None = None,
+        body: str = "",
+        verified: str = "result",
+        root_cause: str = "",
+        source_incident: str = "",
+        verified_at: str = "",
+        status: str = "active",
+        doc_id: str = "",
+        change_note: str = "",
+        actor: str = "mcp_agent",
+    ) -> dict[str, Any]:
+        """自动积累：相似则更新 revision，否则新建。
+
+        verified=result 且 status=active 才是「已验证事实」；
+        verified=speculation 允许入库但不进自动上下文。
+        """
+        if not title or not title.strip():
+            raise ValueError("title required")
+        if verified not in VALID_VERIFIED:
+            raise ValueError("bad verified")
+        if status not in VALID_STATUS:
+            raise ValueError("bad status")
+        # 纯推测不得伪装成已验证
+        if verified == "speculation" and status == "active":
+            status = "draft"
+        objects = [str(o).strip() for o in (objects or []) if str(o).strip()]
+        tags = [str(t).strip() for t in (tags or []) if str(t).strip()]
+        body = (body or "").strip()
+        if verified == "result" and not root_cause:
+            root_cause = "unknown"
+
+        existing = self.get(doc_id) if doc_id else self.find_similar(
+            type=type, objects=objects, tags=tags, title=title, body=body
+        )
+        if existing:
+            new_tags = list(existing.tags)
+            for t in tags:
+                if t not in new_tags:
+                    new_tags.append(t)
+            new_objects = list(existing.objects)
+            for o in objects:
+                if o not in new_objects:
+                    new_objects.append(o)
+            new_body = body if body else existing.body
+            if change_note and body:
+                new_body = body.rstrip() + f"\n\n## 变更说明\n- {change_note}\n"
+            elif change_note:
+                new_body = existing.body.rstrip() + f"\n\n## 变更说明\n- {change_note}\n"
+            revision = existing.revision + 1
+            doc = KnowledgeDoc(
+                id=existing.id,
+                title=title.strip() or existing.title,
+                status=status,
+                type=existing.type,
+                objects=new_objects,
+                tags=new_tags,
+                body=new_body,
+                path=existing.path,
+                depends_on=list(existing.depends_on),
+                verified=verified,
+                root_cause=root_cause or existing.root_cause,
+                source_incident=source_incident or existing.source_incident,
+                verified_at=verified_at or existing.verified_at,
+                revision=revision,
+            )
+            action = "updated"
+        else:
+            slug = doc_id.strip() if doc_id.strip() else _slugify(type, objects, title)
+            doc = KnowledgeDoc(
+                id=slug,
+                title=title.strip(),
+                status=status,
+                type=type if type in VALID_TYPE else "issue",
+                objects=objects,
+                tags=tags,
+                body=body or f"## 现象 / 影响\n{title}\n",
+                path=str(self.root / f"{slug}.md"),
+                verified=verified,
+                root_cause=root_cause,
+                source_incident=source_incident,
+                verified_at=verified_at,
+                revision=1,
+            )
+            action = "created"
+
+        self._write_doc(doc, actor=actor)
+        self.reload()
+        return {
+            "ok": True,
+            "action": action,
+            "doc_id": doc.id,
+            "revision": doc.revision,
+            "path": doc.path,
+            "status": doc.status,
+            "verified": doc.verified,
+        }
+
+    def deprecate(self, doc_id: str, *, reason: str = "", actor: str = "mcp_agent") -> dict[str, Any]:
+        """错误/过时经验标记 deprecated，不再注入自动上下文。"""
+        doc = self.get(doc_id)
+        if not doc:
+            return {"ok": False, "error": "not_found", "doc_id": doc_id}
+        doc.status = "deprecated"
+        if reason:
+            doc.body = doc.body.rstrip() + f"\n\n## 变更说明\n- deprecated: {reason}\n"
+        self._write_doc(doc, actor=actor)
+        self.reload()
+        return {"ok": True, "action": "deprecated", "doc_id": doc.id, "revision": doc.revision}
+
+    def _write_doc(self, doc: KnowledgeDoc, *, actor: str = "") -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        path = self.root / f"{doc.id}.md"
+        path.write_text(format_doc(doc), encoding="utf-8")
+        doc.path = str(path)
+
+
+def _content_words(text: str) -> set[str]:
+    return {w for w in re.findall(r"[\w一-鿿]+", (text or "").lower()) if len(w) >= 2}
+
+
+def _slugify(typ: str, objects: list[str], title: str) -> str:
+    asset_obj = (objects[0] if objects else "general").replace(":", "-").replace("/", "-")
+    words = re.findall(r"[\w一-鿿]+", title.lower())[:4]
+    tail = "-".join(words) if words else "note"
+    slug = f"{typ}-{asset_obj}-{tail}"
+    slug = re.sub(r"[^a-z0-9一-鿿\-]+", "", slug).strip("-") or "knowledge"
+    return slug[:80]
+
+
+def format_doc(doc: KnowledgeDoc) -> str:
+    """按 HANDOFF 模板序列化 Markdown + front matter。"""
+    def _list(items: list[str]) -> str:
+        return "[" + ", ".join(items) + "]" if items else "[]"
+
+    fm = [
+        "---",
+        f"id: {doc.id}",
+        f"title: {doc.title}",
+        f"status: {doc.status}",
+        f"type: {doc.type}",
+        f"objects: {_list(doc.objects)}",
+        f"tags: {_list(doc.tags)}",
+        f"verified: {doc.verified}",
+        f"root_cause: {doc.root_cause or 'unknown'}",
+        f"source_incident: {doc.source_incident}",
+        f"verified_at: {doc.verified_at}",
+        f"revision: {doc.revision}",
+        "---",
+        "",
+    ]
+    return "\n".join(fm) + doc.body.strip() + "\n"

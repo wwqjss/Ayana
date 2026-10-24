@@ -160,6 +160,42 @@ TOOL_SPECS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "knowledge.upsert",
+        "description": (
+            "写入/更新知识（自动积累）。恢复已验证 → verified=result 且 status=active；"
+            "纯推测 → verified=speculation（不进自动上下文）。"
+            "相似条目自动合并并 revision+1，不重复建文档。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "type": {
+                    "type": "string",
+                    "enum": ["system", "issue", "procedure", "note"],
+                },
+                "objects": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "如 [kanata:mysql]",
+                },
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "body": {"type": "string", "description": "Markdown 正文"},
+                "verified": {
+                    "type": "string",
+                    "enum": ["result", "speculation", "none"],
+                    "description": "result=恢复已验证；speculation=纯推测",
+                },
+                "root_cause": {"type": "string", "description": "可 unknown"},
+                "source_incident": {"type": "string"},
+                "verified_at": {"type": "string", "description": "ISO8601"},
+                "doc_id": {"type": "string", "description": "指定更新已有文档"},
+                "change_note": {"type": "string", "description": "本次变更说明"},
+            },
+            "required": ["title", "objects"],
+        },
+    },
+    {
         "name": "asset.list",
         "description": "列出资产（id/名称/Prometheus 标签/启用状态）。",
         "inputSchema": {"type": "object", "properties": {}},
@@ -187,6 +223,7 @@ class OpsTools:
             "incident.close": self.incident_close,
             "knowledge.query": self.knowledge_query,
             "knowledge.get": self.knowledge_get,
+            "knowledge.upsert": self.knowledge_upsert,
             "asset.list": self.asset_list,
         }
         fn = handlers.get(name)
@@ -410,6 +447,37 @@ class OpsTools:
         if not doc:
             raise McpToolError("not_found", doc_id)
         return {"ok": True, "knowledge": doc.to_public()}
+
+    async def knowledge_upsert(self, args: dict[str, Any]) -> dict[str, Any]:
+        title = str(args.get("title") or "").strip()
+        objects = args.get("objects") or []
+        if isinstance(objects, str):
+            objects = [objects]
+        tags = args.get("tags") or []
+        if isinstance(tags, str):
+            tags = [tags]
+        if not title:
+            raise McpToolError("bad_request", "title required")
+        if not objects:
+            raise McpToolError("bad_request", "objects required")
+        verified = str(args.get("verified") or "result").lower()
+        try:
+            res = self.ctx.knowledge.upsert(
+                title=title,
+                type=str(args.get("type") or "issue"),
+                objects=[str(o) for o in objects],
+                tags=[str(t) for t in tags],
+                body=str(args.get("body") or ""),
+                verified=verified,
+                root_cause=str(args.get("root_cause") or ""),
+                source_incident=str(args.get("source_incident") or ""),
+                verified_at=str(args.get("verified_at") or ""),
+                doc_id=str(args.get("doc_id") or ""),
+                change_note=str(args.get("change_note") or ""),
+            )
+        except ValueError as e:
+            raise McpToolError("bad_request", str(e)) from e
+        return res
 
     # ---- asset ----
 
