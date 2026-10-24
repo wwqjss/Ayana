@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import logging
 import sys
 import threading
@@ -24,6 +25,7 @@ from .db import Database
 from .incidents import IncidentService
 from .knowledge import KnowledgeBase
 from .mcp_tools import McpToolError, OpsContext, OpsTools
+from .mimo_session import MimoSessionClient
 from .prom import PromClient
 from .session_bridge import SessionBridge
 from .transport import SSHAssetStore, SSHTransport
@@ -50,7 +52,13 @@ def build_ops_context(cfg: dict[str, Any]) -> OpsContext:
     creds = CredentialStore(db, master_key=cfg.get("ssh_credential_key") or "")
     ssh_store = SSHAssetStore(db)
     transport = SSHTransport(ssh_store, creds)
-    bridge = SessionBridge(db, knowledge=knowledge)
+    mimo = None
+    if os.environ.get("AYANA_MIMO_BIN") or os.environ.get("AYANA_MIMO_MODEL"):
+        mimo = MimoSessionClient(
+            mimo_bin=os.environ.get("AYANA_MIMO_BIN") or "mimo",
+            model=os.environ.get("AYANA_MIMO_MODEL") or "",
+        )
+    bridge = SessionBridge(db, knowledge=knowledge, mimo=mimo)
     incidents.session_bridge = bridge
     return OpsContext(
         transport=transport,

@@ -223,6 +223,22 @@ TOOL_SPECS: list[dict[str, Any]] = [
             "required": ["incident_id"],
         },
     },
+    {
+        "name": "session.remote",
+        "description": (
+            "把本地 Session 关联到 MiMo 远端会话并发起首轮调查 prompt。"
+            "已有存活远端则复用；失效则保留历史后新建（不伪装 resume）。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "incident_id": {"type": "string"},
+                "prompt": {"type": "string", "description": "首轮调查 prompt；空则用自动生成"},
+                "force_new": {"type": "boolean", "description": "强制新建远端会话"},
+            },
+            "required": ["incident_id"],
+        },
+    },
 ]
 
 
@@ -250,6 +266,7 @@ class OpsTools:
             "asset.list": self.asset_list,
             "session.get": self.session_get,
             "session.write_ops": self.session_write_ops,
+            "session.remote": self.session_remote,
         }
         fn = handlers.get(name)
         if not fn:
@@ -523,6 +540,24 @@ class OpsTools:
         if not inc_id:
             raise McpToolError("bad_request", "incident_id required")
         return {"ok": True, "write_ops": self._bridge().write_ops(inc_id)}
+
+    async def session_remote(self, args: dict[str, Any]) -> dict[str, Any]:
+        inc_id = str(args.get("incident_id") or "").strip()
+        if not inc_id:
+            raise McpToolError("bad_request", "incident_id required")
+        br = self._bridge()
+        force = bool(args.get("force_new"))
+        if force:
+            return br.attach_remote(inc_id, force_new=True)
+        prompt = str(args.get("prompt") or "").strip()
+        if prompt:
+            # 先确保存在远端，再追加 prompt
+            attached = br.attach_remote(inc_id)
+            if not attached.get("ok"):
+                return attached
+            sent = br.prompt_remote(inc_id, prompt)
+            return {**attached, "prompt_result": sent}
+        return br.attach_remote(inc_id)
 
     # ---- asset ----
 

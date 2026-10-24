@@ -18,17 +18,23 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from .db import new_id, now
 
 
 class SessionBridge:
-    """薄桥：映射、复用、幂等。无调度、无决策。"""
+    """薄桥：映射、复用、幂等。无调度、无决策。
 
-    def __init__(self, db: Any, knowledge: Any = None):
+    P3：本地 sess_* 为 Ayana 稳定标识；MiMo 远端 ses_* 单独记账。
+    远端失效只重建远端，不丢本地调查记录，也不重放写操作。
+    """
+
+    def __init__(self, db: Any, knowledge: Any = None, mimo: Any = None):
         self.db = db
         self.knowledge = knowledge
+        self.mimo = mimo  # MimoSessionClient | None
 
     # ---- 映射 / 会话 ----
 
@@ -52,7 +58,7 @@ class SessionBridge:
                         (int(generation), now(), incident_id),
                     )
                 existing = self.get_mapping(incident_id)
-            return {"ok": True, "action": "reused", **existing}
+            return {"ok": True, "action": "reused", **existing, **self._remote_fields(existing)}
 
         inc = self.db.query_one("SELECT * FROM incidents WHERE id=?", (incident_id,))
         if not inc:
@@ -82,9 +88,10 @@ class SessionBridge:
             # 并发下 UNIQUE 撞车 → 复用已有，保证单会话
             existing = self.get_mapping(incident_id)
             if existing:
-                return {"ok": True, "action": "reused", **existing}
+                return {"ok": True, "action": "reused", **existing, **self._remote_fields(existing)}
             raise
-        return {"ok": True, "action": "created", **self.get_mapping(incident_id)}
+        created = self.get_mapping(incident_id) or {}
+        return {"ok": True, "action": "created", **created, **self._remote_fields(created)}
 
     def close_session(self, incident_id: str, *, reason: str = "") -> dict[str, Any]:
         m = self.get_mapping(incident_id)
@@ -118,6 +125,182 @@ class SessionBridge:
                 "SELECT * FROM incident_session ORDER BY updated_at DESC LIMIT ?", (limit,)
             )
         return [dict(r) for r in rows]
+
+    # ---- MiMo 远端会话（P3）----
+
+    def _remote_fields(self, mapping: dict[str, Any]) -> dict[str, Any]:
+        history = mapping.get("remote_history") or "[]"
+        try:
+            hist = json.loads(history) if isinstance(history, str) else (history or [])
+        except Exception:
+            hist = []
+        return {
+            "remote_session_id": mapping.get("remote_session_id") or "",
+            "remote_status": mapping.get("remote_status") or "none",
+            "remote_model": mapping.get("remote_model") or "",
+            "remote_last_error": mapping.get("remote_last_error") or "",
+            "remote_history": hist,
+            "remote_updated_at": mapping.get("remote_updated_at") or 0,
+        }
+
+    def _set_remote(
+        self,
+        incident_id: str,
+        *,
+        remote_session_id: str = "",
+        status: str = "none",
+        model: str = "",
+        last_error: str = "",
+        keep_history: bool = True,
+    ) -> None:
+        m = self.get_mapping(incident_id)
+        if not m:
+            return
+        hist: list[dict[str, Any]] = []
+        if keep_history:
+            try:
+                hist = json.loads(m.get("remote_history") or "[]")
+            except Exception:
+                hist = []
+        old = m.get("remote_session_id") or ""
+        if old and old != remote_session_id:
+            hist.append({"id": old, "status": m.get("remote_status") or "", "at": now()})
+        # 只保留最近 10 条历史，且不含密钥
+        hist = hist[-10:]
+        with self.db.tx() as conn:
+            conn.execute(
+                "UPDATE incident_session SET remote_session_id=?, remote_status=?,"
+                " remote_model=?, remote_last_error=?, remote_history=?, remote_updated_at=?"
+                " WHERE incident_id=?",
+                (
+                    remote_session_id,
+                    status,
+                    model or "",
+                    (last_error or "")[:300],
+                    json.dumps(hist, ensure_ascii=False),
+                    now(),
+                    incident_id,
+                ),
+            )
+
+    def attach_remote(
+        self,
+        incident_id: str,
+        *,
+        title: str = "",
+        prompt: str = "",
+        force_new: bool = False,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """本地 Session 关联 MiMo 远端会话。
+
+        - 已有且存活 → 复用（重复告警/重启恢复）
+        - 远端失效/缺失 → 保留历史，受控新建（绝不假装 resume）
+        - mimo 未接入 → remote_status=none，不阻断事件主流程
+        prompt 可覆盖首轮内容（默认用自动生成的调查 prompt）。
+        """
+        m = self.ensure_session(incident_id)
+        if not m.get("ok"):
+            return m
+        base = {
+            "local_session_id": m.get("session_id"),
+            "incident_id": incident_id,
+        }
+        if self.mimo is None:
+            self._set_remote(incident_id, status="none")
+            return {**base, "ok": True, "action": "no_mimo", "remote_session_id": ""}
+
+        rid = m.get("remote_session_id") or ""
+        if rid and not force_new:
+            try:
+                alive = self.mimo.exists(rid)
+            except Exception as e:  # noqa: BLE001
+                self._set_remote(incident_id, remote_session_id=rid, status="error", last_error=str(e))
+                return {**base, "ok": False, "action": "probe_failed", "remote_session_id": rid, "error": str(e)}
+            if alive:
+                self._set_remote(incident_id, remote_session_id=rid, status="active", model=getattr(self.mimo, "model", ""))
+                return {**base, "ok": True, "action": "reused", "remote_session_id": rid}
+            # 远端失效：保留历史后新建
+            self._set_remote(incident_id, remote_session_id=rid, status="missing", last_error="remote missing")
+
+        prompt = (prompt or "").strip() or m.get("prompt") or self.build_prompt(incident_id)
+        title = title or f"inc:{incident_id}"
+        try:
+            remote = self.mimo.create(title=title, prompt=prompt, timeout=timeout)
+        except Exception as e:  # noqa: BLE001
+            code = getattr(e, "code", "error")
+            self._set_remote(
+                incident_id,
+                remote_session_id=rid,
+                status="timeout" if code == "timeout" else "error",
+                last_error=str(e),
+            )
+            return {
+                **base,
+                "ok": False,
+                "action": "create_failed",
+                "error": str(e),
+                "code": code,
+                "remote_session_id": rid,
+            }
+
+        self._set_remote(
+            incident_id,
+            remote_session_id=remote.remote_session_id,
+            status=remote.status or "active",
+            model=remote.model or "",
+            last_error=remote.last_error or "",
+        )
+        return {
+            **base,
+            "ok": True,
+            "action": "created",
+            "remote_session_id": remote.remote_session_id,
+            "remote_status": remote.status,
+            "text": remote.text[:500],
+        }
+
+    def prompt_remote(
+        self,
+        incident_id: str,
+        prompt: str,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """向已关联远端会话追加调查 prompt（不重放历史工具调用）。"""
+        m = self.get_mapping(incident_id)
+        if not m:
+            return {"ok": False, "error": "not_found"}
+        if self.mimo is None:
+            return {"ok": False, "error": "mimo_unavailable"}
+        rid = m.get("remote_session_id") or ""
+        if not rid:
+            attached = self.attach_remote(incident_id, timeout=timeout)
+            if not attached.get("ok"):
+                return attached
+            rid = attached.get("remote_session_id") or ""
+        try:
+            remote = self.mimo.resume(rid, prompt, timeout=timeout)
+        except Exception as e:  # noqa: BLE001
+            code = getattr(e, "code", "error")
+            if code == "session_missing":
+                self._set_remote(incident_id, remote_session_id=rid, status="missing", last_error=str(e))
+                return {"ok": False, "error": "session_missing", "remote_session_id": rid}
+            self._set_remote(incident_id, remote_session_id=rid, status="error", last_error=str(e))
+            return {"ok": False, "error": code, "message": str(e)}
+        self._set_remote(
+            incident_id,
+            remote_session_id=remote.remote_session_id,
+            status=remote.status or "active",
+            model=remote.model or "",
+            last_error=remote.last_error or "",
+        )
+        return {
+            "ok": True,
+            "remote_session_id": remote.remote_session_id,
+            "text": remote.text[:2000],
+            "remote_status": remote.status,
+        }
 
     # ---- Prompt ----
 
