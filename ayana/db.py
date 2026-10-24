@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 
 class MigrationError(RuntimeError):
@@ -916,6 +916,33 @@ CREATE TRIGGER IF NOT EXISTS council_grant_binding_immutable BEFORE UPDATE OF
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_council_step_action ON council_steps(action_id) WHERE action_id!=''")
 
 
+def _migrate_v17_incident_session(conn: sqlite3.Connection) -> None:
+    """Incident→Session 薄桥：映射 + 写操作幂等台账（SpeedSupreme P2）。"""
+    conn.executescript("""
+CREATE TABLE IF NOT EXISTS incident_session (
+  incident_id TEXT PRIMARY KEY,
+  generation INTEGER NOT NULL DEFAULT 1,
+  session_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  prompt TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_incident_session_sid ON incident_session(session_id);
+CREATE TABLE IF NOT EXISTS session_write_ops (
+  id TEXT PRIMARY KEY,
+  incident_id TEXT NOT NULL,
+  session_id TEXT NOT NULL DEFAULT '',
+  action_key TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'claimed',
+  result TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  UNIQUE(incident_id, action_key)
+);
+""")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_v1_baseline,
     2: _migrate_v2_p0_p1_columns,
@@ -933,6 +960,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     14: _migrate_v14_node_watch,
     15: _migrate_v15_ext_tasks,
     16: _migrate_v16_council,
+    17: _migrate_v17_incident_session,
 }
 
 _MIGRATION_NAMES = {
@@ -952,6 +980,7 @@ _MIGRATION_NAMES = {
     14: "node_watch",
     15: "ext_tasks",
     16: "council_plans_reviews_grants",
+    17: "incident_session_bridge",
 }
 
 

@@ -23,6 +23,7 @@ from .config import load_config
 from .controlled import ControlledExecutor
 from .db import Database, now
 from .incidents import IncidentService
+from .session_bridge import SessionBridge
 from .investigation import InvestigationService
 from .instance import acquire_single_instance_lock
 from .knowledge import KnowledgeBase
@@ -279,6 +280,9 @@ class App:
         except Exception as e:
             log.warning("load prometheus_url meta failed: %s", e)
         self.incidents = IncidentService(self.db)
+        # P2 薄桥：只做映射/复用/幂等，不做自动处置（旧自治仍禁用）
+        self.session_bridge = SessionBridge(self.db, knowledge=self.knowledge)
+        self.incidents.session_bridge = self.session_bridge
         # SSH：凭据加密 + 端点；有端点用原生 SSH，否则回落 NT（迁移期）
         self.creds = CredentialStore(self.db, master_key=cfg.get("ssh_credential_key") or "")
         self.ssh_store = SSHAssetStore(self.db)

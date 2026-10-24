@@ -20,6 +20,16 @@ RECURRENCE_WINDOW = 3600.0
 class IncidentService:
     def __init__(self, db: Database):
         self.db = db
+        self.session_bridge = None  # P2 薄桥，可选注入；不引入新自治
+
+    def _touch_session(self, inc_id: str, generation: int | None = None) -> None:
+        """挂上调查 Session（P2）。桥缺失/失败不影响事件主流程。"""
+        if not self.session_bridge or not inc_id:
+            return
+        try:
+            self.session_bridge.ensure_session(inc_id, generation=generation)
+        except Exception:
+            pass
 
     def upsert_from_episode(self, episode_id: str) -> str:
         ep = self.db.query_one("SELECT * FROM alert_episodes WHERE id=?", (episode_id,))
@@ -76,6 +86,7 @@ class IncidentService:
                 },
             )
             self._bind_event_episode(episode_id, inc_id)
+            self._touch_session(inc_id)
             return inc_id
         if chosen and chosen["status"] in ("resolved", "closed"):
             # 复发 → 新 generation
@@ -128,6 +139,7 @@ class IncidentService:
                      )),
                 )
             self._bind_event_episode(episode_id, inc_id)
+            self._touch_session(inc_id)
             return inc_id
         inc_id = new_id("inc")
         title = f"{asset_id or 'unknown'} / {object_id or alertname}: {alertname}"
@@ -157,6 +169,7 @@ class IncidentService:
                  )),
             )
         self._bind_event_episode(episode_id, inc_id)
+        self._touch_session(inc_id)
         return inc_id
 
     def _bind_event_episode(self, episode_id: str, inc_id: str) -> None:
@@ -307,9 +320,15 @@ class IncidentService:
             gen = int(row["generation"] if row else 1)
             conn.execute(
                 "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
-                (inc_id, now(), "generation_bumped", f"generation -> {gen}",
-                 json.dumps({"generation": gen})),
+                (
+                    inc_id,
+                    now(),
+                    "generation_bumped",
+                    f"generation={gen}",
+                    json.dumps({"generation": gen}, ensure_ascii=False),
+                ),
             )
+        self._touch_session(inc_id, generation=gen)
         return gen
 
     def close_manual(
@@ -341,7 +360,16 @@ class IncidentService:
                  json.dumps({"reason": reason, "outcome": "closed_unverified"}, ensure_ascii=False)),
             )
         self._cancel_pending_proposals(inc_id, "manual_close")
+        self._close_session_quiet(inc_id)
         return {"ok": True, "outcome": "closed_unverified"}
+
+    def _close_session_quiet(self, inc_id: str) -> None:
+        if not self.session_bridge:
+            return
+        try:
+            self.session_bridge.close_session(inc_id, reason="incident_closed")
+        except Exception:
+            pass
 
     def set_need_human(self, inc_id: str, reason: str) -> None:
         # 兼容旧字段，同时保存并行义务；一次新的等待批准不能覆盖别的人工任务。

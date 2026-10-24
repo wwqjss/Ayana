@@ -47,6 +47,7 @@ class OpsContext:
     knowledge: Any
     db: Any = None
     notifier: Any = None
+    session_bridge: Any = None
 
 
 TOOL_SPECS: list[dict[str, Any]] = [
@@ -200,6 +201,28 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "description": "列出资产（id/名称/Prometheus 标签/启用状态）。",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "session.get",
+        "description": "取 Incident 的调查 Session（映射/prompt）。无则自动创建（同 Incident 复用）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "incident_id": {"type": "string"},
+            },
+            "required": ["incident_id"],
+        },
+    },
+    {
+        "name": "session.write_ops",
+        "description": "查该 Incident 的写操作台账（防重复执行）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "incident_id": {"type": "string"},
+            },
+            "required": ["incident_id"],
+        },
+    },
 ]
 
 
@@ -225,6 +248,8 @@ class OpsTools:
             "knowledge.get": self.knowledge_get,
             "knowledge.upsert": self.knowledge_upsert,
             "asset.list": self.asset_list,
+            "session.get": self.session_get,
+            "session.write_ops": self.session_write_ops,
         }
         fn = handlers.get(name)
         if not fn:
@@ -478,6 +503,26 @@ class OpsTools:
         except ValueError as e:
             raise McpToolError("bad_request", str(e)) from e
         return res
+
+    # ---- session (P2 薄桥) ----
+
+    def _bridge(self):
+        br = getattr(self.ctx, "session_bridge", None)
+        if br is None:
+            raise McpToolError("unavailable", "session bridge not wired")
+        return br
+
+    async def session_get(self, args: dict[str, Any]) -> dict[str, Any]:
+        inc_id = str(args.get("incident_id") or "").strip()
+        if not inc_id:
+            raise McpToolError("bad_request", "incident_id required")
+        return self._bridge().ensure_session(inc_id)
+
+    async def session_write_ops(self, args: dict[str, Any]) -> dict[str, Any]:
+        inc_id = str(args.get("incident_id") or "").strip()
+        if not inc_id:
+            raise McpToolError("bad_request", "incident_id required")
+        return {"ok": True, "write_ops": self._bridge().write_ops(inc_id)}
 
     # ---- asset ----
 

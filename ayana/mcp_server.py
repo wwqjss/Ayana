@@ -25,6 +25,7 @@ from .incidents import IncidentService
 from .knowledge import KnowledgeBase
 from .mcp_tools import McpToolError, OpsContext, OpsTools
 from .prom import PromClient
+from .session_bridge import SessionBridge
 from .transport import SSHAssetStore, SSHTransport
 
 log = logging.getLogger("ayana.mcp")
@@ -49,12 +50,15 @@ def build_ops_context(cfg: dict[str, Any]) -> OpsContext:
     creds = CredentialStore(db, master_key=cfg.get("ssh_credential_key") or "")
     ssh_store = SSHAssetStore(db)
     transport = SSHTransport(ssh_store, creds)
+    bridge = SessionBridge(db, knowledge=knowledge)
+    incidents.session_bridge = bridge
     return OpsContext(
         transport=transport,
         prom=prom,
         incidents=incidents,
         knowledge=knowledge,
         db=db,
+        session_bridge=bridge,
     )
 
 
