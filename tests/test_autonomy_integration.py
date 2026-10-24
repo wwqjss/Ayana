@@ -27,7 +27,8 @@ class AutonomyIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.tmp.cleanup()
 
     def app(self, **config):
-        instance = App({**self.cfg, **config})
+        # P4.0：旧自治默认关闭；本文件测的是 legacy 路径，显式打开
+        instance = App({**self.cfg, "legacy_agent_loop": True, **config})
         self.apps.append(instance)
         return instance
 
@@ -153,6 +154,59 @@ class AutonomyIntegrationTests(unittest.IsolatedAsyncioTestCase):
         app.autonomy = SimpleNamespace(tick=AsyncMock(side_effect=RuntimeError("offline")))
         await app._run_autonomy_incident("inc1")
         app.autonomy.tick.assert_awaited_once_with("inc1")
+
+
+class LegacyDefaultOffTests(unittest.IsolatedAsyncioTestCase):
+    """P4.0：默认 legacy_agent_loop=false 时旧自治不得启动。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.cfg = {
+            "db_path": str(Path(self.tmp.name) / "app.db"),
+            "base_dir": self.tmp.name,
+            "onewbot_token": "test",
+            "webhook_token": "test",
+            "ssh_credential_key": "test",
+            "web_auth_pepper": "test",
+            "prometheus_config": {"local_dir": str(Path(self.tmp.name) / "prom")},
+        }
+        self.apps = []
+
+    def tearDown(self):
+        for app in self.apps:
+            app.db.close()
+        self.tmp.cleanup()
+
+    async def test_default_no_legacy_workers_or_autonomy(self):
+        app = App(self.cfg)
+        self.apps.append(app)
+        self.assertFalse(app.legacy_agent_loop)
+        self.assertIsNone(app.autonomy)
+        self.assertIsNone(app.council)
+        self.assertTrue(app.agent.legacy_locked)
+        self.assertFalse(app.agent.auto_enabled)
+        scheduled = []
+        def schedule(coro):
+            scheduled.append(coro.cr_code.co_name)
+            coro.close()
+            return Mock()
+        runner = SimpleNamespace(setup=AsyncMock(), cleanup=AsyncMock())
+        app.nodewatch = None
+        app._stop.set()
+        with patch("ayana.main.web.AppRunner", return_value=runner), \
+             patch("ayana.main.web.TCPSite", return_value=SimpleNamespace(start=AsyncMock())), \
+             patch.object(app.auth, "ensure_setup_initialized", return_value={"state": "closed"}), \
+             patch("ayana.main.asyncio.create_task", side_effect=schedule):
+            await app.start()
+        self.assertNotIn("_bg_agent", scheduled)
+        self.assertNotIn("_bg_autonomy", scheduled)
+        self.assertIn("_bg_reconcile", scheduled, "告警对账必须仍启动")
+
+    async def test_toggle_cannot_enable_when_legacy_off(self):
+        app = App(self.cfg)
+        self.apps.append(app)
+        app.agent.set_auto_enabled(True)
+        self.assertFalse(app.agent.auto_enabled)
 
 
 if __name__ == "__main__":

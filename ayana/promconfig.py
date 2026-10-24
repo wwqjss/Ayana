@@ -882,7 +882,17 @@ def _resolve_send_file(transport: Any):
 
 
 async def _retry_exec(transport: Any, asset_id: str, tokens: list[str], *, timeout: float = 20.0, tries: int = 3):
-    """SSH 偶发 kex reset：短重试。"""
+    """SSH 偶发 kex reset：仅对只读安全命令重试。
+
+    P4.2：写入类 tokens 一律单次执行，禁止盲重试导致双写；
+    timeout/结果未知的返回不得当作可重试失败。
+    """
+    from .msgentry import classify_command
+
+    cls = classify_command(list(tokens or []))
+    is_write = cls != "read"
+    if is_write:
+        tries = 1
     last = None
     for i in range(tries):
         try:

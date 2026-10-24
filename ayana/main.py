@@ -329,6 +329,8 @@ class App:
             verify_window=int(cfg.get("verify_window_sec", 90)),
             verify_timeout=int(cfg.get("verify_timeout_sec", 300)),
         )
+        # P4.2：ActionService 与 Session 桥共用写幂等台账
+        self.actions.write_ops = self.session_bridge
         self.notifier = Notifier(self.db, default_target="")
         self.alert_ingest = AlertIngest(self.db, incidents=self.incidents, notifier=self.notifier)
         self.notifier.set_default_target(
@@ -399,29 +401,44 @@ class App:
         # S22: 优先读持久化 auto 开关，回退配置默认值
         _auto_row = self.db.query_one("SELECT value FROM meta WHERE key='agent_auto_enabled'")
         _auto_persisted = _auto_row["value"] if _auto_row else None
+        # P4.0 总闸：legacy_agent_loop 关闭时，旧 AgentLoop 不得自动派发
+        _legacy = bool(cfg.get("legacy_agent_loop", False))
+        self.legacy_agent_loop = _legacy
+        _auto_want = (
+            _auto_persisted == "1" if _auto_persisted is not None
+            else bool(cfg.get("auto_remediation_enabled", False))
+        )
         self.agent = AgentLoop(
             self.db, self.investigation, self.actions, self.policy,
             self.llm, self.notifier,
-            auto_enabled=(
-                _auto_persisted == "1" if _auto_persisted is not None
-                else bool(cfg.get("auto_remediation_enabled", False))
-            ),
+            auto_enabled=bool(_legacy and _auto_want),
             knowledge=self.knowledge,
         )
+        self.agent.legacy_locked = not _legacy
+        if not _legacy and _auto_want:
+            log.warning(
+                "legacy_agent_loop disabled; ignoring agent_auto_enabled/auto_remediation_enabled"
+            )
         # Optional model configuration cannot prevent core monitoring startup.
         self.providers = self.council = self.autonomy = None
-        try:
-            self.providers = ProviderRegistry(self.db, cfg)
-            self.council = CouncilService(self.db, self.actions)
-            self.autonomy = AutonomyEngine(
-                self.db, self.investigation, self.actions, self.policy,
-                self.providers, self.council, self.notifier,
-                runbook_auto_enabled=lambda: self.agent.auto_enabled,
-            )
-        except Exception as exc:
-            # Do not echo configuration, provider responses or credentials.
-            log.warning("autonomy unavailable during initialization (%s); core services remain enabled", type(exc).__name__)
-            self.autonomy = None
+        if _legacy:
+            try:
+                self.providers = ProviderRegistry(self.db, cfg)
+                self.council = CouncilService(self.db, self.actions)
+                self.autonomy = AutonomyEngine(
+                    self.db, self.investigation, self.actions, self.policy,
+                    self.providers, self.council, self.notifier,
+                    runbook_auto_enabled=lambda: self.agent.auto_enabled,
+                )
+            except Exception as exc:
+                # Do not echo configuration, provider responses or credentials.
+                log.warning(
+                    "autonomy unavailable during initialization (%s); core services remain enabled",
+                    type(exc).__name__,
+                )
+                self.autonomy = None
+        else:
+            log.info("legacy_agent_loop disabled: old autonomy/council/agent loop not started")
         self.agent.autonomy_enabled = lambda: bool(self.autonomy is not None and self.autonomy.enabled)
         self.ob = OneBotServer(cfg["onewbot_token"], int(cfg.get("self_id") or 0))
         self.qq = QQBot(
@@ -657,13 +674,17 @@ class App:
                  self.cfg.get("ws_host"), self.cfg.get("ws_port"), self.cfg.get("ws_path"),
                  self.cfg.get("http_host"), self.cfg.get("http_port"))
 
-        # 后台：outbox、周期对账、事件关联、Agent
+        # 后台：outbox、周期对账、事件关联
         self._bg_tasks.append(asyncio.create_task(self._bg_outbox()))
         self._bg_tasks.append(asyncio.create_task(self._bg_reconcile()))
         self._bg_tasks.append(asyncio.create_task(self._bg_correlate()))
-        self._bg_tasks.append(asyncio.create_task(self._bg_agent()))
-        if self.autonomy is not None:
-            self._bg_tasks.append(asyncio.create_task(self._bg_autonomy()))
+        # P4.0：旧自治后台链默认不启动（legacy_agent_loop 显式开启才跑）
+        if self.legacy_agent_loop:
+            self._bg_tasks.append(asyncio.create_task(self._bg_agent()))
+            if self.autonomy is not None:
+                self._bg_tasks.append(asyncio.create_task(self._bg_autonomy()))
+        else:
+            log.info("skip legacy workers: _bg_agent/_bg_autonomy (legacy_agent_loop=false)")
 
         # 推送通道：QQ 走 OneBot；多渠道由 ChannelStore 路由
         async def _sender(target: str, body: str) -> bool:

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any
 
@@ -355,71 +356,232 @@ class SessionBridge:
             )
         return prompt
 
-    # ---- 写操作幂等 ----
+    # ---- 写操作幂等（P4.1：unknown 态 / 租约 / 原子 claim）----
 
-    def claim_write(self, incident_id: str, action_key: str) -> dict[str, Any]:
-        """占用一次写操作。已完成 → 不允许再执行；进行中 → single-flight 拒绝。"""
+    def make_action_key(
+        self,
+        target: str,
+        action: str,
+        params: dict[str, Any] | None = None,
+        *,
+        context: str = "",
+    ) -> str:
+        """规范化幂等键：绑定目标 + 动作 + 参数 + 上下文，非 Agent 随意字符串。"""
+        import hashlib
+
+        canonical = json.dumps(
+            {
+                "target": (target or "").strip(),
+                "action": (action or "").strip(),
+                "params": params or {},
+                "context": (context or "").strip(),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+        safe_target = re.sub(r"[^A-Za-z0-9._:-]", "_", (target or "t")[:32])
+        safe_action = re.sub(r"[^A-Za-z0-9._:-]", "_", (action or "a")[:32])
+        return f"{safe_target}:{safe_action}:{digest}"
+
+    def _lease_seconds(self) -> float:
+        return float(getattr(self, "lease_ttl_sec", 120.0))
+
+    def claim_write(
+        self,
+        incident_id: str,
+        action_key: str,
+        *,
+        target: str = "",
+        params: dict[str, Any] | None = None,
+        claimed_by: str = "",
+        retry_safe: bool = False,
+    ) -> dict[str, Any]:
+        """占用一次写操作。语义：
+
+        - claimed（租约有效）→ 拒绝（in_flight）
+        - claimed（租约过期）→ 置 unknown 并拒绝（租约过期 ≠ 未执行）
+        - done → 永久拒绝
+        - unknown → 拒绝（需人工核验）
+        - failed → 仅 retry_safe=True 才可再 claim
+        - released → 可再 claim
+        """
         if not incident_id or not action_key:
             raise ValueError("incident_id and action_key required")
         m = self.get_mapping(incident_id)
         sid = (m or {}).get("session_id") or ""
         t = now()
+        lease = t + self._lease_seconds()
+        params_hash = ""
+        if params:
+            import hashlib
+
+            params_hash = hashlib.sha256(
+                json.dumps(params, sort_keys=True, ensure_ascii=False, default=str).encode()
+            ).hexdigest()[:16]
+
         try:
             with self.db.tx() as conn:
                 conn.execute(
-                    "INSERT INTO session_write_ops(id, incident_id, session_id, action_key, status,"
-                    " result, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (new_id("wop"), incident_id, sid, action_key, "claimed", "", t, t),
+                    "INSERT INTO session_write_ops("
+                    " id, incident_id, session_id, action_key, status, result,"
+                    " created_at, updated_at, lease_expires_at, target, params_hash, claimed_by)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        new_id("wop"),
+                        incident_id,
+                        sid,
+                        action_key,
+                        "claimed",
+                        "",
+                        t,
+                        t,
+                        lease,
+                        (target or "")[:120],
+                        params_hash,
+                        (claimed_by or "")[:64],
+                    ),
                 )
             return {"ok": True, "claimed": True, "action_key": action_key, "already_done": False}
         except Exception:
-            row = self.db.query_one(
-                "SELECT * FROM session_write_ops WHERE incident_id=? AND action_key=?",
-                (incident_id, action_key),
-            )
-            if not row:
-                return {"ok": False, "error": "claim_failed", "action_key": action_key}
-            st = row["status"]
-            # released / failed 可再次 claim（失败重试）
-            if st in ("released", "failed"):
-                with self.db.tx() as conn:
-                    conn.execute(
-                        "UPDATE session_write_ops SET status='claimed', updated_at=?"
-                        " WHERE incident_id=? AND action_key=?",
-                        (now(), incident_id, action_key),
-                    )
-                return {"ok": True, "claimed": True, "action_key": action_key, "already_done": False, "retry": True}
+            pass
+
+        row = self.db.query_one(
+            "SELECT * FROM session_write_ops WHERE incident_id=? AND action_key=?",
+            (incident_id, action_key),
+        )
+        if not row:
+            return {"ok": False, "error": "claim_failed", "action_key": action_key}
+        st = row["status"] if "status" in row.keys() else ""
+        lease_exp = float(row["lease_expires_at"] or 0) if "lease_expires_at" in row.keys() else 0.0
+
+        if st == "done":
             return {
-                "ok": st != "done",
+                "ok": False,
                 "claimed": False,
-                "already_done": st == "done",
-                "in_flight": st == "claimed",
+                "already_done": True,
                 "action_key": action_key,
                 "status": st,
                 "result": row["result"] or "",
             }
+        if st == "unknown":
+            return {
+                "ok": False,
+                "claimed": False,
+                "already_done": False,
+                "unknown": True,
+                "action_key": action_key,
+                "status": st,
+                "result": row["result"] or "",
+            }
+        if st == "claimed":
+            if lease_exp >= t:
+                return {
+                    "ok": False,
+                    "claimed": False,
+                    "in_flight": True,
+                    "action_key": action_key,
+                    "status": st,
+                }
+            # 租约过期 ≠ 未执行：转入 unknown，禁止自动重放
+            with self.db.tx() as conn:
+                conn.execute(
+                    "UPDATE session_write_ops SET status='unknown', result=?, updated_at=?"
+                    " WHERE incident_id=? AND action_key=? AND status='claimed' AND lease_expires_at<?",
+                    ("lease_expired", now(), incident_id, action_key, t),
+                )
+            return {
+                "ok": False,
+                "claimed": False,
+                "unknown": True,
+                "action_key": action_key,
+                "status": "unknown",
+                "reason": "lease_expired",
+            }
+        if st == "failed" and not retry_safe:
+            return {
+                "ok": False,
+                "claimed": False,
+                "action_key": action_key,
+                "status": st,
+                "error": "retry_requires_confirmed_safe",
+            }
+
+        # released / failed(retry_safe)：原子条件更新，防并发双 claim
+        with self.db.tx() as conn:
+            cur = conn.execute(
+                "UPDATE session_write_ops SET status='claimed', updated_at=?, lease_expires_at=?,"
+                " claimed_by=? WHERE incident_id=? AND action_key=?"
+                " AND status IN ('released','failed')",
+                (now(), lease, (claimed_by or "")[:64], incident_id, action_key),
+            )
+            changed = cur.rowcount == 1
+        if changed:
+            return {"ok": True, "claimed": True, "action_key": action_key, "already_done": False, "retry": True}
+        # 竞态失败：再读一次
+        row2 = self.db.query_one(
+            "SELECT status, result FROM session_write_ops WHERE incident_id=? AND action_key=?",
+            (incident_id, action_key),
+        )
+        st2 = (row2["status"] if row2 else "") or ""
+        return {
+            "ok": False,
+            "claimed": False,
+            "in_flight": st2 == "claimed",
+            "already_done": st2 == "done",
+            "unknown": st2 == "unknown",
+            "action_key": action_key,
+            "status": st2,
+        }
 
     def complete_write(
         self, incident_id: str, action_key: str, *, ok: bool, result: str = ""
     ) -> dict[str, Any]:
+        """记录确定结果。ok=False 仅用于「已确认失败/未生效」。"""
         status = "done" if ok else "failed"
         with self.db.tx() as conn:
             conn.execute(
-                "UPDATE session_write_ops SET status=?, result=?, updated_at=?"
-                " WHERE incident_id=? AND action_key=?",
+                "UPDATE session_write_ops SET status=?, result=?, updated_at=?, lease_expires_at=0"
+                " WHERE incident_id=? AND action_key=? AND status='claimed'",
                 (status, (result or "")[:2000], now(), incident_id, action_key),
             )
         return {"ok": True, "status": status, "action_key": action_key}
 
-    def release_write(self, incident_id: str, action_key: str) -> dict[str, Any]:
-        """失败重试：释放 claimed/failed，允许再次 claim。done 不释放。"""
+    def mark_unknown(
+        self, incident_id: str, action_key: str, *, reason: str = "unknown_result"
+    ) -> dict[str, Any]:
+        """结果未知（超时/断连/进程异常）→ unknown，禁止自动重放。"""
         with self.db.tx() as conn:
             conn.execute(
-                "UPDATE session_write_ops SET status='released', updated_at=?"
+                "UPDATE session_write_ops SET status='unknown', result=?, updated_at=?, lease_expires_at=0"
                 " WHERE incident_id=? AND action_key=? AND status IN ('claimed','failed')",
-                (now(), incident_id, action_key),
+                (f"unknown:{(reason or '')[:180]}", now(), incident_id, action_key),
             )
-        return {"ok": True, "action_key": action_key}
+        return {"ok": True, "status": "unknown", "action_key": action_key}
+
+    def release_write(
+        self, incident_id: str, action_key: str, *, confirmed_safe: bool = False, reason: str = ""
+    ) -> dict[str, Any]:
+        """释放以允许重试。仅 confirmed_safe=True 才放行 failed/unknown 之外的重试窗口。"""
+        row = self.db.query_one(
+            "SELECT status FROM session_write_ops WHERE incident_id=? AND action_key=?",
+            (incident_id, action_key),
+        )
+        st = (row["status"] if row else "") or ""
+        if st == "done":
+            return {"ok": False, "error": "already_done", "action_key": action_key}
+        if st == "unknown" and not confirmed_safe:
+            return {"ok": False, "error": "unknown_requires_manual_verify", "action_key": action_key}
+        if st == "failed" and not confirmed_safe:
+            return {"ok": False, "error": "retry_requires_confirmed_safe", "action_key": action_key}
+        with self.db.tx() as conn:
+            conn.execute(
+                "UPDATE session_write_ops SET status='released', updated_at=?, result=?"
+                " WHERE incident_id=? AND action_key=? AND status IN ('claimed','failed','unknown')",
+                (now(), (reason or "released")[:200], incident_id, action_key),
+            )
+        return {"ok": True, "action_key": action_key, "status": "released"}
 
     def is_write_done(self, incident_id: str, action_key: str) -> bool:
         row = self.db.query_one(

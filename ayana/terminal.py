@@ -69,6 +69,9 @@ class TerminalSession:
         self.last_activity = time.time()
         self.closed = False
         self.close_reason = ""
+        # P4.2 会话审计：统计字节，不做逐键审批
+        self.bytes_in = 0
+        self.bytes_out = 0
         self._client: Any = None
         self._chan: Any = None
         self._lock = threading.Lock()
@@ -186,6 +189,7 @@ class TerminalSession:
         if not self._chan or self._chan.closed:
             raise TerminalError("session_closed")
         self._chan.sendall(data)
+        self.bytes_in = getattr(self, "bytes_in", 0) + len(data)
 
     def read(self, bufsize: int = 8192) -> bytes:
         # S03: 轮询读不刷新 idle，避免空闲会话永不超时
@@ -193,7 +197,9 @@ class TerminalSession:
             return b""
         try:
             if self._chan.recv_ready():
-                return self._chan.recv(bufsize)
+                data = self._chan.recv(bufsize)
+                self.bytes_out = getattr(self, "bytes_out", 0) + len(data or b"")
+                return data
         except Exception:
             pass
         return b""
@@ -372,6 +378,8 @@ class TerminalService:
                 "host": sess.host,
                 "reason": reason,
                 "duration_sec": int(time.time() - sess.created_at),
+                "bytes_in": getattr(sess, "bytes_in", 0),
+                "bytes_out": getattr(sess, "bytes_out", 0),
             },
             channel="web",
         )

@@ -45,8 +45,26 @@ class AgentLoop:
         self.auto_enabled = auto_enabled
         self.autonomy_enabled = lambda: False
         self.knowledge = knowledge or KnowledgeBase(db)
+        # P4.0：默认锁定旧自治自动执行；仅 legacy_agent_loop 显式开启才解锁
+        self.legacy_locked = True
 
     def set_auto_enabled(self, enabled: bool) -> None:
+        # P4.0：legacy 锁定时拒绝打开旧自动执行（关闭请求始终允许）
+        if enabled and getattr(self, "legacy_locked", True):
+            self.auto_enabled = False
+            try:
+                self.db.execute(
+                    "INSERT INTO meta(key, value) VALUES('agent_auto_enabled', ?)"
+                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    ("0",),
+                )
+                self.db.audit(
+                    "system", "agent", "auto_remediation_blocked_legacy_locked",
+                    detail={"requested": True},
+                )
+            except Exception:
+                pass
+            return
         self.auto_enabled = enabled
         # S22: 持久化到 meta，重启后不回退到配置默认值
         try:

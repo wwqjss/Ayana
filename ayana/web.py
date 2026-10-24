@@ -3284,6 +3284,12 @@ class WebApp:
         sess = self._require_admin(request)
         self._check_csrf(request, sess)
         body = await request.json()
+        # P4.2：远端认证变更必须显式确认，防止误触重复下发
+        if not body.get("confirm"):
+            return _json(
+                {"ok": False, "error": "confirm_required", "hint": "set confirm=true"},
+                400,
+            )
         try:
             res = await deploy_public_key(
                 host=body["host"],
@@ -3297,7 +3303,11 @@ class WebApp:
                 "web_user",
                 sess["username"],
                 "ssh_pubkey_deployed",
-                detail={"ok": res.get("ok"), "host": body.get("host")},
+                detail={
+                    "ok": res.get("ok"),
+                    "host": body.get("host"),
+                    "already_present": res.get("already_present", False),
+                },
             )
         except Exception as e:
             return _json({"ok": False, "error": str(e)}, 400)
@@ -3967,8 +3977,16 @@ class WebApp:
         enabled = bool(body.get("enabled"))
         if self.agent:
             self.agent.set_auto_enabled(enabled)
+        actual = bool(getattr(self.agent, "auto_enabled", False)) if self.agent else False
+        locked = bool(getattr(self.agent, "legacy_locked", True)) if self.agent else True
         self.db.audit("web_user", sess["username"], f"agent_auto_{enabled}")
-        return _json({"ok": True, "auto_enabled": enabled})
+        return _json({
+            "ok": True,
+            "auto_enabled": actual,
+            "requested": enabled,
+            "legacy_locked": locked,
+            "note": "legacy locked: cannot enable old auto path" if locked and enabled else "",
+        })
 
     async def api_agent_status(self, request: web.Request) -> web.Response:
         self._require_auth(request)

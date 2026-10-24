@@ -156,9 +156,11 @@ class TestSessionBridge(unittest.TestCase):
         self.bridge.claim_write("inc_1", "restart:frps")
         self.bridge.complete_write("inc_1", "restart:frps", ok=False, result="timeout")
         self.assertFalse(self.bridge.is_write_done("inc_1", "restart:frps"))
-        # 失败可重试：释放后再次 claim
-        self.bridge.release_write("inc_1", "restart:frps")
-        c = self.bridge.claim_write("inc_1", "restart:frps")
+        # P4.1：failed 默认不自动重试；确认安全后才可 release+re-claim
+        blocked = self.bridge.claim_write("inc_1", "restart:frps")
+        self.assertFalse(blocked["claimed"])
+        self.bridge.release_write("inc_1", "restart:frps", confirmed_safe=True, reason="verified not applied")
+        c = self.bridge.claim_write("inc_1", "restart:frps", retry_safe=True)
         self.assertTrue(c["claimed"])
         self.bridge.complete_write("inc_1", "restart:frps", ok=True, result="ok")
         self.assertTrue(self.bridge.is_write_done("inc_1", "restart:frps"))

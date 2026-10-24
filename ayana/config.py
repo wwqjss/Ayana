@@ -42,6 +42,9 @@ DEFAULTS: dict[str, Any] = {
     "verify_timeout_sec": 300,
     "action_ttl_sec": 1800,
     "auto_remediation_enabled": False,
+    # P4.0 总闸：旧自治后台链（AgentLoop / AutonomyEngine）默认关闭。
+    # 仅显式开启才启动；Web 不能绕过本开关重新启用。
+    "legacy_agent_loop": False,
     # 新自治 Agent 使用独立按量 API 凭据；不复用旧 LLM / Token Plan Key。
     "autonomous_agent": {"enabled": False, "budget_cny": 100.0},
     # Prometheus 配置管理（可选）：ssh_asset_id 为空则用本地目录

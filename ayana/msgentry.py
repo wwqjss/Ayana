@@ -313,3 +313,87 @@ def usage_hint_for_controlled() -> str:
         f"写示例: -c {PH_HOST} systemctl restart {PH_CMD}\n"
         f"写操作需审批。"
     )
+
+
+# ---- P4.2: shell 行级读写分类（exec_shell 用）----
+
+_SHELL_WRITE_TOKENS = frozenset({
+    "rm", "mv", "cp", "install", "chmod", "chown", "chgrp", "truncate", "dd",
+    "mkfs", "fdisk", "parted", "mount", "umount", "systemctl", "service",
+    "kill", "killall", "pkill", "reboot", "shutdown", "poweroff", "halt",
+    "useradd", "userdel", "usermod", "groupadd", "passwd", "visudo",
+    "iptables", "nft", "ufw", "sysctl", "modprobe", "insmod", "rmmod",
+    "docker", "podman", "crontab", "timedatectl", "hostnamectl",
+    "update-alternatives", "alternatives", "swapoff", "swapon",
+})
+
+_SHELL_WRITE_VERBS = frozenset({
+    "restart", "start", "stop", "reload", "enable", "disable", "mask", "unmask",
+    "reset-failed", "kill", "isolate", "daemon-reload", "edit",
+    "pull", "push", "rm", "rmi", "run", "create", "update", "start", "stop",
+    "restart", "kill", "exec", "cp", "mv", "rename",
+})
+
+_SHELL_WRITE_HINTS = re.compile(
+    r"(?:^|[\s;|&])(?:rm|mv|cp|install|chmod|chown|dd|mkfs|mount|umount|"
+    r"useradd|userdel|usermod|passwd|reboot|shutdown|kill|killall|pkill|"
+    r"systemctl\s+(?:restart|start|stop|reload|enable|disable|mask|unmask|reset-failed)|"
+    r"service\s+\S+\s+(?:restart|start|stop|reload)|"
+    r"docker\s+(?:rm|rmi|run|start|stop|restart|exec|pull|push|create)|"
+    r"crontab|iptables|ufw\s+|sysctl\s+-w|tee\s+|>>?|"
+    r"echo\s+.*>>?|cat\s+.*>>?|sed\s+-i|perl\s+-pi|python3?\s+-c)",
+    re.IGNORECASE,
+)
+
+
+def classify_shell_command(command: str) -> str:
+    """对任意 shell 命令行做 read|write|unknown 三态分类。
+
+    - 含重定向/管道副作用/写动词 → write
+    - 明确只读常见命令 → read
+    - 其余 → unknown（默认按写处理，禁止经 read 通道偷跑）
+    """
+    if not isinstance(command, str) or not command.strip():
+        return "unknown"
+    # 结构性写特征：重定向到文件、追加、in-place 编辑
+    if re.search(r"(?:^|[^>])>>?|sed\s+-i|tee\s+|crontab\s+-", command):
+        return "write"
+    if _SHELL_WRITE_HINTS.search(command):
+        return "write"
+    first = re.split(r"\s+", command.strip(), maxsplit=1)[0]
+    # 去掉可能的 sudo/env 前缀
+    parts = re.split(r"\s+", command.strip())
+    i = 0
+    while i < len(parts) and parts[i] in ("sudo", "env", "command", "nice", "ionice", "stdbuf"):
+        i += 1
+    if i < len(parts):
+        prog = parts[i]
+        rest = parts[i + 1:]
+        if prog in _SHELL_WRITE_VERBS:
+            return "write"
+        if prog in _SHELL_WRITE_TOKENS and rest:
+            verb = rest[0].lower().lstrip("-")
+            # systemctl/docker 等：动词是写则 write
+            if verb in _SHELL_WRITE_VERBS or prog in ("reboot", "shutdown", "poweroff", "halt", "swapoff", "swapon"):
+                return "write"
+            if prog in ("rm", "mv", "cp", "chmod", "chown", "dd", "install", "mkfs", "mount", "umount", "kill", "killall", "pkill", "useradd", "userdel", "usermod", "passwd", "crontab"):
+                return "write"
+        if prog in (
+            "uptime", "date", "hostname", "uname", "whoami", "id", "pwd",
+            "ls", "cat", "head", "tail", "grep", "egrep", "fgrep", "wc",
+            "ps", "top", "df", "du", "free", "ss", "netstat", "ip", "ifconfig",
+            "systemctl", "journalctl", "dmesg", "env", "printenv", "which",
+            "stat", "file", "lsof", "dig", "ping", "traceroute", "curl", "wget",
+            "test", "true", "false", "echo", "printf", "sha256sum", "md5sum",
+        ):
+            # systemctl 非写动词 → read；其它白名单 → read
+            if prog == "systemctl" and rest:
+                verb = rest[0].lower()
+                if verb in _SHELL_WRITE_VERBS:
+                    return "write"
+                if verb in ("status", "is-active", "is-enabled", "is-failed", "show", "list-units", "list-timers", "cat", "list-unit-files", "show-property"):
+                    return "read"
+                return "unknown"
+            return "read"
+        return "unknown"
+    return "unknown"

@@ -145,6 +145,8 @@ class ActionService:
         self.verify_window = verify_window
         self.verify_timeout = verify_timeout
         self._exec_lock = asyncio.Lock()
+        # P4.2：可选幂等台账（SessionBridge）；未注入则退化为仅 FSM 防重放
+        self.write_ops = None
 
     async def _write_channel(self, asset_id: str, tokens: list[str], timeout: float | None = None):
         """写通道：仅原生 SSH。NT 已移除。"""
@@ -1337,6 +1339,33 @@ class ActionService:
             IncidentService(self.db).reconcile(row["incident_id"], resolution_basis="action_dispatched")
 
         # 网络：真正执行。S14: Transport 异常须收敛，不能卡在 dispatched
+        wo_key = ""
+        wo_incident = row.get("incident_id") or "_action_"
+        if self.write_ops is not None:
+            try:
+                wo_key = self.write_ops.make_action_key(
+                    row["asset_id"],
+                    "action_dispatch",
+                    {
+                        "action_id": action_id,
+                        "tokens": list(tokens or []),
+                        "object_id": row.get("object_id") or "",
+                    },
+                    context="actions.execute",
+                )
+                claim = self.write_ops.claim_write(
+                    wo_incident,
+                    wo_key,
+                    target=row["asset_id"],
+                    params={"action_id": action_id, "tokens": list(tokens or [])[:20]},
+                    claimed_by=f"{actor_type}:{actor_id}",
+                )
+                if not claim.get("claimed"):
+                    raise ActionError("no_replay", f"write_ops:{claim.get('status')}")
+            except ActionError:
+                raise
+            except Exception:
+                wo_key = ""
         try:
             res = await self._write_channel(row["asset_id"], tokens, timeout=15.0)
             state, detail = classify_exec_result(res)
@@ -1345,6 +1374,16 @@ class ActionService:
             log.exception("action write_channel failed")
             state, detail = "unknown", f"exec_exception:{str(e)[:120]}"
             res = None
+        if self.write_ops is not None and wo_key:
+            try:
+                if state == "unknown":
+                    self.write_ops.mark_unknown(wo_incident, wo_key, reason=detail or "unknown")
+                else:
+                    self.write_ops.complete_write(
+                        wo_incident, wo_key, ok=(state == "success"), result=(detail or "")[:500]
+                    )
+            except Exception:
+                pass
 
         # ---- 同事务提交：结果 + 审计 + 验证义务/人工 + 事件 ----
         finished_at = now()

@@ -283,6 +283,8 @@ class OpsTools:
     # ---- host ----
 
     async def host_exec(self, args: dict[str, Any]) -> dict[str, Any]:
+        from .msgentry import classify_shell_command
+
         asset_id = str(args.get("asset_id") or "").strip()
         command = args.get("command")
         if not asset_id:
@@ -297,10 +299,117 @@ class OpsTools:
             timeout_f = float(timeout) if timeout is not None else None
         except (TypeError, ValueError) as e:
             raise McpToolError("bad_request", "timeout_sec must be a number") from e
+
+        cls = classify_shell_command(command)
+        # read 通道不得跑写/未知命令，防 shell 包装绕过
+        if channel == "read" and cls != "read":
+            raise McpToolError(
+                "write_not_allowed_on_read_channel",
+                f"classified={cls}; use channel=write for controlled execution",
+            )
+        # write 通道或未知类别的写 → 受控执行（台账+审计+unknown 语义）
+        if channel == "write" or cls != "read":
+            return await self._controlled_write(
+                asset_id=asset_id,
+                command=command,
+                timeout=timeout_f,
+                channel=channel,
+                classified=cls,
+            )
         res = await self.ctx.transport.exec_shell(
-            asset_id, command, timeout_f, channel=channel
+            asset_id, command, timeout_f, channel="read"
         )
-        return _result_payload(res)
+        return {**_result_payload(res), "classified": "read"}
+
+    async def _controlled_write(
+        self,
+        *,
+        asset_id: str,
+        command: str,
+        timeout: float | None,
+        channel: str,
+        classified: str,
+    ) -> dict[str, Any]:
+        """统一受控写：claim → 执行 → 确定结果/unknown → 审计。"""
+        from .actions import classify_exec_result
+
+        br = getattr(self.ctx, "session_bridge", None)
+        # 无 Incident 的 ad-hoc 写归入 _mcp_ 命名空间，保证幂等键唯一
+        incident_id = str(getattr(self.ctx, "mcp_incident_scope", "") or "_mcp_")
+        action_key = ""
+        if br is not None:
+            try:
+                action_key = br.make_action_key(
+                    asset_id,
+                    "exec_shell",
+                    {"command": command, "channel": channel, "classified": classified},
+                    context="mcp-host-exec",
+                )
+                claim = br.claim_write(
+                    incident_id,
+                    action_key,
+                    target=asset_id,
+                    params={"command": command[:200], "channel": channel},
+                    claimed_by="mcp_agent",
+                )
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "error": "claim_failed", "message": str(e)}
+            if not claim.get("claimed"):
+                return {
+                    "ok": False,
+                    "error": "idempotent_block",
+                    "detail": claim,
+                    "action_key": action_key,
+                }
+        try:
+            res = await self.ctx.transport.exec_shell(
+                asset_id, command, timeout, channel=channel
+            )
+        except Exception as e:  # noqa: BLE001
+            if br is not None and action_key:
+                br.mark_unknown(incident_id, action_key, reason=f"exception:{type(e).__name__}")
+            self._audit_write(asset_id, command, "unknown", str(e)[:200])
+            return {"ok": False, "error": "exec_error", "message": str(e), "action_key": action_key}
+
+        state, detail = classify_exec_result(res)
+        if br is not None and action_key:
+            if state == "unknown":
+                br.mark_unknown(incident_id, action_key, reason=detail or "unknown")
+            else:
+                br.complete_write(
+                    incident_id,
+                    action_key,
+                    ok=(state == "success"),
+                    result=(detail or "")[:500],
+                )
+        self._audit_write(asset_id, command, state, (detail or "")[:200])
+        return {
+            **_result_payload(res),
+            "classified": classified,
+            "exec_state": state,
+            "action_key": action_key,
+            "idempotent_incident": incident_id,
+        }
+
+    def _audit_write(self, asset_id: str, command: str, state: str, result: str) -> None:
+        db = getattr(self.ctx, "db", None)
+        if db is None:
+            return
+        try:
+            db.audit(
+                "agent",
+                "mcp_agent",
+                "mcp_host_exec_write",
+                asset_id=asset_id,
+                detail={
+                    "command": command[:300],
+                    "state": state,
+                    "result": result[:200],
+                },
+                channel="mcp",
+            )
+        except Exception:
+            pass
 
     # ---- metrics ----
 

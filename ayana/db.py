@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 
 class MigrationError(RuntimeError):
@@ -959,6 +959,20 @@ def _migrate_v18_mimo_remote_session(conn: sqlite3.Connection) -> None:
             pass  # 列已存在（幂等重放）
 
 
+def _migrate_v19_write_ops_unknown_lease(conn: sqlite3.Connection) -> None:
+    """写操作台账：unknown 态 + 租约 + 幂等键上下文（P4.1）。"""
+    for ddl in (
+        "ALTER TABLE session_write_ops ADD COLUMN lease_expires_at REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE session_write_ops ADD COLUMN target TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE session_write_ops ADD COLUMN params_hash TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE session_write_ops ADD COLUMN claimed_by TEXT NOT NULL DEFAULT ''",
+    ):
+        try:
+            conn.execute(ddl)
+        except Exception:
+            pass
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_v1_baseline,
     2: _migrate_v2_p0_p1_columns,
@@ -978,6 +992,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     16: _migrate_v16_council,
     17: _migrate_v17_incident_session,
     18: _migrate_v18_mimo_remote_session,
+    19: _migrate_v19_write_ops_unknown_lease,
 }
 
 _MIGRATION_NAMES = {
@@ -999,6 +1014,7 @@ _MIGRATION_NAMES = {
     16: "council_plans_reviews_grants",
     17: "incident_session_bridge",
     18: "mimo_remote_session",
+    19: "write_ops_unknown_lease",
 }
 
 
