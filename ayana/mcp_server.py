@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -127,19 +128,27 @@ class McpStdioServer:
         return _error(mid, -32601, f"method not found: {method}")
 
     async def run_stdio(self) -> None:
+        # 用线程读行再投递，兼容 pipe / 重定向文件（connect_read_pipe 只吃真管道）
         loop = asyncio.get_running_loop()
-        reader = asyncio.StreamReader()
-        protocol = asyncio.StreamReaderProtocol(reader)
-        await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        def _reader() -> None:
+            try:
+                for raw in sys.stdin:
+                    loop.call_soon_threadsafe(queue.put_nowait, raw)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        threading.Thread(target=_reader, daemon=True).start()
         while True:
-            line = await reader.readline()
-            if not line:
+            line = await queue.get()
+            if line is None:
                 break
             line = line.strip()
             if not line:
                 continue
             try:
-                msg = json.loads(line.decode("utf-8"))
+                msg = json.loads(line)
             except Exception:
                 continue
             if not isinstance(msg, dict):
