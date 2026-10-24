@@ -57,20 +57,29 @@ flowchart TD
 
 ## 2. 写操作入口与安全检查矩阵
 
-| 入口 | 链 | Policy | 审批 | 审计 | session_write_ops | 备注 |
-|------|----|--------|------|------|-------------------|------|
-| Web `/api/actions/{id}/execute` | `api_action_execute`→`ActionService.execute` | 可选 | **是** | **是** | **否** | [代码已证实] `web.py:215` |
-| AgentLoop `_auto_dispatch` | 仅 `auto_enabled` | 是 | 视 rule | 是 | **否** | [代码已证实] `agent.py:407` |
-| Autonomy `execute_grant` | `_bg_autonomy` | 是 | 双席/人工 | 是 | **否** | [代码已证实] `council.py:424` |
-| MCP `host.exec` | `exec_shell` | **否** | **否** | 部分 | **否** | [代码已证实] `mcp_tools.py:300` — 权限=SSH 账号 |
-| promconfig 安装/控制 | 多处 `transport.exec` | 否 | 否 | 部分 | **否** | [代码已证实] `promconfig.py:1657-2160`；`_retry_exec` **盲重试×3** `:884-893` |
-| terminal.py / nodewatch / checks | probe 为主 | — | — | — | 否 | [代码已证实] |
-| `send_file` | `transport.send_file` | 否 | 否 | 否 | 否 | [代码已证实] `transport.py:654` |
+全部远程写最终经 `SSHTransport`（`transport.py:486/489/492/654`）或 `LocalExecTransport`（`promconfig.py:2481`）。Transport 只做 host key + token 消毒，**本身不含 policy/审批/审计**。[代码已证实]
+
+| 入口 | 链 | Policy | 审批 | 审计 | write_ops | 备注 |
+|------|----|--------|------|------|-----------|------|
+| `POST /api/actions/*` | web→`propose/execute`→`_write_channel`→`exec` | **Y**（:1126 重检） | **Y**（state+TTL） | **Y** | **N** | 金路径 [代码已证实] `actions.py:159,973` |
+| Agent 自动派发 | `agent.py:467`→execute | Y | auto-approve | Y | **N** | `unknown` 卡住时阻断 |
+| Council reviewed | `council.py:456`→execute | Y | grant 一次性 | Y | **N** | 待删 |
+| 聊天写命令 | `controlled.py:249`→propose | Y :226 | Y 人工 | Y | **N** | 不直写 |
+| **MCP `host.exec`** | `mcp_tools.py:300`→`exec_shell` | **N** | **N** | **N** | **N** | **最高风险**：通用写口 |
+| `/ws/terminal` 交互 | `terminal.py:234` `TerminalSession.write` | Y `shell.interactive` | N | 仅 open | **N** | **逐键写未审计** |
+| promconfig node 安装/控制 | `promconfig.py:2035,1785`→`exec/send_file` | Y `node_exporter.manage` | 需审批则硬阻断 | Y | **N** | 绕过 ActionService |
+| promconfig 规则/目标/回滚 | `exec` 改远端文件 :652,670 | Y `promconfig.write` | no_approval | Y | **N** | admin |
+| `deploy_public_key` | `credentials.py:111` 改 authorized_keys | admin | N | Y | **N** | 远端认证变更 |
+| SSH/通道测试 | `test_connection` | admin | N | Y | **N** | 跑 `true`/hostname |
+| checks/investigation | `probe` | Y 只读 | N | Y | N | 只读 |
+| `send_file` | `transport.py:654` | 否 | 否 | 否 | 否 | node_exporter 安装用 |
+
+**Web 远程写路由**（节选）：`/api/actions/{id}/execute|approve|decision`、`/api/promconfig/node-exporter/*|install|adopt`、`/api/promconfig/rules/*|rollback|targets*`、`/api/ssh/test`、`/api/assets/{id}/test`、`/api/ssh/credentials/deploy-pubkey`、`/api/ssh/switch-to-key`、`/ws/terminal`、`/api/ssh/endpoints/trust`。[代码已证实]
 
 **要点**
 1. `session_write_ops` 目前是**台账接口**，**未强制覆盖任何执行路径**。[代码已证实]
-2. ActionService 自带 FSM 防重放：`unknown/dispatched/success/…` 拒重放（`actions.py:57,1011-1013`）。[代码已证实]
-3. MCP `host.exec` 是**通用写口**，安全边界=SSH 账号+host key，无 claim_write。[代码已证实]
+2. ActionService FSM 防重放：`unknown/dispatched/success/…` 拒重放（`actions.py:57,1011-1013`）。[代码已证实]
+3. MCP `host.exec`、terminal 逐键写、promconfig、deploy-pubkey **均绕过 ActionService**，无 claim_write。[代码已证实]
 
 ---
 
@@ -122,9 +131,10 @@ flowchart TD
 | 3 | **高** | `claim_write` 重试竞态：`released/failed`→claimed 的 UPDATE **无状态谓词**，并发双 claim | `session_bridge.py:385-390` | [代码已证实] |
 | 4 | **中** | ActionService / MCP `host.exec` / promconfig **都不走** `claim_write`，台账是装饰 | `actions.py:973+` `mcp_tools.py:300` | [代码已证实] |
 | 5 | **中** | 重启后 `claimed` 无人释放 → 永久卡住，或手动 release 后重放可能已成功的写 | `session_bridge.py:372`；重启路径 `main.py:606` 不处理 | [代码已证实] |
-| 6 | **中** | MCP `host.exec` 无幂等键；MiMo 断线重试可重复写 | `mcp_tools.py:300` | [代码已证实] |
-| 7 | **低** | `claimed` 无租约/TTL | `session_bridge.py:372` | [代码已证实] |
-| 8 | **低** | ActionService FSM 本身健全：timeout/SSH 断→`unknown`、`no_replay_unknown`、重启 `dispatched→unknown` | `actions.py:2077,1011,1833` | [代码已证实] |
+| 6 | **中** | MCP `host.exec` 无幂等键/无审批/无审计；MiMo 断线重试可重复写 | `mcp_tools.py:300` | [代码已证实] |
+| 7 | **中** | terminal 逐键写、deploy-pubkey、promconfig 绕过 ActionService 的 no-replay/对象锁 | `terminal.py:234` `credentials.py:111` | [代码已证实] |
+| 8 | **低** | `claimed` 无租约/TTL | `session_bridge.py:372` | [代码已证实] |
+| 9 | **低** | ActionService FSM 本身健全：timeout/SSH 断→`unknown`、`no_replay_unknown`、重启 `dispatched→unknown` | `actions.py:2077,1011,1833` | [代码已证实] |
 
 **红线**：执行结果 **unknown ≠ failure**。禁止未核验状态就重放可能已成功的写。  
 ActionService 已遵守；`session_write_ops` **尚未遵守**。[代码已证实]
