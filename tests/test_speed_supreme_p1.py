@@ -78,6 +78,39 @@ class TestKnowledgeUpsert(unittest.TestCase):
         self.assertFalse(doc.usable_for_context())
         self.assertNotIn(doc, self.kb.docs_for_object("kanata", "mysql"))
 
+    def test_speculation_cannot_pollute_verified_fact(self):
+        """推测不得合并进 verified=result 条目并把它降级。"""
+        created = self.kb.upsert(
+            title="frps TargetDown recovery",
+            type="issue",
+            objects=["nerv:frps"],
+            tags=["frps"],
+            body="restart + probe_success=1 on 32659",
+            verified="result",
+            root_cause="unknown",
+        )
+        polluted = self.kb.upsert(
+            title="frps 端口是 7000/7500",
+            type="issue",
+            objects=["nerv:frps"],
+            tags=["frps"],
+            body="猜测 7000/7500，未验证",
+            verified="speculation",
+        )
+        self.assertEqual(polluted["action"], "created", "推测必须另立稿，不得 merged")
+        self.assertNotEqual(polluted["doc_id"], created["doc_id"])
+        fact = self.kb.get(created["doc_id"])
+        self.assertEqual(fact.verified, "result")
+        self.assertEqual(fact.status, "active")
+        self.assertEqual(fact.revision, 1)
+        self.assertTrue(fact.usable_for_context())
+        guess = self.kb.get(polluted["doc_id"])
+        self.assertEqual(guess.verified, "speculation")
+        self.assertFalse(guess.usable_for_context())
+        ctx_ids = [d.id for d in self.kb.docs_for_object("nerv", "frps")]
+        self.assertIn(created["doc_id"], ctx_ids)
+        self.assertNotIn(polluted["doc_id"], ctx_ids)
+
     def test_similar_merges_revision(self):
         self.kb.upsert(
             title="MySQL replica lag",

@@ -496,6 +496,15 @@ class KnowledgeBase:
         existing = self.get(doc_id) if doc_id else self.find_similar(
             type=type, objects=objects, tags=tags, title=title, body=body
         )
+        # 推测不得覆盖/降级已验证事实：另立稿，保持 verified=result 不动
+        if (
+            existing
+            and existing.verified == "result"
+            and verified == "speculation"
+            and not doc_id
+        ):
+            existing = None
+
         if existing:
             new_tags = list(existing.tags)
             for t in tags:
@@ -511,17 +520,23 @@ class KnowledgeBase:
             elif change_note:
                 new_body = existing.body.rstrip() + f"\n\n## 变更说明\n- {change_note}\n"
             revision = existing.revision + 1
+            # 合并时不得因推测把已验证条目降级
+            merged_status = status
+            merged_verified = verified
+            if existing.verified == "result" and verified == "speculation":
+                merged_status = existing.status
+                merged_verified = "result"
             doc = KnowledgeDoc(
                 id=existing.id,
                 title=title.strip() or existing.title,
-                status=status,
+                status=merged_status,
                 type=existing.type,
                 objects=new_objects,
                 tags=new_tags,
                 body=new_body,
                 path=existing.path,
                 depends_on=list(existing.depends_on),
-                verified=verified,
+                verified=merged_verified,
                 root_cause=root_cause or existing.root_cause,
                 source_incident=source_incident or existing.source_incident,
                 verified_at=verified_at or existing.verified_at,
