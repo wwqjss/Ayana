@@ -18,7 +18,7 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from .db import new_id, now
 
@@ -93,8 +93,9 @@ CONCLUSION_PROMPT = """你是值班运维调查助手（只读，禁止修复）
 """
 
 # P6.1：调查后的自治决策（写权限受控阶段）。执行仍由 ActionService 完成。
-DECISION_PROMPT = """你是值班运维处置 Agent（本阶段允许受控写，但必须经 Ayana 工具链）。
-基于调查结论，决定是否执行修复。禁止绕过 action.execute / host.exec 审计。
+DECISION_PROMPT = """你是值班运维处置计划助手。本阶段只生成计划，不执行修复。
+基于调查结论决定是否应修复；禁止调用 action.execute、host.exec 写模式或本机写工具。
+Ayana 会在计划返回后统一通过 OpsLoop → ActionService 执行、验证并审计。
 
 ## 软约束（必须遵守）
 1. 无进展 3 轮停止：连续 3 轮未改善 → decision=human。
@@ -181,6 +182,7 @@ class AutoInvestigator:
         actions: Any = None,
         incidents: Any = None,
         mimo_write: Any = None,
+        readiness_callback: Callable[[], bool] | None = None,
     ):
         self.db = db
         self.knowledge = knowledge
@@ -191,7 +193,8 @@ class AutoInvestigator:
         self.ops_loop = ops_loop
         self.actions = actions
         self.incidents = incidents
-        self.mimo_write = mimo_write  # 写权限受控会话（决策阶段）
+        self.mimo_write = mimo_write  # 兼容字段名；运行装配使用只产计划的专用会话
+        self.readiness_callback = readiness_callback
         self._sem = asyncio.Semaphore(self.config.max_concurrent)
         self._running: dict[str, asyncio.Task] = {}
         self._stop = asyncio.Event()
@@ -290,9 +293,24 @@ class AutoInvestigator:
 
     # ---- 执行 ----
 
+    def _runtime_ready(self) -> bool:
+        if self.readiness_callback is None:
+            return True
+        try:
+            return bool(self.readiness_callback())
+        except Exception:
+            return False
+
+    def _incident_is_current(self, incident_id: str, generation: int) -> bool:
+        inc = self.db.query_one("SELECT status,generation FROM incidents WHERE id=?", (incident_id,))
+        return bool(inc and inc["status"] == "open" and int(inc["generation"] or 1) == generation)
+
     async def tick_once(self) -> int:
         """处理若干排队任务，返回完成数。"""
         if not self.config.enabled or self._stop.is_set():
+            return 0
+        # Missing/changed credentials leave jobs queued without consuming a round.
+        if not self._runtime_ready():
             return 0
         handled = 0
         for job in self.ready_jobs(limit=self.config.max_concurrent):
@@ -380,7 +398,7 @@ class AutoInvestigator:
                 "failed": "failed",
                 "timeout": "timeout",
             }.get(status, "partial")
-            self._finish(
+            accepted = self._finish(
                 incident_id,
                 job_status,
                 generation=generation,
@@ -389,7 +407,7 @@ class AutoInvestigator:
                 duration=now() - started,
             )
             # P6.1：调查完成 → 同一 Incident 进入自治决策/处置/结案
-            if self.config.closed_loop and status in ("completed", "partial"):
+            if accepted and self.config.closed_loop and status in ("completed", "partial"):
                 try:
                     await self._close_loop(incident_id, result, generation=generation)
                 except Exception as e:  # noqa: BLE001
@@ -414,8 +432,8 @@ class AutoInvestigator:
                 "root_cause": "unknown",
             }
         prompt = self._build_invest_prompt(incident_id, round_no=round_no)
-        attached = self.bridge.attach_remote(
-            incident_id,
+        attached = await asyncio.to_thread(
+            self.bridge.attach_remote, incident_id,
             title=f"inv:{incident_id}",
             prompt=prompt,
             timeout=self.config.timeout_sec,
@@ -432,8 +450,8 @@ class AutoInvestigator:
             }
         text = (attached.get("text") or "") if attached.get("action") == "created" else ""
         if attached.get("action") in ("reused",):
-            sent = self.bridge.prompt_remote(
-                incident_id, prompt, timeout=self.config.timeout_sec
+            sent = await asyncio.to_thread(
+                self.bridge.prompt_remote, incident_id, prompt, timeout=self.config.timeout_sec
             )
             text = (sent.get("text") or "") if sent.get("ok") else (sent.get("message") or sent.get("error") or "")
         parsed = _extract_json(text) or {}
@@ -542,9 +560,12 @@ class AutoInvestigator:
             if not data.get("capability") or not data.get("object_id"):
                 data["decision"] = "human"
                 data["reason"] = data.get("reason") or "execute_missing_capability_or_object"
-            if data.get("evidence_ok") is False:
+            if data.get("evidence_ok") is not True:
                 data["decision"] = "human"
                 data["reason"] = data.get("reason") or "evidence_insufficient"
+            if not isinstance(data.get("params", {}), dict):
+                data["decision"] = "human"
+                data["reason"] = "execute_invalid_params"
         if not data.get("plan_sig"):
             data["plan_sig"] = str(data.get("capability") or "plan") + ":" + str(data.get("object_id") or "")
         data["conclusion_root_cause"] = conclusion.get("root_cause") or ""
@@ -554,43 +575,36 @@ class AutoInvestigator:
         self, incident_id: str, conclusion: dict[str, Any], *, generation: int
     ) -> dict[str, Any]:
         """同一 Incident/Session 进入决策；写权限受控 MCP 会话产出 JSON 计划。"""
-        # 1) 调查结论已给出明确 suggested_action → 直接采纳（测试/确定性路径）
+        # Deterministic suggestions pass the same evidence/shape validation.
         suggested = conclusion.get("suggested_action") or {}
         if isinstance(suggested, dict) and suggested.get("capability") and suggested.get("object_id"):
-            return {
-                "decision": "execute",
-                "capability": str(suggested["capability"]),
-                "object_id": str(suggested["object_id"]),
-                "params": suggested.get("params") or {},
-                "plan_sig": str(suggested.get("plan_sig") or f"{suggested['capability']}:{suggested['object_id']}"),
-                "reason": str(suggested.get("reason") or "conclusion_suggested_action"),
-                "evidence_ok": bool(suggested.get("evidence_ok", True)),
-                "source": "conclusion",
-            }
-        # 2) 写权限受控 MiMo 会话决策
+            decision = self._parse_decision(json.dumps({
+                **suggested, "decision": "execute",
+                "reason": suggested.get("reason") or "conclusion_suggested_action",
+            }, ensure_ascii=False), conclusion)
+            decision["source"] = "conclusion"
+            return decision
         client = self.mimo_write or self.mimo
         rid = str(conclusion.get("remote_session_id") or "")
         text = ""
-        if client is not None and self.bridge is not None:
+        if client is not None:
             prompt = self._build_decision_prompt(incident_id, conclusion)
             try:
                 if rid and hasattr(client, "resume"):
-                    sent = client.resume(rid, prompt, timeout=self.config.decision_timeout_sec)
-                    text = (sent.get("text") if isinstance(sent, dict) else "") or ""
+                    sent = await asyncio.to_thread(client.resume, rid, prompt, timeout=self.config.decision_timeout_sec)
                 else:
-                    attached = self.bridge.attach_remote(
-                        incident_id,
-                        title=f"ops:{incident_id}",
-                        prompt=prompt,
-                        timeout=self.config.decision_timeout_sec,
-                    )
-                    text = (attached.get("text") or "") if isinstance(attached, dict) else ""
-            except Exception as e:  # noqa: BLE001
+                    sent = await asyncio.to_thread(client.create, title=f"ops:{incident_id}", prompt=prompt,
+                                                   timeout=self.config.decision_timeout_sec)
+                # Production returns RemoteSession; test adapters may return dict.
+                if isinstance(sent, dict):
+                    if sent.get("ok") is not False and sent.get("status") != "error":
+                        text = str(sent.get("text") or "")
+                elif getattr(sent, "status", "active") not in ("error", "timeout"):
+                    text = str(getattr(sent, "text", "") or "")
+            except Exception as exc:  # noqa: BLE001
                 return {
-                    "decision": "human",
-                    "reason": f"decision_session_failed:{type(e).__name__}",
-                    "evidence_ok": False,
-                    "plan_sig": "",
+                    "decision": "human", "reason": f"decision_session_failed:{type(exc).__name__}",
+                    "evidence_ok": False, "plan_sig": "",
                 }
         decision = self._parse_decision(text, conclusion)
         decision["source"] = "mimo_write" if text else "fallback_human"
@@ -604,8 +618,16 @@ class AutoInvestigator:
         if self.ops_loop is None:
             out["skipped"] = "ops_loop_unavailable"
             return out
+        if not self._incident_is_current(incident_id, generation):
+            return {**out, "skipped": "incident_changed"}
+        if not self._runtime_ready():
+            return {**out, "skipped": "provider_not_verified"}
         decision = await self._decide_remediation(incident_id, conclusion, generation=generation)
         out["decision"] = decision
+        if not self._incident_is_current(incident_id, generation):
+            return {**out, "skipped": "incident_changed"}
+        if not self._runtime_ready():
+            return {**out, "skipped": "provider_not_verified"}
         kind = decision.get("decision")
         if kind == "observe":
             if self.incidents:
@@ -662,7 +684,7 @@ class AutoInvestigator:
         reason: str = "",
         rounds: int = 0,
         duration: float = 0.0,
-    ) -> None:
+    ) -> bool:
         t = now()
         payload = conclusion or {}
         try:
@@ -699,7 +721,7 @@ class AutoInvestigator:
             )
             if cur.rowcount != 1:
                 # A newer generation owns the job; discard stale results and knowledge.
-                return
+                return False
             conn.execute(
                 "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
                 (
@@ -716,6 +738,7 @@ class AutoInvestigator:
                 self._maybe_write_knowledge(incident_id, payload)
             except Exception as e:  # noqa: BLE001
                 log.warning("knowledge write failed: %s", e)
+        return True
 
     def _maybe_write_knowledge(self, incident_id: str, payload: dict[str, Any]) -> None:
         """只允许 verified=result 且带恢复证据；否则 speculation。"""

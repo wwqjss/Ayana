@@ -11,7 +11,7 @@ from ayana.mimo_admin import MimoAdmin
 
 class ClassifyTests(unittest.TestCase):
     def test_success(self):
-        r = MimoAdmin.classify_api_response(200, '{"choices":[]}')
+        r = MimoAdmin.classify_api_response(200, '{"choices":[{"message":{"content":"PONG"}}]}')
         self.assertTrue(r["ok"])
         self.assertEqual(r["result"], "success")
 

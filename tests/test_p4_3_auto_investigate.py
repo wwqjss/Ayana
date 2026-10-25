@@ -6,6 +6,7 @@ import asyncio
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -284,8 +285,20 @@ class TestExecutionLifecycle(unittest.TestCase):
     def test_parallel_incidents_isolated(self):
         insert_incident(self.db, "inc_a")
         insert_incident(self.db, "inc_b")
-        self.mimo.responses.append('{"status":"completed","root_cause":"unknown","symptoms":"A"}')
-        self.mimo.responses.append('{"status":"completed","root_cause":"unknown","symptoms":"B"}')
+        # Parallel calls are not ordered. Bind each scripted reply to its
+        # Incident, as real independent MiMo sessions are, rather than popping
+        # a shared FIFO that accidentally assigns A/B by thread scheduling.
+        entered = threading.Barrier(2)
+        def create(*, title, prompt, timeout=None):
+            incident_id = title.removeprefix("inv:")
+            symptoms = {"inc_a": "A", "inc_b": "B"}[incident_id]
+            self.assertIn(f"## Incident {incident_id} (", prompt)
+            entered.wait(timeout=2)
+            self.mimo.calls.append(("create", title, prompt))
+            return type("R", (), {"remote_session_id": f"ses_{incident_id}", "status": "active",
+                                  "text": json.dumps({"status":"completed", "root_cause":"unknown", "symptoms":symptoms}),
+                                  "model":"test-model"})()
+        self.mimo.create = create
         self.ai.offer("inc_a")
         self.ai.offer("inc_b")
         _run_tick(self.ai)
@@ -297,6 +310,8 @@ class TestExecutionLifecycle(unittest.TestCase):
             row = self.db.query_one("SELECT * FROM investigation_jobs WHERE incident_id=?", (incident_id,))
             self.assertEqual(row["status"], "done")
             self.assertEqual(json.loads(row["last_conclusion_json"])["symptoms"], symptoms)
+            mapping = self.bridge.get_mapping(incident_id)
+            self.assertEqual(mapping["remote_session_id"], f"ses_{incident_id}")
 
     def test_new_generation_runs_after_previous_round_budget_exhausted(self):
         self.ai.offer("inc_1")

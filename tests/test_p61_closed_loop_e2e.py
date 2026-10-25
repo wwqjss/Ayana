@@ -62,7 +62,7 @@ class FakeTransport:
 class FakeGate:
     def get(self, asset_id):
         return SimpleNamespace(
-            expected_host_id="HOST", host_key_sha256="HOST", host_key_trusted_at=now(),
+            expected_host_id="HOST", host_id_verified_at=now(), host_key_sha256="HOST", host_key_trusted_at=now(),
             asset_id=asset_id, read_alias="read", write_alias="write",
         )
 
@@ -224,6 +224,8 @@ class ClosedLoopE2E(unittest.IsolatedAsyncioTestCase):
         auto = [r for r in acts if r["mode"] == "autonomous"]
         self.assertTrue(auto, f"no autonomous action: {acts}")
         self.assertEqual(auto[0]["capability"], "service.restart")
+        self.assertEqual(auto[0]["state"], "success")
+        self.assertEqual(len(self.transport.calls), 1)
         # 审计链：proposal/approved/execute
         entries = [r["entry"] for r in self.db.query("SELECT entry FROM audit_log WHERE incident_id='inc1'")]
         self.assertTrue(any(e.startswith("action_") for e in entries), entries)
@@ -263,6 +265,10 @@ class ClosedLoopE2E(unittest.IsolatedAsyncioTestCase):
         # 至少记录了一次处置轮次
         self.assertGreaterEqual(loop.get("rounds", 0), 1)
         self.assertIsNotNone(inc)
+        self.assertEqual(inc["need_human"], 1)
+        self.assertEqual(loop["status"], "need_human")
+        self.assertEqual(self.db.query_one("SELECT state FROM actions WHERE mode='autonomous'")["state"], "failure")
+        self.assertEqual(len(transport.calls), 1)
 
     async def test_repeated_alert_does_not_double_execute(self):
         conclusion = {

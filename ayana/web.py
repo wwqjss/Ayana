@@ -1315,12 +1315,12 @@ class WebApp:
         return _json(await self._mimo().stats())
 
     async def api_mimo_providers(self, request: web.Request) -> web.Response:
-        self._require_auth(request)
+        self._require_admin(request)
         return _json(self._mimo().provider_summary())
 
     async def api_mimo_provider_status(self, request: web.Request) -> web.Response:
         """配置与验证状态。不含密钥。未验证时 available=false。"""
-        self._require_auth(request)
+        self._require_admin(request)
         admin = self._mimo()
         summary = admin.provider_summary()
         state = admin.verification_state(self.db)
@@ -1340,143 +1340,153 @@ class WebApp:
             "available": bool(state.get("verified")) and bool(st.get("exists")),
         })
 
+    async def _mimo_provider_body(self, request: web.Request) -> dict | None:
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(body, dict) or set(body) - {"provider_id", "base_url", "api_key", "model", "test"}:
+            return None
+        if any(key in body and not isinstance(body[key], str)
+               for key in ("provider_id", "base_url", "api_key", "model")):
+            return None
+        if "test" in body and not isinstance(body["test"], bool):
+            return None
+        return body
+
+    @staticmethod
+    def _mimo_provider_failure(error: Exception, *, status: int = 400, saved: bool = False) -> web.Response:
+        safe = {
+            "invalid_provider_config", "unsafe_config_path", "bad_provider_id", "api_key_required",
+            "bad_api_key", "invalid_base_url", "model_required", "invalid_model",
+            "key_required_for_endpoint_change", "provider_not_verified", "provider_state_save_failed",
+            "provider_save_failed",
+        }
+        code = error.args[0] if isinstance(error, ValueError) and error.args else ""
+        if not isinstance(code, str) or code not in safe:
+            code = "invalid_provider_config" if status == 400 else "provider_save_failed"
+        messages = {
+            "api_key_required": "请填写 API Key。",
+            "key_required_for_endpoint_change": "更换服务地址或 Provider 时，请重新填写 API Key。",
+            "provider_state_save_failed": "验证状态未能保存，请重新验证。",
+            "provider_save_failed": "配置未能保存，请重试。",
+        }
+        if code == "provider_state_save_failed":
+            status = 500
+        message = "配置已写入，但验证状态未能保存，请重新验证。" if saved else messages.get(code, "模型配置无效，请检查地址、密钥和模型。")
+        return _json({"ok": False, "saved": saved, "verified": False, "error": code, "message": message}, status)
+
     async def api_mimo_provider_test(self, request: web.Request) -> web.Response:
-        """测试连接：真实调用模型，区分认证/额度/超时/成功。不保存、不记密钥。"""
-        sess = self._require_auth(request)
-        self._require_admin(request)
+        """Validate a resolved provider off the event loop; draft keys are never returned."""
+        sess = self._require_admin(request)
         self._check_csrf(request, sess)
-        body = await request.json()
-        base_url = str(body.get("base_url") or "")
-        api_key = str(body.get("api_key") or "")
-        model = str(body.get("model") or "")
-        # 留空 api_key 时用已保存密钥做复测（不回显）
-        if not api_key:
-            saved = self._mimo().provider_summary()
-            for p in saved.get("providers") or []:
-                if p.get("key_set"):
-                    # 从配置文件读密钥仅用于复测，不返回
-                    try:
-                        path = self._mimo().config_path()
-                        data = json.loads(path.read_text(encoding="utf-8"))
-                        opts = ((data.get("provider") or {}).get(p.get("name") or "xiaomi") or {}).get("options") or {}
-                        api_key = str(opts.get("apiKey") or "")
-                        if not base_url:
-                            base_url = str(opts.get("baseURL") or "")
-                    except Exception:
-                        pass
-                    break
-        if not model:
-            model = str((self._mimo().provider_summary().get("model") or "").split("/")[-1])
-        res = self._mimo().test_connection(base_url=base_url, api_key=api_key, model=model)
-        self.db.audit(
-            "web_user", sess["username"], "mimo_provider_test",
-            detail={"result": res.get("result"), "http_status": res.get("http_status"), "model": model},
-            channel="web",
-        )
-        if not api_key:
-            return _json({"ok": False, "result": "bad_request", "message": "请填写 API Key 或先保存密钥"})
-        return _json(res)
+        body = await self._mimo_provider_body(request)
+        if body is None:
+            return _json({"ok": False, "error": "bad_request", "message": "请求格式不正确。"}, 400)
+        admin = self._mimo()
+        try:
+            credentials = admin.resolve_provider(**{key: body.get(key, "")
+                for key in ("provider_id", "base_url", "api_key", "model")})
+            result = await asyncio.to_thread(admin.test_connection,
+                **{key: credentials[key] for key in ("base_url", "api_key", "model")})
+            admin.record_verification(self.db, credentials, result)
+        except ValueError as error:
+            return self._mimo_provider_failure(error)
+        except Exception:
+            return _json({"ok": False, "error": "connection_error", "message": "连接测试未完成，请重试。"}, 502)
+        self.db.audit("web_user", sess["username"], "mimo_provider_test",
+            detail={"result": result.get("result"), "http_status": result.get("http_status"),
+                    "provider": credentials["provider_id"], "model": credentials["model"]}, channel="web")
+        return _json({**result, "verification": admin.verification_state(self.db)})
 
     async def api_mimo_provider_apply(self, request: web.Request) -> web.Response:
-        """保存密钥/端点/模型并写入 mimocode；仅测试通过才标记 verified。"""
-        sess = self._require_auth(request)
-        self._require_admin(request)
+        sess = self._require_admin(request)
         self._check_csrf(request, sess)
-        body = await request.json()
-        base_url = str(body.get("base_url") or "")
-        api_key = str(body.get("api_key") or "")
-        model = str(body.get("model") or "")
-        provider_id = str(body.get("provider_id") or "xiaomi")
-        do_test = bool(body.get("test", True))
-        if not api_key:
-            return _json({"ok": False, "error": "api_key_required", "message": "请填写 API Key"}, 400)
-        test_res = None
-        verified = False
-        if do_test:
-            test_res = self._mimo().test_connection(base_url=base_url, api_key=api_key, model=model)
-            verified = bool(test_res.get("ok"))
-            if not verified:
-                # 验证不过：不落密钥，不宣称可用
-                self.db.audit(
-                    "web_user", sess["username"], "mimo_provider_rejected",
-                    detail={"result": test_res.get("result"), "model": model}, channel="web",
-                )
-                return _json({
-                    "ok": False,
-                    "error": test_res.get("result") or "test_failed",
-                    "message": test_res.get("message") or "连接测试未通过，未保存密钥",
-                    "test": test_res,
-                    "saved": False,
-                }, 400)
+        body = await self._mimo_provider_body(request)
+        if body is None:
+            return _json({"ok": False, "error": "bad_request", "message": "请求格式不正确。"}, 400)
+        admin = self._mimo()
+        applied = None
         try:
-            res = self._mimo().apply_provider(
-                provider_id=provider_id,
-                api_key=api_key,
-                base_url=base_url,
-                model=model,
-                verified=verified,
-            )
-        except ValueError as e:
-            return _json({"ok": False, "error": str(e)}, 400)
-        except Exception as e:  # noqa: BLE001
-            return _json({"ok": False, "error": str(e)[:200]}, 500)
-        state = {
-            "verified": verified,
-            "last_test_at": now(),
-            "last_result": (test_res or {}).get("result") or ("skipped" if not do_test else ""),
-            "last_message": (test_res or {}).get("message") or "",
-            "provider_id": provider_id,
-            "model": model,
-            "base_url": base_url,
-        }
-        self._mimo().save_verification_state(self.db, state)
-        self.db.audit(
-            "web_user", sess["username"], "mimo_provider_apply",
-            detail={"provider": provider_id, "model": model, "verified": verified, "key_len": res.get("key_len")},
-            channel="web",
-        )
-        return _json({
-            "ok": True,
-            "saved": True,
-            "verified": verified,
-            "path": res.get("path"),
-            "provider": provider_id,
-            "model": model,
-            "test": test_res,
-        })
+            credentials = admin.resolve_provider(**{key: body.get(key, "")
+                for key in ("provider_id", "base_url", "api_key", "model")})
+            do_test = body.get("test", True)
+            result = {"ok": False, "result": "not_tested", "message": "尚未验证。"}
+            if do_test:
+                result = await asyncio.to_thread(admin.test_connection,
+                    **{key: credentials[key] for key in ("base_url", "api_key", "model")})
+                if result.get("ok") is not True:
+                    admin.record_verification(self.db, credentials, result)
+                    self.db.audit("web_user", sess["username"], "mimo_provider_rejected",
+                        detail={"result": result.get("result"), "provider": credentials["provider_id"],
+                                "model": credentials["model"]}, channel="web")
+                    return _json({"ok": False, "saved": False,
+                        "error": result.get("result") or "test_failed",
+                        "message": result.get("message") or "连接测试未通过，配置未保存。", "test": result}, 400)
+            applied = admin.apply_provider(**credentials, verified=result.get("ok") is True)
+            admin.record_verification(self.db, credentials, result)
+            state = admin.verification_state(self.db)
+        except ValueError as error:
+            return self._mimo_provider_failure(error, saved=applied is not None)
+        except Exception:
+            return self._mimo_provider_failure(ValueError("provider_save_failed"), status=500, saved=applied is not None)
+        verified = state.get("verified") is True
+        self.db.audit("web_user", sess["username"], "mimo_provider_apply",
+            detail={"provider": credentials["provider_id"], "model": credentials["model"],
+                    "verified": verified}, channel="web")
+        return _json({"ok": True, "saved": True, "verified": verified,
+            "path": applied.get("path"), "provider": credentials["provider_id"],
+            "model": credentials["model"], "test": result})
 
     async def api_mimo_provider_clear(self, request: web.Request) -> web.Response:
-        sess = self._require_auth(request)
-        self._require_admin(request)
+        sess = self._require_admin(request)
         self._check_csrf(request, sess)
-        body = await request.json()
-        provider_id = str(body.get("provider_id") or "xiaomi")
-        res = self._mimo().clear_provider(provider_id=provider_id)
-        self._mimo().save_verification_state(self.db, {"verified": False, "last_result": "cleared"})
+        body = await self._mimo_provider_body(request)
+        if body is None:
+            return _json({"ok": False, "error": "bad_request", "message": "请求格式不正确。"}, 400)
+        admin = self._mimo()
+        try:
+            result = admin.clear_provider(provider_id=body.get("provider_id", ""))
+            admin.save_verification_state(self.db, {"verified": False, "last_result": "cleared"})
+        except ValueError as error:
+            return self._mimo_provider_failure(error)
+        except Exception:
+            return self._mimo_provider_failure(ValueError("provider_save_failed"), status=500)
         self.db.audit("web_user", sess["username"], "mimo_provider_cleared",
-                      detail={"provider": provider_id}, channel="web")
-        return _json({"ok": True, **res, "verified": False})
+                      detail={"provider": body.get("provider_id", "")}, channel="web")
+        return _json({**result, "verified": False})
 
     async def api_mimo_chat(self, request: web.Request) -> web.Response:
-        sess = self._require_auth(request)
-        self._require_admin(request)
+        sess = self._require_admin(request)
         self._check_csrf(request, sess)
-        body = await request.json()
-        inc_id = str(body.get("incident_id") or "").strip()
-        prompt = str(body.get("prompt") or "").strip()
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            body = None
+        if not isinstance(body, dict) or not all(isinstance(body.get(key), str) for key in ("incident_id", "prompt")):
+            return _json({"ok": False, "error": "incident_id_and_prompt_required"}, 400)
+        inc_id, prompt = body["incident_id"].strip(), body["prompt"].strip()
         if not inc_id or not prompt:
             return _json({"ok": False, "error": "incident_id_and_prompt_required"}, 400)
-        br = getattr(self, "session_bridge", None) or getattr(self.incidents, "session_bridge", None)
-        if not br:
+        inc = self.incidents.get_incident(inc_id)
+        if not inc:
+            return _json({"ok": False, "error": "not_found"}, 404)
+        if inc.get("asset_id") not in self._visible_asset_ids(sess):
+            return _json({"ok": False, "error": "permission_denied"}, 403)
+        bridge = getattr(self, "session_bridge", None) or getattr(self.incidents, "session_bridge", None)
+        if not bridge:
             return _json({"ok": False, "error": "session_bridge_unavailable"}, 503)
-        attached = br.attach_remote(inc_id)
-        if not attached.get("ok"):
-            return _json(attached, 502)
-        sent = br.prompt_remote(inc_id, prompt)
-        self.db.audit(
-            "web_user", sess["username"], "mimo_chat",
-            detail={"incident_id": inc_id, "prompt_len": len(prompt)}, channel="web",
-        )
+        try:
+            attached = await asyncio.to_thread(bridge.attach_remote, inc_id)
+            if attached.get("ok") is not True:
+                return _json({"ok": False, "error": "mimo_session_failed", "message": "会话未能启动，请检查已验证配置。"}, 502)
+            sent = await asyncio.to_thread(bridge.prompt_remote, inc_id, prompt)
+            if sent.get("ok") is not True:
+                return _json({"ok": False, "error": "mimo_prompt_failed", "message": "消息未能完成，请检查会话状态。"}, 502)
+        except Exception:
+            return _json({"ok": False, "error": "mimo_session_failed", "message": "会话请求未完成，请重试。"}, 502)
+        self.db.audit("web_user", sess["username"], "mimo_chat",
+                      detail={"incident_id": inc_id, "prompt_len": len(prompt)}, channel="web")
         return _json({"ok": True, "session": attached, "prompt_result": sent})
 
     async def api_executions(self, request: web.Request) -> web.Response:

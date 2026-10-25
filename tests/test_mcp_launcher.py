@@ -119,7 +119,11 @@ class TestMimoCliConfiguration(unittest.TestCase):
             self.assertEqual(os.environ["MIMOCODE_PERMISSION"], '{"*":"allow"}')
         parsed = json.loads(env["MIMOCODE_CONFIG_CONTENT"])
         self.assertEqual(parsed["provider"], content["provider"])
-        self.assertEqual(parsed["mcp"], content["mcp"])
+        expected_mcp = {
+            **content["mcp"],
+            "ayana": {**content["mcp"]["ayana"], "environment": {"AYANA_MCP_READONLY": "1"}},
+        }
+        self.assertEqual(parsed["mcp"], expected_mcp)
         self.assertEqual(parsed["agent"]["other-agent"], content["agent"]["other-agent"])
         agent = parsed["agent"][READONLY_AGENT]
         self.assertEqual(agent["description"], "preserved")

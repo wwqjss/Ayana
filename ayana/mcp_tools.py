@@ -262,7 +262,7 @@ TOOL_SPECS: list[dict[str, Any]] = [
                 "incident_id": {"type": "string"},
                 "reason": {"type": "string"},
             },
-            "required": ["asset_id", "object_id", "capability"],
+            "required": ["incident_id", "asset_id", "object_id", "capability"],
         },
     },
     {
@@ -814,30 +814,28 @@ class OpsTools:
 
     async def action_execute(self, args: dict[str, Any]) -> dict[str, Any]:
         self._require_write_mode("action.execute")
-        actions = getattr(self.ctx, "actions", None)
-        if actions is None:
-            raise McpToolError("unavailable", "ActionService not wired")
+        loop = getattr(self.ctx, "ops_loop", None)
+        if loop is None:
+            raise McpToolError("unavailable", "OpsLoop not wired")
         asset_id = str(args.get("asset_id") or "").strip()
         object_id = str(args.get("object_id") or "").strip()
         capability = str(args.get("capability") or "").strip()
-        if not asset_id or not object_id or not capability:
-            raise McpToolError("bad_request", "asset_id, object_id, capability required")
-        try:
-            res = await actions.autonomous_execute(
-                asset_id=asset_id,
-                object_id=object_id,
-                capability=capability,
-                params={},
-                reason=str(args.get("reason") or "mcp_action_execute"),
-                incident_id=str(args.get("incident_id") or ""),
-                actor_id="mcp_agent",
-            )
-        except Exception as e:  # noqa: BLE001
-            code = getattr(e, "code", "exec_failed")
-            self._audit_write(asset_id, capability, "error", str(e)[:200])
-            raise McpToolError(str(code), str(e)[:300]) from e
-        self._audit_write(asset_id, capability, str(res.get("state") or ""), str(res.get("detail") or "")[:200])
-        return {"ok": res.get("state") == "success", **res}
+        incident_id = str(args.get("incident_id") or "").strip()
+        if not asset_id or not object_id or not capability or not incident_id:
+            raise McpToolError("bad_request", "incident_id, asset_id, object_id, capability required")
+        params = args.get("params") or {}
+        if not isinstance(params, dict):
+            raise McpToolError("bad_request", "params must be an object")
+        # The MCP entry shares the same hard round/stop boundary as the worker.
+        res = await loop.run_action_and_verify(
+            incident_id=incident_id, asset_id=asset_id, object_id=object_id,
+            capability=capability, params=params,
+            reason=str(args.get("reason") or "mcp_action_execute"),
+            plan_sig=str(args.get("plan_sig") or f"{capability}:{object_id}"),
+        )
+        self._audit_write(asset_id, capability, str(res.get("state") or res.get("error") or ""),
+                          str(res.get("detail") or "")[:200])
+        return {**res, "id": res.get("action_id") or ""}
 
     async def ops_constraints(self, args: dict[str, Any]) -> dict[str, Any]:
         c = getattr(self.ctx, "constraints", None)

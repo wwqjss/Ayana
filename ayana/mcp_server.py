@@ -38,6 +38,9 @@ SERVER_INFO = {"name": "ayana-mcp", "version": "0.1.0"}
 
 def build_ops_context(cfg: dict[str, Any]) -> OpsContext:
     """装配 MCP 最小服务面（与 App 共用模块，不拉起 Web/自治）。"""
+    # Only the launching Ayana process sets this explicit same-instance binding.
+    cfg = dict(cfg)
+    cfg["db_path"] = os.environ.get("AYANA_MCP_DB_PATH") or cfg["db_path"]
     db = Database(cfg["db_path"])
     knowledge = KnowledgeBase(db)
     try:

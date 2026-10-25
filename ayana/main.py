@@ -280,43 +280,72 @@ class App:
         # P2 薄桥：只做映射/复用/幂等，不做自动处置（旧自治仍禁用）
         self.session_bridge = SessionBridge(self.db, knowledge=self.knowledge)
         self.incidents.session_bridge = self.session_bridge
-        # P6.1：无人值守闭环（调查只读 → 决策写会话 → ActionService）
-        self.auto_investigator = None
-        _ai_cfg = InvestConfig.from_dict(cfg.get("auto_investigate") or {})
-        if _ai_cfg.enabled:
-            from .mimo_session import MimoSessionClient as _MSC
-            from .session_bridge import SessionBridge as _SB
+        # P6.2: one verified provider and one MCP/DB binding for all runtime clients.
+        from .mimo_admin import MimoAdmin
+        from .mimo_session import MimoSessionClient
 
-            _ai_client = _MSC(
-                mimo_bin=_ai_cfg.mimo_bin or "mimo",
-                model=_ai_cfg.mimo_model or "",
-                readonly_env=True,
-                default_timeout=_ai_cfg.timeout_sec,
-            )
-            # 决策阶段：受控写会话（非 readonly MCP）
-            _ai_write = _MSC(
-                mimo_bin=_ai_cfg.mimo_bin or "mimo",
-                model=_ai_cfg.mimo_model or "",
-                readonly_env=False,
-                default_timeout=max(_ai_cfg.decision_timeout_sec, _ai_cfg.timeout_sec),
-            )
-            _ai_bridge = _SB(self.db, knowledge=self.knowledge, mimo=_ai_client)
+        _ai_cfg = InvestConfig.from_dict(cfg.get("auto_investigate") or {})
+        _code_root = str(Path(__file__).resolve().parents[1])
+        _config_base = str(Path(cfg.get("base_dir") or _code_root).resolve())
+        self.mimo_admin = MimoAdmin(
+            mimo_bin=str(cfg.get("mimo_bin") or _ai_cfg.mimo_bin or "mimo"),
+            workdir=str(cfg.get("mimo_workdir") or _code_root),
+            serve_url=str(cfg.get("mimo_serve_url") or ""),
+            unit_name=str(cfg.get("mimo_unit") or ""),
+        )
+
+        def _mimo_runtime():
+            runtime = self.mimo_admin.runtime_configuration(self.db)
+            overlay = dict(runtime.get("config") or {})
+            overlay["mcp"] = {
+                **(overlay.get("mcp") or {}),
+                "ayana": {
+                    "type": "local", "enabled": True,
+                    "command": [sys.executable, "-m", "ayana.mcp_server", _config_base],
+                    "environment": {
+                        "AYANA_MCP_DB_PATH": str(Path(self.db.path).resolve()),
+                        "PYTHONPATH": _code_root + os.pathsep + os.environ.get("PYTHONPATH", ""),
+                    },
+                },
+            }
+            return {
+                **runtime, "config": overlay,
+                "environment": {
+                    "AYANA_MCP_DB_PATH": str(Path(self.db.path).resolve()),
+                    "PYTHONPATH": _code_root + os.pathsep + os.environ.get("PYTHONPATH", ""),
+                },
+            }
+
+        def _mimo_ready():
+            try:
+                _mimo_runtime()
+                return True
+            except Exception:
+                return False
+
+        self.mimo_read_client = MimoSessionClient(
+            mimo_bin=self.mimo_admin.mimo_bin, cwd=self.mimo_admin.workdir,
+            readonly_env=True, default_timeout=_ai_cfg.timeout_sec,
+            runtime_resolver=_mimo_runtime,
+        )
+        self.mimo_decision_client = MimoSessionClient(
+            mimo_bin=self.mimo_admin.mimo_bin, cwd=self.mimo_admin.workdir,
+            decision_only=True, default_timeout=max(_ai_cfg.decision_timeout_sec, _ai_cfg.timeout_sec),
+            runtime_resolver=_mimo_runtime,
+        )
+        # Manual chat shares the verified read-only client rather than a no_mimo bridge.
+        self.session_bridge.mimo = self.mimo_read_client
+        self.auto_investigator = None
+        if _ai_cfg.enabled:
+            _ai_bridge = SessionBridge(self.db, knowledge=self.knowledge, mimo=self.mimo_read_client)
             self.auto_investigator = AutoInvestigator(
-                self.db,
-                knowledge=self.knowledge,
-                mimo=_ai_client,
-                bridge=_ai_bridge,
-                config=_ai_cfg,
-                mimo_write=_ai_write,
-                # ops_loop/actions 在下方装配后注入
+                self.db, knowledge=self.knowledge, mimo=self.mimo_read_client,
+                bridge=_ai_bridge, config=_ai_cfg, mimo_write=self.mimo_decision_client,
+                readiness_callback=_mimo_ready,
             )
             self.incidents.auto_investigator = self.auto_investigator
-            log.info(
-                "auto_investigate enabled closed_loop=%s max_concurrent=%s timeout=%s",
-                _ai_cfg.closed_loop,
-                _ai_cfg.max_concurrent,
-                _ai_cfg.timeout_sec,
-            )
+            log.info("auto_investigate enabled closed_loop=%s max_concurrent=%s timeout=%s",
+                     _ai_cfg.closed_loop, _ai_cfg.max_concurrent, _ai_cfg.timeout_sec)
         else:
             log.info("auto_investigate disabled")
         # SSH：凭据加密 + 端点；有端点用原生 SSH，否则回落 NT（迁移期）
@@ -367,7 +396,6 @@ class App:
         )
         # P4.2：ActionService 与 Session 桥共用写幂等台账
         self.actions.write_ops = self.session_bridge
-        from .mimo_admin import MimoAdmin
         from .ops_constraints import OpsConstraints
         from .ops_loop import OpsLoop, ensure_ops_loop_schema
 
@@ -379,12 +407,6 @@ class App:
             incidents=self.incidents,
             bridge=self.session_bridge,
             constraints=self.ops_constraints,
-        )
-        self.mimo_admin = MimoAdmin(
-            mimo_bin=str(cfg.get("mimo_bin") or "mimo"),
-            workdir=str(cfg.get("mimo_workdir") or ""),
-            serve_url=str(cfg.get("mimo_serve_url") or ""),
-            unit_name=str(cfg.get("mimo_unit") or ""),
         )
         # P6.1：把闭环依赖注入自动调查器
         if self.auto_investigator is not None:

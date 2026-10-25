@@ -466,143 +466,150 @@ async function openOpsConstraints() {
 }
 
 async function openMimoAdmin() {
-  const st = await api("/api/mimo/status");
-  const cfg = await api("/api/mimo/provider");
+  const generation = (openMimoAdmin.generation || 0) + 1;
+  openMimoAdmin.generation = generation;
+  let initialStatus, initialConfig;
+  try {
+    [initialStatus, initialConfig] = await Promise.all([api("/api/mimo/status"), api("/api/mimo/provider")]);
+  } catch (_) {
+    if (openMimoAdmin.generation === generation) showModal("MiMoCode 管理", [el("p", { class: "error", text: "配置加载未完成，请重试。" })]);
+    return;
+  }
+  if (openMimoAdmin.generation !== generation) return;
+  if (!initialConfig || !initialConfig.ok) {
+    showModal("MiMoCode 管理", [el("p", { class: "error", text: (initialConfig && initialConfig.message) || "配置暂时不可用或无管理权限。" })]);
+    return;
+  }
   const wrap = el("div", { class: "form-col" });
   wrap.appendChild(el("h3", { text: "MiMoCode 管理" }));
-  const s = st || {};
-  const c = cfg || {};
-  const ver = c.verification || {};
-  wrap.appendChild(el("p", {
-    class: "muted small",
-    text: `CLI：${s.binary || "?"} · ${s.exists ? "已安装 " + (s.version || "") : "未安装"} · unit：${(s.unit && s.unit.detail) || (s.unit && s.unit.active) || "未配置"}`,
-  }));
-  // 验证状态：未通过不得宣称可用
-  const available = !!c.available;
-  wrap.appendChild(el("p", {
-    class: available ? "small" : "error",
-    text: available
-      ? `MiMoCode 可用 · 模型 ${ver.model || c.model || "?"} · 验证通过`
-      : `MiMoCode 尚未通过连接验证（${ver.last_result || "未测试"}${ver.last_message ? " · " + ver.last_message : ""}）。请填写密钥并点击「测试连接」。`,
-  }));
+  const cli = initialStatus || {};
+  wrap.appendChild(el("p", { class: "muted small", text: `CLI：${cli.exists ? "已安装 " + (cli.version || "") : "未安装或状态不可用"} · unit：${(cli.unit && cli.unit.detail) || "未配置"}` }));
+  const statusLine = el("p", { class: "error" });
+  wrap.appendChild(statusLine);
+  let config = initialConfig;
+  let selectedProvider = "";
+  let keyStatusLabel = null;
+  const active = () => openMimoAdmin.generation === generation && $("modal-body").children[0] === wrap && !$("modal").classList.contains("hidden");
+  const updateStatus = (reply) => {
+    config = reply;
+    const ver = config.verification || {};
+    const prefix = (config.model || "").split("/")[0];
+    selectedProvider = ver.provider_id || config.provider_id || prefix || "";
+    if (keyStatusLabel) {
+      const provider = (config.providers || []).find((item) => item.name === selectedProvider) || {};
+      keyStatusLabel.textContent = provider.key_set ? "API Key（已保存，留空保留；更换地址需重新填写）" : "API Key";
+    }
+    statusLine.className = config.available ? "small" : "error";
+    statusLine.textContent = config.available
+      ? `已保存配置：MiMoCode 可用 · 模型 ${ver.model || config.model || "?"} · 验证通过`
+      : `已保存配置尚未通过连接验证（${ver.last_result || "未测试"}）。请测试连接并保存配置。`;
+  };
+  updateStatus(config);
+  const refreshStatus = async () => {
+    try {
+      const reply = await api("/api/mimo/provider");
+      if (!active()) return;
+      if (reply && reply.ok) updateStatus(reply);
+      else { statusLine.className = "error"; statusLine.textContent = "保存状态暂时无法确认，请刷新后重试。"; }
+    } catch (_) {
+      if (active()) { statusLine.className = "error"; statusLine.textContent = "保存状态暂时无法确认，请刷新后重试。"; }
+    }
+  };
   if (state.user && state.user.is_admin) {
+    const verification = config.verification || {};
+    const selected = (config.providers || []).find((provider) => provider.name === selectedProvider) || {};
+    const baseInput = el("input", { id: "mimo-base-url", type: "url", placeholder: "https://api.xiaomimimo.com/v1", value: verification.base_url || selected.baseURL || "" });
+    const modelInput = el("input", { id: "mimo-model", placeholder: "例如 mimo-v2.6-pro", value: verification.model || (config.model || "").split("/").slice(1).join("/") || "" });
+    const keyInput = el("input", { id: "mimo-api-key", type: "password", autocomplete: "new-password", placeholder: "粘贴你的 API Key" });
+    keyStatusLabel = el("span", { text: selected.key_set ? "API Key（已保存，留空保留；更换地址需重新填写）" : "API Key" });
+    const keyLabel = el("label", {}, [keyStatusLabel, keyInput]);
     wrap.appendChild(el("h4", { text: "模型与 API（由你填写）" }));
-    wrap.appendChild(el("label", { text: "Base URL" }, [
-      el("input", {
-        id: "mimo-base-url", type: "url",
-        placeholder: "https://api.xiaomimimo.com/v1",
-        value: ver.base_url || ((c.providers && c.providers[0] && c.providers[0].baseURL) || ""),
-      }),
-    ]));
-    wrap.appendChild(el("label", { text: "模型 ID" }, [
-      el("input", {
-        id: "mimo-model",
-        placeholder: "例如 mimo-v2.6-pro",
-        value: ver.model || (c.model || "").split("/").pop() || "",
-      }),
-    ]));
-    wrap.appendChild(el("label", {
-      text: (c.providers && c.providers[0] && c.providers[0].key_set)
-        ? "API Key（已保存，留空则不改）"
-        : "API Key",
-    }, [
-      el("input", {
-        id: "mimo-api-key", type: "password", autocomplete: "new-password",
-        placeholder: "粘贴你的 API Key",
-      }),
-    ]));
-    const msg = el("p", { class: "error" });
-    const testBtn = el("button", {
-      class: "btn", text: "测试连接", type: "button",
-      onclick: async () => {
-        const body = {
-          base_url: (($("mimo-base-url") || {}).value || "").trim(),
-          model: (($("mimo-model") || {}).value || "").trim(),
-          api_key: (($("mimo-api-key") || {}).value || "").trim(),
-        };
-        msg.textContent = "正在真实调用模型…";
-        const r = await api("/api/mimo/provider/test", { method: "POST", body: JSON.stringify(body) });
-        const map = {
-          success: "连接成功",
-          auth_failed: "认证失败：API Key 无效",
-          quota_exhausted: "额度不足",
-          rate_limited: "触发限流",
-          timeout: "超时",
-          connection_error: "网络错误",
-          server_error: "服务端错误",
-          http_error: "接口错误",
-        };
-        const label = (r && map[r.result]) || (r && r.message) || "测试失败";
-        msg.textContent = label + (r && r.http_status ? `（HTTP ${r.http_status}）` : "");
-        msg.className = (r && r.ok) ? "small" : "error";
-      },
-    });
-    const saveBtn = el("button", {
-      class: "btn primary", text: "保存并验证", type: "button",
-      onclick: async () => {
-        const body = {
-          base_url: (($("mimo-base-url") || {}).value || "").trim(),
-          model: (($("mimo-model") || {}).value || "").trim(),
-          api_key: (($("mimo-api-key") || {}).value || "").trim(),
-          test: true,
-        };
-        msg.textContent = "保存前验证中…";
-        const r = await api("/api/mimo/provider", { method: "POST", body: JSON.stringify(body) });
-        if (r && r.ok && r.verified) {
-          msg.className = "small";
-          msg.textContent = "已保存，连接验证通过，MiMoCode 可用。";
-          const keyEl = $("mimo-api-key");
-          if (keyEl) keyEl.value = "";
-        } else if (r && r.saved) {
-          msg.className = "error";
-          msg.textContent = "已保存但未通过验证：" + ((r.test && r.test.message) || r.message || "");
-        } else {
-          msg.className = "error";
-          msg.textContent = (r && (r.message || r.error)) || "未保存（验证未通过）";
+    wrap.appendChild(el("label", { text: "Base URL" }, [baseInput]));
+    wrap.appendChild(el("label", { text: "模型 ID" }, [modelInput]));
+    wrap.appendChild(keyLabel);
+    const message = el("p", { class: "error" });
+    let busy = false, revision = 0;
+    const controls = [];
+    const fields = () => ({ provider_id: selectedProvider, base_url: baseInput.value.trim(), model: modelInput.value.trim(), api_key: keyInput.value.trim() });
+    [baseInput, modelInput, keyInput].forEach((input) => input.addEventListener("input", () => {
+      revision += 1;
+      message.className = "muted small";
+      message.textContent = "当前输入已修改，之前的测试结果不适用；请重新测试或保存并验证。";
+    }));
+    const run = async (kind) => {
+      if (busy || !active()) return;
+      if (kind === "clear" && !confirm("清除当前 Provider 已保存的 API Key？清除后需重新配置并验证。")) return;
+      const submitted = fields(), submittedRevision = revision;
+      busy = true;
+      controls.forEach((button) => { button.disabled = true; });
+      message.className = "muted small";
+      message.textContent = kind === "test" ? "正在真实调用模型…" : kind === "save" ? "保存前验证中…" : "正在清除密钥…";
+      try {
+        const path = kind === "test" ? "/api/mimo/provider/test" : kind === "save" ? "/api/mimo/provider" : "/api/mimo/provider/clear";
+        const body = kind === "clear" ? { provider_id: submitted.provider_id } : { ...submitted, ...(kind === "save" ? { test: true } : {}) };
+        const reply = await api(path, { method: "POST", body: JSON.stringify(body) });
+        if (!active()) return;
+        await refreshStatus();
+        if (!active()) return;
+        if (revision !== submittedRevision) {
+          message.className = "muted small";
+          message.textContent = "当前输入已变化，请重新验证当前内容；已保存状态见上方。";
+          return;
         }
-      },
+        if (kind === "test") {
+          message.className = reply && reply.ok ? "small" : "error";
+          message.textContent = reply && reply.ok
+            ? "当前输入连接成功。未保存的修改仍需点击「保存并验证」。"
+            : (reply && (reply.message || reply.error)) || "测试未通过，请检查配置。";
+        } else if (reply && reply.ok) {
+          keyInput.value = "";
+          message.className = kind === "save" && !reply.verified ? "error" : "small";
+          message.textContent = kind === "clear" ? "已清除密钥，验证状态已重置。" : reply.verified ? "配置已保存，连接验证通过。" : "配置已保存但尚未验证，当前不可用。";
+        } else {
+          message.className = "error";
+          message.textContent = (reply && (reply.message || reply.error)) || "操作未完成，请刷新确认。";
+        }
+      } catch (_) {
+        if (active()) {
+          message.className = "error";
+          message.textContent = "请求未完成，请重试；保存状态需刷新确认。";
+        }
+      } finally {
+        busy = false;
+        controls.forEach((button) => { button.disabled = false; });
+      }
+    };
+    [["测试连接", "test"], ["保存并验证", "save"], ["清除已保存密钥", "clear"]].forEach(([text, kind]) => {
+      const button = el("button", { class: kind === "save" ? "btn primary" : "btn", text, type: "button", onclick: () => run(kind) });
+      controls.push(button); wrap.appendChild(button);
     });
-    wrap.appendChild(testBtn);
-    wrap.appendChild(saveBtn);
-    wrap.appendChild(el("button", {
-      class: "btn", text: "清除已保存密钥", type: "button",
-      onclick: async () => {
-        const r = await api("/api/mimo/provider/clear", { method: "POST", body: "{}" });
-        msg.className = "small";
-        msg.textContent = r && r.ok ? "已清除密钥，验证状态已重置" : ((r && r.message) || "清除失败");
-      },
-    }));
-    wrap.appendChild(msg);
-    wrap.appendChild(el("p", {
-      class: "muted small",
-      text: "密钥只保存在服务器 mimocode 配置（0600），界面与日志均不回显。验证未通过时不会标记为可用。",
-    }));
+    wrap.appendChild(message);
+    wrap.appendChild(el("p", { class: "muted small", text: "密钥只保存在服务器，界面不会回填密钥；测试未通过时不会标记已保存配置可用。测试与保存均会发起一次真实验证请求。" }));
   }
-  const msg2 = el("p", { class: "error" });
-  wrap.appendChild(msg2);
+  const processMessage = el("p", { class: "error" });
+  let processBusy = false;
+  const processControls = [];
   if (state.user && state.user.is_admin) {
-    wrap.appendChild(el("button", {
-      class: "btn", text: "启动", type: "button",
-      onclick: async () => {
-        const r = await api("/api/mimo/start", { method: "POST", body: "{}" });
-        msg2.textContent = (r && r.ok !== false) ? "已启动" : ((r && r.error) || "失败");
-      },
-    }));
-    wrap.appendChild(el("button", {
-      class: "btn", text: "停止", type: "button",
-      onclick: async () => {
-        const r = await api("/api/mimo/stop", { method: "POST", body: "{}" });
-        msg2.textContent = (r && r.ok !== false) ? "已停止" : ((r && r.error) || "失败");
-      },
-    }));
+    [["启动", "/api/mimo/start"], ["停止", "/api/mimo/stop"]].forEach(([text, path]) => {
+      const button = el("button", { class: "btn", text, type: "button", onclick: async () => {
+        if (processBusy || !active()) return;
+        processBusy = true; processControls.forEach((control) => { control.disabled = true; });
+        try {
+          const reply = await api(path, { method: "POST", body: "{}" });
+          if (active()) { processMessage.className = reply && reply.ok ? "small" : "error"; processMessage.textContent = reply && reply.ok ? "操作已完成。" : (reply && (reply.message || reply.error)) || "操作失败。"; }
+        } catch (_) { if (active()) processMessage.textContent = "请求未完成，请重试。"; }
+        finally { processBusy = false; processControls.forEach((control) => { control.disabled = false; }); }
+      } });
+      processControls.push(button); wrap.appendChild(button);
+    });
   }
-  wrap.appendChild(el("button", {
-    class: "btn", text: "刷新用量", type: "button",
-    onclick: async () => {
-      const r = await api("/api/mimo/stats");
-      showModal("MiMoCode 用量", [el("pre", { text: (r && (r.stdout || r.stderr || JSON.stringify(r))) || "" })]);
-    },
-  }));
+  wrap.appendChild(processMessage);
+  wrap.appendChild(el("button", { class: "btn", text: "刷新用量", type: "button", onclick: async () => {
+    try {
+      const reply = await api("/api/mimo/stats");
+      if (active()) showModal("MiMoCode 用量", [el("pre", { text: reply && reply.ok ? reply.stdout || "" : (reply && reply.message) || "用量暂时不可用。" })]);
+    } catch (_) { if (active()) processMessage.textContent = "用量加载未完成，请重试。"; }
+  } }));
   showModal("MiMoCode 管理", [wrap]);
 }
 
