@@ -411,6 +411,94 @@ on("pw-change-form", "submit", async (e) => {
 on("chg-pw-btn", "click", () => showPasswordChange(false));
 
 /* ---- Legacy autonomy history: read-only, no provider or execution controls ---- */
+/* ---- 运维软约束 / MiMoCode 管理（最终架构） ---- */
+async function openOpsConstraints() {
+  const res = await api("/api/ops/constraints");
+  if (!res || !res.ok) {
+    showModal("运维软约束", [el("p", { class: "error", text: (res && (res.message || res.error)) || "加载失败" })]);
+    return;
+  }
+  const wrap = el("div", { class: "form-col" });
+  wrap.appendChild(el("h3", { text: "运维软约束（MiMoCode 提示词）" }));
+  wrap.appendChild(el("p", { class: "muted small", text: "约束 Agent 行为：无进展 3 轮停止、同方案失败 2 次停止、证据不足转人工。硬保护不在此层。" }));
+  const cur = res.current || {};
+  wrap.appendChild(el("label", { text: `当前版本 v${cur.version || 0} · ${cur.created_by || "system"}` }, [
+    el("textarea", { id: "ops-constraints-text", rows: "12", style: "width:100%;font-family:monospace", text: cur.text || "" }),
+  ]));
+  wrap.appendChild(el("label", { text: "变更说明" }, [
+    el("input", { id: "ops-constraints-note", placeholder: "例如：收紧转人工条件" }),
+  ]));
+  const msg = el("p", { class: "error" });
+  wrap.appendChild(msg);
+  wrap.appendChild(el("button", {
+    class: "btn primary", text: "保存并生效", type: "button",
+    onclick: async () => {
+      const body = {
+        text: (($("ops-constraints-text") || {}).value || ""),
+        change_note: (($("ops-constraints-note") || {}).value || ""),
+        activate: true,
+      };
+      const r = await api("/api/ops/constraints", { method: "POST", body: JSON.stringify(body) });
+      msg.textContent = r && r.ok ? "已保存并生效" : ((r && (r.message || r.error)) || "保存失败");
+    },
+  }));
+  const vers = res.versions || [];
+  if (vers.length) {
+    wrap.appendChild(el("h4", { text: "历史版本" }));
+    vers.forEach((v) => {
+      wrap.appendChild(el("p", {
+        class: "small",
+        text: `v${v.version} · ${v.created_by || ""} · ${v.change_note || ""}${v.active ? " · 生效中" : ""}`,
+      }, [
+        el("button", {
+          class: "btn small", text: "生效", type: "button",
+          onclick: async () => {
+            const r = await api("/api/ops/constraints/activate", {
+              method: "POST", body: JSON.stringify({ version_id: v.id }),
+            });
+            msg.textContent = r && r.ok ? `已切换到 v${v.version}` : ((r && (r.message || r.error)) || "切换失败");
+          },
+        }),
+      ]));
+    });
+  }
+  showModal("运维软约束", [wrap]);
+}
+
+async function openMimoAdmin() {
+  const st = await api("/api/mimo/status");
+  const wrap = el("div", { class: "form-col" });
+  wrap.appendChild(el("h3", { text: "MiMoCode 管理" }));
+  const s = st || {};
+  wrap.appendChild(el("p", {
+    class: "muted small",
+    text: `二进制：${s.binary || "?"} · 存在：${s.exists ? "是" : "否"} · 版本：${s.version || "?"} · unit：${(s.unit && s.unit.detail) || s.unit && s.unit.active || "未配置"}`,
+  }));
+  const msg = el("p", { class: "error" });
+  const btn = (text, path) => el("button", {
+    class: "btn", text, type: "button",
+    onclick: async () => {
+      const r = await api(path, { method: "POST", body: "{}" });
+      msg.textContent = r && (r.ok !== false) ? "已执行" : ((r && (r.message || r.error)) || "失败");
+    },
+  });
+  if (state.user && state.user.is_admin) {
+    wrap.appendChild(btn("启动", "/api/mimo/start"));
+    wrap.appendChild(btn("停止", "/api/mimo/stop"));
+    wrap.appendChild(btn("重启", "/api/mimo/restart"));
+  }
+  wrap.appendChild(el("button", {
+    class: "btn", text: "刷新用量", type: "button",
+    onclick: async () => {
+      const r = await api("/api/mimo/stats");
+      showModal("MiMoCode 用量", [el("pre", { text: (r && (r.stdout || r.stderr || JSON.stringify(r))) || "" })]);
+    },
+  }));
+  wrap.appendChild(msg);
+  showModal("MiMoCode 管理", [wrap]);
+}
+
+/* ---- 旧自治历史（只读） ---- */
 async function openAutonomySettings() {
   const [settings, usageReply] = await Promise.all([api("/api/autonomy/providers"), api("/api/autonomy/usage")]);
   if (!settings.ok) { showModal("旧自治历史与费用", [el("p", { class: "error", text: settings.message || settings.error || "历史加载失败" })]); return; }
@@ -478,6 +566,12 @@ on("settings-btn", "click", async () => {
   form.appendChild(el("p", { class: "muted small", text: promSt }));
   if (state.user && state.user.is_admin) form.appendChild(el("button", {
     class: "btn", text: "旧自治历史与费用", type: "button", onclick: openAutonomySettings,
+  }));
+  if (state.user && state.user.is_admin) form.appendChild(el("button", {
+    class: "btn", text: "运维软约束（MiMoCode）", type: "button", onclick: openOpsConstraints,
+  }));
+  if (state.user && state.user.is_admin) form.appendChild(el("button", {
+    class: "btn", text: "MiMoCode 管理", type: "button", onclick: openMimoAdmin,
   }));
   wrap.appendChild(form);
   const msg = el("p", { class: "error" });

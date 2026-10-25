@@ -992,6 +992,24 @@ CREATE INDEX IF NOT EXISTS idx_investigation_jobs_status ON investigation_jobs(s
 """)
 
 
+def _migrate_v21_ops_loop(conn: sqlite3.Connection) -> None:
+    """最终架构：工单闭环软约束状态（无进展/同方案失败/停止原因）。"""
+    conn.executescript("""
+CREATE TABLE IF NOT EXISTS ops_loop_state (
+  incident_id TEXT PRIMARY KEY,
+  generation INTEGER NOT NULL DEFAULT 1,
+  rounds INTEGER NOT NULL DEFAULT 0,
+  no_progress_rounds INTEGER NOT NULL DEFAULT 0,
+  same_plan_failures INTEGER NOT NULL DEFAULT 0,
+  last_plan_sig TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'idle',
+  stop_reason TEXT NOT NULL DEFAULT '',
+  last_result TEXT NOT NULL DEFAULT '',
+  updated_at REAL NOT NULL DEFAULT 0
+);
+""")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_v1_baseline,
     2: _migrate_v2_p0_p1_columns,
@@ -1013,6 +1031,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     18: _migrate_v18_mimo_remote_session,
     19: _migrate_v19_write_ops_unknown_lease,
     20: _migrate_v20_investigation_jobs,
+    21: _migrate_v21_ops_loop,
 }
 
 _MIGRATION_NAMES = {
@@ -1036,6 +1055,7 @@ _MIGRATION_NAMES = {
     18: "mimo_remote_session",
     19: "write_ops_unknown_lease",
     20: "investigation_jobs",
+    21: "ops_loop_state",
 }
 
 

@@ -74,15 +74,19 @@ def write_may_dispatch(state: str) -> bool:
 
 
 def legacy_action_block(action: Any) -> tuple[str, str] | None:
-    """Persisted autonomous authorization cannot become a manual write."""
+    """Persisted autonomous authorization cannot become a manual write.
+
+    Final architecture: mode=autonomous is the MiMoCode closed-loop path.
+    Legacy council/auto/reviewed grants remain permanently retired.
+    """
     row = dict(action)
     mode = str(row.get("mode") or "manual").strip().lower()
     if (mode in ("auto", "reviewed") or row.get("council_grant_id")
             or row.get("council_step", -1) not in (-1, None)
             or str(row.get("decision_channel") or "").strip().lower() == "council"):
         return "legacy_autonomy_retired", "Legacy autonomous authorization is permanently retired"
-    if mode != "manual":
-        return "bad_mode", "Only manual actions may execute"
+    if mode not in ("manual", "autonomous"):
+        return "bad_mode", "Only manual or autonomous actions may execute"
     return None
 
 
@@ -209,6 +213,10 @@ class ActionService:
                 raise ActionError(
                     "template_required", "manual write requires template_id or runbook_id"
                 )
+        # autonomous：MiMoCode 闭环写；契约=能力目录+对象绑定，不强制 template/runbook
+        if mode == "autonomous":
+            runbook_id = runbook_id or ""
+            template_id = template_id or ""
         obj = self._object(asset_id, object_id)
         if not obj:
             raise ActionError("object_not_registered", object_id)
@@ -230,21 +238,34 @@ class ActionService:
             self._assert_incident_matches(incident_id, asset_id, obj)
 
         # 自动语义与人工语义分开（P1-01：服务端三态）
-        decision = self.policy.effective_decision(
-            subject_type=proposer_type,
-            subject_id=proposer_id,
-            capability=capability,
-            asset_id=asset_id,
-            object_id=obj["id"],
-            auto=(mode in ("auto", "reviewed")),
-        )
+        # final: mode=autonomous 退役 Agent Ceiling 与三态自治限制；
+        # 人工 Web/QQ 仍走 Policy。硬保护（能力目录/对象绑定/host key/幂等）不变。
+        if mode == "autonomous":
+            decision = {
+                "decision": "automatic",
+                "allowed": True,
+                "require_approval": False,
+                "auto_allowed": True,
+                "reason": "autonomous_ceiling_and_three_state_retired",
+                "rule": None,
+                "agent_ceiling": None,
+            }
+        else:
+            decision = self.policy.effective_decision(
+                subject_type=proposer_type,
+                subject_id=proposer_id,
+                capability=capability,
+                asset_id=asset_id,
+                object_id=obj["id"],
+                auto=(mode in ("auto", "reviewed")),
+            )
         if decision.get("decision") == "forbidden" or not decision["allowed"]:
             if mode == "auto" and decision.get("reason") == "auto_not_allowed":
                 raise ActionError("auto_not_allowed", decision.get("reason", ""))
             raise ActionError("denied", decision.get("reason") or "forbidden")
         if mode in ("auto", "reviewed") and decision.get("decision") != "automatic":
             raise ActionError("auto_not_allowed", decision.get("reason", ""))
-        if mode in ("auto", "reviewed"):
+        if mode in ("auto", "reviewed", "autonomous"):
             from .incidents import IncidentService
             from .verify_profiles import profile_for_action
 
@@ -341,21 +362,99 @@ class ActionService:
                         ensure_ascii=False,
                     ),
                     incident_id or "",
-                    "system" if mode == "auto" else "web",
+                    "system" if mode in ("auto", "autonomous") else "web",
                 ),
             )
+        state = "proposed"
+        require_approval = decision.get("require_approval", True)
+        # autonomous：系统即批，无需常规人工审批（人工 Web/QQ 路径不变）
+        if mode == "autonomous":
+            require_approval = False
+            self._system_approve_autonomous(
+                aid, incident_id=incident_id, asset_id=asset_id, object_id=obj["id"],
+                capability=capability, tokens=tokens,
+            )
+            state = "approved"
         return {
             "id": aid,
-            "state": "proposed",
+            "state": state,
             "tokens": tokens,
             "mode": mode,
             "runbook_id": runbook_id,
             "runbook_rev": runbook_rev,
             "template_id": template_id,
-            "require_approval": decision.get("require_approval", True),
+            "require_approval": require_approval,
             "decision": decision.get("decision", "approval_required"),
             "effective_decision": decision,
         }
+
+    def _system_approve_autonomous(
+        self,
+        action_id: str,
+        *,
+        incident_id: str,
+        asset_id: str,
+        object_id: str,
+        capability: str,
+        tokens: list[str],
+    ) -> None:
+        """autonomous 系统批准：记审计与 decision 快照，不走人工 Policy。"""
+        t = now()
+        decision_id = new_id("dec")
+        snapshot = {
+            "decision": "automatic",
+            "reason": "autonomous_ceiling_and_three_state_retired",
+            "require_approval": False,
+            "agent_ceiling": None,
+        }
+        with self.db.tx() as conn:
+            conn.execute(
+                "UPDATE actions SET state='approved', approver_type='system',"
+                " approver_id='autonomous', approved_at=?, decision_channel='autonomous',"
+                " decision_reason='autonomous_ceiling_and_three_state_retired', decided_at=?,"
+                " decision_id=?, decision_snapshot_json=? WHERE id=? AND state='proposed'",
+                (t, t, decision_id, json.dumps(snapshot, ensure_ascii=False), action_id),
+            )
+            conn.execute(
+                "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, object_id,"
+                " action_id, detail_json, incident_id, channel) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    t, "system", "autonomous", "action_approved",
+                    asset_id, object_id, action_id,
+                    json.dumps({"capability": capability, "tokens": tokens, "mode": "autonomous"}),
+                    incident_id or "", "autonomous",
+                ),
+            )
+
+    async def autonomous_execute(
+        self,
+        *,
+        asset_id: str,
+        object_id: str,
+        capability: str,
+        params: dict | None = None,
+        reason: str = "",
+        incident_id: str = "",
+        actor_id: str = "mimo_agent",
+    ) -> dict[str, Any]:
+        """MiMoCode 闭环：提案（系统批准）→ 执行。硬保护仍在 execute。"""
+        proposed = self.propose(
+            asset_id=asset_id,
+            object_id=object_id,
+            capability=capability,
+            params=params,
+            reason=reason,
+            incident_id=incident_id,
+            proposer_type="agent",
+            proposer_id=actor_id,
+            mode="autonomous",
+        )
+        return await self.execute(
+            proposed["id"],
+            actor_type="agent",
+            actor_id=actor_id,
+            is_admin=False,
+        )
 
     def _assert_incident_matches(self, incident_id: str, asset_id: str, obj: dict) -> None:
         inc = self.db.query_one("SELECT * FROM incidents WHERE id=?", (incident_id,))
@@ -1084,6 +1183,7 @@ class ActionService:
                 reject = ("approval_expired", "approval_deadline")
 
             # 唯一派发门：当前 Policy 复查（P0-02）
+            # autonomous：退役 Ceiling/三态，不在此复查 Policy；人工仍复查。
             action_mode = (fresh["mode"] or "manual") if "mode" in fresh.keys() else "manual"
             if reject is None and action_mode in ("auto", "reviewed") and fresh["incident_id"]:
                 from .incidents import IncidentService
@@ -1091,7 +1191,7 @@ class ActionService:
                 blocked = IncidentService(self.db).source_block_reason(fresh["incident_id"])
                 if blocked:
                     reject = (_source_block_code(blocked), blocked)
-            if reject is None:
+            if reject is None and action_mode != "autonomous":
                 for subject_type, subject_id in (
                     (fresh["proposer_type"] or "web_user", fresh["proposer_id"] or "system"),
                     (fresh["approver_type"] or "", fresh["approver_id"] or ""),
@@ -1130,11 +1230,11 @@ class ActionService:
                     tmpl = get_manual_template(tmpl_id)
                     if not tmpl:
                         reject = ("template_missing", tmpl_id)
-                elif action_mode != "reviewed":
+                elif action_mode not in ("reviewed", "autonomous"):
                     reject = ("template_required", "no runbook/template on action")
 
-            # 实际派发人必须具备该能力（非管理员）
-            if reject is None and not is_admin:
+            # 实际派发人必须具备该能力（非管理员）；autonomous 跳过
+            if reject is None and not is_admin and action_mode != "autonomous":
                 d = self.policy.check(
                     subject_type=actor_type,
                     subject_id=actor_id,

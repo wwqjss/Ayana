@@ -51,6 +51,11 @@ class OpsContext:
     session_bridge: Any = None
     # P4.3：只读模式（自动调查用）——执行层拒写，不靠提示词
     readonly: bool = False
+    # 最终架构：自治写 / 配置 / 闭环 / 软约束
+    actions: Any = None
+    promconfig: Any = None
+    ops_loop: Any = None
+    constraints: Any = None
 
 
 TOOL_SPECS: list[dict[str, Any]] = [
@@ -242,6 +247,72 @@ TOOL_SPECS: list[dict[str, Any]] = [
             "required": ["incident_id"],
         },
     },
+    {
+        "name": "action.execute",
+        "description": (
+            "自主执行已登记对象上的受控写能力（service.restart 等），"
+            "退役 Ceiling/三态后系统自动批准；仍受能力目录/对象绑定/host key/幂等/unknown 保护。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "asset_id": {"type": "string"},
+                "object_id": {"type": "string"},
+                "capability": {"type": "string"},
+                "incident_id": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+            "required": ["asset_id", "object_id", "capability"],
+        },
+    },
+    {
+        "name": "ops.constraints",
+        "description": "读取当前生效的 MiMoCode 运维软约束文本（无进展/同方案失败/转人工）。",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "ops.loop_status",
+        "description": "查询工单闭环软约束状态（轮次/无进展/停止原因）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"incident_id": {"type": "string"}},
+            "required": ["incident_id"],
+        },
+    },
+    {
+        "name": "config.prom_target_add",
+        "description": "自然语言配置：向 Prometheus file_sd 增加采集目标（校验+备份+回滚）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string"},
+                "labels": {"type": "object"},
+            },
+            "required": ["address"],
+        },
+    },
+    {
+        "name": "config.prom_target_update",
+        "description": "更新 Prometheus 采集目标。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string"},
+                "new_address": {"type": "string"},
+                "labels": {"type": "object"},
+            },
+            "required": ["address"],
+        },
+    },
+    {
+        "name": "config.prom_target_delete",
+        "description": "删除 Prometheus 采集目标。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"address": {"type": "string"}},
+            "required": ["address"],
+        },
+    },
 ]
 
 
@@ -270,6 +341,12 @@ class OpsTools:
             "session.get": self.session_get,
             "session.write_ops": self.session_write_ops,
             "session.remote": self.session_remote,
+            "action.execute": self.action_execute,
+            "ops.constraints": self.ops_constraints,
+            "ops.loop_status": self.ops_loop_status,
+            "config.prom_target_add": self.config_prom_target_add,
+            "config.prom_target_update": self.config_prom_target_update,
+            "config.prom_target_delete": self.config_prom_target_delete,
         }
         fn = handlers.get(name)
         if not fn:
@@ -727,6 +804,97 @@ class OpsTools:
                 for r in rows
             ],
         }
+
+    # ---- final architecture: autonomous action / ops / config ----
+
+    def _require_write_mode(self, tool: str) -> None:
+        if getattr(self.ctx, "readonly", False):
+            self._audit_write("", "", "rejected_readonly", tool)
+            raise McpToolError("readonly_mode_rejects_write", f"{tool} disabled in readonly mode")
+
+    async def action_execute(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_write_mode("action.execute")
+        actions = getattr(self.ctx, "actions", None)
+        if actions is None:
+            raise McpToolError("unavailable", "ActionService not wired")
+        asset_id = str(args.get("asset_id") or "").strip()
+        object_id = str(args.get("object_id") or "").strip()
+        capability = str(args.get("capability") or "").strip()
+        if not asset_id or not object_id or not capability:
+            raise McpToolError("bad_request", "asset_id, object_id, capability required")
+        try:
+            res = await actions.autonomous_execute(
+                asset_id=asset_id,
+                object_id=object_id,
+                capability=capability,
+                params={},
+                reason=str(args.get("reason") or "mcp_action_execute"),
+                incident_id=str(args.get("incident_id") or ""),
+                actor_id="mcp_agent",
+            )
+        except Exception as e:  # noqa: BLE001
+            code = getattr(e, "code", "exec_failed")
+            self._audit_write(asset_id, capability, "error", str(e)[:200])
+            raise McpToolError(str(code), str(e)[:300]) from e
+        self._audit_write(asset_id, capability, str(res.get("state") or ""), str(res.get("detail") or "")[:200])
+        return {"ok": res.get("state") == "success", **res}
+
+    async def ops_constraints(self, args: dict[str, Any]) -> dict[str, Any]:
+        c = getattr(self.ctx, "constraints", None)
+        if c is None:
+            raise McpToolError("unavailable", "constraints not wired")
+        return {"ok": True, "constraints": c.current()}
+
+    async def ops_loop_status(self, args: dict[str, Any]) -> dict[str, Any]:
+        loop = getattr(self.ctx, "ops_loop", None)
+        inc_id = str(args.get("incident_id") or "").strip()
+        if loop is None:
+            raise McpToolError("unavailable", "ops_loop not wired")
+        if not inc_id:
+            raise McpToolError("bad_request", "incident_id required")
+        return {"ok": True, "loop": loop.status(inc_id)}
+
+    async def config_prom_target_add(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_write_mode("config.prom_target_add")
+        pc = getattr(self.ctx, "promconfig", None)
+        if pc is None:
+            raise McpToolError("unavailable", "promconfig not wired")
+        try:
+            return await pc.add_target(
+                address=str(args.get("address") or ""),
+                labels=args.get("labels") or {},
+                actor="mcp_agent",
+            )
+        except Exception as e:  # noqa: BLE001
+            raise McpToolError(getattr(e, "code", "promconfig_failed"), str(e)[:300]) from e
+
+    async def config_prom_target_update(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_write_mode("config.prom_target_update")
+        pc = getattr(self.ctx, "promconfig", None)
+        if pc is None:
+            raise McpToolError("unavailable", "promconfig not wired")
+        try:
+            return await pc.update_target(
+                address=str(args.get("address") or ""),
+                new_address=args.get("new_address") or None,
+                labels=args.get("labels"),
+                actor="mcp_agent",
+            )
+        except Exception as e:  # noqa: BLE001
+            raise McpToolError(getattr(e, "code", "promconfig_failed"), str(e)[:300]) from e
+
+    async def config_prom_target_delete(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_write_mode("config.prom_target_delete")
+        pc = getattr(self.ctx, "promconfig", None)
+        if pc is None:
+            raise McpToolError("unavailable", "promconfig not wired")
+        try:
+            return await pc.delete_target(
+                address=str(args.get("address") or ""),
+                actor="mcp_agent",
+            )
+        except Exception as e:  # noqa: BLE001
+            raise McpToolError(getattr(e, "code", "promconfig_failed"), str(e)[:300]) from e
 
 
 def tool_result(ok: bool, data: dict[str, Any] | None = None, error: str = "") -> dict[str, Any]:

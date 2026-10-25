@@ -61,6 +61,53 @@ def build_ops_context(cfg: dict[str, Any]) -> OpsContext:
     readonly = str(os.environ.get("AYANA_MCP_READONLY") or "").strip() in ("1", "true", "yes", "on")
     bridge = SessionBridge(db, knowledge=knowledge, mimo=mimo)
     incidents.session_bridge = bridge
+    from .actions import ActionService
+    from .ntsafe import AssetBinding, IdentityGate, NTClient
+    from .ops_constraints import OpsConstraints
+    from .ops_loop import OpsLoop, ensure_ops_loop_schema
+    from .policy import Policy
+    from .promconfig import build_prom_config_service
+
+    def _load_bindings(database: Database) -> list:
+        rows = database.query(
+            "SELECT id, read_alias, write_alias, expected_host_id, host_id_verified_at FROM assets WHERE enabled=1"
+        )
+        out = []
+        for r in rows:
+            out.append(
+                AssetBinding(
+                    asset_id=r["id"],
+                    read_alias=r["read_alias"] or "",
+                    write_alias=r["write_alias"] or "",
+                    expected_host_id=r["expected_host_id"] or "",
+                    host_id_verified_at=r["host_id_verified_at"] or 0,
+                )
+            )
+        return out
+
+    ensure_ops_loop_schema(db)
+    policy = Policy(db)
+    nt = NTClient(privilege_mode="restricted_dispatcher")
+    gate = IdentityGate(nt, _load_bindings(db))
+    actions = ActionService(
+        db, nt, gate, policy, prom,
+        transport=transport,
+        action_ttl=int(cfg.get("action_ttl_sec", 1800)),
+        verify_window=int(cfg.get("verify_window_sec", 90)),
+        verify_timeout=int(cfg.get("verify_timeout_sec", 300)),
+    )
+    actions.write_ops = bridge
+    constraints = OpsConstraints(db)
+    ops_loop = OpsLoop(
+        db, actions=actions, incidents=incidents, bridge=bridge, constraints=constraints
+    )
+    promconfig = None
+    try:
+        promconfig = build_prom_config_service(
+            db, cfg, prom=prom, transport=transport
+        )
+    except Exception:
+        promconfig = None
     return OpsContext(
         transport=transport,
         prom=prom,
@@ -69,6 +116,10 @@ def build_ops_context(cfg: dict[str, Any]) -> OpsContext:
         db=db,
         session_bridge=bridge,
         readonly=readonly,
+        actions=actions,
+        promconfig=promconfig,
+        ops_loop=ops_loop,
+        constraints=constraints,
     )
 
 

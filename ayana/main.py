@@ -357,6 +357,25 @@ class App:
         )
         # P4.2：ActionService 与 Session 桥共用写幂等台账
         self.actions.write_ops = self.session_bridge
+        from .mimo_admin import MimoAdmin
+        from .ops_constraints import OpsConstraints
+        from .ops_loop import OpsLoop, ensure_ops_loop_schema
+
+        ensure_ops_loop_schema(self.db)
+        self.ops_constraints = OpsConstraints(self.db)
+        self.ops_loop = OpsLoop(
+            self.db,
+            actions=self.actions,
+            incidents=self.incidents,
+            bridge=self.session_bridge,
+            constraints=self.ops_constraints,
+        )
+        self.mimo_admin = MimoAdmin(
+            mimo_bin=str(cfg.get("mimo_bin") or "mimo"),
+            workdir=str(cfg.get("mimo_workdir") or ""),
+            serve_url=str(cfg.get("mimo_serve_url") or ""),
+            unit_name=str(cfg.get("mimo_unit") or ""),
+        )
         self.notifier = Notifier(self.db, default_target="")
         self.alert_ingest = AlertIngest(self.db, incidents=self.incidents, notifier=self.notifier)
         self.notifier.set_default_target(
@@ -481,6 +500,9 @@ class App:
             llm=self.llm,
             nodewatch=getattr(self, "nodewatch", None),
             exttx=self.exttx,
+            ops_loop=self.ops_loop,
+            ops_constraints=self.ops_constraints,
+            mimo_admin=self.mimo_admin,
             alertmanager_webhook_path=cfg.get("alertmanager_webhook_path") or "/hooks/alertmanager",
         )
         self._stop = asyncio.Event()

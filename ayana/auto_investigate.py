@@ -58,13 +58,18 @@ class InvestConfig:
 CONCLUSION_PROMPT = """你是值班运维调查助手（只读，禁止修复）。
 目标：调查该 Incident，收集证据并给出结构化结论。不要重启服务、不要改配置、不要写文件。
 
+## 软约束（必须遵守）
+1. 无进展 3 轮停止：连续 3 轮未产生新证据 → 停止并输出 partial/failed。
+2. 同方案失败 2 次停止：同一修复意图不得重复尝试超过 2 次。
+3. 证据不足转人工：根因不明或探测无样本 → root_cause=unknown，next_steps 标明需人工。
+
 只允许使用只读 MCP 工具（实际工具名使用下划线）：
 - ayana_knowledge_query / ayana_knowledge_get
 - ayana_metrics_query
 - ayana_incident_list / ayana_incident_get
 - ayana_asset_list
 - ayana_host_exec（仅 channel=read 且命令必须是只读，如 uptime / systemctl status）
-禁止：ayana_host_exec 写模式、ayana_knowledge_upsert、ayana_incident_close、ayana_session_remote。
+禁止：ayana_host_exec 写模式、ayana_knowledge_upsert、ayana_incident_close、ayana_session_remote、ayana_action_execute。
 若工具拒绝写操作，记录该事实，不得绕过。
 
 必须实际调用至少一次上述只读工具，并把工具返回内容写入 facts.evidence；不要编造命令输出或工具结果。

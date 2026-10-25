@@ -126,6 +126,9 @@ class WebApp:
         exttx=None,
         autonomy=None,
         providers=None,
+        ops_loop=None,
+        ops_constraints=None,
+        mimo_admin=None,
         alertmanager_webhook_path: str = "/hooks/alertmanager",
     ):
         self.db = db
@@ -155,6 +158,9 @@ class WebApp:
         self.checks = checks
         self.nodewatch = nodewatch
         self.exttx = exttx
+        self.ops_loop = ops_loop
+        self.ops_constraints = ops_constraints
+        self.mimo_admin = mimo_admin
         # Legacy kwargs remain accepted for older callers, but no live service is retained.
         from .legacy_history import LegacyHistory
 
@@ -199,6 +205,20 @@ class WebApp:
         app.router.add_post("/api/setup/monitor", self.api_setup_monitor_post)
         app.router.add_get("/api/settings/global", self.api_settings_global_get)
         app.router.add_post("/api/settings/global", self.api_settings_global_post)
+        # 最终架构：软约束 / 工单闭环 / MiMoCode 管理 / 统一台账
+        app.router.add_get("/api/ops/constraints", self.api_ops_constraints_get)
+        app.router.add_post("/api/ops/constraints", self.api_ops_constraints_save)
+        app.router.add_post("/api/ops/constraints/activate", self.api_ops_constraints_activate)
+        app.router.add_get("/api/ops/loop/{inc_id}", self.api_ops_loop_status)
+        app.router.add_get("/api/mimo/status", self.api_mimo_status)
+        app.router.add_post("/api/mimo/start", self.api_mimo_start)
+        app.router.add_post("/api/mimo/stop", self.api_mimo_stop)
+        app.router.add_post("/api/mimo/restart", self.api_mimo_restart)
+        app.router.add_get("/api/mimo/logs", self.api_mimo_logs)
+        app.router.add_get("/api/mimo/stats", self.api_mimo_stats)
+        app.router.add_get("/api/mimo/providers", self.api_mimo_providers)
+        app.router.add_post("/api/mimo/chat", self.api_mimo_chat)
+        app.router.add_get("/api/executions", self.api_executions)
         app.router.add_get("/api/overview", self.api_overview)
         app.router.add_get("/api/assets", self.api_assets)
         app.router.add_get("/api/assets/{asset_id}", self.api_asset_detail)
@@ -1179,6 +1199,158 @@ class WebApp:
                 "probe": probe,
             }
         )
+
+    # ---- final architecture: ops constraints / mimo / ledger ----
+
+    async def api_ops_constraints_get(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        if not self.ops_constraints:
+            return _json({"ok": False, "error": "unavailable"}, 503)
+        return _json(
+            {
+                "ok": True,
+                "current": self.ops_constraints.current(),
+                "versions": self.ops_constraints.list_versions(),
+            }
+        )
+
+    async def api_ops_constraints_save(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        self._require_admin(request)
+        self._check_csrf(request, sess)
+        if not self.ops_constraints:
+            return _json({"ok": False, "error": "unavailable"}, 503)
+        body = await request.json()
+        text = str(body.get("text") or "")
+        try:
+            cur = self.ops_constraints.save(
+                text,
+                actor=sess["username"],
+                change_note=str(body.get("change_note") or ""),
+                activate=bool(body.get("activate", True)),
+            )
+        except ValueError as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True, "current": cur})
+
+    async def api_ops_constraints_activate(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        self._require_admin(request)
+        self._check_csrf(request, sess)
+        if not self.ops_constraints:
+            return _json({"ok": False, "error": "unavailable"}, 503)
+        body = await request.json()
+        try:
+            cur = self.ops_constraints.activate(int(body.get("version_id") or 0), actor=sess["username"])
+        except ValueError as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        return _json({"ok": True, "current": cur})
+
+    async def api_ops_loop_status(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        inc_id = request.match_info["inc_id"]
+        if not self.ops_loop:
+            return _json({"ok": False, "error": "unavailable"}, 503)
+        return _json({"ok": True, "loop": self.ops_loop.status(inc_id)})
+
+    def _mimo(self):
+        if not self.mimo_admin:
+            raise web.HTTPNotFound(text=json.dumps({"error": "mimo_admin_unavailable"}))
+        return self.mimo_admin
+
+    async def api_mimo_status(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        st = await self._mimo().status()
+        return _json(st)
+
+    async def api_mimo_start(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        self._require_admin(request)
+        self._check_csrf(request, sess)
+        res = await self._mimo().start()
+        self.db.audit("web_user", sess["username"], "mimo_start", detail=res, channel="web")
+        return _json(res)
+
+    async def api_mimo_stop(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        self._require_admin(request)
+        self._check_csrf(request, sess)
+        res = await self._mimo().stop()
+        self.db.audit("web_user", sess["username"], "mimo_stop", detail=res, channel="web")
+        return _json(res)
+
+    async def api_mimo_restart(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        self._require_admin(request)
+        self._check_csrf(request, sess)
+        res = await self._mimo().restart()
+        self.db.audit("web_user", sess["username"], "mimo_restart", detail=res, channel="web")
+        return _json(res)
+
+    async def api_mimo_logs(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        lines = int(request.rel_url.query.get("lines") or 80)
+        return _json(await self._mimo().logs(lines=lines))
+
+    async def api_mimo_stats(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        return _json(await self._mimo().stats())
+
+    async def api_mimo_providers(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        return _json(self._mimo().provider_summary())
+
+    async def api_mimo_chat(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        inc_id = str(body.get("incident_id") or "").strip()
+        prompt = str(body.get("prompt") or "").strip()
+        if not inc_id or not prompt:
+            return _json({"ok": False, "error": "incident_id_and_prompt_required"}, 400)
+        br = getattr(self, "session_bridge", None) or getattr(self.incidents, "session_bridge", None)
+        if not br:
+            return _json({"ok": False, "error": "session_bridge_unavailable"}, 503)
+        attached = br.attach_remote(inc_id)
+        if not attached.get("ok"):
+            return _json(attached, 502)
+        sent = br.prompt_remote(inc_id, prompt)
+        self.db.audit(
+            "web_user", sess["username"], "mimo_chat",
+            detail={"incident_id": inc_id, "prompt_len": len(prompt)}, channel="web",
+        )
+        return _json({"ok": True, "session": attached, "prompt_result": sent})
+
+    async def api_executions(self, request: web.Request) -> web.Response:
+        """统一查询 actions + session_write_ops（关联 Incident/资产）。"""
+        sess = self._require_auth(request)
+        inc_id = str(request.rel_url.query.get("incident_id") or "").strip()
+        limit = min(200, int(request.rel_url.query.get("limit") or 50))
+        where = " WHERE incident_id=?" if inc_id else ""
+        params = (inc_id,) if inc_id else ()
+        actions = [
+            dict(r)
+            for r in self.db.query(
+                f"SELECT id, incident_id, asset_id, object_id, capability, state, mode,"
+                f" proposer_type, proposer_id, created_at, finished_at, result_detail"
+                f" FROM actions{where} ORDER BY created_at DESC LIMIT ?",
+                (*params, limit),
+            )
+        ]
+        try:
+            wops = [
+                dict(r)
+                for r in self.db.query(
+                    f"SELECT id, incident_id, session_id, action_key, status, result,"
+                    f" target, claimed_by, created_at, updated_at FROM session_write_ops{where}"
+                    f" ORDER BY created_at DESC LIMIT ?",
+                    (*params, limit),
+                )
+            ]
+        except Exception:
+            wops = []
+        return _json({"ok": True, "actions": actions, "session_write_ops": wops})
 
     # ---- business api ----
 
