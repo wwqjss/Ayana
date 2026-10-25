@@ -73,6 +73,19 @@ def write_may_dispatch(state: str) -> bool:
     return state == "approved"
 
 
+def legacy_action_block(action: Any) -> tuple[str, str] | None:
+    """Persisted autonomous authorization cannot become a manual write."""
+    row = dict(action)
+    mode = str(row.get("mode") or "manual").strip().lower()
+    if (mode in ("auto", "reviewed") or row.get("council_grant_id")
+            or row.get("council_step", -1) not in (-1, None)
+            or str(row.get("decision_channel") or "").strip().lower() == "council"):
+        return "legacy_autonomy_retired", "Legacy autonomous authorization is permanently retired"
+    if mode != "manual":
+        return "bad_mode", "Only manual actions may execute"
+    return None
+
+
 def action_incident_block(store: Any, action: Any) -> tuple[str, str] | None:
     """Current incident validity for approval and the final dispatch claim.
 
@@ -176,15 +189,13 @@ class ActionService:
         council_grant_id: str = "",
         council_step: int = -1,
     ) -> dict[str, Any]:
+        blocked = legacy_action_block({"mode": mode, "council_grant_id": council_grant_id,
+                                       "council_step": council_step})
+        if blocked:
+            raise ActionError(*blocked)
         cap = get_capability(capability)
         if cap.kind != "write":
             raise ActionError("not_a_write_capability")
-        if mode not in ("manual", "auto", "reviewed"):
-            raise ActionError("bad_mode", mode)
-        if mode != "reviewed" and council_grant_id:
-            raise ActionError("council_grant_invalid", "grant linkage requires reviewed mode")
-        if mode == "reviewed" and (not council_grant_id or proposer_type != "auto_rule" or proposer_id != "agent"):
-            raise ActionError("council_grant_required")
         # 自动必须带 runbook；人工必须带 template 或 runbook（显式契约）
         if mode == "auto" and not runbook_id:
             raise ActionError("runbook_required", "auto mode requires runbook_id")
@@ -249,7 +260,7 @@ class ActionService:
                     )
                 raise ActionError("unsupported_verification_profile")
 
-        if self._object_locked(asset_id, obj["id"], council_grant_id=council_grant_id):
+        if self._object_locked(asset_id, obj["id"]):
             raise ActionError("object_locked", f"{asset_id}/{obj['id']}")
 
         aid = new_id("act")
@@ -267,26 +278,6 @@ class ActionService:
         }
         approval_deadline = now() + float(self.action_ttl)
         with self.db.tx() as conn:
-            if mode == "reviewed":
-                from .council import current_plan_block
-                grant = conn.execute("SELECT * FROM council_grants WHERE id=?", (council_grant_id,)).fetchone()
-                if not grant or grant["state"] != "executing" or not grant["claimed_at"] or now() >= grant["expires_at"]:
-                    raise ActionError("council_grant_invalid")
-                plan = conn.execute("SELECT * FROM council_plans WHERE id=?", (grant["plan_id"],)).fetchone()
-                blocked = current_plan_block(conn, plan) if plan else ("council_grant_invalid", "plan missing")
-                if blocked:
-                    raise ActionError(*blocked)
-                steps = json.loads(plan["plan_json"])["steps"]
-                if type(council_step) is not int or not 0 <= council_step < len(steps):
-                    raise ActionError("council_step_invalid")
-                step = steps[council_step]
-                if (plan["incident_id"] != incident_id or plan["asset_id"] != asset_id or plan["object_id"] != obj["id"]
-                        or step["capability"] != capability or step["params"] != (params or {}) or step["tokens"] != tokens):
-                    raise ActionError("council_step_mismatch")
-                cur = conn.execute("UPDATE council_steps SET state='prepared',action_id=? WHERE grant_id=? AND ordinal=? AND state='pending' AND action_id=''",
-                                   (aid, council_grant_id, council_step))
-                if cur.rowcount != 1:
-                    raise ActionError("council_step_consumed")
             conn.execute(
                 "INSERT INTO actions(id, incident_id, asset_id, object_id, capability,"
                 " params_json, reason, state, proposer_type, proposer_id, created_at,"
@@ -315,8 +306,6 @@ class ActionService:
                     approval_deadline,
                 ),
             )
-            if mode == "reviewed":
-                conn.execute("UPDATE actions SET council_grant_id=?,council_step=? WHERE id=?", (council_grant_id, council_step, aid))
             conn.execute(
                 "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
                 (
@@ -388,29 +377,7 @@ class ActionService:
             )
 
     def authorize_reviewed(self, action_id: str, *, grant_id: str, ordinal: int) -> dict:
-        """Backend-only grant consumption; ordinary human/model approval cannot use it."""
-        from .council import reviewed_action_block
-        with self.db.tx() as conn:
-            row = conn.execute("SELECT * FROM actions WHERE id=?", (action_id,)).fetchone()
-            if (not row or row["state"] != "proposed" or row["mode"] != "reviewed"
-                    or row["council_grant_id"] != grant_id or row["council_step"] != ordinal):
-                raise ActionError("council_step_invalid")
-            blocked = reviewed_action_block(conn, row)
-            if blocked:
-                raise ActionError(*blocked)
-            decision = self.policy.effective_decision(subject_type="auto_rule", subject_id="agent",
-                capability=row["capability"], asset_id=row["asset_id"], object_id=row["object_id"], auto=True)
-            if not decision.get("allowed") or decision.get("decision") != "automatic":
-                raise ActionError("policy_revoked")
-            conn.execute("UPDATE actions SET state='approved',approver_type='auto_rule',approver_id='agent',approved_at=?,"
-                " decision_channel='council',decision_reason='two_independent_reviews',decided_at=?,decision_id=?,decision_snapshot_json=? WHERE id=? AND state='proposed'",
-                (now(), now(), grant_id, json.dumps(decision, ensure_ascii=False, default=str), action_id))
-            self.db.audit("system", "council", "action_approved", action_id=action_id, incident_id=row["incident_id"],
-                asset_id=row["asset_id"], object_id=row["object_id"], decision_id=grant_id, channel="council",
-                detail={"grant_id": grant_id, "ordinal": ordinal, "tokens": json.loads(row["params_json"])["tokens"]})
-            self.db.event("action_approved", "双委员授权已绑定精确操作", incident_id=row["incident_id"],
-                payload={"action_id": action_id, "grant_id": grant_id, "ordinal": ordinal})
-        return {"id": action_id, "state": "approved", "decision_id": grant_id}
+        raise ActionError("legacy_autonomy_retired")
 
     # ------------------------------------------------------------------
     # 批准 / 拒绝 / 取消（Web / QQ 共用；幂等）
@@ -427,8 +394,9 @@ class ActionService:
     ) -> dict[str, Any]:
         """批准提案。幂等：已批准/已派发不重复产生第二次 dispatch。"""
         row = self._get(action_id)
-        if row.get("mode") == "reviewed":
-            raise ActionError("council_approval_required", "reviewed action requires its exact council grant")
+        blocked = legacy_action_block(row)
+        if blocked:
+            raise ActionError(*blocked)
         state = row["state"]
         if state in ("approved", "dispatched", "success", "failure", "unknown"):
             return {
@@ -986,6 +954,8 @@ class ActionService:
                     action_id, actor_type=actor_type, actor_id=actor_id, is_admin=is_admin
                 )
             except ActionError as exc:
+                if exc.code == "legacy_autonomy_retired":
+                    raise
                 row = self._get(action_id)
                 retryable_auto = row.get("mode") == "auto" and exc.code in AUTO_RETRYABLE_BLOCKS
                 if row["state"] == "approved" and not retryable_auto and not action_incident_block(self.db, row):
@@ -1016,6 +986,9 @@ class ActionService:
             raise ActionError("no_replay", row["state"])
         if not write_may_dispatch(row["state"]):
             raise ActionError("bad_state", row["state"])
+        blocked = legacy_action_block(row)
+        if blocked:
+            raise ActionError(*blocked)
 
         # 记录核验时使用的绑定快照，领取事务里逐项比对
         # SSH 路径：以 host_key 信任为准；NT 路径：保留 alias/host_id 绑定
@@ -1073,6 +1046,9 @@ class ActionService:
             if not fresh or fresh["state"] != "approved":
                 raise ActionError("bad_state", "not_approved")
 
+            blocked = legacy_action_block(fresh)
+            if blocked:
+                raise ActionError(*blocked)
             reject = action_incident_block(conn, fresh)
 
             # 资产当前登记 vs 核验时快照
@@ -1109,9 +1085,6 @@ class ActionService:
 
             # 唯一派发门：当前 Policy 复查（P0-02）
             action_mode = (fresh["mode"] or "manual") if "mode" in fresh.keys() else "manual"
-            if reject is None and action_mode == "reviewed":
-                from .council import reviewed_action_block, reviewed_runtime_block
-                reject = reviewed_runtime_block(conn) or reviewed_action_block(conn, fresh)
             if reject is None and action_mode in ("auto", "reviewed") and fresh["incident_id"]:
                 from .incidents import IncidentService
 
@@ -1216,7 +1189,6 @@ class ActionService:
             if reject is None:
                 if self._object_locked(
                     fresh["asset_id"], fresh["object_id"], exclude=action_id,
-                    council_grant_id=fresh["council_grant_id"] if action_mode == "reviewed" else "",
                 ):
                     reject = ("object_locked", fresh["object_id"])
 
@@ -1227,13 +1199,6 @@ class ActionService:
 
                 rule = get_runbook_rule(rb_id_b) if rb_id_b else None
                 rules = [rule or RunbookRule(id="", name="")]
-                if action_mode == "reviewed":
-                    from .runbook import RUNBOOK
-                    object_name = resolve_object_name(dict(obj))
-                    rules = [r for r in RUNBOOK if r.capability == fresh["capability"]
-                             and r.asset_id in ("*", fresh["asset_id"])
-                             and r.object_name in ("*", object_name)]
-                    rules = rules or [RunbookRule(id="council_default", name="Council operation limit", capability=fresh["capability"])]
                 for operation_rule in rules:
                     budget = auto_budget_state(
                         conn, operation_rule,
@@ -1291,12 +1256,6 @@ class ActionService:
                 if code in ("source_quarantined", "unsupported_verification_profile"):
                     self._mark_need_human(fresh_d.get("incident_id") or "", f"{code}:{action_id}")
             else:
-                if action_mode == "reviewed":
-                    step_claim = conn.execute("UPDATE council_steps SET state='dispatched',claimed_at=?"
-                        " WHERE grant_id=? AND ordinal=? AND state='prepared' AND action_id=?",
-                        (now(), fresh["council_grant_id"], fresh["council_step"], action_id))
-                    if step_claim.rowcount != 1:
-                        raise ActionError("council_step_consumed")
                 cur = conn.execute(
                     "UPDATE actions SET state='dispatched', dispatched_at=?, exec_account=?,"
                     " budget_claimed_at=? WHERE id=? AND state='approved'",
@@ -1507,7 +1466,7 @@ class ActionService:
             except Exception:
                 pass
 
-        if state == "success" and vid and row.get("mode") != "reviewed":
+        if state == "success" and vid:
             try:
                 asyncio.create_task(self._run_verification(vid, action_id))
             except RuntimeError:
@@ -2047,17 +2006,7 @@ class ActionService:
 
     def _object_locked(self, asset_id: str, object_id: str, exclude: str = "", *, council_grant_id: str = "") -> bool:
         if council_grant_id:
-            # Earlier steps in this exact claimed multi-step grant retain their
-            # verification locks for everyone except their remaining exact steps.
-            # Pending manual approvals also block autonomous writes.
-            row = self.db.query_one(
-                "SELECT COUNT(*) AS n FROM actions WHERE asset_id=? AND object_id=? AND id!=?"
-                " AND (state IN ('unknown','dispatched','proposed','approved')"
-                " OR (state='success' AND council_grant_id!=? AND id IN"
-                " (SELECT action_id FROM verifications WHERE status='pending')))",
-                (asset_id, object_id, exclude, council_grant_id),
-            )
-            return bool(row and row["n"])
+            raise ActionError("legacy_autonomy_retired")
         from .incidents import IncidentService
         return IncidentService(self.db).object_actions_locked(
             asset_id, object_id, exclude=exclude

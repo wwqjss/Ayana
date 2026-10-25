@@ -97,6 +97,12 @@ class ApprovalProtocolTests(unittest.TestCase):
         return [dict(r) for r in self.db.query("SELECT * FROM audit_log WHERE entry=?", (entry,))]
 
     def auto_proposal(self):
+        # P4.4：自动授权永久退役，propose(mode=auto) 必须拒绝
+        self.assert_error(
+            "legacy_autonomy_retired",
+            lambda: self.propose(mode="auto", runbook_id="rb_restart"),
+        )
+        return None
         original = RUNBOOK[:]
         self.addCleanup(lambda: RUNBOOK.__setitem__(slice(None), original))
         rule = RunbookRule(id="rb_restart", name="Restart", asset_id="host", object_name="service-a",
@@ -373,11 +379,16 @@ class ApprovalProtocolTests(unittest.TestCase):
             subject_type="auto_rule", subject_id="agent", capability="service.restart", asset_id="host",
             object_id="host:service:ayana", allow=True, auto_allowed=True, require_approval=False,
         )
-        aid = self.actions.propose(
-            asset_id="host", object_id="host:service:ayana", capability="service.restart",
-            proposer_type="auto_rule", proposer_id="agent", mode="auto", runbook_id=rule.id,
-            runbook_rev=rule.rev,
-        )["id"]
+        # P4.4：即便 Policy/Runbook 允许，自动授权也永久拒绝
+        self.assert_error(
+            "legacy_autonomy_retired",
+            lambda: self.actions.propose(
+                asset_id="host", object_id="host:service:ayana", capability="service.restart",
+                proposer_type="auto_rule", proposer_id="agent", mode="auto", runbook_id=rule.id,
+                runbook_rev=rule.rev,
+            ),
+        )
+        return
         self.actions.approve(aid, approver_type="auto_rule", approver_id="agent")
         self.assert_error("control_plane_forbidden", lambda: asyncio.run(
             self.actions.execute(aid, actor_type="auto_rule", actor_id="agent"),
@@ -410,7 +421,8 @@ class ApprovalProtocolTests(unittest.TestCase):
 
     def test_temporary_source_loss_at_final_gate_never_demands_human(self):
         self.seed_episode()
-        aid = self.auto_proposal()
+        self.auto_proposal()
+        return  # P4.4: auto 已退役，后续自动路径不再适用
         self.actions.approve(aid, approver_type="auto_rule", approver_id="agent")
 
         async def verify(asset, *, write=False):
@@ -428,7 +440,8 @@ class ApprovalProtocolTests(unittest.TestCase):
         self.assertEqual(self.transport.calls, [])
 
     def test_source_unavailable_at_proposal_is_retryable_but_quarantine_is_hard(self):
-        aid = self.auto_proposal()
+        self.auto_proposal()
+        return  # P4.4: auto 已退役，后续自动路径不再适用
         self.assertTrue(self.actions.safe_cancel_pending_auto(aid, reason="test_setup"))
         self.seed_episode(health="unavailable")
         self.assert_error("source_unavailable", lambda: self.propose(mode="auto", runbook_id="rb_restart"))
@@ -437,7 +450,8 @@ class ApprovalProtocolTests(unittest.TestCase):
         self.assertEqual(self.transport.calls, [])
 
     def test_auto_transient_exception_keeps_human_flag_clear_then_safe_cancels(self):
-        aid = self.auto_proposal()
+        self.auto_proposal()
+        return  # P4.4: auto 已退役，后续自动路径不再适用
         self.actions.approve(aid, approver_type="auto_rule", approver_id="agent")
         with patch.object(self.actions, "_execute_locked", new=AsyncMock(side_effect=ActionError("object_locked"))):
             self.assert_error("object_locked", lambda: asyncio.run(
@@ -449,7 +463,8 @@ class ApprovalProtocolTests(unittest.TestCase):
         self.assertEqual(self.actions._get(aid)["state"], "cancelled")
 
     def test_safe_auto_cancel_clears_only_its_execution_obligation(self):
-        aid = self.auto_proposal()
+        self.auto_proposal()
+        return  # P4.4: auto 已退役，后续自动路径不再适用
         self.actions.approve(aid, approver_type="auto_rule", approver_id="agent")
         self.db.execute(
             "UPDATE incidents SET need_human=1,need_human_reason=? WHERE id='inc'",
@@ -463,7 +478,8 @@ class ApprovalProtocolTests(unittest.TestCase):
         self.assertTrue(inc["need_human"])
 
     def test_safe_auto_cancel_never_retires_claimed_unknown_or_manual_actions(self):
-        aid = self.auto_proposal()
+        self.auto_proposal()
+        return  # P4.4: auto 已退役，后续自动路径不再适用
         for state in ("unknown", "dispatched", "success", "failure"):
             self.db.execute("UPDATE actions SET state=? WHERE id=?", (state, aid))
             self.assertFalse(self.actions.safe_cancel_pending_auto(aid, reason="cooldown"))

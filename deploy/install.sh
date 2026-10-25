@@ -370,7 +370,6 @@ else
   "prometheus_url": "http://127.0.0.1:9090",
   "alertmanager_url": "http://127.0.0.1:9093",
   "admin_qq": "",
-  "auto_remediation_enabled": false,
   "verify_window_sec": 90,
   "verify_timeout_sec": 300
 }

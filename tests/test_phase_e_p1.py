@@ -62,7 +62,6 @@ from ayana.investigation import (
 from ayana.knowledge import KnowledgeBase, parse_doc
 from ayana.ntsafe import NTResult
 from ayana.policy import Policy
-from ayana.agent import AgentLoop
 
 
 class FakeNT:

@@ -1,4 +1,4 @@
-/* Exercise the production council UI and independent role configuration. */
+/* Exercise retired Council history and the absence of legacy mutation controls. */
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -28,6 +28,7 @@ test("incident shows independent full reviews, veto reasons and immutable plan h
   const env = setup(() => detail({phase:"reviewing",plans}));
   await env.run('openIncidentDetail("inc1")');
   assert.ok(content(env).includes("接奏 → 调查 → 拟旨 → 会审"));
+  assert.ok(content(env).includes("旧自治流程已退役"));
   for (const expected of ["门下省 A · Kimi：同意", "门下省 B · DeepSeek：否决", "缺少端口证据", "缺失证据：端口占用", "修改建议：先查端口", "投票箱：封驳", "不可变方案版本"]) assert.ok(content(env).includes(expected), expected);
   assert.equal(buttons(env).some((button) => /执行|批准/.test(button.textContent)), false);
 });
@@ -42,7 +43,7 @@ test("missing reviewer opinion cannot display ballot approval", async () => {
 test("draft blocked by policy is visible without implying execution authority", async () => {
   const env = setup(() => detail({phase:"manual",draft:{rationale:"等待明确权限",steps:[{capability:"service.reload"}]}}));
   await env.run('openIncidentDetail("inc1")');
-  assert.ok(content(env).includes("当前拟案 · 尚不代表获得执行授权"));
+  assert.ok(content(env).includes("历史拟案 · 不提供执行授权"));
   assert.ok(content(env).includes("等待明确权限"));
   assert.equal(content(env).includes("投票箱：准奏"),false);
 });
@@ -66,7 +67,7 @@ test("reviewed council Actions never expose ordinary manual approval or resume b
 test("unconfigured service and unavailable service do not invent recovery success", async () => {
   for (const council of [{enabled:false,status:"disabled"},{status:"unavailable",error:"offline"}]) {
     const env = setup(() => detail(council)); await env.run('openIncidentDetail("inc1")');
-    assert.ok(/尚未启用|暂时不可用/.test(content(env)));
+    assert.ok(/已退役|暂时不可用/.test(content(env)));
     assert.equal(content(env).includes("投票箱：准奏"), false);
   }
 });
@@ -80,80 +81,76 @@ test("unknown usage stays unknown rather than showing zero as complete cost", as
 test("read-only users see manual adjudication without a write button", async () => {
   const env = setup(() => detail({manual_required:true,goals:[{id:"goal1",manual_required:true,repair_goal:"恢复frps",consecutive_vetoes:3}]}), false);
   await env.run('openIncidentDetail("inc1")');
-  assert.ok(content(env).includes("等待人工裁决"));
+  assert.ok(content(env).includes("历史记录含人工裁决请求"));
   assert.equal(find(env,"允许此目标重新拟案"), undefined);
 });
 
-test("manual decision targets one exact goal and sends no approve or execution flags", async () => {
-  const council = {manual_required:true,goals:[{id:"goal1",manual_required:true}]};
-  const env = setup(({body}) => body ? {ok:true} : detail(council));
-  await env.run('openIncidentDetail("inc1")'); env.promptReplies.push("123456");
-  await find(env,"允许此目标重新拟案").click();
-  const writes = env.calls.filter((call) => call.body);
-  assert.equal(writes.length,1);
-  assert.equal(writes[0].url,"/api/incidents/inc1/council/review");
-  assert.equal(JSON.stringify(writes[0].body),' {"goal_id":"goal1","totp":"123456"}'.trim());
-});
-
-test("canceling manual TOTP prompt sends no write request", async () => {
-  const env = setup(() => detail({manual_required:true,goals:[{id:"goal1",manual_required:true}]}));
-  await env.run('openIncidentDetail("inc1")'); env.promptReplies.push(null);
-  await find(env,"允许此目标重新拟案").click();
+test("even an exact current goal has no manual restart or execution controls", async () => {
+  const council = {enabled:true,manual_required:true,goals:[{id:"goal1",manual_required:true}]};
+  const env = setup(() => detail(council));
+  await env.run('openIncidentDetail("inc1")');
+  assert.equal(find(env,"允许此目标重新拟案"),undefined);
+  assert.equal(buttons(env).some((button) => /执行|批准|重新拟案/.test(button.textContent)),false);
   assert.equal(env.calls.filter((call) => call.body).length,0);
 });
 
-test("manual failure stays visible and allows retry without claiming adjudication success", async () => {
-  const env = setup(({body}) => body ? {ok:false,error:"goal_generation_stale"} : detail({manual_required:true,goals:[{id:"goal1",manual_required:true}]}));
-  await env.run('openIncidentDetail("inc1")'); env.promptReplies.push("");
-  await find(env,"允许此目标重新拟案").click();
-  assert.ok(content(env).includes("goal_generation_stale"));
-  assert.equal(find(env,"允许此目标重新拟案").disabled,false);
+test("retired manual history does not prompt for TOTP or send mutations", async () => {
+  const env = setup(() => detail({manual_required:true,goals:[{id:"goal1",manual_required:true}]}));
+  env.promptReplies.push("123456");
+  await env.run('openIncidentDetail("inc1")');
+  assert.equal(find(env,"允许此目标重新拟案"),undefined);
+  assert.equal(env.promptReplies.length,1);
+  assert.equal(env.calls.filter((call) => call.body).length,0);
 });
 
-test("role settings expose no saved key value and distinguish unverified accounts", async () => {
+test("historical manual failure stays visible without retry or success controls", async () => {
+  const env = setup(() => detail({last_error:"goal_generation_stale",manual_required:true,goals:[{id:"goal1",manual_required:true}]}));
+  await env.run('openIncidentDetail("inc1")');
+  assert.ok(content(env).includes("历史阻碍：goal_generation_stale"));
+  assert.equal(find(env,"允许此目标重新拟案"),undefined);
+  assert.equal(env.calls.filter((call) => call.body).length,0);
+});
+
+test("retired provider history has no credential inputs or account verification controls", async () => {
+  const unsafeOldConfig = {...config,roles:{planner:{api_key:"must-not-display",model:"legacy-model"}}};
+  const env = setup(({url}) => url.endsWith("/usage") ? {ok:true,usage:{}} : {ok:true,config:unsafeOldConfig});
+  await env.run("openAutonomySettings()");
+  assert.equal(env.nodes.get("modal-body").querySelectorAll("input").length,0);
+  assert.equal(labels(env,"独立 API Key").length,0);
+  assert.equal(find(env,"核验已保存的账户与模型"),undefined);
+  assert.equal(content(env).includes("must-not-display"),false);
+  assert.ok(content(env).includes("旧自治流程已退役"));
+});
+
+test("retired provider history cannot save keys, prices, or an enable switch", async () => {
   const env = setup(({url}) => url.endsWith("/usage") ? {ok:true,usage:{}} : {ok:true,config});
   await env.run("openAutonomySettings()");
-  assert.equal(labels(env,"独立 API Key").length,3);
-  assert.ok(labels(env,"独立 API Key").every((input) => input.value === ""));
-  assert.equal(content(env).split("该账户与模型尚未验证").length - 1,3);
-  assert.ok(content(env).includes("不能填入 MiMo Token Plan Key"));
+  assert.equal(find(env,"保存 Agent 配置"),undefined);
+  assert.equal(labels(env,"启用自治 Agent").length,0);
+  assert.equal(labels(env,"清除此角色").length,0);
+  assert.equal(env.calls.filter((call) => call.body).length,0);
+  assert.equal(env.calls.map((call) => call.url).sort().join(","),"/api/autonomy/providers,/api/autonomy/usage");
 });
 
-test("save keeps independent role keys write-only, unknown prices null, and clears entered keys", async () => {
-  const env = setup(({url,body}) => body ? {ok:true,config} : url.endsWith("/usage") ? {ok:true,usage:{}} : {ok:true,config});
+test("retired provider history cannot issue account model probes", async () => {
+  const env = setup(({url}) => url.endsWith("/usage") ? {ok:false,error:"history_unavailable"} : {ok:true,config});
   await env.run("openAutonomySettings()");
-  labels(env,"独立 API Key")[0].value = "new-planner-secret";
-  labels(env,"清除此角色")[1].checked = true;
-  env.promptReplies.push(""); await find(env,"保存 Agent 配置").click();
-  const posted = env.calls.find((call) => call.body);
-  assert.equal(posted.url,"/api/autonomy/providers");
-  assert.equal(posted.body.roles.planner.api_key,"new-planner-secret");
-  assert.equal(posted.body.roles.reviewer_kimi.clear_api_key,true);
-  assert.equal(posted.body.roles.reviewer_deepseek.api_key,undefined);
-  assert.equal(posted.body.roles.planner.input_cny_per_million,null);
-  assert.equal(labels(env,"独立 API Key")[0].value,"");
-});
-
-test("account verification probes only the explicit saved role and reports a rejected model", async () => {
-  const env = setup(({url,body}) => body ? {ok:false,error:"model_not_available",result:{ok:false}} : url.endsWith("/usage") ? {ok:true,usage:{}} : {ok:true,config});
-  await env.run("openAutonomySettings()"); env.promptReplies.push("123456");
-  await buttons(env).filter((button) => button.textContent === "核验已保存的账户与模型")[1].click();
-  const posted = env.calls.find((call) => call.body);
-  assert.equal(posted.url,"/api/autonomy/providers/verify");
-  assert.equal(posted.body.role,"reviewer_kimi");
-  assert.equal(Object.hasOwn(posted.body,"api_key"),false);
-  assert.ok(content(env).includes("该账户的模型列表不包含此模型"));
-  assert.equal(content(env).includes("已核验：已保存的账户支持该模型"),false);
+  assert.equal(find(env,"核验已保存的账户与模型"),undefined);
+  assert.ok(content(env).includes("history_unavailable"));
+  assert.equal(env.calls.some((call) => call.url.endsWith("/verify")),false);
+  assert.equal(env.calls.filter((call) => call.body).length,0);
 });
 
 test("budget limits and unknown costs use registry totals without claiming actual account charges", async () => {
-  const usage = {overall:{cost_cny:1,complete:false},budget:{budget_cny:100,remaining_cny:75,warning:true,exhausted:true,account_balance_cny:null}};
+  const usage = {overall:{cost_cny:null,known_cost_cny:1,complete:false},budget:{budget_cny:100,remaining_cny:75,warning:true,exhausted:true,account_balance_cny:null}};
   const env = setup(({url}) => url.endsWith("/usage") ? {ok:true,usage} : {ok:true,config});
   await env.run("openAutonomySettings()");
   assert.ok(content(env).includes("已统计费用：未知"));
+  assert.ok(content(env).includes("已知部分小计 ¥1.0000"));
   assert.ok(content(env).includes("可用预算：¥75.0000"));
   assert.ok(content(env).includes("账户余额：未知"));
-  assert.ok(content(env).includes("模型调用已熔断"));
+  assert.ok(content(env).includes("旧自治流程已退役"));
+  assert.equal(buttons(env).length,0);
 });
 
 (async () => {

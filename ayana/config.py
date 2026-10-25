@@ -41,10 +41,6 @@ DEFAULTS: dict[str, Any] = {
     "verify_window_sec": 90,
     "verify_timeout_sec": 300,
     "action_ttl_sec": 1800,
-    "auto_remediation_enabled": False,
-    # P4.0 总闸：旧自治后台链（AgentLoop / AutonomyEngine）默认关闭。
-    # 仅显式开启才启动；Web 不能绕过本开关重新启用。
-    "legacy_agent_loop": False,
     # P4.3 无人值守只读调查（默认关；验收后可开）
     "auto_investigate": {
         "enabled": False,
@@ -57,8 +53,6 @@ DEFAULTS: dict[str, Any] = {
         "mimo_bin": "mimo",
         "lease_ttl_sec": 600,
     },
-    # 新自治 Agent 使用独立按量 API 凭据；不复用旧 LLM / Token Plan Key。
-    "autonomous_agent": {"enabled": False, "budget_cny": 100.0},
     # Prometheus 配置管理（可选）：ssh_asset_id 为空则用本地目录
     "prometheus_config": {
         "local_dir": "prometheus",
@@ -92,11 +86,16 @@ SECRET_KEYS = (
     "llm_api_key",
     "llm_base_url",
     "llm_model",
-    "ai_credential_key",
-    "ai_planner_api_key",
-    "ai_reviewer_kimi_api_key",
-    "ai_reviewer_deepseek_api_key",
 )
+
+
+# Retired P4.4 inputs are accepted only for migration compatibility and ignored.
+# They cannot re-enable a worker or load old planner/reviewer credentials.
+RETIRED_AUTONOMY_KEYS = frozenset({
+    "legacy_agent_loop", "auto_remediation_enabled", "autonomous_agent",
+    "ai_credential_key", "ai_planner_api_key", "ai_reviewer_kimi_api_key",
+    "ai_reviewer_deepseek_api_key",
+})
 
 
 class ConfigError(Exception):
@@ -126,6 +125,8 @@ def load_config(base_dir: str | Path) -> dict[str, Any]:
 
     cfg = dict(DEFAULTS)
     cfg.update(_read_json(cfg_path))
+    for retired_key in RETIRED_AUTONOMY_KEYS:
+        cfg.pop(retired_key, None)
 
     secrets = _read_json(secrets_path)
     for key in SECRET_KEYS:

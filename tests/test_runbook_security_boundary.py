@@ -171,7 +171,7 @@ class AutoExecuteBoundaryTests(unittest.TestCase):
                 proposer_id="agent",
                 mode="auto",
             )
-        self.assertIn(ctx.exception.code, ("runbook_required", "denied", "template_required"))
+        self.assertIn(ctx.exception.code, ("runbook_required", "denied", "template_required", "legacy_autonomy_retired"))
 
     def test_manual_without_template_or_runbook_rejected(self):
         """无 template/runbook 的能力不得提案；有通用模板的仍走 Policy（默认拒绝）。"""
@@ -186,7 +186,7 @@ class AutoExecuteBoundaryTests(unittest.TestCase):
                 proposer_id="admin",
                 mode="manual",
             )
-        self.assertIn(ctx.exception.code, ("denied", "template_required", "auto_not_allowed"))
+        self.assertIn(ctx.exception.code, ("denied", "template_required", "auto_not_allowed", "legacy_autonomy_retired"))
         # 不存在的写能力类路径：无模板不得放行
         with self.assertRaises(ActionError) as ctx2:
             self.actions.propose(
@@ -228,7 +228,7 @@ class AutoExecuteBoundaryTests(unittest.TestCase):
                 mode="auto",
                 runbook_id="rb_a",
             )
-        self.assertIn(ctx.exception.code, ("denied", "auto_not_allowed", "forbidden"))
+        self.assertIn(ctx.exception.code, ("denied", "auto_not_allowed", "forbidden", "legacy_autonomy_retired"))
 
 
 if __name__ == "__main__":

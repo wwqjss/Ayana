@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock
 
-from ayana.agent import AgentLoop
+from ayana.notification_obligations import NotificationObligations
 from ayana.db import Database, now
 from ayana.notify import Notifier
 from ayana.notify_channels import ChannelStore
@@ -32,9 +32,7 @@ class NotificationObligationTests(unittest.IsolatedAsyncioTestCase):
         self.notifier = Notifier(self.db)
         self.notifier.set_channel_store(self.store)
         self.rule = RunbookRule(id="rb-frps", name="frps 探测失败自动重启", asset_id="nerv", object_name="frps", capability="service.restart")
-        self.agent = AgentLoop.__new__(AgentLoop)
-        self.agent.db = self.db
-        self.agent.notifier = self.notifier
+        self.obligations = NotificationObligations(self.db, self.notifier)
 
     def channel(self, enabled=True):
         return self.store.create(name="告警", kind="qq", config={"target": "user:123"}, enabled=enabled)
@@ -45,11 +43,11 @@ class NotificationObligationTests(unittest.IsolatedAsyncioTestCase):
     def authorization(self):
         self.db.execute("INSERT INTO actions(id,incident_id,asset_id,object_id,capability,state,proposer_type,proposer_id,created_at,approval_deadline,params_json,policy_snapshot_json) VALUES('act1','inc1','nerv','nerv:service:frps','service.restart','proposed','auto_rule','agent',?,?,?, '{}')", (now(), now() + 600, json.dumps({"tokens": ["systemctl", "restart", "frps"], "object_name": "frps"})))
         self.db.event("action_proposed", incident_id="inc1", payload={"action_id": "act1"})
-        self.agent._notify_awaiting_approval("inc1", "act1", self.rule, {"decision": "confirm"}, {"status": "satisfied"})
+        self.obligations._notify_awaiting_approval("inc1", "act1", self.rule, {"decision": "confirm"}, {"status": "satisfied"})
         return self.db.query_one("SELECT id FROM events WHERE type='proposal_waiting'")["id"]
 
     def waiting(self, *, retry_at, reason="冷却中"):
-        self.agent._wait_for_preconditions(self.incident(), self.rule, {}, {
+        self.obligations._wait_for_preconditions(self.incident(), self.rule, {}, {
             "blockers": ["budget"], "reasons": ["budget: unsatisfied"],
             "budget_reason": reason, "retry_at": retry_at,
         })
@@ -182,7 +180,7 @@ class NotificationObligationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_escalation_is_bound_to_its_exact_human_obligation(self):
         self.channel()
-        self.agent._escalate(dict(self.db.query_one("SELECT * FROM incidents WHERE id='inc1'")), "no_runbook_match")
+        self.obligations._escalate(dict(self.db.query_one("SELECT * FROM incidents WHERE id='inc1'")), "no_runbook_match")
         self.db.execute("UPDATE incidents SET need_human=1,need_human_reason='verify_failed:ver1' WHERE id='inc1'")
         self.assertEqual(await self.notifier.flush(), 0)
         self.store.send.assert_not_awaited()

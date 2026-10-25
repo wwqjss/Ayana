@@ -45,6 +45,7 @@ except Exception:
 
 from ayana.actions import ActionError, ActionService
 from ayana.agent import AgentLoop
+from ayana.legacy_history import RetiredAutonomyError
 from ayana.db import Database, now
 from ayana.investigation import InvestigationService
 from ayana.knowledge import KnowledgeBase
@@ -285,11 +286,16 @@ class TestP002DispatchGate(unittest.TestCase):
         tmp, db, policy, nt, prom, gate, actions = make_env()
         self.addCleanup(close_env, tmp, db)
         rule = get_runbook_rule("rb_frps_down_restart")
-        prop = actions.propose(
-            asset_id="nerv", object_id="frps", capability="service.restart",
-            proposer_type="auto_rule", proposer_id="agent",
-            mode="auto", runbook_id="rb_frps_down_restart", runbook_rev="OLDREV",
-        )
+        # P4.4：自动授权退役，propose(mode=auto) 直接拒绝，零派发
+        with self.assertRaises(ActionError) as ctx:
+            actions.propose(
+                asset_id="nerv", object_id="frps", capability="service.restart",
+                proposer_type="auto_rule", proposer_id="agent",
+                mode="auto", runbook_id="rb_frps_down_restart", runbook_rev="OLDREV",
+            )
+        self.assertEqual(ctx.exception.code, "legacy_autonomy_retired")
+        self.assertFalse(nt.exec_calls)
+        return
         actions.approve(prop["id"], approver_type="auto_rule", approver_id="agent")
 
         async def run():
@@ -377,8 +383,7 @@ class TestP003Preconditions(unittest.TestCase):
             def enqueue(self, **kw):
                 pass
 
-        agent = AgentLoop(db, inv, actions, policy, NoLLM(), NQ(), auto_enabled=True,
-                          knowledge=KnowledgeBase(db))
+        agent = AgentLoop.__new__(AgentLoop)
         # 注入测试本地 runbook 规则（发行版 RUNBOOK 为空）
         apply_runbook_rules([{
             "id": "rb_frps_down_restart", "name": "frps down restart",
@@ -389,54 +394,60 @@ class TestP003Preconditions(unittest.TestCase):
         return tmp, db, nt, actions, agent
 
     def test_global_pause_zero_auto_dispatch(self):
-        tmp, db, nt, actions, agent = self._agent_env(probe_value=0)
-        self.addCleanup(close_env, tmp, db)
-        db.execute(
-            "UPDATE global_stops SET enabled=1, reason='maintenance' WHERE key='auto_dispatch'"
-        )
-        res = asyncio.run(agent.handle_incident("inc1"))
-        self.assertFalse(nt.exec_calls, res)
-        self.assertEqual(res.get("action"), "waiting_precondition")
-        self.assertEqual(db.query_one("SELECT need_human FROM incidents WHERE id='inc1'")["need_human"], 0)
-        self.assertEqual(db.query_one("SELECT COUNT(*) n FROM actions")["n"], 0)
-        db.execute("UPDATE global_stops SET enabled=0 WHERE key='auto_dispatch'")
-        from unittest.mock import patch
-        with patch("ayana.agent.now", return_value=res["retry_at"] + 1):
-            self.assertIn("inc1", agent.ready_incident_ids())
+        tmp,db,nt,actions,agent=self._agent_env(probe_value=0)
+        self.addCleanup(close_env,tmp,db)
+        db.execute("UPDATE global_stops SET enabled=1 WHERE key='auto_dispatch'")
+        before=list(db.query("SELECT id,state FROM actions ORDER BY id"))
+        with self.assertRaises(RetiredAutonomyError):
+            asyncio.run(agent.handle_incident("inc1"))
+        self.assertFalse(nt.exec_calls)
+        self.assertEqual([tuple(r) for r in before],[tuple(r) for r in db.query("SELECT id,state FROM actions ORDER BY id")])
+        self.assertEqual(db.query_one("SELECT need_human FROM incidents WHERE id='inc1'")["need_human"],0)
 
     def test_budget_exhausted_zero_auto_dispatch(self):
-        tmp, db, nt, actions, agent = self._agent_env(probe_value=0)
-        self.addCleanup(close_env, tmp, db)
-        t = now()
+        tmp,db,nt,actions,agent=self._agent_env(probe_value=0)
+        self.addCleanup(close_env,tmp,db)
         for i in range(3):
-            db.execute(
-                "INSERT INTO actions(id, asset_id, object_id, capability, params_json, state,"
-                " mode, created_at, dispatched_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (f"old{i}", "nerv", "nerv:service:frps", "service.restart", "{}",
-                 "success", "auto", t - 3600, t - 3600),
-            )
-        res = asyncio.run(agent.handle_incident("inc1"))
-        self.assertFalse(nt.exec_calls, res)
+           db.execute("INSERT INTO actions(id,asset_id,object_id,capability,state,mode,created_at,dispatched_at) VALUES(?,'nerv','frps','service.restart','success','auto',?,?)",(f"old{i}",now()-3600,now()-3600))
+        before=list(db.query("SELECT id,state FROM actions ORDER BY id"))
+        with self.assertRaises(RetiredAutonomyError):
+            asyncio.run(agent.handle_incident("inc1"))
+        self.assertFalse(nt.exec_calls)
+        self.assertEqual([tuple(r) for r in before],[tuple(r) for r in db.query("SELECT id,state FROM actions ORDER BY id")])
+        self.assertEqual(db.query_one("SELECT need_human FROM incidents WHERE id='inc1'")["need_human"],0)
 
     def test_fresh_fail_probe_auto_positive(self):
-        tmp, db, nt, actions, agent = self._agent_env(probe_value=0)
-        self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(agent.handle_incident("inc1"))
-        self.assertTrue(nt.exec_calls, res)
-        self.assertEqual(res.get("action"), "success")
+        tmp,db,nt,actions,agent=self._agent_env(probe_value=0)
+        self.addCleanup(close_env,tmp,db)
+
+        before=list(db.query("SELECT id,state FROM actions ORDER BY id"))
+        with self.assertRaises(RetiredAutonomyError):
+            asyncio.run(agent.handle_incident("inc1"))
+        self.assertFalse(nt.exec_calls)
+        self.assertEqual([tuple(r) for r in before],[tuple(r) for r in db.query("SELECT id,state FROM actions ORDER BY id")])
+        self.assertEqual(db.query_one("SELECT need_human FROM incidents WHERE id='inc1'")["need_human"],0)
 
     def test_recovered_probe_zero_auto_dispatch(self):
-        tmp, db, nt, actions, agent = self._agent_env(probe_value=1)
-        self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(agent.handle_incident("inc1"))
-        self.assertFalse(nt.exec_calls, res)
-        self.assertIn("precondition", (res.get("action") or "") + str(res.get("steps")))
+        tmp,db,nt,actions,agent=self._agent_env(probe_value=1)
+        self.addCleanup(close_env,tmp,db)
+
+        before=list(db.query("SELECT id,state FROM actions ORDER BY id"))
+        with self.assertRaises(RetiredAutonomyError):
+            asyncio.run(agent.handle_incident("inc1"))
+        self.assertFalse(nt.exec_calls)
+        self.assertEqual([tuple(r) for r in before],[tuple(r) for r in db.query("SELECT id,state FROM actions ORDER BY id")])
+        self.assertEqual(db.query_one("SELECT need_human FROM incidents WHERE id='inc1'")["need_human"],0)
 
     def test_empty_probe_zero_auto_dispatch(self):
-        tmp, db, nt, actions, agent = self._agent_env(probe_value=None)
-        self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(agent.handle_incident("inc1"))
-        self.assertFalse(nt.exec_calls, res)
+        tmp,db,nt,actions,agent=self._agent_env(probe_value=None)
+        self.addCleanup(close_env,tmp,db)
+
+        before=list(db.query("SELECT id,state FROM actions ORDER BY id"))
+        with self.assertRaises(RetiredAutonomyError):
+            asyncio.run(agent.handle_incident("inc1"))
+        self.assertFalse(nt.exec_calls)
+        self.assertEqual([tuple(r) for r in before],[tuple(r) for r in db.query("SELECT id,state FROM actions ORDER BY id")])
+        self.assertEqual(db.query_one("SELECT need_human FROM incidents WHERE id='inc1'")["need_human"],0)
 
     def test_require_probe_fail_consumed(self):
         apply_runbook_rules([{

@@ -54,6 +54,7 @@ except Exception:
 
 from ayana.actions import ActionError, ActionService
 from ayana.agent import AgentLoop
+from ayana.legacy_history import RetiredAutonomyError
 from ayana.db import Database, now
 from ayana.investigation import InvestigationService
 from ayana.knowledge import KnowledgeBase
@@ -317,72 +318,14 @@ class TestP002IdentityAndAuthz(unittest.TestCase):
         self.assertFalse(res.get("ok"), f"P0-02: WRONG-HOST still accepted ({res})")
 
     def test_expected_fail_execute_skips_auto_flag(self):
-        """P0-02: auto dispatch must recheck auto_allowed."""
-        tmp = tempfile.TemporaryDirectory()
-        db, policy, prom, actions = _make_actions(tmp)
-        self.addCleanup(_close_tmp, db, tmp)
-        policy.upsert_permission(
-            subject_type="auto_rule", subject_id="agent", capability="service.restart",
-            asset_id="nerv", object_id="*", allow=True, require_approval=True,
-            auto_allowed=False, actor="test",
-        )
-        try:
-            actions.propose(
-                asset_id="nerv", object_id="frps", capability="service.restart",
-                proposer_type="auto_rule", proposer_id="agent",
-                reason="p0-02", mode="auto",
-                runbook_id="rb_frps_down_restart", runbook_rev="x",
-            )
-            proposed = True
-        except ActionError as e:
-            proposed = False
-            self.assertEqual(e.code, "auto_not_allowed")
-        self.assertFalse(proposed, "P0-02: auto propose allowed without auto_allowed")
-
-        policy.upsert_permission(
-            subject_type="auto_rule", subject_id="agent", capability="service.restart",
-            asset_id="nerv", object_id="*", allow=True, require_approval=False,
-            auto_allowed=True, actor="test",
-        )
-        from ayana.runbook import apply_runbook_rules, get_runbook_rule as _grr
-
-        apply_runbook_rules([{
-            "id": "rb_frps_down_restart", "name": "frps down restart",
-            "asset_id": "nerv", "object_name": "frps", "alertname": "TargetDown",
-            "capability": "service.restart", "reason": "restart frps",
-            "require_probe_fail": True,
-        }])
-        self.addCleanup(lambda: apply_runbook_rules([]))
-
-        rule_rev = _grr("rb_frps_down_restart").rev
-        prop = actions.propose(
-            asset_id="nerv", object_id="frps", capability="service.restart",
-            proposer_type="auto_rule", proposer_id="agent",
-            reason="p0-02b", mode="auto",
-            runbook_id="rb_frps_down_restart", runbook_rev=rule_rev,
-        )
-        actions.approve(prop["id"], approver_type="auto_rule", approver_id="agent")
-        policy.upsert_permission(
-            subject_type="auto_rule", subject_id="agent", capability="service.restart",
-            asset_id="nerv", object_id="*", allow=True, require_approval=True,
-            auto_allowed=False, actor="test",
-        )
-
-        async def run():
-            return await actions.execute(
-                prop["id"], actor_type="auto_rule", actor_id="agent"
-            )
-
-        try:
-            res = asyncio.run(run())
-            dispatched = res.get("state") in ("dispatched", "success", "failure", "unknown")
-        except ActionError as e:
-            dispatched = False
-            res = {"error": e.code}
-        self.assertFalse(
-            dispatched,
-            f"P0-02: auto dispatched after auto revoked (state={res})",
-        )
+        tmp=tempfile.TemporaryDirectory(); db,policy,prom,actions=_make_actions(tmp)
+        self.addCleanup(_close_tmp,db,tmp)
+        for allowed in (False,True):
+            policy.upsert_permission(subject_type="auto_rule",subject_id="agent",capability="service.restart",asset_id="nerv",object_id="*",allow=True,require_approval=not allowed,auto_allowed=allowed,actor="test")
+            with self.assertRaises(ActionError) as denied:
+                actions.propose(asset_id="nerv",object_id="frps",capability="service.restart",proposer_type="auto_rule",proposer_id="agent",reason="legacy",mode="auto",runbook_id="rb_frps_down_restart")
+            self.assertEqual(denied.exception.code,"legacy_autonomy_retired")
+        self.assertEqual(db.query_one("SELECT COUNT(*) n FROM actions")["n"],0)
 
     def test_expected_fail_manual_propose_without_runbook(self):
         """P0-02: propose does not persist runbook/template contract."""
@@ -465,18 +408,10 @@ class TestP003Preconditions(unittest.TestCase):
             def enqueue(self, **kw):
                 pass
 
-        agent = AgentLoop(
-            db, inv, actions, policy, NoLLM(), QuietNotify(), auto_enabled=True,
-            knowledge=KnowledgeBase(db),
-        )
-        res = asyncio.run(agent.handle_incident("inc_fail"))
-        executed = bool(nt.exec_calls) or any(
-            (s.get("step") == "execute" and s.get("ok")) for s in res.get("steps", [])
-        )
-        self.assertFalse(
-            executed,
-            f"P0-03: agent executed despite failed investigation; steps={res.get('steps')}",
-        )
+        with self.assertRaises(RetiredAutonomyError):
+            AgentLoop(db,inv,actions,policy,NoLLM(),QuietNotify(),auto_enabled=True,knowledge=KnowledgeBase(db))
+        self.assertFalse(nt.exec_calls)
+        self.assertEqual(db.query_one("SELECT COUNT(*) n FROM actions")["n"],0)
 
 
 class TestP004IncidentConvergence(unittest.TestCase):

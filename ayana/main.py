@@ -15,7 +15,6 @@ from aiohttp import web
 
 from . import VERSION
 from .actions import ActionService
-from .agent import AgentLoop
 from .agent_query import AgentQueryService
 from .alertmanager import AlertIngest
 from .auth import AuthService
@@ -29,9 +28,6 @@ from .investigation import InvestigationService
 from .instance import acquire_single_instance_lock
 from .knowledge import KnowledgeBase
 from .llm import make_llm
-from .ai_providers import ProviderRegistry
-from .autonomy import AutonomyEngine
-from .council import CouncilService
 from .ntsafe import AssetBinding, IdentityGate, NTClient
 from .notify import Notifier
 from .notify_channels import ChannelStore
@@ -428,48 +424,10 @@ class App:
         except Exception as e:
             log.warning("load llm meta failed: %s", e)
         self.investigation.llm = self.llm
-        # S22: 优先读持久化 auto 开关，回退配置默认值
-        _auto_row = self.db.query_one("SELECT value FROM meta WHERE key='agent_auto_enabled'")
-        _auto_persisted = _auto_row["value"] if _auto_row else None
-        # P4.0 总闸：legacy_agent_loop 关闭时，旧 AgentLoop 不得自动派发
-        _legacy = bool(cfg.get("legacy_agent_loop", False))
-        self.legacy_agent_loop = _legacy
-        _auto_want = (
-            _auto_persisted == "1" if _auto_persisted is not None
-            else bool(cfg.get("auto_remediation_enabled", False))
-        )
-        self.agent = AgentLoop(
-            self.db, self.investigation, self.actions, self.policy,
-            self.llm, self.notifier,
-            auto_enabled=bool(_legacy and _auto_want),
-            knowledge=self.knowledge,
-        )
-        self.agent.legacy_locked = not _legacy
-        if not _legacy and _auto_want:
-            log.warning(
-                "legacy_agent_loop disabled; ignoring agent_auto_enabled/auto_remediation_enabled"
-            )
-        # Optional model configuration cannot prevent core monitoring startup.
-        self.providers = self.council = self.autonomy = None
-        if _legacy:
-            try:
-                self.providers = ProviderRegistry(self.db, cfg)
-                self.council = CouncilService(self.db, self.actions)
-                self.autonomy = AutonomyEngine(
-                    self.db, self.investigation, self.actions, self.policy,
-                    self.providers, self.council, self.notifier,
-                    runbook_auto_enabled=lambda: self.agent.auto_enabled,
-                )
-            except Exception as exc:
-                # Do not echo configuration, provider responses or credentials.
-                log.warning(
-                    "autonomy unavailable during initialization (%s); core services remain enabled",
-                    type(exc).__name__,
-                )
-                self.autonomy = None
-        else:
-            log.info("legacy_agent_loop disabled: old autonomy/council/agent loop not started")
-        self.agent.autonomy_enabled = lambda: bool(self.autonomy is not None and self.autonomy.enabled)
+        # P4.4: old execution services have no runtime composition path.
+        # Compatibility attributes are inert; historical data is read separately.
+        self.agent = self.providers = self.council = self.autonomy = None
+        self.legacy_agent_loop = False
         self.ob = OneBotServer(cfg["onewbot_token"], int(cfg.get("self_id") or 0))
         self.qq = QQBot(
             self.db,
@@ -509,7 +467,6 @@ class App:
             webhook_token=cfg.get("webhook_token") or "",
             alert_ingest=self.alert_ingest,
             notifier=self.notifier,
-            agent=self.agent,
             permission_changes=self.permission_changes,
             ssh_store=self.ssh_store,
             cred_store=self.creds,
@@ -522,8 +479,6 @@ class App:
             promconfig=self.promconfig,
             checks=self.checks,
             llm=self.llm,
-            providers=self.providers,
-            autonomy=self.autonomy,
             nodewatch=getattr(self, "nodewatch", None),
             exttx=self.exttx,
             alertmanager_webhook_path=cfg.get("alertmanager_webhook_path") or "/hooks/alertmanager",
@@ -659,16 +614,6 @@ class App:
         resumed = self.actions.resume_pending_verifications()
         if resumed:
             log.info("resumed %d pending verifications", resumed)
-        if self.autonomy is not None:
-            try:
-                self.autonomy.recover_inflight()
-            except Exception as exc:
-                # Recovery failure disables new autonomous writes; legacy
-                # unknown-write and verification recovery above still apply.
-                log.warning("autonomy recovery failed (%s); autonomous worker disabled", type(exc).__name__)
-                self.autonomy = None
-                self.webapp.autonomy = None
-
         # 一次性 Token 注册门闩：不单凭用户数=0 开放
         try:
             setup = self.auth.ensure_setup_initialized()
@@ -711,13 +656,8 @@ class App:
         # P4.3：只读调查 worker（独立于旧自治）
         if self.auto_investigator is not None:
             self._bg_tasks.append(asyncio.create_task(self.auto_investigator.run_forever()))
-        # P4.0：旧自治后台链默认不启动（legacy_agent_loop 显式开启才跑）
-        if self.legacy_agent_loop:
-            self._bg_tasks.append(asyncio.create_task(self._bg_agent()))
-            if self.autonomy is not None:
-                self._bg_tasks.append(asyncio.create_task(self._bg_autonomy()))
-        else:
-            log.info("skip legacy workers: _bg_agent/_bg_autonomy (legacy_agent_loop=false)")
+        # Manual authorization expiry is independent of any investigation worker.
+        self._bg_tasks.append(asyncio.create_task(self._bg_maintenance()))
 
         # 推送通道：QQ 走 OneBot；多渠道由 ChannelStore 路由
         async def _sender(target: str, body: str) -> bool:
@@ -870,75 +810,28 @@ class App:
                 log.warning("AM reconcile failed: %s", e)
             await asyncio.sleep(60)
 
-    async def _bg_agent(self) -> None:
-        """Agent 闭环：只读调查 + 提案（始终）；自动派发仅 auto_enabled。"""
+    async def _bg_maintenance(self) -> None:
+        """Expire manual proposals and permission changes without legacy agents."""
         while not self._stop.is_set():
+            for name, expire in (
+                ("proposals", self.actions.expire_stale_proposals),
+                ("permission_changes", self.permission_changes.expire_stale),
+            ):
+                try:
+                    expire()
+                except Exception:
+                    log.exception("expire %s failed", name)
             try:
-                for inc_id in self.agent.ready_incident_ids(limit=3):
-                    await self.agent.handle_incident(inc_id)
-                # 过期 proposal 清扫（TTL / approval_deadline）
-                try:
-                    self.actions.expire_stale_proposals()
-                except Exception:
-                    log.exception("expire proposals failed")
-                # 过期 permission_change 清扫
-                try:
-                    self.permission_changes.expire_stale()
-                except Exception:
-                    log.exception("expire permission_changes failed")
                 self.db.execute(
-                    "INSERT OR REPLACE INTO meta(key, value) VALUES('worker_agent_last_ok', ?)",
+                    "INSERT OR REPLACE INTO meta(key,value) VALUES('worker_maintenance_last_ok',?)",
                     (str(time.time()),),
                 )
             except Exception:
-                log.exception("agent loop failed")
-            await asyncio.sleep(15)
-
-    async def _run_autonomy_incident(self, inc_id: str) -> None:
-        try:
-            await self.autonomy.tick(inc_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            log.warning("autonomy incident failed id=%s (%s)", inc_id, type(exc).__name__)
-
-    async def _bg_autonomy(self) -> None:
-        """Bound model concurrency while independent core workers keep running.
-
-        Verification is polled on every pass, including while a model request
-        is awaiting its provider. An incident has at most one local task.
-        """
-        inflight: dict[str, asyncio.Task] = {}
-        try:
-            while not self._stop.is_set():
-                try:
-                    for inc_id, task in list(inflight.items()):
-                        if task.done():
-                            await asyncio.gather(task, return_exceptions=True)
-                            del inflight[inc_id]
-                    self.autonomy.poll_verifications()
-                    capacity = 3 - len(inflight)
-                    if capacity > 0:
-                        for inc_id in self.autonomy.ready_incident_ids(limit=3):
-                            if inc_id in inflight:
-                                continue
-                            inflight[inc_id] = asyncio.create_task(self._run_autonomy_incident(inc_id))
-                            capacity -= 1
-                            if capacity == 0:
-                                break
-                    self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('worker_autonomy_last_ok',?)", (str(time.time()),))
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    log.warning("autonomy worker pass failed (%s)", type(exc).__name__)
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    pass
-        finally:
-            for task in inflight.values():
-                task.cancel()
-            await asyncio.gather(*inflight.values(), return_exceptions=True)
+                log.exception("maintenance heartbeat failed")
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                pass
 
     async def _bg_correlate(self) -> None:
         """同步 episode→Incident（孤儿修复）。

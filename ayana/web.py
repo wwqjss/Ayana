@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hmac
-import inspect
 import json
 import logging
 import re
@@ -86,6 +85,14 @@ def _json(data: Any, status: int = 200) -> web.Response:
     return web.json_response(data, status=status)
 
 
+def _legacy_autonomy_retired() -> web.Response:
+    return _json({
+        "ok": False, "error": "legacy_autonomy_retired", "retired": True,
+        "read_only": True, "enabled": False, "auto_enabled": False,
+        "message": "旧自治流程已退役，仅保留历史只读查看；人工审批、手动调查和 Runbook 继续可用。",
+    }, 410)
+
+
 class WebApp:
     def __init__(
         self,
@@ -148,8 +155,12 @@ class WebApp:
         self.checks = checks
         self.nodewatch = nodewatch
         self.exttx = exttx
-        self.autonomy = autonomy
-        self.providers = providers
+        # Legacy kwargs remain accepted for older callers, but no live service is retained.
+        from .legacy_history import LegacyHistory
+
+        self.autonomy = None
+        self.providers = None
+        self.legacy_history = LegacyHistory(db)
         # P2-4: 死键修复 — 路由读取 config.alertmanager_webhook_path
         self.alertmanager_webhook_path = alertmanager_webhook_path or "/hooks/alertmanager"
 
@@ -1688,19 +1699,17 @@ class WebApp:
         })
 
     async def _council_snapshot(self, inc_id: str) -> dict:
-        if self.autonomy is None:
-            return {"enabled": False, "status": "disabled", "phase": "received"}
         try:
-            snapshot = self.autonomy.snapshot(inc_id)
-            if inspect.isawaitable(snapshot):
-                snapshot = await snapshot
+            snapshot = self.legacy_history.snapshot(inc_id)
             if not isinstance(snapshot, dict):
-                raise ValueError("invalid snapshot")
+                raise ValueError("invalid history snapshot")
             return snapshot
         except Exception:
-            # Optional AI services must never break the existing incident UI.
-            log.warning("autonomy snapshot unavailable for incident %s", inc_id)
-            return {"enabled": False, "status": "unavailable", "error": "autonomy_unavailable"}
+            log.warning("legacy autonomy history unavailable for incident %s", inc_id)
+            return {
+                "enabled": False, "retired": True, "read_only": True,
+                "status": "unavailable", "error": "legacy_history_unavailable",
+            }
 
     def _council_visible_incident(self, request: web.Request, sess: dict) -> dict | web.Response:
         inc = self.incidents.get_incident(request.match_info["inc_id"])
@@ -1719,100 +1728,35 @@ class WebApp:
 
     async def api_autonomy_providers(self, request: web.Request) -> web.Response:
         self._require_admin(request)
-        if self.providers is None:
-            return _json({"ok": True, "config": {"enabled": False, "budget_cny": 100, "roles": {}}, "available": False})
-        return _json({"ok": True, "config": self.providers.public_config(), "available": True})
+        return _json({
+            "ok": True, "config": self.legacy_history.public_config(),
+            "available": False, "retired": True, "read_only": True,
+        })
 
     async def api_autonomy_providers_save(self, request: web.Request) -> web.Response:
         sess = self._require_admin(request)
         self._check_csrf(request, sess)
-        if self.providers is None:
-            return _json({"ok": False, "error": "autonomy_unavailable"}, 503)
-        try:
-            body = await request.json()
-        except (ValueError, TypeError):
-            return _json({"ok": False, "error": "invalid_json"}, 400)
-        if not isinstance(body, dict):
-            return _json({"ok": False, "error": "invalid_config"}, 400)
-        totp_error = self._sensitive_totp(sess, body)
-        if totp_error:
-            return _json(totp_error, 403)
-        patch = {key: value for key, value in body.items() if key not in {"totp", "totp_code"}}
-        try:
-            self.providers.update_config(patch, actor=sess["username"])
-        except ValueError as exc:
-            # Configuration errors may contain supplied secrets; return only a known-safe code.
-            code = str(getattr(exc, "code", "invalid_config"))
-            if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):
-                code = "invalid_config"
-            return _json({"ok": False, "error": code, "message": "配置未保存，请检查地址、模型、价格及账户验证状态。"}, 400)
-        return _json({"ok": True, "config": self.providers.public_config()})
+        return _legacy_autonomy_retired()
 
     async def api_autonomy_usage(self, request: web.Request) -> web.Response:
         self._require_admin(request)
-        if self.providers is None:
-            return _json({"ok": True, "usage": {"budget_cny": 100, "cost_cny": None, "status": "disabled"}})
-        return _json({"ok": True, "usage": self.providers.usage_summary()})
+        return _json({
+            "ok": True, "usage": self.legacy_history.usage_summary(),
+            "retired": True, "read_only": True,
+        })
 
     async def api_autonomy_provider_verify(self, request: web.Request) -> web.Response:
         sess = self._require_admin(request)
         self._check_csrf(request, sess)
-        if self.providers is None:
-            return _json({"ok": False, "error": "autonomy_unavailable"}, 503)
-        try:
-            body = await request.json()
-        except (ValueError, TypeError):
-            return _json({"ok": False, "error": "invalid_json"}, 400)
-        if not isinstance(body, dict) or not isinstance(body.get("role"), str) or body.get("role") not in {"planner", "reviewer_kimi", "reviewer_deepseek"} or set(body) - {"role", "totp", "totp_code"}:
-            return _json({"ok": False, "error": "invalid_role"}, 400)
-        totp_error = self._sensitive_totp(sess, body)
-        if totp_error:
-            return _json(totp_error, 403)
-        try:
-            result = await self.providers.verify_account(body["role"])
-        except ValueError as exc:
-            code = str(getattr(exc, "code", "verification_failed"))
-            if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):
-                code = "verification_failed"
-            return _json({"ok": False, "error": code, "message": "账户模型核验未通过，请检查独立 API 凭据、模型及服务状态。"}, 400)
-        if not isinstance(result, dict):
-            result = {"ok": False, "error": "verification_failed"}
-        ok = result.get("ok") is True
-        self.db.audit("web_user", sess["username"], "ai_provider_account_verified", detail={"role": body["role"], "ok": ok, "error": result.get("error", "")}, channel="web")
-        return _json({"ok": ok, "result": result, "error": "" if ok else result.get("error", "verification_failed"), "config": self.providers.public_config()}, 200 if ok else 400)
+        return _legacy_autonomy_retired()
 
     async def api_council_manual_review(self, request: web.Request) -> web.Response:
-        from .council import CouncilError
         sess = self._require_admin(request)
         self._check_csrf(request, sess)
         inc = self._council_visible_incident(request, sess)
         if isinstance(inc, web.Response):
             return inc
-        if self.autonomy is None:
-            return _json({"ok": False, "error": "autonomy_unavailable"}, 503)
-        try:
-            body = await request.json()
-        except (ValueError, TypeError):
-            return _json({"ok": False, "error": "invalid_json"}, 400)
-        if not isinstance(body, dict) or not isinstance(body.get("goal_id"), str) or not body["goal_id"].strip():
-            return _json({"ok": False, "error": "goal_required"}, 400)
-        if set(body) - {"goal_id", "totp", "totp_code"}:
-            return _json({"ok": False, "error": "invalid_fields"}, 400)
-        totp_error = self._sensitive_totp(sess, body)
-        if totp_error:
-            return _json(totp_error, 403)
-        try:
-            result = self.autonomy.release_manual_barrier(inc["id"], body["goal_id"], actor=sess["username"])
-            if inspect.isawaitable(result):
-                result = await result
-        except CouncilError as exc:
-            return _json({"ok": False, "error": exc.code}, 409)
-        except ValueError:
-            return _json({"ok": False, "error": "manual_review_conflict"}, 409)
-        if isinstance(result, dict) and result.get("ok") is False:
-            return _json({"ok": False, "error": "manual_review_conflict"}, 409)
-        # This endpoint only reopens deliberation; it cannot approve a plan or execute an Action.
-        return _json({"ok": True, "result": result, "message": "已允许该目标重新拟案，新方案仍须两位委员重新审议。"})
+        return _legacy_autonomy_retired()
 
     def _incident_disposition(self, inc: dict) -> dict:
         """P1-01：事件详情处置上下文（服务端求值，前端不重算 Policy）。"""
@@ -3973,31 +3917,15 @@ class WebApp:
     async def api_agent_auto_toggle(self, request: web.Request) -> web.Response:
         sess = self._require_admin(request)
         self._check_csrf(request, sess)
-        body = await request.json()
-        enabled = bool(body.get("enabled"))
-        if self.agent:
-            self.agent.set_auto_enabled(enabled)
-        actual = bool(getattr(self.agent, "auto_enabled", False)) if self.agent else False
-        locked = bool(getattr(self.agent, "legacy_locked", True)) if self.agent else True
-        self.db.audit("web_user", sess["username"], f"agent_auto_{enabled}")
-        return _json({
-            "ok": True,
-            "auto_enabled": actual,
-            "requested": enabled,
-            "legacy_locked": locked,
-            "note": "legacy locked: cannot enable old auto path" if locked and enabled else "",
-        })
+        return _legacy_autonomy_retired()
 
     async def api_agent_status(self, request: web.Request) -> web.Response:
         self._require_auth(request)
         from .runbook import list_runbook
 
-        auto = self.agent.auto_enabled if self.agent else False
-        llm_ok = getattr(self.agent, "llm", None) and self.agent.llm.enabled
         return _json({
-            "ok": True,
-            "auto_enabled": auto,
-            "llm_enabled": bool(llm_ok),
+            "ok": True, "retired": True, "read_only": True,
+            "auto_enabled": False, "enabled": False, "llm_enabled": False,
             "runbook_count": len(list_runbook()),
         })
 

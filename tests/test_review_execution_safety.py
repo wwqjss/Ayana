@@ -18,6 +18,8 @@ import aiohttp  # 先加载真实模块；后台任务测试需要 aiohttp.web�
 
 from ayana.actions import ActionError, ActionService
 from ayana.agent import AgentLoop
+from ayana.legacy_history import RetiredAutonomyError
+from ayana.notification_obligations import NotificationObligations
 from ayana.alertmanager import AlertIngest
 from ayana.db import Database, now
 from ayana.incidents import IncidentService
@@ -118,10 +120,7 @@ class TestExecutionSafety(unittest.IsolatedAsyncioTestCase):
                                              "ok": True, "observed": {"service_state": "active"}}],
             }),
         )
-        self.agent = AgentLoop(
-            self.db, self.investigation, self.actions, self.policy,
-            SimpleNamespace(enabled=False), self.notifier, auto_enabled=True,
-        )
+        self.obligations = NotificationObligations(self.db, self.notifier)
 
     def tearDown(self):
         self.db.close()
@@ -173,39 +172,50 @@ class TestExecutionSafety(unittest.IsolatedAsyncioTestCase):
 
     async def test_agent_rejects_legacy_quarantined_incident(self):
         self.seed_episode(quarantined=True)
-        result = await self.agent.handle_incident("inc1")
-        self.assertEqual(result["action"], "escalated_source")
+        before = self.db.query_one("SELECT total_changes()")[0]
+        with self.assertRaises(RetiredAutonomyError) as denied:
+            AgentLoop(self.db, self.investigation, self.actions, self.policy,
+                      SimpleNamespace(enabled=True), self.notifier, auto_enabled=True)
+        self.assertEqual(denied.exception.code, "legacy_autonomy_retired")
+        with self.assertRaises(RetiredAutonomyError):
+            await AgentLoop.__new__(AgentLoop).handle_incident("inc1")
         self.investigation.run_loop.assert_not_called()
         self.transport.exec.assert_not_called()
-        self.assertTrue(self.incident()["need_human"])
+        self.assertEqual(self.db.query_one("SELECT total_changes()")[0], before)
 
     async def test_final_gate_rechecks_source_after_identity_wait(self):
+        """A stale automatic authorization appearing during identity I/O is rejected atomically."""
         self.seed_episode()
-        action_id = self.proposal(mode="auto")
-        self.actions.approve(action_id, approver_type="auto_rule", approver_id="agent")
+        action_id = self.proposal()
+        self.actions.approve(action_id, approver_id="admin")
 
         async def identity_wait(*args, **kwargs):
             self.db.execute("UPDATE alert_episodes SET source_state='quarantine' WHERE id='ep1'")
+            self.db.execute(
+                "UPDATE actions SET mode='auto',runbook_id='rb_frps_down_restart' WHERE id=?",
+                (action_id,),
+            )
             return {"ok": True, "mode": "exec"}
 
-        self.gate.verify_account = identity_wait
+        self.gate.verify_account = AsyncMock(side_effect=identity_wait)
         with self.assertRaises(ActionError) as denied:
-            await self.actions.execute(action_id, actor_type="auto_rule", actor_id="agent")
-        self.assertEqual(denied.exception.code, "source_quarantined")
-        self.assertEqual(self.actions.get_action(action_id)["state"], "cancelled")
+            await self.actions.execute(action_id, actor_id="admin")
+        self.assertEqual(denied.exception.code, "legacy_autonomy_retired")
+        self.gate.verify_account.assert_awaited_once()
+        self.assertEqual(self.actions.get_action(action_id)["state"], "approved")
+        self.assertIsNone(self.actions.get_action(action_id)["dispatched_at"])
+        self.assertEqual(self.db.query_one("SELECT source_state FROM alert_episodes WHERE id='ep1'")[0], "quarantine")
         self.transport.exec.assert_not_called()
-        self.assertTrue(self.incident()["need_human"])
 
     async def test_unsupported_profile_stops_agent_before_write(self):
-        """verification contract 缺失时 agent 在写入前硬停（escalated_precondition）。"""
+        """The retired Agent stays blocked even with incomplete verification contracts."""
         self.db.execute("UPDATE incidents SET object_id='frps', title='nerv / frps: TargetDown'")
         self.seed_episode()
         with patch("ayana.verify_profiles.profile_for_action", return_value=None):
-            result = await self.agent.handle_incident("inc1")
-        self.assertEqual(result["action"], "escalated_precondition")
-        pre = next(step for step in result["steps"] if step["step"] == "preconditions")
-        self.assertIn("verification_contract", ";".join(pre["reasons"]))
-        self.assertTrue(self.incident()["need_human"])
+            with self.assertRaises(RetiredAutonomyError) as denied:
+                await AgentLoop.__new__(AgentLoop).handle_incident("inc1")
+        self.assertEqual(denied.exception.code, "legacy_autonomy_retired")
+        self.investigation.run_loop.assert_not_called()
         self.transport.exec.assert_not_called()
         self.assertEqual(self.db.query_one("SELECT COUNT(*) AS n FROM actions")["n"], 0)
 
@@ -213,28 +223,39 @@ class TestExecutionSafety(unittest.IsolatedAsyncioTestCase):
         self.db.execute("UPDATE incidents SET object_id='frps'")
         action_id = self.proposal(object_id="frps")
         self.actions.approve(action_id, approver_id="admin")
-        # 模拟旧版本已经产生的 auto 提案，验证最终派发门而不是创建入口。
+        # Historical rows remain queryable, but neither their mode nor Policy can authorize a write.
         self.db.execute("UPDATE actions SET mode='auto',runbook_id='rb_frps_down_restart' WHERE id=?",
                         (action_id,))
         self.policy.upsert_permission(
             subject_type="web_user", subject_id="admin", capability="service.restart",
             asset_id="nerv", object_id="*", allow=True, require_approval=False, auto_allowed=True,
         )
+        before = self.db.query_one("SELECT total_changes()")[0]
         with patch("ayana.verify_profiles.profile_for_action", return_value=None):
             with self.assertRaises(ActionError) as denied:
                 await self.actions.execute(action_id, actor_id="admin")
-        self.assertEqual(denied.exception.code, "unsupported_verification_profile")
+        self.assertEqual(denied.exception.code, "legacy_autonomy_retired")
+        self.gate.verify_account.assert_not_awaited()
         self.transport.exec.assert_not_called()
-        self.assertTrue(self.incident()["need_human"])
+        self.assertEqual(self.db.query_one("SELECT total_changes()")[0], before)
+        self.assertEqual(self.actions.get_action(action_id)["state"], "approved")
 
     async def test_contract_removed_during_identity_wait_blocks_write(self):
-        action_id = self.proposal(mode="auto")
-        self.actions.approve(action_id, approver_type="auto_rule", approver_id="agent")
+        with self.assertRaises(ActionError) as proposal_denied:
+            self.proposal(mode="auto")
+        self.assertEqual(proposal_denied.exception.code, "legacy_autonomy_retired")
+        action_id = self.proposal()
+        self.actions.approve(action_id, approver_id="admin")
+        # Seed a legacy approved action rather than using the now-retired proposal path.
+        self.db.execute("UPDATE actions SET mode='auto',runbook_id='rb_frps_down_restart' WHERE id=?",
+                        (action_id,))
         with patch("ayana.verify_profiles.profile_for_action", return_value=None):
             with self.assertRaises(ActionError) as denied:
                 await self.actions.execute(action_id, actor_type="auto_rule", actor_id="agent")
-        self.assertEqual(denied.exception.code, "unsupported_verification_profile")
+        self.assertEqual(denied.exception.code, "legacy_autonomy_retired")
+        self.gate.verify_account.assert_not_awaited()
         self.transport.exec.assert_not_called()
+        self.assertIsNone(self.actions.get_action(action_id)["dispatched_at"])
 
     async def test_transport_exception_converges_and_retains_no_replay_lock(self):
         action_id = self.proposal()
@@ -256,11 +277,11 @@ class TestExecutionSafety(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.transport.exec.await_count, 1)
 
     async def test_approval_and_passed_verification_complete_recovery(self):
-        result = self.agent._propose_for_human(
-            self.incident(), get_runbook_rule("rb_frps_down_restart"), {"steps": []},
-            {"decision": "approval_required"}, {"status": "satisfied"}, None, "",
+        action_id = self.proposal()
+        self.obligations._notify_awaiting_approval(
+            "inc1", action_id, get_runbook_rule("rb_frps_down_restart"),
+            {"decision": "approval_required"}, {"status": "satisfied"},
         )
-        action_id = result["action_id"]
         self.assertTrue(self.incident()["need_human"])
         self.actions.approve(action_id, approver_id="admin")
         self.assertFalse(self.incident()["need_human"])

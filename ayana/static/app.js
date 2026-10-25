@@ -410,97 +410,25 @@ on("pw-change-form", "submit", async (e) => {
 
 on("chg-pw-btn", "click", () => showPasswordChange(false));
 
-/* ---- 三省制 Provider settings, on the existing settings surface ---- */
+/* ---- Legacy autonomy history: read-only, no provider or execution controls ---- */
 async function openAutonomySettings() {
   const [settings, usageReply] = await Promise.all([api("/api/autonomy/providers"), api("/api/autonomy/usage")]);
-  if (!settings.ok) { showModal("三省制 Agent", [el("p", { class: "error", text: settings.message || settings.error || "配置加载失败" })]); return; }
-  const config = settings.config || {};
+  if (!settings.ok) { showModal("旧自治历史与费用", [el("p", { class: "error", text: settings.message || settings.error || "历史加载失败" })]); return; }
   const wrap = el("div", { class: "form-col" });
-  wrap.appendChild(el("p", { class: "muted small", text: "中书省拟案，两位门下省委员独立审议；两票同意后仍由现有 Policy、Action 与独立验证控制执行。" }));
-  wrap.appendChild(el("p", { class: "muted small", text: "自治 Agent 使用单独获许可的 API 凭据，不能填入 MiMo Token Plan Key。密钥只写入，不回显；留空保留原值。费用按 API usage 和配置单价计算，未获得实际账单时不代表账户扣费。" }));
-  const enabled = el("input", { type: "checkbox" }); enabled.checked = !!config.enabled;
-  wrap.appendChild(el("label", { text: "启用自治 Agent" }, [enabled]));
-  const field = (label, value, type = "number") => {
-    const input = el("input", { type, value: value == null ? "" : String(value), step: "any" });
-    wrap.appendChild(el("label", { text: label }, [input])); return input;
-  };
-  const budget = field("总预算（元）", config.budget_cny ?? 100);
-  const warning = field("预算预警比例（0–1）", config.warning_ratio ?? 0.8);
-  const incidentLimit = field("每事件最多模型调用次数", config.max_calls_per_incident ?? 60);
-  const generationLimit = field("每轮故障最多模型调用次数", config.max_calls_per_generation ?? 30);
-  const roleFields = {};
-  [["planner", "中书省 · MiMo"], ["reviewer_kimi", "门下省 A · Kimi"], ["reviewer_deepseek", "门下省 B · DeepSeek"]].forEach(([role, title]) => {
-    const conf = (config.roles || {})[role] || {};
-    wrap.appendChild(el("h4", { text: title, style: "margin:16px 0 4px" }));
-    const verificationMessage = el("p", { class: "muted small", text: `${conf.key_configured ? "API 凭据已配置" : "API 凭据未配置"} · ${conf.account_verified ? "已核验账户支持该模型" : "该账户与模型尚未验证"}${conf.verification_error ? " · " + conf.verification_error : ""}` });
-    wrap.appendChild(verificationMessage);
-    const fields = {
-      base_url: field("Base URL", conf.base_url || "", "url"),
-      model: field("模型 ID（按账户实际支持填写）", conf.model || "", "text"),
-      timeout: field("单次超时（秒）", conf.timeout ?? 60),
-      retries: field("失败重试次数（0–2）", conf.retries ?? 0),
-      input_cny_per_million: field("输入单价（元 / 百万 Token，未知留空）", conf.input_cny_per_million),
-      output_cny_per_million: field("输出单价（元 / 百万 Token，未知留空）", conf.output_cny_per_million),
-      api_key: field("独立 API Key（留空不更改）", "", "password"),
-    };
-    fields.api_key.setAttribute("autocomplete", "new-password");
-    fields.clear_api_key = el("input", { type: "checkbox" });
-    wrap.appendChild(el("label", { text: "清除此角色已保存的 API Key" }, [fields.clear_api_key]));
-    let verifying = false;
-    const verifyButton = el("button", { class: "btn small", text: "核验已保存的账户与模型", onclick: async () => {
-      if (verifying) return;
-      const totp = prompt("动态验证码（若账号已启用 2FA，否则留空）:", ""); if (totp === null) return;
-      verifying = true; verifyButton.disabled = true;
-      verificationMessage.textContent = "正在通过官方模型列表核验已保存配置…";
-      try {
-        const result = await api("/api/autonomy/providers/verify", { method: "POST", body: JSON.stringify({ role, totp }) });
-        const error = result.error || (result.result || {}).error || "verification_failed";
-        const reasons = { provider_unconfigured: "未配置独立 API 凭据", model_not_available: "该账户的模型列表不包含此模型", llm_timeout: "服务响应超时", llm_http_error: "服务拒绝请求，请检查账户与凭据", llm_connection_error: "无法连接模型服务", llm_blocked_endpoint: "服务地址不在允许的官方地址内", totp_required: "请输入动态验证码", totp_invalid: "动态验证码不正确" };
-        verificationMessage.textContent = result.ok && (result.result || {}).ok ? "已核验：已保存的账户支持该模型。" : "核验未通过：" + (reasons[error] || error);
-      } catch (_) { verificationMessage.textContent = "核验未完成，请检查网络后重试。"; }
-      finally { verifying = false; verifyButton.disabled = false; }
-    } });
-    if (settings.available === false) verifyButton.disabled = true;
-    wrap.appendChild(verifyButton);
-    if (conf.model_source) wrap.appendChild(el("a", { text: "官方模型与 API 资料", href: conf.model_source, target: "_blank", rel: "noopener noreferrer", class: "small" }));
-    roleFields[role] = fields;
-  });
-  const usage = usageReply.ok ? usageReply.usage || {} : {};
-  const totals = usage.overall || usage;
-  const budgetView = usage.budget || usage;
-  wrap.appendChild(el("h4", { text: "模型费用与预算", style: "margin:16px 0 4px" }));
-  wrap.appendChild(el("p", { class: "muted small", text: `已统计费用：${councilMoney(totals.complete === false ? null : (totals.cost_cny ?? totals.total_cost_cny))} · 预算：${councilMoney(budgetView.budget_cny ?? config.budget_cny)} · 可用预算：${councilMoney(budgetView.remaining_cny)} · 账户余额：${councilMoney(budgetView.account_balance_cny)}` }));
-  Object.entries(usage.by_role || {}).forEach(([role, row]) => wrap.appendChild(el("p", { class: "small", text: `${{planner: "中书省", reviewer_kimi: "Kimi 委员", reviewer_deepseek: "DeepSeek 委员"}[role] || role} · 输入 ${row.input_tokens ?? "未知"} / 输出 ${row.output_tokens ?? "未知"} Token · 费用 ${councilMoney(row.complete === false ? null : row.cost_cny)}` })));
-  if (totals.complete === false) wrap.appendChild(el("p", { class: "muted small", text: `存在未知费用调用；已知部分小计 ${councilMoney(totals.cost_cny)}，不代表完整费用或实际扣费。` }));
-  if (budgetView.warning || usage.budget_warning) wrap.appendChild(el("p", { class: "error", text: "模型预算已触发预警，请检查费用明细。" }));
-  if (budgetView.exhausted || usage.blocked || usage.circuit_open) wrap.appendChild(el("p", { class: "error", text: "模型调用已熔断；告警接收、只读监控、人工处置和已有 Runbook 继续运行。" }));
-  if (usageReply.ok) wrap.appendChild(councilObjectDetails("按角色、Provider 与事件查看 Token 和费用", usage));
-  const message = el("p", { class: "error" });
-  wrap.appendChild(message);
-  let submitting = false;
-  const save = el("button", { class: "btn primary", text: "保存 Agent 配置", onclick: async () => {
-    if (submitting) return;
-    const totp = prompt("动态验证码（若账号已启用 2FA，否则留空）:", ""); if (totp === null) return;
-    const payload = { enabled: enabled.checked, budget_cny: Number(budget.value), warning_ratio: Number(warning.value), max_calls_per_incident: Number(incidentLimit.value), max_calls_per_generation: Number(generationLimit.value), roles: {}, totp };
-    Object.entries(roleFields).forEach(([role, fields]) => {
-      const out = { base_url: fields.base_url.value.trim(), model: fields.model.value.trim(), timeout: Number(fields.timeout.value), retries: Number(fields.retries.value) };
-      ["input_cny_per_million", "output_cny_per_million"].forEach((key) => { out[key] = fields[key].value.trim() === "" ? null : Number(fields[key].value); });
-      if (fields.api_key.value.trim()) out.api_key = fields.api_key.value.trim();
-      if (fields.clear_api_key.checked) out.clear_api_key = true;
-      payload.roles[role] = out;
-    });
-    submitting = true; save.disabled = true;
-    try {
-      const result = await api("/api/autonomy/providers", { method: "POST", body: JSON.stringify(payload) });
-      if (!result.ok) { message.textContent = result.message || result.error || "配置保存失败"; return; }
-      Object.values(roleFields).forEach((fields) => { fields.api_key.value = ""; fields.clear_api_key.checked = false; });
-      message.textContent = "已保存。模型与凭据将在下一次调用时生效。";
-    } catch (_) { message.textContent = "请求未完成，请重新加载确认配置。"; }
-    finally { submitting = false; save.disabled = false; }
-  } });
-  if (settings.available === false) save.disabled = true;
-  wrap.appendChild(save);
-  showModal("三省制 Agent · 模型与预算", [wrap]);
+  wrap.appendChild(el("p", { class: "muted small", text: "旧自治流程已退役。本页仅保留历史费用记录；模型配置、账户核验和自动执行入口已关闭。人工审批、手动调查和 Runbook 继续可用。" }));
+  if (!usageReply.ok) {
+    wrap.appendChild(el("p", { class: "error", text: usageReply.message || usageReply.error || "历史费用暂时不可用" }));
+  } else {
+    const usage = usageReply.usage || {};
+    const totals = usage.overall || usage;
+    const budgetView = usage.budget || usage;
+    wrap.appendChild(el("h4", { text: "历史模型费用与预算", style: "margin:16px 0 4px" }));
+    wrap.appendChild(el("p", { class: "muted small", text: `已统计费用：${councilMoney(totals.complete === false ? null : (totals.cost_cny ?? totals.total_cost_cny))} · 历史预算：${councilMoney(budgetView.budget_cny)} · 历史可用预算：${councilMoney(budgetView.remaining_cny)} · 账户余额：${councilMoney(budgetView.account_balance_cny)}` }));
+    Object.entries(usage.by_role || {}).forEach(([role, row]) => wrap.appendChild(el("p", { class: "small", text: `${{planner: "中书省", reviewer_kimi: "Kimi 委员", reviewer_deepseek: "DeepSeek 委员"}[role] || role} · 输入 ${row.input_tokens ?? "未知"} / 输出 ${row.output_tokens ?? "未知"} Token · 费用 ${councilMoney(row.complete === false ? null : row.cost_cny)}` })));
+    if (totals.complete === false) wrap.appendChild(el("p", { class: "muted small", text: `存在未知费用调用；已知部分小计 ${councilMoney(totals.known_cost_cny ?? totals.cost_cny)}，不代表完整费用或实际扣费。` }));
+    wrap.appendChild(councilObjectDetails("历史 Token 与费用明细", usage));
+  }
+  showModal("旧自治历史与费用", [wrap]);
 }
 
 /* ---- 全局设置（用户名旁） ---- */
@@ -549,7 +477,7 @@ on("settings-btn", "click", async () => {
     : "Prometheus：不可用（" + (res.prometheus_error || "未连接") + "）。安装后一键接入才能验证指标。";
   form.appendChild(el("p", { class: "muted small", text: promSt }));
   if (state.user && state.user.is_admin) form.appendChild(el("button", {
-    class: "btn", text: "三省制 Agent · 模型与预算", type: "button", onclick: openAutonomySettings,
+    class: "btn", text: "旧自治历史与费用", type: "button", onclick: openAutonomySettings,
   }));
   wrap.appendChild(form);
   const msg = el("p", { class: "error" });
@@ -1833,21 +1761,20 @@ function councilObjectDetails(title, value) {
 
 function renderCouncilPanel(council, incId) {
   const wrap = el("section", { class: "card", style: "margin:16px 0" });
-  wrap.appendChild(el("h3", { text: "三省制 · 自治处置" }));
+  wrap.appendChild(el("h3", { text: "旧自治 · 历史记录" }));
+  wrap.appendChild(el("p", { class: "muted small", text: "旧自治流程已退役，以下仅展示历史记录；不会重新拟案、审批或自动执行。人工审批、手动调查和 Runbook 继续可用。" }));
   if (council.status === "unavailable" || council.error) {
-    wrap.appendChild(el("p", { class: "error", text: "自治处置状态暂时不可用，告警与现有处置记录仍可查看。" }));
+    wrap.appendChild(el("p", { class: "error", text: "旧自治历史暂时不可用，告警与现有处置记录仍可查看。" }));
     return wrap;
   }
   const phaseNames = { received: "接奏", investigating: "调查", planning: "拟旨", drafting: "拟旨", reviewing: "会审", approved: "准奏", vetoed: "封驳", rejected: "封驳", executing: "奉旨执行", verifying: "验证", reporting: "回奏", done: "结案", closed: "结案", manual: "等待人工裁决", need_human: "等待人工裁决", waiting: "等待重试", watching: "持续观察", provider_unavailable: "模型暂不可用", budget_blocked: "费用熔断", disabled: "未启用" };
   const phase = council.phase || council.status || "received";
   wrap.appendChild(el("p", { class: "muted small", text: "接奏 → 调查 → 拟旨 → 会审 → 准奏/封驳 → 奉旨执行 → 验证 → 回奏 → 结案" }));
-  wrap.appendChild(badge(council.enabled === false ? "未启用" : (phaseNames[phase] || phase), council.manual_required ? "warn" : "dim"));
-  if (council.enabled === false) wrap.appendChild(el("p", { class: "muted small", text: "新自治 Agent 尚未启用；现有监控、人工处置和已授权 Runbook 继续按原有规则运行。" }));
-  if (council.next_retry_at) wrap.appendChild(el("p", { class: "muted small", text: "下次调查：" + fmtTime(council.next_retry_at) }));
-  if (council.last_error) wrap.appendChild(el("p", { class: "error small", text: "当前阻碍：" + (typeof council.last_error === "string" ? council.last_error : JSON.stringify(council.last_error)) }));
+  wrap.appendChild(badge("已退役 · 历史阶段：" + (phaseNames[phase] || phase), "dim"));
+  if (council.last_error) wrap.appendChild(el("p", { class: "error small", text: "历史阻碍：" + (typeof council.last_error === "string" ? council.last_error : JSON.stringify(council.last_error)) }));
   const evidence = council.evidence || [];
   if (evidence.length) wrap.appendChild(councilObjectDetails("中书省调查证据 · " + evidence.length + " 项", evidence));
-  if (council.draft) wrap.appendChild(councilObjectDetails("当前拟案 · 尚不代表获得执行授权", council.draft));
+  if (council.draft) wrap.appendChild(councilObjectDetails("历史拟案 · 不提供执行授权", council.draft));
   if ((council.feedback || []).length) wrap.appendChild(councilObjectDetails("封驳、执行失败与验证反馈", council.feedback));
   const plans = council.plans || [];
   plans.forEach((record) => {
@@ -1881,27 +1808,10 @@ function renderCouncilPanel(council, incId) {
   const totals = usage.overall || usage;
   wrap.appendChild(el("p", { class: "muted small", text: `本事件模型费用：${councilMoney(totals.complete === false ? null : (totals.cost_cny ?? totals.total_cost_cny))} · 输入 Token：${totals.input_tokens ?? "未知"} · 输出 Token：${totals.output_tokens ?? "未知"}` }));
   if (Object.keys(usage).length) wrap.appendChild(councilObjectDetails("Token 与费用明细", usage));
-  const goals = (council.goals || []).filter((goal) => goal.manual_required &&
-    (council.current_generation == null || goal.generation == null || Number(goal.generation) === Number(council.current_generation)));
-  if (council.manual_required) wrap.appendChild(el("p", { class: "error", text: "等待人工裁决；只读调查和监控继续。新方案必须重新经过双委员审议。" }));
+  const goals = (council.goals || []).filter((goal) => goal.manual_required);
+  if (council.manual_required || goals.length) wrap.appendChild(el("p", { class: "muted small", text: "历史记录含人工裁决请求；旧流程已退役，不能重新拟案。" }));
   goals.forEach((goal) => {
-    wrap.appendChild(el("p", { class: "small", text: `修复目标：${goal.repair_goal || goal.id} · 连续封驳 ${goal.consecutive_vetoes || 0} 次${goal.manual_reason ? " · " + goal.manual_reason : ""}` }));
-    if (!(state.user && state.user.is_admin)) return;
-    const message = el("p", { class: "muted small" });
-    let submitting = false;
-    const button = el("button", { class: "btn", text: "允许此目标重新拟案", onclick: async () => {
-      if (submitting || !confirm("允许该修复目标重新拟案？新方案仍须两位委员重新同意。")) return;
-      const totp = prompt("动态验证码（若账号已启用 2FA，否则留空）:", "");
-      if (totp === null) return;
-      submitting = true; button.disabled = true;
-      try {
-        const result = await api(`/api/incidents/${encodeURIComponent(incId)}/council/review`, { method: "POST", body: JSON.stringify({ goal_id: goal.id, totp }) });
-        if (!result.ok) { message.textContent = result.message || result.error || "裁决未保存"; return; }
-        await openIncidentDetail(incId);
-      } catch (_) { message.textContent = "请求未完成，请刷新确认裁决状态。"; }
-      finally { submitting = false; button.disabled = false; }
-    } });
-    wrap.appendChild(button); wrap.appendChild(message);
+    wrap.appendChild(el("p", { class: "small", text: `历史修复目标：${goal.repair_goal || goal.id} · 连续封驳 ${goal.consecutive_vetoes || 0} 次${goal.manual_reason ? " · " + goal.manual_reason : ""}` }));
   });
   return wrap;
 }

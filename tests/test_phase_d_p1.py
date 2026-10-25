@@ -45,6 +45,8 @@ except Exception:
 
 from ayana.actions import ActionError, ActionService
 from ayana.agent import AgentLoop
+from ayana.notification_obligations import NotificationObligations
+from ayana.legacy_history import RetiredAutonomyError
 from ayana.alertmanager import (
     AlertIngest,
     normalize_starts_at,
@@ -209,8 +211,7 @@ def make_env(
              0, "", 1, "", t, t),
         )
     inv = InvestigationService(db, nt, gate, prom, policy)
-    agent = AgentLoop(db, inv, actions, policy, NoLLM(), NQ(), auto_enabled=auto_enabled,
-                      knowledge=KnowledgeBase(db))
+    agent = NotificationObligations(db, NQ())
     incidents = IncidentService(db)
     # 注入测试本地 runbook 规则（发行版 RUNBOOK 为空）
     rule = seed_runbook_rule()
@@ -254,28 +255,22 @@ def seed_runbook_rule():
 
 class TestP101HumanLoop(unittest.TestCase):
     def test_forbidden_no_proposal(self):
-        tmp, db, policy, nt, prom, gate, actions, agent, incidents = make_env(
-            auto_rule=(False, True, False), probe_value=0
-        )
+        tmp, db, policy, nt, prom, gate, actions, obligations, incidents = make_env(auto_rule=(False, True, False), probe_value=0)
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(agent.handle_incident("inc1"))
+        with self.assertRaises(ActionError):
+            actions.propose(asset_id="nerv",object_id="frps",capability="service.restart",reason="explicit request",incident_id="inc1",proposer_type="auto_rule",proposer_id="agent",mode="manual",template_id="tmpl_service_restart")
         self.assertFalse(nt.exec_calls)
-        self.assertEqual(res.get("action"), "escalated_policy")
-        n = db.query_one("SELECT COUNT(*) AS n FROM actions")
-        self.assertEqual(int(n["n"]), 0)
+        self.assertEqual(db.query_one("SELECT COUNT(*) n FROM actions")["n"],0)
 
     def test_approval_required_proposal_zero_dispatch(self):
-        tmp, db, policy, nt, prom, gate, actions, agent, incidents = make_env(
-            auto_rule=(True, True, False), probe_value=0, auto_enabled=False
-        )
-        self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(agent.handle_incident("inc1"))
-        self.assertEqual(res.get("action"), "awaiting_approval")
-        self.assertFalse(nt.exec_calls, res)
-        row = db.query_one("SELECT * FROM actions")
-        self.assertIsNotNone(row)
-        self.assertEqual(row["state"], "proposed")
-        self.assertEqual(row["mode"], "manual")
+        tmp, db, policy, nt, prom, gate, actions, obligations, incidents = make_env(auto_rule=(True, True, False), probe_value=0, auto_enabled=False)
+        self.addCleanup(close_env,tmp,db)
+        prop=actions.propose(asset_id="nerv",object_id="frps",capability="service.restart",reason="human request",incident_id="inc1",proposer_type="web_user",proposer_id="admin",mode="manual",template_id="tmpl_service_restart")
+        obligations._notify_awaiting_approval("inc1",prop["id"],seed_runbook_rule(),{"decision":"approval_required"},{"status":"satisfied"})
+        self.assertFalse(nt.exec_calls)
+        row=db.query_one("SELECT * FROM actions")
+        self.assertEqual((row["state"],row["mode"]),("proposed","manual"))
+        self.assertTrue(db.query_one("SELECT need_human FROM incidents")["need_human"])
 
     def test_approve_exactly_one_dispatch(self):
         tmp, db, policy, nt, prom, gate, actions, agent, incidents = make_env(
@@ -427,18 +422,16 @@ class TestP101HumanLoop(unittest.TestCase):
         self.assertIn("qq", aud["detail_json"])
 
     def test_auto_off_still_investigates_and_proposes(self):
-        tmp, db, policy, nt, prom, gate, actions, agent, incidents = make_env(
-            auto_rule=(True, True, False), probe_value=0, auto_enabled=False
-        )
-        self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(agent.handle_incident("inc1"))
-        self.assertEqual(res.get("action"), "awaiting_approval")
-        # 只读调查发生了
-        inv = db.query_one("SELECT COUNT(*) AS n FROM investigations")
-        self.assertGreaterEqual(int(inv["n"]), 1)
-        prop = db.query_one("SELECT * FROM actions")
-        self.assertIsNotNone(prop)
-        self.assertEqual(prop["state"], "proposed")
+        """Retired automatic entry leaves explicit read investigation/manual actions intact."""
+        tmp, db, policy, nt, prom, gate, actions, obligations, incidents = make_env(auto_rule=(True, True, False),probe_value=0,auto_enabled=False)
+        self.addCleanup(close_env,tmp,db)
+        with self.assertRaises(RetiredAutonomyError):
+            AgentLoop(db,None,actions,policy,None,None,auto_enabled=False)
+        inv=InvestigationService(db,nt,gate,prom,policy)
+        asyncio.run(inv.run(incident_id="inc1",asset_id="nerv",object_id="frps",actor_type="auto_rule",actor_id="agent",capability="asset.summary"))
+        prop=actions.propose(asset_id="nerv",object_id="frps",capability="service.restart",reason="human request",incident_id="inc1",proposer_type="web_user",proposer_id="admin",mode="manual",template_id="tmpl_service_restart")
+        self.assertGreaterEqual(db.query_one("SELECT COUNT(*) n FROM investigations")["n"],1)
+        self.assertEqual(actions.get_action(prop["id"])["state"],"proposed")
         self.assertFalse(nt.exec_calls)
 
     def test_policy_three_state_values(self):
