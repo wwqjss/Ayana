@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 
 class MigrationError(RuntimeError):
