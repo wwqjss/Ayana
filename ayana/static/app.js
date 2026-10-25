@@ -467,25 +467,134 @@ async function openOpsConstraints() {
 
 async function openMimoAdmin() {
   const st = await api("/api/mimo/status");
+  const cfg = await api("/api/mimo/provider");
   const wrap = el("div", { class: "form-col" });
   wrap.appendChild(el("h3", { text: "MiMoCode 管理" }));
   const s = st || {};
+  const c = cfg || {};
+  const ver = c.verification || {};
   wrap.appendChild(el("p", {
     class: "muted small",
-    text: `二进制：${s.binary || "?"} · 存在：${s.exists ? "是" : "否"} · 版本：${s.version || "?"} · unit：${(s.unit && s.unit.detail) || s.unit && s.unit.active || "未配置"}`,
+    text: `CLI：${s.binary || "?"} · ${s.exists ? "已安装 " + (s.version || "") : "未安装"} · unit：${(s.unit && s.unit.detail) || (s.unit && s.unit.active) || "未配置"}`,
   }));
-  const msg = el("p", { class: "error" });
-  const btn = (text, path) => el("button", {
-    class: "btn", text, type: "button",
-    onclick: async () => {
-      const r = await api(path, { method: "POST", body: "{}" });
-      msg.textContent = r && (r.ok !== false) ? "已执行" : ((r && (r.message || r.error)) || "失败");
-    },
-  });
+  // 验证状态：未通过不得宣称可用
+  const available = !!c.available;
+  wrap.appendChild(el("p", {
+    class: available ? "small" : "error",
+    text: available
+      ? `MiMoCode 可用 · 模型 ${ver.model || c.model || "?"} · 验证通过`
+      : `MiMoCode 尚未通过连接验证（${ver.last_result || "未测试"}${ver.last_message ? " · " + ver.last_message : ""}）。请填写密钥并点击「测试连接」。`,
+  }));
   if (state.user && state.user.is_admin) {
-    wrap.appendChild(btn("启动", "/api/mimo/start"));
-    wrap.appendChild(btn("停止", "/api/mimo/stop"));
-    wrap.appendChild(btn("重启", "/api/mimo/restart"));
+    wrap.appendChild(el("h4", { text: "模型与 API（由你填写）" }));
+    wrap.appendChild(el("label", { text: "Base URL" }, [
+      el("input", {
+        id: "mimo-base-url", type: "url",
+        placeholder: "https://api.xiaomimimo.com/v1",
+        value: ver.base_url || ((c.providers && c.providers[0] && c.providers[0].baseURL) || ""),
+      }),
+    ]));
+    wrap.appendChild(el("label", { text: "模型 ID" }, [
+      el("input", {
+        id: "mimo-model",
+        placeholder: "例如 mimo-v2.6-pro",
+        value: ver.model || (c.model || "").split("/").pop() || "",
+      }),
+    ]));
+    wrap.appendChild(el("label", {
+      text: (c.providers && c.providers[0] && c.providers[0].key_set)
+        ? "API Key（已保存，留空则不改）"
+        : "API Key",
+    }, [
+      el("input", {
+        id: "mimo-api-key", type: "password", autocomplete: "new-password",
+        placeholder: "粘贴你的 API Key",
+      }),
+    ]));
+    const msg = el("p", { class: "error" });
+    const testBtn = el("button", {
+      class: "btn", text: "测试连接", type: "button",
+      onclick: async () => {
+        const body = {
+          base_url: (($("mimo-base-url") || {}).value || "").trim(),
+          model: (($("mimo-model") || {}).value || "").trim(),
+          api_key: (($("mimo-api-key") || {}).value || "").trim(),
+        };
+        msg.textContent = "正在真实调用模型…";
+        const r = await api("/api/mimo/provider/test", { method: "POST", body: JSON.stringify(body) });
+        const map = {
+          success: "连接成功",
+          auth_failed: "认证失败：API Key 无效",
+          quota_exhausted: "额度不足",
+          rate_limited: "触发限流",
+          timeout: "超时",
+          connection_error: "网络错误",
+          server_error: "服务端错误",
+          http_error: "接口错误",
+        };
+        const label = (r && map[r.result]) || (r && r.message) || "测试失败";
+        msg.textContent = label + (r && r.http_status ? `（HTTP ${r.http_status}）` : "");
+        msg.className = (r && r.ok) ? "small" : "error";
+      },
+    });
+    const saveBtn = el("button", {
+      class: "btn primary", text: "保存并验证", type: "button",
+      onclick: async () => {
+        const body = {
+          base_url: (($("mimo-base-url") || {}).value || "").trim(),
+          model: (($("mimo-model") || {}).value || "").trim(),
+          api_key: (($("mimo-api-key") || {}).value || "").trim(),
+          test: true,
+        };
+        msg.textContent = "保存前验证中…";
+        const r = await api("/api/mimo/provider", { method: "POST", body: JSON.stringify(body) });
+        if (r && r.ok && r.verified) {
+          msg.className = "small";
+          msg.textContent = "已保存，连接验证通过，MiMoCode 可用。";
+          const keyEl = $("mimo-api-key");
+          if (keyEl) keyEl.value = "";
+        } else if (r && r.saved) {
+          msg.className = "error";
+          msg.textContent = "已保存但未通过验证：" + ((r.test && r.test.message) || r.message || "");
+        } else {
+          msg.className = "error";
+          msg.textContent = (r && (r.message || r.error)) || "未保存（验证未通过）";
+        }
+      },
+    });
+    wrap.appendChild(testBtn);
+    wrap.appendChild(saveBtn);
+    wrap.appendChild(el("button", {
+      class: "btn", text: "清除已保存密钥", type: "button",
+      onclick: async () => {
+        const r = await api("/api/mimo/provider/clear", { method: "POST", body: "{}" });
+        msg.className = "small";
+        msg.textContent = r && r.ok ? "已清除密钥，验证状态已重置" : ((r && r.message) || "清除失败");
+      },
+    }));
+    wrap.appendChild(msg);
+    wrap.appendChild(el("p", {
+      class: "muted small",
+      text: "密钥只保存在服务器 mimocode 配置（0600），界面与日志均不回显。验证未通过时不会标记为可用。",
+    }));
+  }
+  const msg2 = el("p", { class: "error" });
+  wrap.appendChild(msg2);
+  if (state.user && state.user.is_admin) {
+    wrap.appendChild(el("button", {
+      class: "btn", text: "启动", type: "button",
+      onclick: async () => {
+        const r = await api("/api/mimo/start", { method: "POST", body: "{}" });
+        msg2.textContent = (r && r.ok !== false) ? "已启动" : ((r && r.error) || "失败");
+      },
+    }));
+    wrap.appendChild(el("button", {
+      class: "btn", text: "停止", type: "button",
+      onclick: async () => {
+        const r = await api("/api/mimo/stop", { method: "POST", body: "{}" });
+        msg2.textContent = (r && r.ok !== false) ? "已停止" : ((r && r.error) || "失败");
+      },
+    }));
   }
   wrap.appendChild(el("button", {
     class: "btn", text: "刷新用量", type: "button",
@@ -494,7 +603,6 @@ async function openMimoAdmin() {
       showModal("MiMoCode 用量", [el("pre", { text: (r && (r.stdout || r.stderr || JSON.stringify(r))) || "" })]);
     },
   }));
-  wrap.appendChild(msg);
   showModal("MiMoCode 管理", [wrap]);
 }
 

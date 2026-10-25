@@ -148,17 +148,129 @@ class MimoAdmin:
             for name, conf in providers.items():
                 if not isinstance(conf, dict):
                     continue
+                opts = conf.get("options") if isinstance(conf.get("options"), dict) else {}
                 out["providers"].append(
                     {
                         "name": name,
                         "models": conf.get("models") or conf.get("model") or [],
-                        "baseURL": conf.get("options", {}).get("baseURL")
-                        or conf.get("baseURL")
-                        or conf.get("base_url")
-                        or "",
+                        "baseURL": opts.get("baseURL") or conf.get("baseURL") or "",
+                        "key_set": bool(opts.get("apiKey")),
                     }
                 )
+        out["model"] = data.get("model") or ""
         return out
+
+    def verification_state(self, db: Any = None) -> dict[str, Any]:
+        """连接验证状态（不含密钥）。未验证不得宣称可用。"""
+        row = None
+        if db is not None:
+            try:
+                row = db.query_one("SELECT value FROM meta WHERE key='mimo_provider_state'")
+            except Exception:
+                row = None
+        if row and row["value"]:
+            try:
+                st = json.loads(row["value"])
+            except Exception:
+                st = {}
+        else:
+            st = {}
+        return {
+            "verified": bool(st.get("verified")),
+            "last_test_at": st.get("last_test_at") or 0,
+            "last_result": st.get("last_result") or "",
+            "last_message": (st.get("last_message") or "")[:200],
+            "provider_id": st.get("provider_id") or "",
+            "model": st.get("model") or "",
+            "base_url": st.get("base_url") or "",
+        }
+
+    def save_verification_state(self, db: Any, state: dict[str, Any]) -> None:
+        if db is None:
+            return
+        try:
+            db.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('mimo_provider_state', ?)",
+                (json.dumps(state, ensure_ascii=False),),
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def classify_api_response(status: int, body: str, timed_out: bool = False) -> dict[str, Any]:
+        """区分：成功 / 认证失败 / 额度不足 / 超时 / 其它。"""
+        text = body or ""
+        low = text.lower()
+        if timed_out:
+            return {"ok": False, "result": "timeout", "message": "请求超时"}
+        if status in (200, 201):
+            return {"ok": True, "result": "success", "message": "连接成功"}
+        if status in (401, 403):
+            return {"ok": False, "result": "auth_failed", "message": "认证失败：API Key 无效或无权限"}
+        if status == 429:
+            if any(x in low for x in ("quota", "exhaust", "limitation", "insufficient", "余额", "额度")):
+                return {"ok": False, "result": "quota_exhausted", "message": "额度不足或已用尽"}
+            return {"ok": False, "result": "rate_limited", "message": "触发限流，请稍后再试"}
+        if status >= 500:
+            return {"ok": False, "result": "server_error", "message": f"服务端错误 HTTP {status}"}
+        return {"ok": False, "result": "http_error", "message": f"HTTP {status}"}
+
+    def test_connection(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        """真实调用模型接口做连通性验证。不落盘密钥，不写日志明文。"""
+        import urllib.error
+        import urllib.request
+
+        base = (base_url or "").strip().rstrip("/")
+        key = (api_key or "").strip()
+        model = (model or "").strip()
+        if not base or not key or not model:
+            return {"ok": False, "result": "bad_request", "message": "base_url / api_key / model 均必填"}
+        if not base.startswith(("http://", "https://")):
+            return {"ok": False, "result": "bad_request", "message": "base_url 必须是 http(s)"}
+        url = base + "/chat/completions"
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "Reply with exactly: PONG"}],
+            "max_tokens": 8,
+            "temperature": 0,
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + key,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read(4000).decode("utf-8", "replace")
+                out = self.classify_api_response(int(resp.status), body)
+                out["http_status"] = int(resp.status)
+                return out
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read(2000).decode("utf-8", "replace")
+            except Exception:
+                body = ""
+            out = self.classify_api_response(int(e.code or 0), body)
+            out["http_status"] = int(e.code or 0)
+            return out
+        except TimeoutError:
+            return {"ok": False, "result": "timeout", "message": "请求超时"}
+        except Exception as e:  # noqa: BLE001
+            name = type(e).__name__
+            if "timed out" in str(e).lower() or name in ("TimeoutError", "URLError"):
+                return {"ok": False, "result": "timeout", "message": "请求超时或网络不可达"}
+            return {"ok": False, "result": "connection_error", "message": f"{name}: {str(e)[:120]}"}
 
     def apply_provider(
         self,
@@ -168,8 +280,9 @@ class MimoAdmin:
         base_url: str = "",
         model: str = "",
         config_dir: str = "",
+        verified: bool = False,
     ) -> dict[str, Any]:
-        """把 Ayana 侧配置的密钥/端点写入 mimocode 配置（对接真实 MiMoCode）。"""
+        """把用户在 Ayana 填写的密钥/端点写入 mimocode。密钥不回显、不进审计明文。"""
         if not api_key:
             raise ValueError("api_key_required")
         if not provider_id or not re.fullmatch(r"[a-z][a-z0-9_-]{0,32}", provider_id):
@@ -210,4 +323,34 @@ class MimoAdmin:
             os.chmod(path, 0o600)
         except Exception:
             pass
-        return {"ok": True, "path": str(path), "provider": provider_id, "model": model}
+        return {
+            "ok": True,
+            "path": str(path),
+            "provider": provider_id,
+            "model": model,
+            "verified": bool(verified),
+            "key_len": len(api_key),
+        }
+
+    def clear_provider(self, provider_id: str = "xiaomi", config_dir: str = "") -> dict[str, Any]:
+        """移除已写入的 apiKey（配置未验证/更换密钥时）。"""
+        path = self.config_path(config_dir)
+        if not path.exists():
+            return {"ok": True, "cleared": False}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        providers = data.get("provider") or {}
+        conf = providers.get(provider_id) or {}
+        opts = conf.get("options") or {}
+        opts.pop("apiKey", None)
+        conf["options"] = opts
+        providers[provider_id] = conf
+        data["provider"] = providers
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+        return {"ok": True, "cleared": True, "path": str(path)}
