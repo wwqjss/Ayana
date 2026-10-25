@@ -26,6 +26,7 @@ SVC_USER="ayana"
 HTTP_PORT="6200"
 WS_PORT="6199"
 PY="${PYTHON_BIN:-python3}"
+SVC_NAME="ayana"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -41,6 +42,10 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+
+# systemd unit name follows install prefix so sandbox does not clash with prod
+SVC_NAME="$(basename "$PREFIX")"
+[[ "$SVC_NAME" == "ayana" ]] || SVC_NAME="ayana-$SVC_NAME"
 
 log()  { printf '[ayana-setup] %s\n' "$*"; }
 die()   { printf '[ayana-setup] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -103,10 +108,10 @@ EOF
 }
 
 write_unit() {
-  local unit=/etc/systemd/system/ayana.service
+  local unit="/etc/systemd/system/${SVC_NAME}.service"
   cat >"$unit" <<EOF
 [Unit]
-Description=Ayana ops agent (non-root)
+Description=Ayana ops agent ($SVC_NAME)
 After=network-online.target
 Wants=network-online.target
 
@@ -137,12 +142,12 @@ health() {
   code=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_PORT/health" || echo 000)
   if [[ "$code" == "200" ]]; then
     log "health OK (HTTP $code)"
-    systemctl is-active ayana
+    systemctl is-active "$SVC_NAME"
     return 0
   fi
   log "health FAIL (HTTP $code)"
-  systemctl is-active ayana || true
-  journalctl -u ayana -n 20 --no-pager || true
+  systemctl is-active "$SVC_NAME" || true
+  journalctl -u "$SVC_NAME" -n 20 --no-pager || true
   return 1
 }
 
@@ -193,7 +198,7 @@ cmd_init() {
   chmod 600 "$CONF_DIR/secrets.json"
 
   write_unit
-  systemctl enable --now ayana
+  systemctl enable --now "$SVC_NAME"
   sleep 2
   health || die "init finished but health failed"
   log "init complete"
@@ -207,7 +212,7 @@ cmd_update() {
   git -C "$PREFIX" checkout "$GIT_REF"
   git -C "$PREFIX" pull --ff-only || log "pull ff-only skipped (local ref)"
   "$PREFIX/.venv/bin/pip" install -e "$PREFIX" >/dev/null
-  systemctl restart ayana
+  systemctl restart "$SVC_NAME"
   sleep 2
   if ! health; then
     log "update health failed — rolling back"
@@ -229,7 +234,7 @@ cmd_rollback() {
   done
   [[ -e "$rel/pyproject.toml" ]] && cp -a "$rel/pyproject.toml" "$PREFIX/"
   "$PREFIX/.venv/bin/pip" install -e "$PREFIX" >/dev/null || true
-  systemctl restart ayana
+  systemctl restart "$SVC_NAME"
   sleep 2
   health || die "rollback health failed"
   log "rollback complete"
@@ -238,7 +243,7 @@ cmd_rollback() {
 cmd_status() {
   echo "prefix=$PREFIX data=$DATA_DIR conf=$CONF_DIR"
   git -C "$PREFIX" log --oneline -3 2>/dev/null || echo "git: n/a"
-  systemctl is-active ayana || true
+  systemctl is-active "$SVC_NAME" || true
   ls -la "$CONF_DIR" 2>/dev/null || true
   echo "--- releases ---"
   ls -la "$PREFIX/.releases" 2>/dev/null | tail -5 || true
