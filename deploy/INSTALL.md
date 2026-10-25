@@ -57,3 +57,14 @@ cat ~/.local/share/ayana-data/bootstrap-admin.password
 - 代码目录只读；数据（DB / secrets / 日志 / bootstrap 口令）在数据目录
 - `secrets.json` 由 `scripts/gen-secrets.py` 自动生成，勿提交仓库
 - NapCat / 企微可选，不影响 Web 登录
+
+## 推荐：一键部署（P4.5）
+
+`ash
+sudo bash deploy/ayana-setup.sh init --git https://github.com/wwqjss/Ayana.git --branch speed-supreme
+sudo bash deploy/ayana-setup.sh update     # 备份+更新+健康检查，失败自动回滚
+sudo bash deploy/ayana-setup.sh rollback   # 回滚上一版
+sudo bash deploy/ayana-setup.sh health
+`
+
+secrets/config 自动生成且不入 Git。详见 docs/P4.5-DELIVERY.md。
