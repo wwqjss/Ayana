@@ -2316,23 +2316,13 @@ class WebApp:
 
     async def api_agent_ceiling_list(self, request: web.Request) -> web.Response:
         self._require_auth(request)
-        return _json({"ok": True, "agent_ceiling": self.policy.agent_ceiling.list()})
+        return _legacy_autonomy_retired()
 
     async def api_agent_ceiling_set(self, request: web.Request) -> web.Response:
+        self._require_admin(request)
         sess = self._require_admin(request)
         self._check_csrf(request, sess)
-        body = await request.json()
-        try:
-            eff = self.policy.agent_ceiling.set(
-                body["capability"],
-                allowed=bool(body.get("allowed", True)),
-                allow_auto=bool(body.get("allow_auto", False)),
-                actor=sess["username"],
-            )
-        except Exception as e:
-            # 含 ObjectBindingError：能力不在源码目录 → 400，不得发明
-            return _json({"ok": False, "error": str(e)}, 400)
-        return _json({"ok": True, "agent_ceiling": eff})
+        return _legacy_autonomy_retired()
 
     # ---- Permission Change（0.4：TOTP 只签一笔）----
 
