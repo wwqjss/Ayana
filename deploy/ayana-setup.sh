@@ -45,7 +45,7 @@ done
 
 # systemd unit name follows install prefix so sandbox does not clash with prod
 SVC_NAME="$(basename "$PREFIX")"
-[[ "$SVC_NAME" == "ayana" ]] || SVC_NAME="ayana-$SVC_NAME"
+# basename is the unit name
 
 log()  { printf '[ayana-setup] %s\n' "$*"; }
 die()   { printf '[ayana-setup] ERROR: %s\n' "$*" >&2; exit 1; }
