@@ -131,7 +131,9 @@ class RetirementFlowTests(unittest.IsolatedAsyncioTestCase):
                 db.close()
 
     async def test_default_auto_stays_off_and_old_config_meta_env_cannot_start_a_legacy_worker(self):
-        self.assertFalse(DEFAULTS["auto_investigate"]["enabled"])
+        # P6.1: 新闭环 auto_investigate 默认开；legacy worker 仍不得被拉起
+        self.assertTrue(DEFAULTS["auto_investigate"]["enabled"])
+        self.assertTrue(DEFAULTS["auto_investigate"].get("closed_loop", False))
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp, ExitStack() as stack:
             base = Path(temp)
             (base / "config.json").write_text(json.dumps({
@@ -154,7 +156,9 @@ class RetirementFlowTests(unittest.IsolatedAsyncioTestCase):
             cfg.update(legacy_agent_loop=True, auto_remediation_enabled=True, autonomous_agent={"enabled": True})
             app = App(cfg)
             try:
-                self.assertIsNone(app.auto_investigator)
+                # P6.1: auto_investigator 是新闭环入口（默认开），不是旧 AgentLoop
+                self.assertIsNotNone(app.auto_investigator)
+                self.assertTrue(getattr(app.auto_investigator.config, "closed_loop", False))
                 for attr in ("agent", "providers", "council", "autonomy"):
                     self.assertIsNone(getattr(app, attr))
                 scheduled = []
@@ -170,8 +174,10 @@ class RetirementFlowTests(unittest.IsolatedAsyncioTestCase):
                 app.nodewatch = None
                 app._stop.set()
                 await app.start()
-                for name in ("_bg_agent", "_bg_autonomy", "run_forever"):
+                # 旧自治 worker 不得调度；新闭环 AutoInvestigator.run_forever 允许且仅一次
+                for name in ("_bg_agent", "_bg_autonomy"):
                     self.assertNotIn(name, scheduled)
+                self.assertLessEqual(scheduled.count("run_forever"), 1)
                 for name in ("_bg_maintenance", "_bg_outbox", "_bg_reconcile", "_bg_checks"):
                     self.assertEqual(scheduled.count(name), 1)
                 self.assertEqual(app.db.query_one("SELECT COUNT(*) n FROM investigation_jobs")["n"], 0)
@@ -200,12 +206,12 @@ class RetirementHistoryTests(unittest.TestCase):
                 return {table: [dict(row) for row in database.query("SELECT * FROM " + table + " ORDER BY rowid")] for table in tables}
             before = rows(db)
             ddl = [tuple(row) for row in db.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name")]
-            self.assertEqual(int(db.query_one("SELECT value FROM meta WHERE key='schema_version'")["value"]), 20)
+            self.assertEqual(int(db.query_one("SELECT value FROM meta WHERE key='schema_version'")["value"]), 21)
             db.close()
             reopened = Database(path)
             try:
-                self.assertEqual(SCHEMA_VERSION, 20)
-                self.assertEqual(int(reopened.query_one("SELECT value FROM meta WHERE key='schema_version'")["value"]), 20)
+                self.assertEqual(SCHEMA_VERSION, 21)
+                self.assertEqual(int(reopened.query_one("SELECT value FROM meta WHERE key='schema_version'")["value"]), 21)
                 self.assertEqual(rows(reopened), before)
                 self.assertEqual([tuple(row) for row in reopened.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name")], ddl)
                 snapshot = LegacyHistory(reopened).snapshot("history-inc")

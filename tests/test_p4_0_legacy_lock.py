@@ -28,7 +28,9 @@ class TestLegacyLockDefaults(unittest.TestCase):
     def test_config_defaults_safe(self):
         for key in ("auto_remediation_enabled", "legacy_agent_loop", "autonomous_agent"):
             self.assertNotIn(key, DEFAULTS)
-        self.assertFalse(DEFAULTS["auto_investigate"]["enabled"])
+        # P6.1: auto_investigate 是新闭环入口，默认开启；legacy agent auto 仍锁死
+        self.assertTrue(DEFAULTS["auto_investigate"]["enabled"])
+        self.assertTrue(DEFAULTS["auto_investigate"].get("closed_loop", False))
 
     def test_agent_loop_starts_locked(self):
         """Construction itself is rejected before any legacy service is used."""

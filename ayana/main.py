@@ -280,7 +280,7 @@ class App:
         # P2 薄桥：只做映射/复用/幂等，不做自动处置（旧自治仍禁用）
         self.session_bridge = SessionBridge(self.db, knowledge=self.knowledge)
         self.incidents.session_bridge = self.session_bridge
-        # P4.3：无人值守只读调查（默认关）
+        # P6.1：无人值守闭环（调查只读 → 决策写会话 → ActionService）
         self.auto_investigator = None
         _ai_cfg = InvestConfig.from_dict(cfg.get("auto_investigate") or {})
         if _ai_cfg.enabled:
@@ -293,6 +293,13 @@ class App:
                 readonly_env=True,
                 default_timeout=_ai_cfg.timeout_sec,
             )
+            # 决策阶段：受控写会话（非 readonly MCP）
+            _ai_write = _MSC(
+                mimo_bin=_ai_cfg.mimo_bin or "mimo",
+                model=_ai_cfg.mimo_model or "",
+                readonly_env=False,
+                default_timeout=max(_ai_cfg.decision_timeout_sec, _ai_cfg.timeout_sec),
+            )
             _ai_bridge = _SB(self.db, knowledge=self.knowledge, mimo=_ai_client)
             self.auto_investigator = AutoInvestigator(
                 self.db,
@@ -300,10 +307,13 @@ class App:
                 mimo=_ai_client,
                 bridge=_ai_bridge,
                 config=_ai_cfg,
+                mimo_write=_ai_write,
+                # ops_loop/actions 在下方装配后注入
             )
             self.incidents.auto_investigator = self.auto_investigator
             log.info(
-                "auto_investigate enabled max_concurrent=%s timeout=%s",
+                "auto_investigate enabled closed_loop=%s max_concurrent=%s timeout=%s",
+                _ai_cfg.closed_loop,
                 _ai_cfg.max_concurrent,
                 _ai_cfg.timeout_sec,
             )
@@ -376,7 +386,13 @@ class App:
             serve_url=str(cfg.get("mimo_serve_url") or ""),
             unit_name=str(cfg.get("mimo_unit") or ""),
         )
+        # P6.1：把闭环依赖注入自动调查器
+        if self.auto_investigator is not None:
+            self.auto_investigator.ops_loop = self.ops_loop
+            self.auto_investigator.actions = self.actions
+            self.auto_investigator.incidents = self.incidents
         self.notifier = Notifier(self.db, default_target="")
+        self.ops_loop.notifier = self.notifier
         self.alert_ingest = AlertIngest(self.db, incidents=self.incidents, notifier=self.notifier)
         self.notifier.set_default_target(
             f"user:{cfg['admin_qq']}" if cfg.get("admin_qq") else ""

@@ -1251,7 +1251,21 @@ class WebApp:
         inc_id = request.match_info["inc_id"]
         if not self.ops_loop:
             return _json({"ok": False, "error": "unavailable"}, 503)
-        return _json({"ok": True, "loop": self.ops_loop.status(inc_id)})
+        loop = self.ops_loop.status(inc_id)
+        job = self.db.query_one(
+            "SELECT status, rounds, last_result_status, last_error, generation, updated_at"
+            " FROM investigation_jobs WHERE incident_id=?",
+            (inc_id,),
+        )
+        ai = getattr(self, "auto_investigator", None)
+        cfg = getattr(ai, "config", None) if ai else None
+        return _json({
+            "ok": True,
+            "loop": loop,
+            "investigation": dict(job) if job else None,
+            "closed_loop_enabled": bool(getattr(cfg, "closed_loop", False)) if cfg else False,
+            "auto_investigate_enabled": bool(getattr(cfg, "enabled", False)) if cfg else False,
+        })
 
     def _mimo(self):
         if not self.mimo_admin:

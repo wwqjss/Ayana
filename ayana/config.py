@@ -41,9 +41,10 @@ DEFAULTS: dict[str, Any] = {
     "verify_window_sec": 90,
     "verify_timeout_sec": 300,
     "action_ttl_sec": 1800,
-    # P4.3 无人值守只读调查（默认关；验收后可开）
+    # P6.1 无人值守闭环：调查→决策→autonomous 执行→验证→结案（默认开）
     "auto_investigate": {
-        "enabled": False,
+        "enabled": True,
+        "closed_loop": True,
         "max_concurrent": 2,
         "per_incident_concurrent": 1,
         "timeout_sec": 300,
@@ -52,6 +53,7 @@ DEFAULTS: dict[str, Any] = {
         "mimo_model": "",
         "mimo_bin": "mimo",
         "lease_ttl_sec": 600,
+        "decision_timeout_sec": 180,
     },
     # Prometheus 配置管理（可选）：ssh_asset_id 为空则用本地目录
     "prometheus_config": {

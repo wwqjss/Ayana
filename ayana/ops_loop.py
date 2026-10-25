@@ -126,6 +126,7 @@ class OpsLoop:
 
     def escalate(self, incident_id: str, *, reason: str, detail: Any = None) -> dict[str, Any]:
         """转人工：记 need_human、写事件、通知。"""
+        self._state(incident_id)  # 确保状态行存在
         if self.incidents:
             try:
                 self.incidents.set_need_human(incident_id, reason)
