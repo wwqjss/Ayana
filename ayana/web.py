@@ -217,6 +217,7 @@ class WebApp:
         app.router.add_get("/api/mimo/logs", self.api_mimo_logs)
         app.router.add_get("/api/mimo/stats", self.api_mimo_stats)
         app.router.add_get("/api/mimo/providers", self.api_mimo_providers)
+        app.router.add_post("/api/mimo/provider", self.api_mimo_provider_apply)
         app.router.add_post("/api/mimo/chat", self.api_mimo_chat)
         app.router.add_get("/api/executions", self.api_executions)
         app.router.add_get("/api/overview", self.api_overview)
@@ -1313,6 +1314,31 @@ class WebApp:
     async def api_mimo_providers(self, request: web.Request) -> web.Response:
         self._require_auth(request)
         return _json(self._mimo().provider_summary())
+
+    async def api_mimo_provider_apply(self, request: web.Request) -> web.Response:
+        """把 Ayana 配置的模型密钥写入 mimocode 配置，驱动真实 MiMoCode。"""
+        sess = self._require_auth(request)
+        self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        try:
+            res = self._mimo().apply_provider(
+                provider_id=str(body.get("provider_id") or "xiaomi"),
+                api_key=str(body.get("api_key") or ""),
+                base_url=str(body.get("base_url") or ""),
+                model=str(body.get("model") or ""),
+                config_dir=str(body.get("config_dir") or ""),
+            )
+        except ValueError as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        except Exception as e:  # noqa: BLE001
+            return _json({"ok": False, "error": str(e)[:200]}, 500)
+        self.db.audit(
+            "web_user", sess["username"], "mimo_provider_apply",
+            detail={"provider": res.get("provider"), "model": res.get("model"), "path": res.get("path")},
+            channel="web",
+        )
+        return _json(res)
 
     async def api_mimo_chat(self, request: web.Request) -> web.Response:
         sess = self._require_auth(request)

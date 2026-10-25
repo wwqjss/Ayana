@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -108,20 +109,37 @@ class MimoAdmin:
     async def models(self) -> dict[str, Any]:
         return await self._run([self._bin(), "models"], timeout=15.0)
 
+    def config_path(self, config_dir: str = "") -> Path:
+        """官方布局：~/.config/mimocode/mimocode.jsonc；兼容旧 ~/.mimocode。"""
+        if config_dir:
+            base = Path(config_dir)
+            for name in ("mimocode.jsonc", "mimocode.json", "config.jsonc", "config.json"):
+                p = base / name
+                if p.exists():
+                    return p
+            return base / "mimocode.jsonc"
+        xdg = Path.home() / ".config" / "mimocode"
+        for name in ("mimocode.jsonc", "mimocode.json"):
+            p = xdg / name
+            if p.exists():
+                return p
+        legacy = Path.home() / ".mimocode"
+        for name in ("mimocode.jsonc", "mimocode.json", "config.jsonc", "config.json"):
+            p = legacy / name
+            if p.exists():
+                return p
+        return xdg / "mimocode.jsonc"
+
     def provider_summary(self, config_dir: str = "") -> dict[str, Any]:
         """只读展示 mimocode 配置中的 provider/model 名，不读密钥。"""
-        base = Path(config_dir or (Path.home() / ".mimocode"))
-        out: dict[str, Any] = {"ok": True, "config_dir": str(base), "providers": []}
-        cfg = base / "config.json"
-        if not cfg.exists():
-            cfg = base / "config.jsonc"
-        if not cfg.exists():
+        path = self.config_path(config_dir)
+        out: dict[str, Any] = {"ok": True, "config_dir": str(path.parent), "providers": [], "path": str(path)}
+        if not path.exists():
             out["ok"] = False
             out["error"] = "config_not_found"
             return out
         try:
-            raw = cfg.read_text(encoding="utf-8")
-            # 宽松提取非密钥字段
+            raw = path.read_text(encoding="utf-8")
             data = json.loads(raw) if raw.lstrip().startswith("{") else {}
         except Exception:
             data = {}
@@ -134,18 +152,62 @@ class MimoAdmin:
                     {
                         "name": name,
                         "models": conf.get("models") or conf.get("model") or [],
-                        "baseURL": conf.get("baseURL") or conf.get("base_url") or "",
-                        # 绝不输出 apiKey / token
+                        "baseURL": conf.get("options", {}).get("baseURL")
+                        or conf.get("baseURL")
+                        or conf.get("base_url")
+                        or "",
                     }
                 )
-        elif isinstance(providers, list):
-            for conf in providers:
-                if isinstance(conf, dict):
-                    out["providers"].append(
-                        {
-                            "name": conf.get("name") or conf.get("id") or "",
-                            "models": conf.get("models") or [],
-                            "baseURL": conf.get("baseURL") or conf.get("base_url") or "",
-                        }
-                    )
         return out
+
+    def apply_provider(
+        self,
+        *,
+        provider_id: str = "xiaomi",
+        api_key: str = "",
+        base_url: str = "",
+        model: str = "",
+        config_dir: str = "",
+    ) -> dict[str, Any]:
+        """把 Ayana 侧配置的密钥/端点写入 mimocode 配置（对接真实 MiMoCode）。"""
+        if not api_key:
+            raise ValueError("api_key_required")
+        if not provider_id or not re.fullmatch(r"[a-z][a-z0-9_-]{0,32}", provider_id):
+            raise ValueError("bad_provider_id")
+        path = self.config_path(config_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data: dict[str, Any] = {}
+        if path.exists():
+            try:
+                raw = path.read_text(encoding="utf-8")
+                data = json.loads(raw) if raw.lstrip().startswith("{") else {}
+            except Exception:
+                data = {}
+        if not isinstance(data, dict):
+            data = {}
+        providers = data.get("provider") or {}
+        if not isinstance(providers, dict):
+            providers = {}
+        conf = dict(providers.get(provider_id) or {})
+        conf.setdefault("name", provider_id)
+        conf.setdefault("npm", "@ai-sdk/openai-compatible")
+        conf["options"] = dict(conf.get("options") or {})
+        conf["options"]["apiKey"] = api_key
+        if base_url:
+            conf["options"]["baseURL"] = base_url
+        models = conf.get("models")
+        if not isinstance(models, dict):
+            models = {}
+        if model:
+            models[model] = {"name": model}
+        conf["models"] = models
+        providers[provider_id] = conf
+        data["provider"] = providers
+        if model:
+            data["model"] = f"{provider_id}/{model}"
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+        return {"ok": True, "path": str(path), "provider": provider_id, "model": model}

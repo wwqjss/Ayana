@@ -16,6 +16,8 @@ log = __import__("logging").getLogger("ayana.ops_loop")
 # 软约束硬编码上限（与提示词一致，执行层强制）
 MAX_NO_PROGRESS_ROUNDS = 3
 MAX_SAME_PLAN_FAILURES = 2
+# P6.2：执行前硬限制，防止无限自治循环
+MAX_EXECUTE_ROUNDS = 8
 
 
 class OpsLoop:
@@ -164,9 +166,37 @@ class OpsLoop:
         reason: str = "",
         plan_sig: str = "",
     ) -> dict[str, Any]:
-        """自主写 + 验证。失败/unknown 记软约束。"""
+        """自主写 + 验证。失败/unknown 记软约束。执行前有硬轮次上限。"""
         if not self.actions:
             return {"ok": False, "error": "actions_unavailable"}
+        # P6.2 执行前硬限制：达到上限不再派发，强制转人工
+        st = self._state(incident_id)
+        if st.get("status") in ("need_human", "stopped", "done"):
+            return {
+                "ok": False,
+                "error": "loop_stopped",
+                "status": st.get("status"),
+                "stop_reason": st.get("stop_reason") or "",
+            }
+        if int(st.get("rounds") or 0) >= MAX_EXECUTE_ROUNDS:
+            self.note_round(
+                incident_id,
+                progressed=False,
+                plan_sig=plan_sig or capability,
+                write_ok=None,
+                result="max_execute_rounds",
+            )
+            self.escalate(
+                incident_id,
+                reason="max_execute_rounds",
+                detail={"rounds": st.get("rounds"), "limit": MAX_EXECUTE_ROUNDS},
+            )
+            return {
+                "ok": False,
+                "error": "max_execute_rounds",
+                "rounds": st.get("rounds"),
+                "limit": MAX_EXECUTE_ROUNDS,
+            }
         try:
             res = await self.actions.autonomous_execute(
                 asset_id=asset_id,
