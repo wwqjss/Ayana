@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
@@ -303,13 +304,22 @@ class OpsTools:
             raise McpToolError("bad_request", "timeout_sec must be a number") from e
 
         cls = classify_shell_command(command)
-        # P4.3 只读模式：执行层拒绝任何写/未知命令，并审计
-        if getattr(self.ctx, "readonly", False) and cls != "read":
-            self._audit_write(asset_id, command, "rejected_readonly", cls)
-            raise McpToolError(
-                "readonly_mode_rejects_write",
-                f"auto-investigation is read-only; classified={cls}",
-            )
+        # 自动调查复用严格的只读参数语法；首命令分类不足以约束复合 shell。
+        if getattr(self.ctx, "readonly", False):
+            from .readonly_commands import readonly_command
+
+            try:
+                tokens = shlex.split(command)
+            except ValueError:
+                tokens = []
+            if cls != "read" or not readonly_command(tokens):
+                self._audit_write(asset_id, command, "rejected_readonly", cls)
+                raise McpToolError(
+                    "readonly_mode_rejects_write",
+                    f"auto-investigation requires an allowed read-only command; classified={cls}",
+                )
+            # 重新引用参数，避免让原始 shell 字符串引入额外解释。
+            command = shlex.join(tokens)
         # read 通道不得跑写/未知命令，防 shell 包装绕过
         if channel == "read" and cls != "read":
             raise McpToolError(
@@ -529,6 +539,9 @@ class OpsTools:
         }
 
     async def incident_note(self, args: dict[str, Any]) -> dict[str, Any]:
+        if getattr(self.ctx, "readonly", False):
+            self._audit_write("", str(args.get("incident_id") or ""), "rejected_readonly", "incident.note")
+            raise McpToolError("readonly_mode_rejects_write", "incident.note disabled in readonly mode")
         inc_id = str(args.get("incident_id") or "").strip()
         text = str(args.get("text") or "").strip()
         if not text:
@@ -672,6 +685,9 @@ class OpsTools:
         return {"ok": True, "write_ops": self._bridge().write_ops(inc_id)}
 
     async def session_remote(self, args: dict[str, Any]) -> dict[str, Any]:
+        if getattr(self.ctx, "readonly", False):
+            self._audit_write("", str(args.get("incident_id") or ""), "rejected_readonly", "session.remote")
+            raise McpToolError("readonly_mode_rejects_write", "session.remote disabled in readonly mode")
         inc_id = str(args.get("incident_id") or "").strip()
         if not inc_id:
             raise McpToolError("bad_request", "incident_id required")

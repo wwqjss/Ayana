@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -94,6 +95,30 @@ class TestExtractJson(unittest.TestCase):
         self.assertIsNone(_extract_json(""))
 
 
+    def test_bare_nested_conclusion(self):
+        expected = {
+            "status": "completed",
+            "facts": [{"claim": "read", "evidence": {"ok": True}}],
+            "root_cause": "unknown",
+        }
+        self.assertEqual(_extract_json(json.dumps(expected)), expected)
+
+    def test_final_conclusion_wins_over_prelude(self):
+        text = '{"status":"partial"}\nFinal:\n{"status":"completed","facts":[{"claim":"read"}]}'
+        self.assertEqual(_extract_json(text)["status"], "completed")
+
+    def test_last_fenced_conclusion_wins(self):
+        text = '```json\n{"status":"partial"}\n```\n```JSON\n{"status":"completed","facts":[{"claim":"read"}]}\n```'
+        self.assertEqual(_extract_json(text)["status"], "completed")
+
+    def test_braces_and_escaped_quotes_in_evidence(self):
+        expected = {"status": "partial", "facts": [{"evidence": 'literal } { and "quoted" \\ path'}]}
+        self.assertEqual(_extract_json('Conclusion: ' + json.dumps(expected)), expected)
+
+    def test_truncated_nested_output_is_not_an_inner_conclusion(self):
+        self.assertIsNone(_extract_json('{"status":"completed","facts":[{"claim":"read"}]'))
+
+
 class TestOfferAndDedup(unittest.TestCase):
     def setUp(self):
         self.tmp, self.db = make_db()
@@ -139,12 +164,25 @@ class TestOfferAndDedup(unittest.TestCase):
 
     def test_generation_bump_requeues(self):
         self.ai.offer("inc_1", generation=1)
-        self.db.execute("UPDATE investigation_jobs SET status='done' WHERE incident_id='inc_1'")
+        self.db.execute(
+            "UPDATE investigation_jobs SET status='failed', rounds=3, last_error='old failure',"
+            " last_result_status='failed', last_conclusion_json='old conclusion' WHERE incident_id='inc_1'"
+        )
         r = self.ai.offer("inc_1", generation=2)
         self.assertEqual(r["action"], "requeued")
-        row = self.db.query_one("SELECT status, generation FROM investigation_jobs")
+        row = self.db.query_one("SELECT * FROM investigation_jobs")
         self.assertEqual(row["status"], "queued")
         self.assertEqual(row["generation"], 2)
+        self.assertEqual(row["rounds"], 0)
+        self.assertEqual(row["last_error"], "")
+        self.assertEqual(row["last_result_status"], "")
+        self.assertEqual(row["last_conclusion_json"], "")
+
+    def test_same_generation_retry_keeps_round_budget(self):
+        self.ai.offer("inc_1")
+        self.db.execute("UPDATE investigation_jobs SET status='failed', rounds=1, updated_at=0")
+        self.assertEqual(self.ai.offer("inc_1")["action"], "requeued")
+        self.assertEqual(self.db.query_one("SELECT rounds FROM investigation_jobs")["rounds"], 1)
 
     def test_closed_incident_skipped(self):
         insert_incident(self.db, "inc_closed", status="closed")
@@ -178,7 +216,7 @@ class TestExecutionLifecycle(unittest.TestCase):
         self.ai.offer("inc_1")
         _run_tick(self.ai)
         row = self.db.query_one("SELECT * FROM investigation_jobs WHERE incident_id='inc_1'")
-        self.assertIn(row["status"], ("done", "partial", "running"))
+        self.assertEqual(row["status"], "done")
         ev = self.db.query_one(
             "SELECT * FROM events WHERE incident_id='inc_1' AND type='auto_investigation'"
         )
@@ -254,7 +292,68 @@ class TestExecutionLifecycle(unittest.TestCase):
         n = self.db.query_one(
             "SELECT COUNT(*) n FROM events WHERE type='auto_investigation'"
         )
-        self.assertGreaterEqual(n["n"], 1)
+        self.assertEqual(n["n"], 2)
+        for incident_id, symptoms in (("inc_a", "A"), ("inc_b", "B")):
+            row = self.db.query_one("SELECT * FROM investigation_jobs WHERE incident_id=?", (incident_id,))
+            self.assertEqual(row["status"], "done")
+            self.assertEqual(json.loads(row["last_conclusion_json"])["symptoms"], symptoms)
+
+    def test_new_generation_runs_after_previous_round_budget_exhausted(self):
+        self.ai.offer("inc_1")
+        self.db.execute("UPDATE investigation_jobs SET status='failed', rounds=2")
+        self.db.execute("UPDATE incidents SET generation=2 WHERE id='inc_1'")
+        self.ai.offer("inc_1")
+        _run_tick(self.ai)
+        row = self.db.query_one("SELECT * FROM investigation_jobs")
+        self.assertEqual(row["generation"], 2)
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["rounds"], 1)
+        self.assertEqual(len(self.mimo.calls), 1)
+
+    def test_obsolete_generation_does_not_start_remote_work(self):
+        self.ai.offer("inc_1")
+        stale_job = self.ai._row("inc_1")
+        self.ai.offer("inc_1", generation=2)
+        asyncio.run(self.ai._run_job("inc_1", stale_job))
+        self.assertEqual(self.mimo.calls, [])
+        row = self.db.query_one("SELECT generation, status FROM investigation_jobs")
+        self.assertEqual((row["generation"], row["status"]), (2, "queued"))
+
+    def test_old_generation_result_cannot_overwrite_recurrence_or_write_knowledge(self):
+        async def race():
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            original_investigate = self.ai._investigate
+
+            async def old_investigation(*args, **kwargs):
+                entered.set()
+                await release.wait()
+                return {
+                    "status": "completed",
+                    "root_cause": "unknown",
+                    "knowledge_write": {"enabled": True, "title": "stale knowledge", "body": "old generation"},
+                }
+
+            self.ai._investigate = old_investigation
+            self.ai.offer("inc_1")
+            await self.ai.tick_once()
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            self.db.execute("UPDATE incidents SET generation=2 WHERE id='inc_1'")
+            self.ai.offer("inc_1")
+            release.set()
+            await _drain(self.ai)
+            row = self.ai._row("inc_1")
+            self.assertEqual((row["generation"], row["status"], row["rounds"]), (2, "queued", 0))
+            self.assertEqual(row["last_conclusion_json"], "")
+            self.assertEqual(self.kb.list_docs(), [])
+            self.assertEqual(self.db.query_one("SELECT COUNT(*) n FROM events WHERE type='auto_investigation'")["n"], 0)
+            self.ai._investigate = original_investigate
+            await self.ai.tick_once()
+            await _drain(self.ai)
+            row = self.ai._row("inc_1")
+            self.assertEqual((row["generation"], row["status"], row["rounds"]), (2, "done", 1))
+
+        asyncio.run(race())
 
     def test_malformed_output_not_fake_success(self):
         self.mimo.responses.append("完全不是 JSON 的胡言乱语")
@@ -263,6 +362,71 @@ class TestExecutionLifecycle(unittest.TestCase):
         row = self.db.query_one("SELECT status, last_conclusion_json FROM investigation_jobs")
         self.assertIn(row["status"], ("partial", "failed"))
         self.assertIn("raw_excerpt", row["last_conclusion_json"])
+
+
+    def test_tool_result_json_is_not_a_completed_conclusion(self):
+        self.mimo.responses.append('{"ok":true,"assets":[]}')
+        self.ai.offer("inc_1")
+        _run_tick(self.ai)
+        row = self.db.query_one("SELECT status, last_conclusion_json FROM investigation_jobs")
+        self.assertEqual(row["status"], "partial")
+        self.assertEqual(json.loads(row["last_conclusion_json"])["root_cause"], "unknown")
+
+    def test_malformed_conclusion_collections_are_partial(self):
+        self.mimo.responses.append('{"status":"completed","facts":{"evidence":"tool"}}')
+        self.ai.offer("inc_1")
+        _run_tick(self.ai)
+        row = self.db.query_one("SELECT status FROM investigation_jobs")
+        self.assertEqual(row["status"], "partial")
+
+    def test_root_cause_without_evidence_is_unknown(self):
+        self.mimo.responses.append('{"status":"completed","root_cause":"claimed crash","facts":[{"claim":"crash"}]}')
+        self.ai.offer("inc_1")
+        _run_tick(self.ai)
+        row = self.db.query_one("SELECT last_conclusion_json FROM investigation_jobs")
+        self.assertEqual(json.loads(row["last_conclusion_json"])["root_cause"], "unknown")
+
+    def test_root_cause_with_evidence_is_preserved(self):
+        self.mimo.responses.append('{"status":"completed","root_cause":"service exited","facts":[{"claim":"service exited","evidence":"service status: exited"}]}')
+        self.ai.offer("inc_1")
+        _run_tick(self.ai)
+        row = self.db.query_one("SELECT last_conclusion_json FROM investigation_jobs")
+        self.assertEqual(json.loads(row["last_conclusion_json"])["root_cause"], "service exited")
+
+    def test_long_created_response_reaches_valid_persisted_conclusion(self):
+        self._assert_long_conclusion(reused=False)
+
+    def test_long_resumed_response_reaches_valid_persisted_conclusion(self):
+        self._assert_long_conclusion(reused=True)
+
+    def _assert_long_conclusion(self, *, reused):
+        if reused:
+            attached = self.bridge.attach_remote("inc_1")
+            self.assertEqual(attached["action"], "created")
+        evidence = "read-only MCP evidence " * 800
+        payload = {
+            "status": "completed",
+            "symptoms": "long response",
+            "facts": [{"claim": "read succeeded", "evidence": evidence}],
+            "hypotheses": [],
+            "unconfirmed": [],
+            "next_steps": [],
+            "root_cause": "unknown",
+        }
+        text = "Investigating...\n" + json.dumps(payload)
+        self.assertGreater(len(text), 8000)
+        self.mimo.responses.append(text)
+        self.ai.offer("inc_1")
+        _run_tick(self.ai)
+        row = self.db.query_one("SELECT * FROM investigation_jobs WHERE incident_id='inc_1'")
+        self.assertEqual(row["status"], "done")
+        saved = json.loads(row["last_conclusion_json"])
+        self.assertEqual(saved["facts"], payload["facts"])
+        self.assertEqual(saved["remote_session_id"], "ses_test1")
+        self.assertGreater(len(row["last_conclusion_json"]), 8000)
+        self.assertEqual(self.mimo.calls[-1][0], "resume" if reused else "create")
+        event = self.db.query_one("SELECT * FROM events WHERE type='auto_investigation'")
+        self.assertEqual(json.loads(event["payload_json"])["fact_count"], 1)
 
 
 class TestReadonlyBoundary(unittest.TestCase):
@@ -346,6 +510,45 @@ class TestReadonlyBoundary(unittest.TestCase):
         self.assertIsNotNone(row)
 
 
+    def test_readonly_rejects_command_and_argument_bypasses_before_transport(self):
+        self.transport.exec_shell = AsyncMock(return_value=NTResult(ok=True, output="ok", returncode=0))
+        for command in (
+            "uptime; touch /tmp/x",
+            "uptime$(touch /tmp/x)",
+            "date -s 2026-01-01",
+            "curl -q -X POST http://localhost",
+            "wget -O /tmp/x http://localhost",
+            "ip link set lo down",
+            "env PATH=/tmp uptime",
+        ):
+            with self.subTest(command=command), self.assertRaises(Exception) as cm:
+                asyncio.run(self.tools.call("host.exec", {"asset_id": "nerv", "command": command, "channel": "read"}))
+            self.assertEqual(getattr(cm.exception, "code", ""), "readonly_mode_rejects_write")
+        self.transport.exec_shell.assert_not_awaited()
+
+    def test_readonly_normal_reads_use_read_transport_even_with_default_channel(self):
+        self.transport.exec_shell = AsyncMock(return_value=NTResult(ok=True, output="ok", returncode=0))
+        for command in ("uptime", "systemctl status --no-pager frps"):
+            with self.subTest(command=command):
+                out = asyncio.run(self.tools.call("host.exec", {"asset_id": "nerv", "command": command}))
+                self.assertTrue(out["ok"])
+                self.assertTrue(out["readonly"])
+                self.assertEqual(self.transport.exec_shell.await_args.kwargs["channel"], "read")
+
+    def test_readonly_rejects_note_and_remote_session_before_side_effects(self):
+        bridge = MagicMock()
+        self.tools.ctx.session_bridge = bridge
+        for name, args in (
+            ("incident.note", {"incident_id": "inc_1", "text": "mutation"}),
+            ("session.remote", {"incident_id": "inc_1", "prompt": "start another session"}),
+        ):
+            with self.subTest(name=name), self.assertRaises(Exception) as cm:
+                asyncio.run(self.tools.call(name, args))
+            self.assertEqual(getattr(cm.exception, "code", ""), "readonly_mode_rejects_write")
+        self.assertFalse(bridge.mock_calls)
+        self.assertEqual(self.db.query_one("SELECT COUNT(*) n FROM events")["n"], 0)
+
+
 class TestKnowledgeDiscipline(unittest.TestCase):
     def test_auto_investigation_cannot_claim_verified(self):
         tmp, db = make_db()
@@ -373,6 +576,72 @@ class TestKnowledgeDiscipline(unittest.TestCase):
         docs = kb.list_docs()
         self.assertTrue(docs)
         self.assertNotEqual(docs[0].verified, "result", "自动调查不得写 verified=result")
+
+
+    def test_auto_knowledge_always_speculative_for_all_supplied_labels(self):
+        tmp, db = make_db()
+        try:
+            kb = KnowledgeBase(db, root=Path(tmp.name) / "kb")
+            Path(tmp.name, "kb").mkdir(exist_ok=True)
+            kb.reload()
+            insert_incident(db)
+            ai = AutoInvestigator(db, knowledge=kb, config=InvestConfig(enabled=True))
+            for verified in ("none", "invalid", "result", "speculation"):
+                with self.subTest(verified=verified):
+                    ai._maybe_write_knowledge("inc_1", {
+                        "status": "completed", "symptoms": "auto draft", "root_cause": "unknown",
+                        "knowledge_write": {"enabled": True, "title": "auto draft", "body": "unverified", "verified": verified},
+                    })
+                    docs = kb.list_docs()
+                    self.assertEqual(len(docs), 1)
+                    self.assertEqual(docs[0].verified, "speculation")
+                    self.assertEqual(docs[0].status, "draft")
+                    self.assertEqual(kb.docs_for_object("nerv", "frps"), [])
+        finally:
+            db.close()
+            tmp.cleanup()
+
+    def test_same_named_verified_document_is_preserved(self):
+        tmp, db = make_db()
+        try:
+            kb = KnowledgeBase(db, root=Path(tmp.name) / "kb")
+            Path(tmp.name, "kb").mkdir(exist_ok=True)
+            kb.reload()
+            insert_incident(db)
+            original = kb.upsert(title="same title", objects=["nerv:frps"], tags=["auto-investigation"], body="verified evidence", verified="result")
+            ai = AutoInvestigator(db, knowledge=kb, config=InvestConfig(enabled=True))
+            ai._maybe_write_knowledge("inc_1", {
+                "status": "completed", "root_cause": "unknown",
+                "knowledge_write": {"enabled": True, "title": "same title", "body": "unverified guess", "verified": "none"},
+            })
+            fact = kb.get(original["doc_id"])
+            self.assertEqual((fact.verified, fact.status, fact.body), ("result", "active", "verified evidence"))
+            docs = kb.list_docs()
+            self.assertEqual(len(docs), 2)
+            self.assertEqual([doc.id for doc in kb.docs_for_object("nerv", "frps")], [fact.id])
+            self.assertNotIn("unverified guess", kb.investigation_context("nerv", "frps")["context_text"])
+        finally:
+            db.close()
+            tmp.cleanup()
+
+    def test_auto_draft_id_cannot_overwrite_a_promoted_verified_fact(self):
+        tmp, db = make_db()
+        try:
+            kb = KnowledgeBase(db, root=Path(tmp.name) / "kb")
+            Path(tmp.name, "kb").mkdir(exist_ok=True)
+            kb.reload()
+            insert_incident(db)
+            ai = AutoInvestigator(db, knowledge=kb, config=InvestConfig(enabled=True))
+            payload = {"status": "completed", "knowledge_write": {"enabled": True, "title": "draft", "body": "guess"}}
+            ai._maybe_write_knowledge("inc_1", payload)
+            draft = kb.list_docs()[0]
+            kb.upsert(doc_id=draft.id, title="verified", objects=["nerv:frps"], body="verified evidence", verified="result")
+            ai._maybe_write_knowledge("inc_1", payload)
+            fact = kb.get(draft.id)
+            self.assertEqual((fact.verified, fact.status, fact.body), ("result", "active", "verified evidence"))
+        finally:
+            db.close()
+            tmp.cleanup()
 
 
 if __name__ == "__main__":

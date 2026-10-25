@@ -186,6 +186,10 @@ def _error(mid: Any, code: int, message: str) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # MCP JSON lines use UTF-8 even on Windows with a legacy console code page.
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     args = list(argv if argv is not None else sys.argv[1:])
     base = Path(args[0]).resolve() if args else Path.cwd()

@@ -42,6 +42,12 @@ class RemoteSession:
 _SES_RE = re.compile(r'"sessionID"\s*:\s*"(ses_[^"]+)"')
 _SES_LIST_RE = re.compile(r"\b(ses_[A-Za-z0-9]+)\b")
 
+READONLY_AGENT = "ayana-readonly"
+READONLY_TOOLS = (
+    "ayana_knowledge_query", "ayana_knowledge_get", "ayana_metrics_query",
+    "ayana_incident_list", "ayana_incident_get", "ayana_asset_list", "ayana_host_exec",
+)
+
 
 class MimoSessionClient:
     """薄封装：子进程调 mimo run。cwd/mimo 路径可注入。"""
@@ -66,13 +72,50 @@ class MimoSessionClient:
         argv = [self.mimo_bin, "run", "--format", "json"]
         if self.model:
             argv += ["-m", self.model]
+        # P4.3 E2E：显式 --dir，确保加载该目录 .mimocode/mimocode.json 的 MCP
+        if self.cwd:
+            argv += ["--dir", str(self.cwd)]
+        if self.readonly_env:
+            argv += ["--agent", READONLY_AGENT]
         argv += extra
         return argv
 
-    def _run(self, extra: list[str], timeout: float) -> tuple[int, str, str]:
+    def _environment(self) -> dict[str, str]:
         env = {**os.environ}
-        if self.readonly_env:
-            env["AYANA_MCP_READONLY"] = "1"
+        if not self.readonly_env:
+            return env
+        try:
+            content = env.get("MIMOCODE_CONFIG_CONTENT") or "{}"
+            config = json.loads(content)
+            if not isinstance(config, dict):
+                raise ValueError("config must be object")
+            agents = config.setdefault("agent", {})
+            if not isinstance(agents, dict):
+                raise ValueError("agent must be object")
+            agent = agents.setdefault(READONLY_AGENT, {})
+            if not isinstance(agent, dict):
+                raise ValueError("read-only agent must be object")
+            # Preserve provider/MCP configuration, but replace this agent's safety fields.
+            policy = {"*": "deny", **dict.fromkeys(READONLY_TOOLS, "allow")}
+            # This native helper only searches the already allowlisted MCP catalog.
+            policy["mcp_tool_search"] = "allow"
+            agent.update({
+                "mode": "primary", "disable": False,
+                "tool_allowlist": list(READONLY_TOOLS), "permission": policy,
+            })
+            config["agent"] = agents
+            env["MIMOCODE_CONFIG_CONTENT"] = json.dumps(config, ensure_ascii=False)
+            # Override inherited broad permissions; agent allowlist is also enforced by MiMo.
+            env["MIMOCODE_PERMISSION"] = json.dumps(policy)
+        except (ValueError, TypeError) as e:
+            raise MimoSessionError(
+                "readonly_config_invalid", "read-only MiMo configuration must be valid JSON objects"
+            ) from e
+        env["AYANA_MCP_READONLY"] = "1"
+        return env
+
+    def _run(self, extra: list[str], timeout: float) -> tuple[int, str, str]:
+        env = self._environment()
         try:
             proc = subprocess.run(
                 self._argv(extra),

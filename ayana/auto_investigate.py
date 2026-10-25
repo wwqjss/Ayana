@@ -14,8 +14,8 @@ Alertmanager → Incident → SessionBridge → MiMo(只读) → 结论 → Inci
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
-import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -58,42 +58,75 @@ class InvestConfig:
 CONCLUSION_PROMPT = """你是值班运维调查助手（只读，禁止修复）。
 目标：调查该 Incident，收集证据并给出结构化结论。不要重启服务、不要改配置、不要写文件。
 
-只允许使用只读工具：knowledge.query / knowledge.get / metrics.query / incident.list / incident.get / asset.list / host.exec(channel=read)。
+只允许使用只读 MCP 工具（实际工具名使用下划线）：
+- ayana_knowledge_query / ayana_knowledge_get
+- ayana_metrics_query
+- ayana_incident_list / ayana_incident_get
+- ayana_asset_list
+- ayana_host_exec（仅 channel=read 且命令必须是只读，如 uptime / systemctl status）
+禁止：ayana_host_exec 写模式、ayana_knowledge_upsert、ayana_incident_close、ayana_session_remote。
 若工具拒绝写操作，记录该事实，不得绕过。
 
-最后必须输出一个 JSON 对象（可包在 ```json 代码块），字段：
+必须实际调用至少一次上述只读工具，并把工具返回内容写入 facts.evidence；不要编造命令输出或工具结果。
+
+最后必须输出一个 JSON 对象（可包在 ```json 代码块），**放在回答的最末尾**，字段：
 {
   "status": "completed|partial|failed|timeout",
   "symptoms": "故障现象",
-  "facts": [{"claim": "已确认事实", "evidence": "证据来源"}],
+  "facts": [{"claim": "已确认事实", "evidence": "工具返回的证据来源"}],
   "hypotheses": [{"claim": "可能原因", "confidence": "high|medium|low"}],
   "unconfirmed": ["未确认事项"],
   "next_steps": ["建议的下一步只读/需授权操作"],
   "root_cause": "unknown 或简述（无证据必须 unknown）"
 }
 
-要求：事实/推测/建议严格分开；无证据不得写 root_cause 已确认；不要编造命令输出。
+要求：事实/推测/建议严格分开；无证据不得写 root_cause 已确认。
 """
 
 
 def _extract_json(text: str) -> dict[str, Any] | None:
+    """Return the last complete JSON object, including fenced/nested conclusions.
+
+    Track JSON string escapes while balancing braces so braces in evidence do
+    not terminate a candidate, and nested objects are never parsed in isolation.
+    """
     if not text:
         return None
-    m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.S | re.I)
-    blob = m.group(1) if m else ""
-    if not blob:
-        # 取最后一个平衡的花括号块
-        start = text.rfind("{")
-        end = text.rfind("}")
-        if start >= 0 and end > start:
-            blob = text[start : end + 1]
-    if not blob:
-        return None
-    try:
-        data = json.loads(blob)
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
+    result = None
+    depth = 0
+    start = 0
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if depth == 0:
+            if char == "{":
+                start = index
+                depth = 1
+                in_string = False
+                escaped = False
+            continue
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    data = json.loads(text[start : index + 1])
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(data, dict):
+                    result = data
+    return result
 
 
 def _safe_excerpt(text: str, limit: int = 1500) -> str:
@@ -163,12 +196,22 @@ class AutoInvestigator:
                 cooldown_until = float(row.get("updated_at") or 0) + self.config.cooldown_sec
                 if t < cooldown_until:
                     return {"ok": True, "action": "cooldown", "retry_after": cooldown_until}
-            # 新一代或冷却后重试 → 排队
+            # New generations get a fresh budget; retries keep the same budget.
+            new_generation = int(row.get("generation") or 1) != gen
             with self.db.tx() as conn:
                 conn.execute(
-                    "UPDATE investigation_jobs SET generation=?, status='queued',"
+                    "UPDATE investigation_jobs SET generation=?, status='queued', rounds=?,"
+                    " last_error=?, last_result_status=?, last_conclusion_json=?,"
                     " lease_expires_at=0, updated_at=? WHERE incident_id=?",
-                    (gen, t, incident_id),
+                    (
+                        gen,
+                        0 if new_generation else int(row.get("rounds") or 0),
+                        "" if new_generation else (row.get("last_error") or ""),
+                        "" if new_generation else (row.get("last_result_status") or ""),
+                        "" if new_generation else (row.get("last_conclusion_json") or ""),
+                        t,
+                        incident_id,
+                    ),
                 )
             return {"ok": True, "action": "requeued", "generation": gen}
         with self.db.tx() as conn:
@@ -220,8 +263,8 @@ class AutoInvestigator:
             with self.db.tx() as conn:
                 cur = conn.execute(
                     "UPDATE investigation_jobs SET status='running', lease_expires_at=?,"
-                    " updated_at=? WHERE incident_id=? AND status='queued'",
-                    (t + self.config.lease_ttl_sec, t, inc_id),
+                    " updated_at=? WHERE incident_id=? AND status='queued' AND generation=?",
+                    (t + self.config.lease_ttl_sec, t, inc_id, job["generation"]),
                 )
                 if cur.rowcount != 1:
                     continue
@@ -253,10 +296,18 @@ class AutoInvestigator:
 
     async def _run_job(self, incident_id: str, job: dict[str, Any]) -> None:
         async with self._sem:
+            generation = int(job.get("generation") or 1)
+            current = self._row(incident_id)
+            if (
+                not current
+                or int(current.get("generation") or 1) != generation
+                or current.get("status") != "running"
+            ):
+                return
             started = now()
             rounds = int(job.get("rounds") or 0)
             if rounds >= self.config.max_rounds:
-                self._finish(incident_id, "failed", reason="max_rounds_exceeded", rounds=rounds)
+                self._finish(incident_id, "failed", generation=generation, reason="max_rounds_exceeded", rounds=rounds)
                 return
             try:
                 result = await asyncio.wait_for(
@@ -267,6 +318,7 @@ class AutoInvestigator:
                 self._finish(
                     incident_id,
                     "timeout",
+                    generation=generation,
                     reason=f"timeout:{self.config.timeout_sec}s",
                     rounds=rounds + 1,
                 )
@@ -275,11 +327,12 @@ class AutoInvestigator:
                 self._finish(
                     incident_id,
                     "failed",
+                    generation=generation,
                     reason=f"{type(e).__name__}:{e}",
                     rounds=rounds + 1,
                 )
                 return
-            status = result.get("status") or "completed"
+            status = result.get("status") or "partial"
             job_status = {
                 "completed": "done",
                 "partial": "partial",
@@ -289,6 +342,7 @@ class AutoInvestigator:
             self._finish(
                 incident_id,
                 job_status,
+                generation=generation,
                 conclusion=result,
                 rounds=rounds + 1,
                 duration=now() - started,
@@ -329,18 +383,40 @@ class AutoInvestigator:
             )
             text = (sent.get("text") or "") if sent.get("ok") else (sent.get("message") or sent.get("error") or "")
         parsed = _extract_json(text) or {}
+        # Tool result objects and malformed conclusion fields are not success.
+        if parsed.get("status") not in ("completed", "partial", "failed", "timeout"):
+            parsed = {}
+        if any(
+            key in parsed and not isinstance(parsed[key], list)
+            for key in ("facts", "hypotheses", "unconfirmed", "next_steps")
+        ) or any(
+            not isinstance(item, dict)
+            for key in ("facts", "hypotheses")
+            for item in parsed.get(key, [])
+        ):
+            parsed = {}
         if not parsed:
+            # 取最后一段非空文本作摘要（模型可能先出前言再出 JSON）
+            tail = ""
+            for line in (text or "").strip().splitlines()[::-1]:
+                if line.strip():
+                    tail = line.strip()
+                    break
             return {
                 "status": "partial" if text else "failed",
-                "symptoms": _safe_excerpt(text, 400),
+                "symptoms": _safe_excerpt(tail or text, 400),
                 "facts": [],
                 "hypotheses": [],
-                "unconfirmed": ["MiMo 输出未含结构化 JSON；保留原始摘要"],
+                "unconfirmed": ["MiMo 输出未含有效结构化结论 JSON；保留原始摘要"],
                 "next_steps": ["人工查看会话记录"],
                 "root_cause": "unknown",
-                "raw_excerpt": _safe_excerpt(text),
+                "raw_excerpt": _safe_excerpt(text, 4000),
             }
-        if not str(parsed.get("root_cause") or "").strip():
+        has_evidence = any(
+            str(fact.get("evidence") or "").strip()
+            for fact in parsed.get("facts", [])
+        )
+        if not has_evidence or not str(parsed.get("root_cause") or "").strip():
             parsed["root_cause"] = "unknown"
         parsed["round"] = round_no
         parsed["remote_session_id"] = attached.get("remote_session_id") or ""
@@ -383,6 +459,7 @@ class AutoInvestigator:
         incident_id: str,
         status: str,
         *,
+        generation: int,
         conclusion: dict[str, Any] | None = None,
         reason: str = "",
         rounds: int = 0,
@@ -393,6 +470,7 @@ class AutoInvestigator:
         try:
             summary = {
                 "round": payload.get("round") or rounds,
+                "generation": generation,
                 "status": status if not payload.get("status") else payload.get("status"),
                 "root_cause": payload.get("root_cause") or "unknown",
                 "symptoms": payload.get("symptoms") or "",
@@ -406,20 +484,24 @@ class AutoInvestigator:
         except Exception:
             summary = {"status": status, "reason": reason}
         with self.db.tx() as conn:
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE investigation_jobs SET status=?, rounds=?, last_error=?,"
                 " last_result_status=?, last_conclusion_json=?, lease_expires_at=0, updated_at=?"
-                " WHERE incident_id=?",
+                " WHERE incident_id=? AND generation=? AND status='running'",
                 (
                     status,
                     rounds,
                     (reason or payload.get("raw_excerpt") or "")[:300],
                     str(payload.get("status") or status),
-                    json.dumps(payload, ensure_ascii=False, default=str)[:8000],
+                    json.dumps(payload, ensure_ascii=False, default=str),
                     t,
                     incident_id,
+                    generation,
                 ),
             )
+            if cur.rowcount != 1:
+                # A newer generation owns the job; discard stale results and knowledge.
+                return
             conn.execute(
                 "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
                 (
@@ -444,10 +526,14 @@ class AutoInvestigator:
         kw = payload.get("knowledge_write") or {}
         if not kw.get("enabled"):
             return
-        verified = str(kw.get("verified") or "speculation").lower()
-        # 自动调查不得声称已验证恢复（无人执行修复）
-        if verified == "result":
-            verified = "speculation"
+        # No unattended investigation can establish a verified recovery fact.
+        verified = "speculation"
+        # Explicitly separate auto drafts from similarly named verified documents.
+        doc_id = "auto-investigation-" + hashlib.sha256(incident_id.encode("utf-8")).hexdigest()[:24]
+        existing = self.knowledge.get(doc_id)
+        if existing is not None and existing.verified != "speculation":
+            log.warning("refusing to overwrite non-speculative knowledge for %s", incident_id)
+            return
         inc = self.db.query_one("SELECT * FROM incidents WHERE id=?", (incident_id,))
         inc_d = dict(inc) if inc else {}
         title = str(kw.get("title") or (payload.get("symptoms") or f"investigation {incident_id}"))[:120]
@@ -458,6 +544,7 @@ class AutoInvestigator:
             tags=["auto-investigation"],
             body=str(kw.get("body") or payload.get("symptoms") or "")[:2000],
             verified=verified,
+            doc_id=doc_id,
             root_cause=str(payload.get("root_cause") or "unknown")[:80],
             source_incident=incident_id,
         )

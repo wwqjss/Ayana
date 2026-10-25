@@ -258,7 +258,8 @@ class SessionBridge:
             "action": "created",
             "remote_session_id": getattr(remote, "remote_session_id", ""),
             "remote_status": getattr(remote, "status", ""),
-            "text": (getattr(remote, "text", "") or "")[:500],
+            # P4.3 E2E：结论 JSON 可能很长，不能截断到 500
+            "text": (getattr(remote, "text", "") or ""),
         }
 
     def prompt_remote(
@@ -299,7 +300,7 @@ class SessionBridge:
         return {
             "ok": True,
             "remote_session_id": getattr(remote, "remote_session_id", "") or rid,
-            "text": (getattr(remote, "text", "") or "")[:2000],
+            "text": (getattr(remote, "text", "") or ""),
             "remote_status": getattr(remote, "status", ""),
         }
 
