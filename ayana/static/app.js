@@ -203,6 +203,8 @@ function badge(text, cls) {
 
 /* ---- login（两阶段） ---- */
 function showLogin() {
+  if (typeof closeSettings === "function") closeSettings(true);
+  if (typeof closeAccountMenu === "function") closeAccountMenu();
   $("login-view").classList.remove("hidden");
   $("main-view").classList.add("hidden");
   const pvc = $("pw-change-view");
@@ -408,88 +410,43 @@ on("pw-change-form", "submit", async (e) => {
   if (le) le.textContent = "密码已修改，请使用新密码登录。";
 });
 
-on("chg-pw-btn", "click", () => showPasswordChange(false));
+on("chg-pw-btn", "click", () => openSettings("profile"));
 
 /* ---- Legacy autonomy history: read-only, no provider or execution controls ---- */
 /* ---- 运维软约束 / MiMoCode 管理（最终架构） ---- */
-async function openOpsConstraints() {
-  const res = await api("/api/ops/constraints");
-  if (!res || !res.ok) {
-    showModal("运维软约束", [el("p", { class: "error", text: (res && (res.message || res.error)) || "加载失败" })]);
-    return;
-  }
-  const wrap = el("div", { class: "form-col" });
-  wrap.appendChild(el("h3", { text: "运维软约束（MiMoCode 提示词）" }));
-  wrap.appendChild(el("p", { class: "muted small", text: "约束 Agent 行为：无进展 3 轮停止、同方案失败 2 次停止、证据不足转人工。硬保护不在此层。" }));
-  const cur = res.current || {};
-  wrap.appendChild(el("label", { text: `当前版本 v${cur.version || 0} · ${cur.created_by || "system"}` }, [
-    el("textarea", { id: "ops-constraints-text", rows: "12", style: "width:100%;font-family:monospace", text: cur.text || "" }),
-  ]));
-  wrap.appendChild(el("label", { text: "变更说明" }, [
-    el("input", { id: "ops-constraints-note", placeholder: "例如：收紧转人工条件" }),
-  ]));
-  const msg = el("p", { class: "error" });
-  wrap.appendChild(msg);
-  wrap.appendChild(el("button", {
-    class: "btn primary", text: "保存并生效", type: "button",
-    onclick: async () => {
-      const body = {
-        text: (($("ops-constraints-text") || {}).value || ""),
-        change_note: (($("ops-constraints-note") || {}).value || ""),
-        activate: true,
-      };
-      const r = await api("/api/ops/constraints", { method: "POST", body: JSON.stringify(body) });
-      msg.textContent = r && r.ok ? "已保存并生效" : ((r && (r.message || r.error)) || "保存失败");
-    },
-  }));
-  const vers = res.versions || [];
-  if (vers.length) {
-    wrap.appendChild(el("h4", { text: "历史版本" }));
-    vers.forEach((v) => {
-      wrap.appendChild(el("p", {
-        class: "small",
-        text: `v${v.version} · ${v.created_by || ""} · ${v.change_note || ""}${v.active ? " · 生效中" : ""}`,
-      }, [
-        el("button", {
-          class: "btn small", text: "生效", type: "button",
-          onclick: async () => {
-            const r = await api("/api/ops/constraints/activate", {
-              method: "POST", body: JSON.stringify({ version_id: v.id }),
-            });
-            msg.textContent = r && r.ok ? `已切换到 v${v.version}` : ((r && (r.message || r.error)) || "切换失败");
-          },
-        }),
-      ]));
-    });
-  }
-  showModal("运维软约束", [wrap]);
-}
+async function openOpsConstraints() { return openSettings("prompts"); }
 
-async function openMimoAdmin() {
+async function openMimoAdmin(host = null, context = null) {
+  const current = () => !context || context.active();
+  const present = (title, children) => {
+    if (!current()) return;
+    if (host) { host.innerHTML = ""; children.forEach((child) => host.appendChild(child)); }
+    else showModal(title, children);
+  };
   const generation = (openMimoAdmin.generation || 0) + 1;
   openMimoAdmin.generation = generation;
   let initialStatus, initialConfig;
   try {
     [initialStatus, initialConfig] = await Promise.all([api("/api/mimo/status"), api("/api/mimo/provider")]);
   } catch (_) {
-    if (openMimoAdmin.generation === generation) showModal("MiMoCode 管理", [el("p", { class: "error", text: "配置加载未完成，请重试。" })]);
+    if (openMimoAdmin.generation === generation) present("MiMoCode 管理", [el("p", { class: "error", text: "配置加载未完成，请重试。" })]);
     return;
   }
-  if (openMimoAdmin.generation !== generation) return;
+  if (openMimoAdmin.generation !== generation || !current()) return;
   if (!initialConfig || !initialConfig.ok) {
-    showModal("MiMoCode 管理", [el("p", { class: "error", text: (initialConfig && initialConfig.message) || "配置暂时不可用或无管理权限。" })]);
+    present("MiMoCode 管理", [el("p", { class: "error", text: (initialConfig && initialConfig.message) || "配置暂时不可用或无管理权限。" })]);
     return;
   }
-  const wrap = el("div", { class: "form-col" });
-  wrap.appendChild(el("h3", { text: "MiMoCode 管理" }));
+  const wrap = el("div", { class: host ? "settings-card form-col" : "form-col" });
+  wrap.appendChild(el("h3", { text: host ? "MiMoCode" : "MiMoCode 管理" }));
   const cli = initialStatus || {};
-  wrap.appendChild(el("p", { class: "muted small", text: `CLI：${cli.exists ? "已安装 " + (cli.version || "") : "未安装或状态不可用"} · unit：${(cli.unit && cli.unit.detail) || "未配置"}` }));
+  wrap.appendChild(el("p", { class: "muted small", text: host ? `MiMoCode ${cli.exists ? "已安装 · " + (cli.version || "") : "暂不可用"} · 会话按需启动` : `CLI：${cli.exists ? "已安装 " + (cli.version || "") : "未安装或状态不可用"} · unit：${(cli.unit && cli.unit.detail) || "未配置"}` }));
   const statusLine = el("p", { class: "error" });
   wrap.appendChild(statusLine);
   let config = initialConfig;
   let selectedProvider = "";
   let keyStatusLabel = null;
-  const active = () => openMimoAdmin.generation === generation && $("modal-body").children[0] === wrap && !$("modal").classList.contains("hidden");
+  const active = () => current() && openMimoAdmin.generation === generation && (host ? host.contains(wrap) : $("modal-body").children[0] === wrap && !$("modal").classList.contains("hidden"));
   const updateStatus = (reply) => {
     config = reply;
     const ver = config.verification || {};
@@ -499,7 +456,7 @@ async function openMimoAdmin() {
       const provider = (config.providers || []).find((item) => item.name === selectedProvider) || {};
       keyStatusLabel.textContent = provider.key_set ? "API Key（已保存，留空保留；更换地址需重新填写）" : "API Key";
     }
-    statusLine.className = config.available ? "small" : "error";
+    statusLine.className = host ? (config.available ? "settings-status ok" : "settings-status warn") : config.available ? "small" : "error";
     statusLine.textContent = config.available
       ? `已保存配置：MiMoCode 可用 · 模型 ${ver.model || config.model || "?"} · 验证通过`
       : `已保存配置尚未通过连接验证（${ver.last_result || "未测试"}）。请测试连接并保存配置。`;
@@ -533,6 +490,7 @@ async function openMimoAdmin() {
     const fields = () => ({ provider_id: selectedProvider, base_url: baseInput.value.trim(), model: modelInput.value.trim(), api_key: keyInput.value.trim() });
     [baseInput, modelInput, keyInput].forEach((input) => input.addEventListener("input", () => {
       revision += 1;
+      if (context) context.setDirty(true);
       message.className = "muted small";
       message.textContent = "当前输入已修改，之前的测试结果不适用；请重新测试或保存并验证。";
     }));
@@ -541,6 +499,7 @@ async function openMimoAdmin() {
       if (kind === "clear" && !confirm("清除当前 Provider 已保存的 API Key？清除后需重新配置并验证。")) return;
       const submitted = fields(), submittedRevision = revision;
       busy = true;
+      if (context) context.setBusy(true);
       controls.forEach((button) => { button.disabled = true; });
       message.className = "muted small";
       message.textContent = kind === "test" ? "正在真实调用模型…" : kind === "save" ? "保存前验证中…" : "正在清除密钥…";
@@ -563,6 +522,7 @@ async function openMimoAdmin() {
             : (reply && (reply.message || reply.error)) || "测试未通过，请检查配置。";
         } else if (reply && reply.ok) {
           keyInput.value = "";
+          if (context && kind === "save") context.setDirty(false);
           message.className = kind === "save" && !reply.verified ? "error" : "small";
           message.textContent = kind === "clear" ? "已清除密钥，验证状态已重置。" : reply.verified ? "配置已保存，连接验证通过。" : "配置已保存但尚未验证，当前不可用。";
         } else {
@@ -576,12 +536,15 @@ async function openMimoAdmin() {
         }
       } finally {
         busy = false;
+        if (context) context.setBusy(false);
         controls.forEach((button) => { button.disabled = false; });
       }
     };
     [["测试连接", "test"], ["保存并验证", "save"], ["清除已保存密钥", "clear"]].forEach(([text, kind]) => {
       const button = el("button", { class: kind === "save" ? "btn primary" : "btn", text, type: "button", onclick: () => run(kind) });
-      controls.push(button); wrap.appendChild(button);
+      controls.push(button);
+      if (host && context && kind === "save") context.actions.appendChild(button);
+      else wrap.appendChild(button);
     });
     wrap.appendChild(message);
     wrap.appendChild(el("p", { class: "muted small", text: "密钥只保存在服务器，界面不会回填密钥；测试未通过时不会标记已保存配置可用。测试与保存均会发起一次真实验证请求。" }));
@@ -589,7 +552,7 @@ async function openMimoAdmin() {
   const processMessage = el("p", { class: "error" });
   let processBusy = false;
   const processControls = [];
-  if (state.user && state.user.is_admin) {
+  if (state.user && state.user.is_admin && (!host || (cli.unit && cli.unit.configured))) {
     [["启动", "/api/mimo/start"], ["停止", "/api/mimo/stop"]].forEach(([text, path]) => {
       const button = el("button", { class: "btn", text, type: "button", onclick: async () => {
         if (processBusy || !active()) return;
@@ -607,10 +570,13 @@ async function openMimoAdmin() {
   wrap.appendChild(el("button", { class: "btn", text: "刷新用量", type: "button", onclick: async () => {
     try {
       const reply = await api("/api/mimo/stats");
-      if (active()) showModal("MiMoCode 用量", [el("pre", { text: reply && reply.ok ? reply.stdout || "" : (reply && reply.message) || "用量暂时不可用。" })]);
+      if (active()) {
+        const usage = el("pre", { class: "settings-detail", text: reply && reply.ok ? reply.stdout || "暂无用量记录" : "用量暂时不可用。" });
+        if (host) processMessage.replaceChildren(usage); else present("MiMoCode 用量", [usage]);
+      }
     } catch (_) { if (active()) processMessage.textContent = "用量加载未完成，请重试。"; }
   } }));
-  showModal("MiMoCode 管理", [wrap]);
+  present("MiMoCode 管理", [wrap]);
 }
 
 /* ---- 旧自治历史（只读） ---- */
@@ -635,91 +601,8 @@ async function openAutonomySettings() {
 }
 
 /* ---- 全局设置（用户名旁） ---- */
-on("settings-btn", "click", async () => {
-  const res = await api("/api/settings/global");
-  if (!res || !res.ok) {
-    showModal("全局设置", [
-      el("p", { class: "error", text: (res && (res.message || res.error)) || "加载失败" }),
-    ]);
-    return;
-  }
-
-  const wrap = el("div", { class: "totp-manage" });
-  wrap.appendChild(el("h3", { text: "全局设置" }));
-  wrap.appendChild(el("p", {
-    class: "muted small",
-    text: "AI 模型用于「帮我填表」等智能辅助；监控地址影响资源曲线与一键接入。API Key 只保存不回显。",
-  }));
-
-  const form = el("div", { class: "form-col" });
-  form.appendChild(el("h4", { text: "AI 模型", style: "margin:10px 0 4px" }));
-  form.appendChild(el("label", { text: "Base URL" }, [
-    el("input", { id: "gs-llm-base", type: "url", placeholder: "https://api.example.com/v1", value: res.llm_base_url || "" }),
-  ]));
-  form.appendChild(el("label", { text: "模型名" }, [
-    el("input", { id: "gs-llm-model", placeholder: "例如 gpt-4o-mini / mimo-v2.6-flash", value: res.llm_model || "" }),
-  ]));
-  form.appendChild(el("label", {
-    text: res.llm_api_key_set ? "API Key（已配置，留空则不改）" : "API Key",
-  }, [
-    el("input", {
-      id: "gs-llm-key", type: "password", autocomplete: "new-password",
-      placeholder: res.llm_api_key_set ? (res.llm_api_key_masked || "已保存") : "sk-…",
-    }),
-  ]));
-
-  form.appendChild(el("h4", { text: "监控地址", style: "margin:14px 0 4px" }));
-  form.appendChild(el("label", { text: "Prometheus URL" }, [
-    el("input", { id: "gs-prom-url", type: "url", placeholder: "http://127.0.0.1:9090", value: res.prometheus_url || "" }),
-  ]));
-  form.appendChild(el("label", { text: "Alertmanager URL" }, [
-    el("input", { id: "gs-am-url", type: "url", placeholder: "http://127.0.0.1:9093", value: res.alertmanager_url || "" }),
-  ]));
-  const promSt = res.prometheus_ok
-    ? "Prometheus：可用"
-    : "Prometheus：不可用（" + (res.prometheus_error || "未连接") + "）。安装后一键接入才能验证指标。";
-  form.appendChild(el("p", { class: "muted small", text: promSt }));
-  if (state.user && state.user.is_admin) form.appendChild(el("button", {
-    class: "btn", text: "旧自治历史与费用", type: "button", onclick: openAutonomySettings,
-  }));
-  if (state.user && state.user.is_admin) form.appendChild(el("button", {
-    class: "btn", text: "运维软约束（MiMoCode）", type: "button", onclick: openOpsConstraints,
-  }));
-  if (state.user && state.user.is_admin) form.appendChild(el("button", {
-    class: "btn", text: "MiMoCode 管理", type: "button", onclick: openMimoAdmin,
-  }));
-  wrap.appendChild(form);
-  const msg = el("p", { class: "error" });
-  wrap.appendChild(msg);
-
-  showModal("全局设置", [wrap]);
-  const actions = $("modal") && $("modal").querySelector(".modal-actions");
-  const saveBtn = el("button", {
-    class: "btn primary",
-    text: "保存",
-    onclick: async () => {
-      const payload = {
-        llm_base_url: (($("gs-llm-base") || {}).value || "").trim(),
-        llm_model: (($("gs-llm-model") || {}).value || "").trim(),
-        prometheus_url: (($("gs-prom-url") || {}).value || "").trim(),
-        alertmanager_url: (($("gs-am-url") || {}).value || "").trim(),
-      };
-      const key = (($("gs-llm-key") || {}).value || "").trim();
-      if (key) payload.llm_api_key = key;
-      const r = await api("/api/settings/global", {
-        method: "POST",
-        body: JSON.stringify(payload),
-      });
-      if (r && r.ok) {
-        msg.textContent = "已保存";
-        setTimeout(() => { $("modal").classList.add("hidden"); }, 500);
-      } else {
-        msg.textContent = (r && (r.message || r.error)) || "保存失败";
-      }
-    },
-  });
-  if (actions) actions.insertBefore(saveBtn, actions.firstChild);
-});
+/* Unified settings entry; legacy history remains read-only. */
+on("settings-btn", "click", () => openSettings("model"));
 
 on("login-back-btn", "click", () => {
   state.pendingLogin = null;
@@ -789,128 +672,18 @@ on("login-totp", "keydown", (e) => {
 });
 
 on("logout-btn", "click", async () => {
-  await api("/api/logout", { method: "POST", body: "{}" });
-  state.csrf = "";
-  state.user = null;
-  state.pendingLogin = null;
-  showLogin();
+  const logout = async () => {
+    if (typeof closeSettings === "function") closeSettings(true);
+    if (typeof closeAccountMenu === "function") closeAccountMenu();
+    await api("/api/logout", { method: "POST", body: "{}" });
+    state.csrf = ""; state.user = null; state.pendingLogin = null; showLogin();
+  };
+  if (typeof settingsState !== "undefined" && settingsState.opened && !settingsCanLeave(logout)) return;
+  await logout();
 });
 
-/* ---- 2FA 设置（Ayana 自有弹层，不用 alert/prompt/confirm） ---- */
-function openTotpManage() {
-  const body = $("modal-body");
-  if (!body) return;
-  body.innerHTML = "";
-  const wrap = el("div", { class: "totp-manage" });
-  wrap.appendChild(el("h3", { text: "两步验证（2FA）" }));
-  wrap.appendChild(el("p", {
-    class: "muted small",
-    text: "更换或关闭前需验证当前密码。启用后请保存恢复码（仅显示一次）。",
-  }));
-
-  const form = el("div", { class: "form-col" });
-  form.appendChild(el("label", { text: "当前密码（首次绑定可留空）" }, [
-    el("input", { id: "tm-password", type: "password", placeholder: "当前登录密码" }),
-  ]));
-  form.appendChild(el("label", { text: "当前动态码（已有 2FA 时填写）" }, [
-    el("input", { id: "tm-current-otp", maxlength: "6", inputmode: "numeric", placeholder: "6 位" }),
-  ]));
-  wrap.appendChild(form);
-
-  const actions = el("div", { class: "form-row", style: "margin-top:12px" }, [
-    el("button", {
-      class: "btn primary", text: "启用 / 更换 2FA",
-      onclick: () => totpStartSetup(),
-    }),
-    el("button", {
-      class: "btn", text: "关闭 2FA",
-      onclick: () => totpDisable(),
-    }),
-  ]);
-  wrap.appendChild(actions);
-  wrap.appendChild(el("div", { id: "tm-result", style: "margin-top:12px" }));
-  wrap.appendChild(el("div", { id: "tm-setup" }));
-  body.appendChild(wrap);
-  const m = $("modal");
-  if (m) m.classList.remove("hidden");
-}
-
-async function totpStartSetup() {
-  const password = (($("tm-password") || {}).value || "").trim();
-  const totp = (($("tm-current-otp") || {}).value || "").trim();
-  const box = $("tm-result");
-  const setup = await api("/api/totp/setup", {
-    method: "POST",
-    body: JSON.stringify({ password, totp }),
-  });
-  if (!setup.ok) {
-    if (box) box.textContent = setup.message || setup.error || "TOTP 初始化失败";
-    return;
-  }
-  const dest = $("tm-setup");
-  if (!dest) return;
-  dest.innerHTML = "";
-  dest.appendChild(el("p", { class: "muted small", text: "用验证器 App 扫码，或手动输入 Secret：" }));
-  dest.appendChild(el("div", {
-    id: "totp-qr",
-    style: "background:#fff;padding:12px;border-radius:8px;display:inline-block;margin:8px 0",
-  }));
-  dest.appendChild(el("pre", { id: "totp-secret", text: setup.secret, style: "user-select:all" }));
-  dest.appendChild(el("p", { class: "muted small", text: "输入 6 位验证码完成启用" }));
-  dest.appendChild(el("input", {
-    id: "totp-confirm-code", maxlength: "6", inputmode: "numeric",
-    style: "width:140px;padding:8px;margin:6px 0",
-  }));
-  dest.appendChild(el("div", { id: "totp-result" }));
-  dest.appendChild(el("button", {
-    class: "btn primary", text: "确认启用",
-    style: "margin-top:8px",
-    onclick: async () => {
-      const code = (($("totp-confirm-code") || {}).value || "").trim();
-      const password2 = (($("tm-password") || {}).value || "").trim();
-      const res = await api("/api/totp/confirm", {
-        method: "POST",
-        body: JSON.stringify({ code, password: password2 }),
-      });
-      if (!res.ok) {
-        const r = $("totp-result");
-        if (r) r.textContent = res.message || res.error || "失败";
-        return;
-      }
-      if (res.csrf_token) state.csrf = res.csrf_token;
-      dest.innerHTML = "";
-      dest.appendChild(el("p", { text: "已启用 2FA。请保存恢复码（仅显示一次）：" }));
-      dest.appendChild(el("pre", {
-        text: (res.recovery_codes || []).join("\n"),
-        style: "user-select:all;white-space:pre-wrap",
-      }));
-    },
-  }));
-  try {
-    const qr = window.QR.encode(setup.otpauth, 4);
-    $("totp-qr").innerHTML = window.QR.toSvg(qr, 4);
-  } catch (e) {
-    $("totp-qr").innerHTML = '<span class="muted small">二维码生成失败，请用 Secret 手动添加</span>';
-  }
-}
-
-async function totpDisable() {
-  const password = (($("tm-password") || {}).value || "").trim();
-  const totp = (($("tm-current-otp") || {}).value || "").trim();
-  const box = $("tm-result");
-  if (box) box.textContent = "正在关闭 2FA…";
-  const res = await api("/api/totp/disable", {
-    method: "POST",
-    body: JSON.stringify({ password, totp }),
-  });
-  if (!res.ok) {
-    if (box) box.textContent = res.message || res.error || "关闭失败";
-    return;
-  }
-  if (res.csrf_token) state.csrf = res.csrf_token;
-  if (box) box.textContent = "已关闭两步验证。";
-}
-
+/* ---- 双重验证 uses the settings security section ---- */
+function openTotpManage() { return openSettings("security"); }
 on("totp-btn", "click", () => openTotpManage());
 
 /* ---- tabs ---- */
@@ -4093,6 +3866,9 @@ async function pcRunAdoptFlow(asset) {
 }
 
 function showModal(title, children) {
+  const footer = $("modal") && $("modal").querySelector(".modal-card > .modal-actions");
+  if (footer) Array.from(footer.children).forEach((node) => { if (node.id !== "modal-close") node.remove(); });
+  const closeButton = $("modal-close"); if (closeButton) closeButton.classList.remove("hidden");
   $("modal-title").textContent = title;
   const body = $("modal-body");
   body.innerHTML = "";
@@ -5128,26 +4904,29 @@ function notifyMsg(t) {
 }
 
 async function notifyCreate(payload) {
-  const r = await api("/api/notify/channels", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-  notifyMsg(r.ok ? "已添加，可点「发送测试」验证" : (r.detail || r.error || "添加失败"));
-  if (r.ok) {
-    ($("notify-name") || {}).value = "";
-    loadNotifyChannels();
-  }
-  return r;
+  if (typeof settingsNotificationSaving === "function" && !settingsNotificationSaving(true)) return { ok: false };
+  try {
+    const r = await api("/api/notify/channels", { method: "POST", body: JSON.stringify(payload) });
+    notifyMsg(r.ok ? "已添加，可点「发送测试」验证" : (r.detail || r.error || "添加失败"));
+    if (r.ok) {
+      ($("notify-name") || {}).value = "";
+      if (typeof settingsNotificationSaved === "function") settingsNotificationSaved();
+      loadNotifyChannels();
+    }
+    return r;
+  } finally { if (typeof settingsNotificationSaving === "function") settingsNotificationSaving(false); }
 }
 
 on("notify-add-btn", "click", async () => {
   const name = (($("notify-name") || {}).value || "").trim();
   if (!name) return notifyMsg("请填写名称");
   const target = (($("notify-qq-target") || {}).value || "").trim();
-  await notifyCreate({
+  const created = await notifyCreate({
     name, kind: "qq", config: { target }, secret: {}, enabled: true,
   });
-  ($("notify-qq-target") || {}).value = "";
+  if (created.ok) {
+    ($("notify-qq-target") || {}).value = "";
+  }
 });
 
 on("notify-add-btn-wecom", "click", async () => {
@@ -5159,11 +4938,13 @@ on("notify-add-btn-wecom", "click", async () => {
     renderNotifyGuide("wecom");
     return;
   }
-  await notifyCreate({
+  const created = await notifyCreate({
     name, kind: "wecom",
     config: { url }, secret: { webhook_url: url }, enabled: true,
   });
-  ($("notify-wecom-url") || {}).value = "";
+  if (created.ok) {
+    ($("notify-wecom-url") || {}).value = "";
+  }
 });
 
 on("notify-add-btn-aibot", "click", async () => {
@@ -5180,15 +4961,17 @@ on("notify-add-btn-aibot", "click", async () => {
     return;
   }
   // 推送目标可为空：连接后从群消息自动发现
-  await notifyCreate({
+  const created = await notifyCreate({
     name, kind: "wecom_aibot",
     config: { bot_id: botId, targets, ws_url: wsUrl },
     secret: { bot_id: botId, secret },
     enabled: true,
   });
-  ($("notify-aibot-botid") || {}).value = "";
-  ($("notify-aibot-secret") || {}).value = "";
-  ($("notify-aibot-targets") || {}).value = "";
+  if (created.ok) {
+    ($("notify-aibot-botid") || {}).value = "";
+    ($("notify-aibot-secret") || {}).value = "";
+    ($("notify-aibot-targets") || {}).value = "";
+  }
 });
 
 on("notify-add-btn-hook", "click", async () => {
@@ -5205,10 +4988,12 @@ on("notify-add-btn-hook", "click", async () => {
     try { config.headers = JSON.parse(hdr); }
     catch (e) { return notifyMsg("自定义头不是合法 JSON"); }
   }
-  await notifyCreate({ name, kind: "webhook", config, secret, enabled: true });
-  ($("notify-hook-url") || {}).value = "";
-  ($("notify-hook-token") || {}).value = "";
-  ($("notify-hook-headers") || {}).value = "";
+  const created = await notifyCreate({ name, kind: "webhook", config, secret, enabled: true });
+  if (created.ok) {
+    ($("notify-hook-url") || {}).value = "";
+    ($("notify-hook-token") || {}).value = "";
+    ($("notify-hook-headers") || {}).value = "";
+  }
 });
 on("notify-outbox-refresh", "click", () => loadNotifyOutbox());
 on("notify-outbox-state", "change", () => loadNotifyOutbox());

@@ -205,6 +205,12 @@ class WebApp:
         app.router.add_post("/api/setup/monitor", self.api_setup_monitor_post)
         app.router.add_get("/api/settings/global", self.api_settings_global_get)
         app.router.add_post("/api/settings/global", self.api_settings_global_post)
+        app.router.add_get("/api/settings/prompts", self.api_settings_prompts_get)
+        app.router.add_post("/api/settings/prompts", self.api_settings_prompts_save)
+        app.router.add_post("/api/settings/prompts/restore", self.api_settings_prompts_restore)
+        app.router.add_get("/api/settings/skills", self.api_settings_skills)
+        app.router.add_get("/api/settings/about", self.api_settings_about)
+        app.router.add_post("/api/settings/updates/check", self.api_settings_updates_check)
         # 最终架构：软约束 / 工单闭环 / MiMoCode 管理 / 统一台账
         app.router.add_get("/api/ops/constraints", self.api_ops_constraints_get)
         app.router.add_post("/api/ops/constraints", self.api_ops_constraints_save)
@@ -640,6 +646,7 @@ class WebApp:
                     "is_admin": sess["is_admin"],
                     "user_id": sess["user_id"],
                     "must_change_password": bool(sess.get("must_change_password")),
+                    "totp_enabled": bool(self.auth.totp_enabled(sess["username"])),
                 },
                 "csrf_token": sess["csrf_token"],
             }
@@ -1032,8 +1039,9 @@ class WebApp:
         try:
             await self.prom.query("1")
             return True, ""
-        except Exception as e:
-            return False, str(e)[:200]
+        except Exception as error:
+            log.warning("Prometheus settings probe failed: %s", type(error).__name__)
+            return False, "连接失败，请检查监控地址和服务状态后重试。"
 
     def _mask_secret(self, value: str) -> str:
         v = (value or "").strip()
@@ -1186,8 +1194,9 @@ class WebApp:
             try:
                 await self.prom.query("1")
                 probe = {"ok": True, "error": ""}
-            except Exception as e:
-                probe = {"ok": False, "error": str(e)[:200]}
+            except Exception as error:
+                log.warning("Prometheus setup probe failed: %s", type(error).__name__)
+                probe = {"ok": False, "error": "连接失败，请检查监控地址和服务状态后重试。"}
 
         self.db.audit(
             "web_user",
@@ -1203,6 +1212,99 @@ class WebApp:
                 "probe": probe,
             }
         )
+
+    # ---- Unified settings center: versioned prompts, inventory and about ----
+
+    async def _settings_body(self, request: web.Request, allowed: set[str]) -> dict | None:
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return None
+        return body if isinstance(body, dict) and not set(body) - allowed else None
+
+    @staticmethod
+    def _settings_failure(error: Exception) -> web.Response:
+        messages = {
+            "invalid_prompt_key": "请选择有效的提示词。",
+            "empty_prompt": "提示词不能为空。",
+            "prompt_too_long": "提示词不能超过 20000 个字符。",
+            "invalid_prompt": "提示词包含无效字符。",
+            "invalid_change_note": "变更说明不能超过 300 个字符。",
+            "invalid_version_id": "请选择有效的历史版本。",
+            "version_not_found": "该提示词版本不存在。",
+        }
+        code = str(error) if isinstance(error, ValueError) else "settings_failed"
+        if code not in messages:
+            code = "settings_failed"
+        return _json({"ok": False, "error": code, "message": messages.get(code, "设置操作未完成，请稍后重试。")}, 400 if code in messages else 500)
+
+    async def api_settings_prompts_get(self, request: web.Request) -> web.Response:
+        self._require_admin(request)
+        from .settings_admin import PromptSettings
+        return _json(PromptSettings(self.db).overview())
+
+    async def api_settings_prompts_save(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await self._settings_body(request, {"key", "text", "change_note"})
+        if body is None:
+            return _json({"ok": False, "error": "bad_request", "message": "请求格式不正确。"}, 400)
+        from .settings_admin import PromptSettings
+        try:
+            current = PromptSettings(self.db).save(body.get("key"), body.get("text"), actor=sess["username"], change_note=body.get("change_note", ""))
+        except Exception as error:
+            return self._settings_failure(error)
+        return _json({"ok": True, "current": current, "effect": "next_call", "message": "已保存，下次调查或决策调用生效。"})
+
+    async def api_settings_prompts_restore(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await self._settings_body(request, {"key", "version_id"})
+        if body is None:
+            return _json({"ok": False, "error": "bad_request", "message": "请求格式不正确。"}, 400)
+        from .settings_admin import PromptSettings
+        try:
+            current = PromptSettings(self.db).restore(body.get("key"), body.get("version_id"), actor=sess["username"])
+        except Exception as error:
+            return self._settings_failure(error)
+        return _json({"ok": True, "current": current, "effect": "next_call", "message": "已恢复为新版本，下次调查或决策调用生效。"})
+
+    async def api_settings_skills(self, request: web.Request) -> web.Response:
+        self._require_admin(request)
+        from .settings_admin import discover_skills
+        try:
+            result = await asyncio.to_thread(discover_skills, workdir=Path(self._mimo().workdir or Path(__file__).resolve().parents[1]))
+            # Redact source strings before JSON escapes quotes/backslashes in
+            # credentials. Redacting the serialized JSON cannot match those keys.
+            def redact(value):
+                if isinstance(value, str):
+                    return self._mimo()._redact(value)
+                if isinstance(value, list):
+                    return [redact(item) for item in value]
+                if isinstance(value, dict):
+                    return {redact(key): redact(item) for key, item in value.items()}
+                return value
+            return _json(await asyncio.to_thread(redact, result))
+        except Exception:
+            return _json({"ok": False, "error": "skills_unavailable", "message": "技能目录暂时无法读取，请稍后重试。"}, 503)
+
+    async def api_settings_about(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        from .settings_admin import PROJECT_URL
+        status = await self._mimo().status()
+        return _json({"ok": True, "ayana_version": self.version, "mimocode_version": status.get("version") or "未安装或无法读取",
+                      "project_url": PROJECT_URL, "update_supported": True, "update_note": "检查项目正式发布版本，不会安装或执行更新。"})
+
+    async def api_settings_updates_check(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await self._settings_body(request, set())
+        if body is None:
+            return _json({"ok": False, "error": "bad_request", "message": "请求格式不正确。"}, 400)
+        from .settings_admin import check_update
+        result = await check_update(self.version)
+        self.db.audit("web_user", sess["username"], "settings_update_checked", detail={"result": result.get("result") or result.get("error")}, channel="web")
+        return _json(result)
 
     # ---- final architecture: ops constraints / mimo / ledger ----
 

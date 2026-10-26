@@ -72,15 +72,31 @@ class PromClient:
 
     async def query(self, expr: str) -> dict[str, Any]:
         data = await self._get("/api/v1/query", {"query": expr})
-        if data.get("status") != "success":
-            raise PromError(str(data)[:200])
-        result = data.get("data", {}).get("result", [])
+        if not isinstance(data, dict) or data.get("status") != "success":
+            raise PromError("query_failed")
+        payload = data.get("data")
+        if not isinstance(payload, dict):
+            raise PromError("invalid_query_response")
+        result = payload.get("result", [])
+        kind = payload.get("resultType", "vector")
+        if kind == "scalar":
+            if not isinstance(result, list) or len(result) != 2:
+                raise PromError("invalid_scalar_response")
+            try:
+                raw = float(result[1])
+            except (TypeError, ValueError):
+                raise PromError("invalid_scalar_response") from None
+            return {"result": [{"metric": {}, "value": raw}], "evaluated_at": time.time()}
+        if kind != "vector" or not isinstance(result, list):
+            raise PromError("unsupported_query_result")
         samples = []
         for item in result:
+            if not isinstance(item, dict):
+                raise PromError("invalid_vector_response")
             metric = item.get("metric", {})
             value = item.get("value", [None, None])
             raw = None
-            if value and len(value) >= 2:
+            if isinstance(value, (list, tuple)) and len(value) >= 2:
                 try:
                     raw = float(value[1])
                 except (TypeError, ValueError):

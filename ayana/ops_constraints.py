@@ -22,7 +22,7 @@ DEFAULT_CONSTRAINTS = """# MiMoCode 运维软约束（生效版本）
 2. **同方案失败 2 次停止**：同一修复方案（相同 capability/命令意图）连续失败 2 次 → 停止重试，换策略或转人工。
 3. **证据不足转人工**：根因不明、关键探测无样本、或写结果为 unknown → 不得假装恢复；标记需人工并通知。
 4. **SSH 成功 ≠ 恢复**：必须用指标/探针/服务状态验证。
-5. **写操作可自主执行**，但必须走 Ayana 工具链（host.exec / action），禁止绕过审计。
+5. **处置计划由 Ayana 统一执行**：调查和决策阶段只收集证据、生成计划；实际写操作必须经 OpsLoop / ActionService 执行、验证与审计。
 6. **不接触明文凭据**；不把密钥写入日志/知识库。
 
 ## 输出
@@ -41,7 +41,7 @@ class OpsConstraints:
     def current(self) -> dict[str, Any]:
         rows = self.db.query(
             "SELECT payload_json, created_at, created_by, id FROM config_versions"
-            " WHERE kind=? ORDER BY id DESC LIMIT 20",
+            " WHERE kind=? ORDER BY id DESC",
             (self.KIND,),
         )
         active = None
@@ -66,8 +66,6 @@ class OpsConstraints:
                 active = item
         if active:
             return active
-        if latest:
-            return latest
         return {
             "text": DEFAULT_CONSTRAINTS,
             "version": 0,
@@ -111,84 +109,90 @@ class OpsConstraints:
             raise ValueError("empty_constraints")
         if len(text) > 20000:
             raise ValueError("constraints_too_long")
-        cur = self.db.execute(
-            "INSERT INTO config_versions(kind, payload_json, created_at, created_by)"
-            " VALUES(?,?,?,?)",
-            (
-                self.KIND,
-                json.dumps(
-                    {
-                        "text": text,
-                        "active": bool(activate),
-                        "change_note": change_note or "",
-                        "version": 0,
-                    },
-                    ensure_ascii=False,
+        with self.db.tx() as conn:
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+            cur = self.db.execute(
+                "INSERT INTO config_versions(kind, payload_json, created_at, created_by)"
+                " VALUES(?,?,?,?)",
+                (
+                    self.KIND,
+                    json.dumps(
+                        {
+                            "text": text,
+                            "active": bool(activate),
+                            "change_note": change_note or "",
+                            "version": 0,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    now(),
+                    actor,
                 ),
-                now(),
+            )
+            vid = int(cur.lastrowid or 0)
+            payload = {
+                "text": text,
+                "active": bool(activate),
+                "change_note": change_note or "",
+                "version": vid,
+            }
+            self.db.execute(
+                "UPDATE config_versions SET payload_json=? WHERE id=?",
+                (json.dumps(payload, ensure_ascii=False), vid),
+            )
+            if activate:
+                for r in self.db.query(
+                    "SELECT id, payload_json FROM config_versions WHERE kind=? AND id!=?",
+                    (self.KIND, vid),
+                ):
+                    try:
+                        p = json.loads(r["payload_json"] or "{}")
+                    except Exception:
+                        p = {}
+                    p["active"] = False
+                    self.db.execute(
+                        "UPDATE config_versions SET payload_json=? WHERE id=?",
+                        (json.dumps(p, ensure_ascii=False), int(r["id"])),
+                    )
+            self.db.audit(
+                "web_user",
                 actor,
-            ),
-        )
-        vid = int(cur.lastrowid or 0)
-        payload = {
-            "text": text,
-            "active": bool(activate),
-            "change_note": change_note or "",
-            "version": vid,
-        }
-        self.db.execute(
-            "UPDATE config_versions SET payload_json=? WHERE id=?",
-            (json.dumps(payload, ensure_ascii=False), vid),
-        )
-        if activate:
+                "ops_constraints_saved",
+                detail={"version": vid, "activate": bool(activate), "change_note": change_note or ""},
+                channel="web",
+            )
+            return self.current()
+
+    def activate(self, version_id: int, *, actor: str = "web_user") -> dict[str, Any]:
+        with self.db.tx() as conn:
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+            row = self.db.query_one(
+                "SELECT id, payload_json FROM config_versions WHERE id=? AND kind=?",
+                (int(version_id), self.KIND),
+            )
+            if not row:
+                raise ValueError("version_not_found")
+            # 唯一生效：先关闭其它 active，再激活目标
             for r in self.db.query(
-                "SELECT id, payload_json FROM config_versions WHERE kind=? AND id!=?",
-                (self.KIND, vid),
+                "SELECT id, payload_json FROM config_versions WHERE kind=?", (self.KIND,)
             ):
                 try:
                     p = json.loads(r["payload_json"] or "{}")
                 except Exception:
                     p = {}
-                p["active"] = False
+                p["active"] = int(r["id"]) == int(row["id"])
+                p["version"] = int(r["id"])
                 self.db.execute(
                     "UPDATE config_versions SET payload_json=? WHERE id=?",
                     (json.dumps(p, ensure_ascii=False), int(r["id"])),
                 )
-        self.db.audit(
-            "web_user",
-            actor,
-            "ops_constraints_saved",
-            detail={"version": vid, "activate": bool(activate), "change_note": change_note or ""},
-            channel="web",
-        )
-        return self.current()
-
-    def activate(self, version_id: int, *, actor: str = "web_user") -> dict[str, Any]:
-        row = self.db.query_one(
-            "SELECT id, payload_json FROM config_versions WHERE id=? AND kind=?",
-            (int(version_id), self.KIND),
-        )
-        if not row:
-            raise ValueError("version_not_found")
-        # 唯一生效：先关闭其它 active，再激活目标
-        for r in self.db.query(
-            "SELECT id, payload_json FROM config_versions WHERE kind=?", (self.KIND,)
-        ):
-            try:
-                p = json.loads(r["payload_json"] or "{}")
-            except Exception:
-                p = {}
-            p["active"] = int(r["id"]) == int(row["id"])
-            p["version"] = int(r["id"])
-            self.db.execute(
-                "UPDATE config_versions SET payload_json=? WHERE id=?",
-                (json.dumps(p, ensure_ascii=False), int(r["id"])),
+            self.db.audit(
+                "web_user",
+                actor,
+                "ops_constraints_activated",
+                detail={"version": int(row["id"])},
+                channel="web",
             )
-        self.db.audit(
-            "web_user",
-            actor,
-            "ops_constraints_activated",
-            detail={"version": int(row["id"])},
-            channel="web",
-        )
-        return self.current()
+            return self.current()

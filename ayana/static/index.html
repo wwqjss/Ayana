@@ -10,7 +10,7 @@
 
 <title>Ayana</title>
 
-<link rel="stylesheet" href="/static/app.css?v=16">
+<link rel="stylesheet" href="/static/app.css?v=17">
 
 <link rel="stylesheet" href="/static/xterm/xterm.css">
 
@@ -126,18 +126,34 @@
 
       </nav>
 
-      <div class="user-box">
-
-        <span id="username"></span>
-
-        <button id="chg-pw-btn" class="btn ghost small">改密</button>
-
-        <button id="totp-btn" class="btn ghost small">2FA</button>
-
-        <button id="settings-btn" class="btn ghost small">设置</button>
-
-        <button id="logout-btn" class="btn ghost small">退出</button>
-
+      <div class="user-box account-control">
+        <button id="account-menu-btn" class="account-trigger" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="account-menu">
+          <span class="account-avatar" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="8" r="3.5"/><path d="M5.5 20v-1.5a6.5 6.5 0 0 1 13 0V20"/></svg>
+          </span>
+          <span id="username"></span>
+          <svg class="account-chevron" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m6 8 4 4 4-4"/></svg>
+        </button>
+        <div id="account-menu" class="account-menu hidden" role="menu" aria-label="账户菜单">
+          <div class="account-menu-caption">账户与偏好</div>
+          <button id="chg-pw-btn" class="account-menu-item" type="button" role="menuitem">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="8" r="3.5"/><path d="M5.5 20v-1.5a6.5 6.5 0 0 1 13 0V20"/></svg>
+            <span>个人资料</span>
+          </button>
+          <button id="totp-btn" class="account-menu-item" type="button" role="menuitem">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m12 3 8 3v5c0 5-3.3 8-8 10-4.7-2-8-5-8-10V6l8-3Z"/><path d="m8.5 11.5 2.5 2.5 4.5-5"/></svg>
+            <span>双重验证</span>
+          </button>
+          <button id="settings-btn" class="account-menu-item" type="button" role="menuitem">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3Z"/><circle cx="12" cy="12" r="3"/></svg>
+            <span>设置</span>
+          </button>
+          <div class="account-menu-divider" role="separator"></div>
+          <button id="logout-btn" class="account-menu-item account-menu-logout" type="button" role="menuitem">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M10 4H5v16h5M10 12h11m-4-4 4 4-4 4"/></svg>
+            <span>退出登录</span>
+          </button>
+        </div>
       </div>
 
     </header>
@@ -426,7 +442,7 @@
 
 
 
-      
+
       <!-- 业务检查已并入 资源 → 业务监控；保留空锚点兼容旧 hash -->
       <section id="tab-checks" class="tab-panel hidden"></section>
 
@@ -683,176 +699,11 @@
         </div>
 
         <div id="notify-sub-channels" class="subpanel">
-
-        <div class="card">
-
-          <h2>通知渠道</h2>
-
-          <p class="muted small">
-
-            同一事件会并行发到所有已启用渠道；各渠道独立记录状态与失败原因，互不影响。
-
-            敏感凭据加密保存，界面不回显明文。配置顺序：消息平台 → 接入方式 → 填写配置。
-
-          </p>
-
-          <div class="form-row" id="notify-add-form">
-
-            <label>消息平台
-
-              <select id="notify-platform">
-
-                <option value="qq">QQ</option>
-
-                <option value="wecom" selected>企业微信</option>
-
-                <option value="webhook">通用 Webhook</option>
-
-              </select>
-
-            </label>
-
-            <label>接入方式
-
-              <select id="notify-method"></select>
-
-            </label>
-
-            <label>名称 <input id="notify-name" placeholder="例如 值班群 / 企微告警"></label>
-
+          <div class="card">
+            <h2>通知渠道</h2>
+            <p class="muted small">通知渠道配置已集中到设置中的「系统连接」。消息记录、发送队列和节点状态仍可在这里查看。</p>
+            <button id="notify-settings-open" class="btn" type="button" style="margin-top:14px">管理通知渠道</button>
           </div>
-
-
-
-          <!-- QQ -->
-
-          <div class="form-row" id="notify-qq-wrap">
-
-            <label>目标
-
-              <input id="notify-qq-target" placeholder="user:123 或 group:456">
-
-            </label>
-
-            <button class="btn primary" id="notify-add-btn" type="button">添加渠道</button>
-
-          </div>
-
-
-
-          <!-- 企业微信 · 群机器人 Webhook -->
-
-          <div class="form-row hidden" id="notify-wecom-wrap">
-
-            <label style="flex:2">Webhook 地址
-
-              <input id="notify-wecom-url" type="password" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...">
-
-            </label>
-
-            <button class="btn primary" id="notify-add-btn-wecom" type="button">添加渠道</button>
-
-          </div>
-
-
-
-          <!-- 企业微信 · 智能机器人长连接 -->
-
-          <div class="hidden" id="notify-aibot-wrap">
-
-            <div class="form-row">
-
-              <label>Bot ID
-
-                <input id="notify-aibot-botid" type="password" placeholder="企微后台「API 模式 · 长连接」生成">
-
-              </label>
-
-              <label>Secret
-
-                <input id="notify-aibot-secret" type="password" placeholder="长连接专用 Secret">
-
-              </label>
-
-              <label style="flex:2">WebSocket 地址（可选）
-
-                <input id="notify-aibot-wsurl" placeholder="默认 wss://openws.work.weixin.qq.com；私有部署另填">
-
-              </label>
-
-            </div>
-
-            <div class="form-row" style="margin-top:8px">
-
-              <label style="flex:2">推送目标（可空，可多条，逗号/换行分隔）
-
-                <input id="notify-aibot-targets" placeholder="可先留空；连接后在群里 @机器人 即可自动发现，也可手动填 chatid/userid">
-
-              </label>
-
-              <button class="btn primary" id="notify-add-btn-aibot" type="button">添加渠道</button>
-
-            </div>
-
-            <p class="muted small" style="margin-top:6px">
-
-              提示：推送目标可为空保存。连接成功后，在企业微信群内 @机器人 发送一条消息，即可在渠道列表的「已发现的推送目标」中勾选该群。
-
-            </p>
-
-          </div>
-
-
-
-          <!-- 通用 Webhook -->
-
-          <div class="hidden" id="notify-hook-wrap">
-
-            <div class="form-row">
-
-              <label style="flex:2">URL
-
-                <input id="notify-hook-url" placeholder="https://example.com/hook">
-
-              </label>
-
-              <label>密钥 Token
-
-                <input id="notify-hook-token" type="password" placeholder="将作为 Bearer 发送（加密保存）">
-
-              </label>
-
-              <button class="btn primary" id="notify-add-btn-hook" type="button">添加渠道</button>
-
-            </div>
-
-            <div class="form-row" style="margin-top:8px">
-
-              <label>自定义头
-
-                <input id="notify-hook-headers" placeholder='JSON，如 {"X-From":"Ayana"}'>
-
-              </label>
-
-            </div>
-
-          </div>
-
-
-
-          <p class="muted small" id="notify-msg"></p>
-
-          <div id="notify-guide" class="notify-guide"></div>
-
-        </div>
-
-        <div class="card">
-
-          <h2>渠道列表</h2>
-
-          <div id="notify-list"></div>
-
-        </div>
         </div>
 
         <div id="notify-sub-messages" class="subpanel hidden">
@@ -1114,6 +965,206 @@
 
 
 
+<!-- Settings use one persistent window; each category owns its content and actions. -->
+<div id="settings-storage" class="hidden" aria-hidden="true">
+  <div id="settings-notification-content" class="settings-notification-content">
+
+        <div class="card">
+
+          <h2>通知渠道</h2>
+
+          <p class="muted small">
+
+            同一事件会并行发到所有已启用渠道；各渠道独立记录状态与失败原因，互不影响。
+
+            敏感凭据加密保存，界面不回显明文。配置顺序：消息平台 → 接入方式 → 填写配置。
+
+          </p>
+
+          <div class="form-row" id="notify-add-form">
+
+            <label>消息平台
+
+              <select id="notify-platform">
+
+                <option value="qq">QQ</option>
+
+                <option value="wecom" selected>企业微信</option>
+
+                <option value="webhook">通用 Webhook</option>
+
+              </select>
+
+            </label>
+
+            <label>接入方式
+
+              <select id="notify-method"></select>
+
+            </label>
+
+            <label>名称 <input id="notify-name" placeholder="例如 值班群 / 企微告警"></label>
+
+          </div>
+
+
+
+          <!-- QQ -->
+
+          <div class="form-row" id="notify-qq-wrap">
+
+            <label>目标
+
+              <input id="notify-qq-target" placeholder="user:123 或 group:456">
+
+            </label>
+
+            <button class="btn primary" id="notify-add-btn" type="button">添加渠道</button>
+
+          </div>
+
+
+
+          <!-- 企业微信 · 群机器人 Webhook -->
+
+          <div class="form-row hidden" id="notify-wecom-wrap">
+
+            <label style="flex:2">Webhook 地址
+
+              <input id="notify-wecom-url" type="password" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...">
+
+            </label>
+
+            <button class="btn primary" id="notify-add-btn-wecom" type="button">添加渠道</button>
+
+          </div>
+
+
+
+          <!-- 企业微信 · 智能机器人长连接 -->
+
+          <div class="hidden" id="notify-aibot-wrap">
+
+            <div class="form-row">
+
+              <label>Bot ID
+
+                <input id="notify-aibot-botid" type="password" placeholder="企微后台「API 模式 · 长连接」生成">
+
+              </label>
+
+              <label>Secret
+
+                <input id="notify-aibot-secret" type="password" placeholder="长连接专用 Secret">
+
+              </label>
+
+              <label style="flex:2">WebSocket 地址（可选）
+
+                <input id="notify-aibot-wsurl" placeholder="默认 wss://openws.work.weixin.qq.com；私有部署另填">
+
+              </label>
+
+            </div>
+
+            <div class="form-row" style="margin-top:8px">
+
+              <label style="flex:2">推送目标（可空，可多条，逗号/换行分隔）
+
+                <input id="notify-aibot-targets" placeholder="可先留空；连接后在群里 @机器人 即可自动发现，也可手动填 chatid/userid">
+
+              </label>
+
+              <button class="btn primary" id="notify-add-btn-aibot" type="button">添加渠道</button>
+
+            </div>
+
+            <p class="muted small" style="margin-top:6px">
+
+              提示：推送目标可为空保存。连接成功后，在企业微信群内 @机器人 发送一条消息，即可在渠道列表的「已发现的推送目标」中勾选该群。
+
+            </p>
+
+          </div>
+
+
+
+          <!-- 通用 Webhook -->
+
+          <div class="hidden" id="notify-hook-wrap">
+
+            <div class="form-row">
+
+              <label style="flex:2">URL
+
+                <input id="notify-hook-url" placeholder="https://example.com/hook">
+
+              </label>
+
+              <label>密钥 Token
+
+                <input id="notify-hook-token" type="password" placeholder="将作为 Bearer 发送（加密保存）">
+
+              </label>
+
+              <button class="btn primary" id="notify-add-btn-hook" type="button">添加渠道</button>
+
+            </div>
+
+            <div class="form-row" style="margin-top:8px">
+
+              <label>自定义头
+
+                <input id="notify-hook-headers" placeholder='JSON，如 {"X-From":"Ayana"}'>
+
+              </label>
+
+            </div>
+
+          </div>
+
+
+
+          <p class="muted small" id="notify-msg"></p>
+
+          <div id="notify-guide" class="notify-guide"></div>
+
+        </div>
+
+        <div class="card">
+
+          <h2>渠道列表</h2>
+
+          <div id="notify-list"></div>
+
+        </div>
+
+  </div>
+</div>
+
+<div id="settings-dialog" class="settings-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="settings-title" tabindex="-1">
+  <div class="settings-window">
+    <aside class="settings-sidebar">
+      <div class="settings-sidebar-head">
+        <h2 id="settings-title">设置</h2>
+        <p>账户与运行配置</p>
+      </div>
+      <nav id="settings-nav" class="settings-nav" aria-label="设置分类"></nav>
+      <div class="settings-sidebar-foot"><span class="settings-brand-mark" aria-hidden="true">A</span><span>Ayana</span></div>
+    </aside>
+    <section class="settings-main" aria-labelledby="settings-section-title">
+      <header class="settings-header">
+        <h2 id="settings-section-title">模型</h2>
+        <button id="settings-close" class="settings-close" type="button" aria-label="关闭设置" title="关闭设置">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+        </button>
+      </header>
+      <div id="settings-content" class="settings-content" role="region" aria-labelledby="settings-section-title" tabindex="-1"></div>
+      <footer id="settings-actions" class="settings-actions"></footer>
+    </section>
+  </div>
+</div>
+
 <div id="modal" class="modal hidden">
 
   <div class="modal-card">
@@ -1168,7 +1219,8 @@
 
 <script src="/static/xterm/xterm-addon-fit.js"></script>
 
-<script src="/static/app.js?v=45"></script>
+<script src="/static/app.js?v=46"></script>
+<script src="/static/settings.js?v=20261026"></script>
 
 </body>
 

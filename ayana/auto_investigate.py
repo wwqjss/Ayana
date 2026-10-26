@@ -497,8 +497,12 @@ class AutoInvestigator:
     def _build_invest_prompt(self, incident_id: str, *, round_no: int) -> str:
         inc_row = self.db.query_one("SELECT * FROM incidents WHERE id=?", (incident_id,))
         inc = dict(inc_row) if inc_row else {}
+        from .settings_admin import PromptSettings
+        prompts = PromptSettings(self.db)
         lines = [
-            CONCLUSION_PROMPT,
+            prompts.current("investigation")["text"],
+            "\n## 当前生效的运维软约束",
+            prompts.current("constraints")["text"],
             f"\n## Incident {incident_id} (round {round_no})",
             f"title: {inc.get('title')}",
             f"asset: {inc.get('asset_id')}  object: {inc.get('object_id')}",
@@ -530,9 +534,13 @@ class AutoInvestigator:
 
     def _build_decision_prompt(self, incident_id: str, conclusion: dict[str, Any]) -> str:
         inc = dict(self.db.query_one("SELECT * FROM incidents WHERE id=?", (incident_id,)) or {})
+        from .settings_admin import PromptSettings
+        prompts = PromptSettings(self.db)
         return "\n".join(
             [
-                DECISION_PROMPT,
+                prompts.current("decision")["text"],
+                "\n## 当前生效的运维软约束",
+                prompts.current("constraints")["text"],
                 f"\n## Incident {incident_id}",
                 f"title: {inc.get('title')}",
                 f"asset: {inc.get('asset_id')}  object: {inc.get('object_id')}",
