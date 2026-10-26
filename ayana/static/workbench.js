@@ -701,6 +701,9 @@
     }
     const tb = $("aw-term-btn");
     if (tb) tb.onclick = toggleTerminal;
+    window.addEventListener("resize", () => {
+      if (term.visible) fitTerminal();
+    });
     const acq = $("aw-term-acquire");
     if (acq) acq.onclick = acquireControl;
     const rel = $("aw-term-release");
@@ -762,13 +765,27 @@
     return term.xterm;
   }
 
+  function fitTerminal() {
+    if (!term.fit || !term.xterm) return;
+    try {
+      term.fit.fit();
+    } catch (e) { /* ignore */ }
+    if (term.xterm && term.ws && term.ws.readyState === 1 && term.control) {
+      try {
+        term.ws.send(JSON.stringify({ type: "resize", cols: term.xterm.cols, rows: term.xterm.rows }));
+      } catch (e) { /* ignore */ }
+    }
+  }
+
   function showTerminalPanel(show) {
     const panel = $("aw-terminal");
     const chat = $("aw-chat-scroll");
     const composer = $("aw-composer");
+    const center = $("aw-center");
     if (!panel) return;
     term.visible = !!show;
     panel.classList.toggle("hidden", !show);
+    if (center) center.classList.toggle("terminal-mode", !!show);
     if (chat) chat.classList.toggle("hidden", show);
     if (composer) composer.classList.toggle("hidden", show);
     const btn = $("aw-term-btn");
@@ -776,12 +793,12 @@
     if (show) {
       const t = ensureXterm();
       const host = $("aw-term-host");
-      if (t && host && t.element && t.element.parentElement !== host) {
-        // already opened elsewhere; keep instance
-      } else if (t && host && !t.element) {
-        t.open(host);
-      }
-      if (term.fit) setTimeout(() => { try { term.fit.fit(); } catch (e) {} }, 30);
+      if (t && host && !t.element) t.open(host);
+      // layout settles after flex show; fit twice to avoid a short first frame
+      requestAnimationFrame(() => {
+        fitTerminal();
+        setTimeout(fitTerminal, 60);
+      });
     }
     updateTermUi();
   }
@@ -898,7 +915,8 @@
             term.ready = true;
             bindTermIo();
             updateTermUi();
-            if (term.xterm && term.fit) setTimeout(() => { try { term.fit.fit(); } catch (e) {} }, 30);
+            fitTerminal();
+            setTimeout(fitTerminal, 80);
             return;
           }
           if (msg.type === "control") {
