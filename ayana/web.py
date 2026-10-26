@@ -1663,6 +1663,10 @@ class WebApp:
         if not self.mimo_serve:
             raise ValueError("runtime_unavailable")
         await self.mimo_serve.ensure_running()
+        # Observing an existing task must never wait for its execution lease.
+        current = duty.get(sid)
+        if current and current.get("remote_session_id"):
+            return {"session": current, "remote_session_id": current["remote_session_id"], "agent": READONLY_AGENT}
         async with duty.async_turn(sid):
             session = duty.get(sid)
             if not session:
@@ -1841,10 +1845,15 @@ class WebApp:
             "events": events,
             "pending_writes": pending_writes,
             "pending_actions": pending_actions,
+            "can_prepare": bool(sess.get("is_admin")),
+            "can_control": bool(sess.get("is_admin") and s.get("status") == "open"),
+            "runtime": (await self.agent_tui.status(sid)).get("binding") if getattr(self, "agent_tui", None) else None,
         })
 
     async def api_agent_session_prompt(self, request: web.Request) -> web.Response:
         from .mimo_session import READONLY_AGENT
+        from .duty_session import NativeTurnBusyError
+        import uuid
         user = self._require_admin(request); self._check_csrf(request, user)
         sid = request.match_info.get("sid") or ""
         session = self._agent_session_require(user, sid, control=True)
@@ -1856,12 +1865,37 @@ class WebApp:
             return _json({"ok": False, "error": "prompt_required"}, 400)
         prompt = body["prompt"].strip()
         duty = self._duty()
-        duty.add_message(sid, role="user", kind="prompt", title="", body=prompt)
+        receipt_id = ""
         try:
-            ready = await self._agent_remote_ready(sid)
-            rid = ready["remote_session_id"]
-            receipt = await self.mimo_serve.client().prompt_async(rid, prompt, agent=READONLY_AGENT)
-            duty.set_runtime_state(sid, "running", receipt_id=receipt.get("receipt_id") or receipt.get("receiptId") or "", receipt_status="accepted")
+            async with duty.async_turn(sid, timeout=0):
+                blockers = duty.native_admission_blockers(sid, include_business=True)
+                if blockers:
+                    raise NativeTurnBusyError(blockers)
+                ready = await self._agent_remote_ready(sid)
+                rid = ready["remote_session_id"]
+                client = self.mimo_serve.client()
+                statuses = await client.session_status()
+                if not isinstance(statuses, dict):
+                    raise ValueError("native_status_unavailable")
+                native = statuses.get(rid)
+                if native is not None and (not isinstance(native, dict) or native.get("type") != "idle"):
+                    raise NativeTurnBusyError(["native_turn_pending"])
+                duty.add_message(sid, role="user", kind="prompt", title="", body=prompt)
+                try:
+                    receipt = await client.prompt_async(rid, prompt, agent=READONLY_AGENT, message_id="msg_" + uuid.uuid4().hex)
+                    if not receipt.get("accepted"):
+                        return _json({"ok": False, "error": "turn_not_admitted", "message": "当前任务尚未接受新输入，请等待任务状态更新。"}, 409)
+                    receipt_id = str(receipt.get("receipt_id") or "")
+                    duty.record_receipt(sid, rid, receipt_id, origin="manual_api")
+                    duty.set_runtime_state(sid, "running", receipt_id=receipt_id, receipt_status="accepted")
+                except BaseException as error:
+                    if getattr(error, "code", "") not in ("invalid_prompt", "http_400", "http_401", "http_403", "http_404", "provider_not_verified", "runtime_changed"):
+                        # Persist uncertainty before releasing the submission lease,
+                        # including cancellation caused by an HTTP disconnect.
+                        duty.set_runtime_state(sid, "unknown", receipt_id=receipt_id, receipt_status="unknown")
+                    raise
+        except (NativeTurnBusyError, TimeoutError):
+            return _json({"ok": False, "error": "session_busy", "message": "该会话仍有任务执行中或结果待确认，请等待当前任务结束。"}, 409)
         except Exception:
             duty.add_message(sid, role="system", kind="error", title="发送失败", body="原生运行服务或已验证模型配置暂不可用。")
             return self._agent_runtime_failure()
@@ -1875,9 +1909,7 @@ class WebApp:
         sid = request.match_info.get("sid") or ""
         if not duty:
             return _json({"ok": False, "error": "unavailable"}, 503)
-        s = duty.get(sid)
-        if not s:
-            return _json({"ok": False, "error": "not_found"}, 404)
+        s = self._agent_session_require(sess, sid, control=True)
         serve = getattr(self, "mimo_serve", None)
         remote_id = (s.get("remote_session_id") or "").strip()
         if not serve or not remote_id:
@@ -1893,9 +1925,14 @@ class WebApp:
 
     async def api_agent_events(self, request: web.Request) -> web.Response:
         """实时事件轮询：after=unix_ts 增量。前端 1s 轮询即可获得流式体验。"""
-        self._require_auth(request)
+        user = self._require_auth(request)
         after = float(request.rel_url.query.get("after") or 0)
         sess_filter = str(request.rel_url.query.get("session_id") or "").strip()
+        permitted = {}
+        for row in self.db.query("SELECT * FROM duty_sessions WHERE remote_session_id<>''"):
+            session = dict(row)
+            if self._agent_session_visible(user, session):
+                permitted[session["remote_session_id"]] = session["id"]
         live = []
         fn = getattr(self, "mimo_events", None)
         if callable(fn):
@@ -1911,8 +1948,10 @@ class WebApp:
                 ts = 0
             if ts <= after:
                 continue
-            if sess_filter and ev.get("session_id") and ev.get("session_id") != sess_filter:
-                # mimo session id 过滤；无 id 的保留
+            remote = str(ev.get("session_id") or "")
+            if remote not in permitted:
+                continue
+            if sess_filter and sess_filter not in (remote, permitted[remote]):
                 continue
             out.append(ev)
         return _json({"ok": True, "events": out[-80:], "server_time": time.time()})
@@ -1935,6 +1974,7 @@ class WebApp:
         sid = request.match_info.get("sid") or ""
         if not duty:
             return _json({"ok": False, "error": "duty_unavailable"}, 503)
+        self._agent_session_require(sess, sid, control=True)
         res = duty.archive_session(sid, reason="manual")
         self.db.audit("web_user", sess["username"], "agent_session_archive",
                       detail={"session_id": sid}, channel="web")
@@ -1946,6 +1986,7 @@ class WebApp:
         sid = request.match_info.get("sid") or ""
         if not duty:
             return _json({"ok": False, "error": "duty_unavailable"}, 503)
+        self._agent_session_require(sess, sid)
         after_id = int(request.rel_url.query.get("after_id") or 0)
         events = duty.events(sid, after_id=after_id, limit=100)
         return _json({"ok": True, "events": events})
@@ -1996,21 +2037,32 @@ class WebApp:
             if key not in allowed:
                 continue
             if key == "require_human_approval":
-                val = "1" if value in (True, 1, "1", "true", "True") else "0"
-            else:
+                if type(value) is not bool:
+                    return _json({"ok": False, "error": "boolean_required", "field": key}, 400)
+                val = "1" if value else "0"
+            elif key == "archive_delay_sec":
+                if type(value) is not int or not 30 <= value <= 3600:
+                    return _json({"ok": False, "error": "invalid_archive_delay", "field": key}, 400)
                 val = str(value)
-            duty.set_setting(key, val, actor=actor)
+            else:
+                if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value):
+                    return _json({"ok": False, "error": "invalid_credential_role", "field": key}, 400)
+                val = str(value)
             changed[key] = val
+        for key, val in changed.items():
+            duty.set_setting(key, val, actor=actor)
         self.db.audit("web_user", actor, "agent_settings_saved",
                       detail={"changed": changed}, channel="web")
         return _json({"ok": True, "changed": changed, "settings": duty.settings()})
 
     async def api_agent_pending_writes(self, request: web.Request) -> web.Response:
-        self._require_auth(request)
+        user = self._require_auth(request)
         bridge = self._bridge()
         if not bridge:
             return _json({"ok": False, "error": "bridge_unavailable"}, 503)
-        return _json({"ok": True, "pending": bridge.list_pending_writes(limit=50)})
+        visible = self._visible_asset_ids(user)
+        pending = [row for row in bridge.list_pending_writes(limit=50) if row.get("target") in visible]
+        return _json({"ok": True, "pending": pending})
 
     async def api_agent_pending_approve(self, request: web.Request) -> web.Response:
         sess = self._require_admin(request)
@@ -2084,13 +2136,14 @@ class WebApp:
         return _json(res)
 
     async def api_agent_pending_actions(self, request: web.Request) -> web.Response:
-        self._require_auth(request)
+        user = self._require_auth(request)
         rows = self.db.query(
             "SELECT id, incident_id, asset_id, object_id, capability, state, mode,"
             " proposer_type, proposer_id, reason, created_at, approval_deadline, params_json"
             " FROM actions WHERE state='proposed' ORDER BY created_at DESC LIMIT 50"
         )
-        return _json({"ok": True, "actions": [dict(r) for r in rows]})
+        visible = self._visible_asset_ids(user)
+        return _json({"ok": True, "actions": [dict(r) for r in rows if r["asset_id"] in visible]})
 
     async def api_executions(self, request: web.Request) -> web.Response:
         """统一查询 actions + session_write_ops（关联 Incident/资产）。"""
@@ -2120,7 +2173,9 @@ class WebApp:
             ]
         except Exception:
             wops = []
-        return _json({"ok": True, "actions": actions, "session_write_ops": wops})
+        visible = self._visible_asset_ids(sess)
+        return _json({"ok": True, "actions": [row for row in actions if row.get("asset_id") in visible],
+                      "session_write_ops": [row for row in wops if row.get("target") in visible]})
 
     # ---- business api ----
 

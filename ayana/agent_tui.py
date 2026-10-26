@@ -30,6 +30,9 @@ MAX_INPUT = 16384
 MAX_BODY = 131072
 MAX_UPSTREAM_BYTES = 8 * 1024 * 1024
 CONTROL_SECONDS = 60.0
+TERMINAL_REPLY = re.compile(
+    r"(?:\x1b\[(?:[?>]?[0-9;]*c|[0-9]+;[0-9]+R|[0-9;]+t|\?[0-9]+u)"
+    r"|\x1b\](?:10|11);rgb:[0-9a-f/]+(?:\x07|\x1b\\))\Z", re.IGNORECASE)
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS agent_runtime_bindings (
  session_id TEXT PRIMARY KEY, remote_session_id TEXT NOT NULL DEFAULT '',
@@ -178,7 +181,7 @@ class AgentTuiManager:
         except Exception:
             raise AgentTuiError("provider_not_verified") from None
 
-    def _token(self, session_id: str, remote_id: str) -> str:
+    def _token(self, session_id: str, remote_id: str, *, start_home: bool = False) -> str:
         _private_directory(self.state_dir)
         _private_directory(self.state_dir / "secrets")
         path = self._file(session_id)
@@ -193,7 +196,7 @@ class AgentTuiManager:
             token = secrets.token_urlsafe(40)
         _atomic_private(path, {"session_id": session_id, "remote_id": remote_id, "token": token,
                               "mimo_bin": self.mimo_bin, "directory": self.workdir, "home": self.home,
-                              "proxy_url": self.proxy_url})
+                              "proxy_url": self.proxy_url, "start_home": start_home})
         self._tokens[hashlib.sha256(token.encode()).hexdigest()] = session_id
         return token
 
@@ -204,13 +207,6 @@ class AgentTuiManager:
         self.ensure_schema()
         _private_directory(self.state_dir)
         _private_directory(self.state_dir / "secrets")
-        if os.name == "posix":
-            # Web owns the loopback proxy; it also keeps the hardened tmux
-            # server available so the first attach does not race a cold start.
-            try:
-                await self.bootstrap_tmux()
-            except AgentTuiError as error:
-                log.warning("agent_tui tmux bootstrap deferred: %s", error.code)
         for path in (self.state_dir / "secrets").glob("*.json"):
             try:
                 config = _read_private(path)
@@ -223,7 +219,7 @@ class AgentTuiManager:
         self._http = ClientSession(timeout=ClientTimeout(total=None, sock_connect=5, sock_read=None), trust_env=False)
         app = web.Application(client_max_size=MAX_BODY)
         app.router.add_route("*", "/{path:.*}", self.proxy_request)
-        self._runner = web.AppRunner(app, access_log=None)
+        self._runner = web.AppRunner(app, access_log=None, shutdown_timeout=2)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.proxy_host, self.proxy_port)
         try:
@@ -237,12 +233,14 @@ class AgentTuiManager:
     async def stop(self) -> None:
         # The proxy may restart with Ayana; tmux and model ownership belong to
         # the independent runtime unit and are deliberately not stopped here.
-        if self._runner is not None:
-            await self._runner.cleanup()
-            self._runner = None
+        # Close upstream SSE before waiting for downstream handlers; otherwise
+        # an attached native client can keep Web shutdown waiting indefinitely.
         if self._http is not None:
             await self._http.close()
             self._http = None
+        if self._runner is not None:
+            await self._runner.cleanup()
+            self._runner = None
 
     def _tmux(self, *arguments: str, timeout: float = 8.0) -> subprocess.CompletedProcess:
         try:
@@ -277,7 +275,7 @@ class AgentTuiManager:
             configured = await asyncio.to_thread(self._tmux, *command)
             # Hardening is idempotent: unbind on an already-clean server and
             # repeat set-option must not block the first operator attach.
-            if configured.returncode and command[0] == "set-option" and command[2] in ("status", "mouse", "remain-on-exit", "exit-empty"):
+            if configured.returncode and command[0] == "set-option":
                 raise AgentTuiError("tmux_hardening_failed")
         if self.socket.exists() and not self.socket.is_symlink():
             self.socket.chmod(0o600)
@@ -306,17 +304,22 @@ class AgentTuiManager:
                 raise AgentTuiError("runtime_binding_changed")
             server = await asyncio.to_thread(self._tmux, "list-sessions")
             if server.returncode:
-                # First attach after a cold start: bring the hardened server up
-                # rather than failing the operator out of the same running task.
-                await self.bootstrap_tmux()
-                server = await asyncio.to_thread(self._tmux, "list-sessions")
-                if server.returncode:
-                    raise AgentTuiError("tmux_runtime_not_started")
+                raise AgentTuiError("tmux_runtime_not_started")
             name = "ayana-" + hashlib.sha256(session_id.encode()).hexdigest()[:24]
             existing = self._binding(session_id)
             if existing and existing.get("remote_session_id") not in ("", remote_id):
                 raise AgentTuiError("runtime_binding_changed")
-            self._token(session_id, remote_id)
+            runtime = self._runtime()
+            attestation = _read_private(Path(runtime.get("runtime_attestation_path") or self.state_dir.parent / "attestation.json"))
+            engine_pid = attestation.get("owner_pid")
+            engine_start = attestation.get("owner_start")
+            if (type(engine_pid) is not int or not engine_start or _identity(engine_pid) != engine_start
+                    or attestation.get("workdir") != self.workdir or attestation.get("home") != self.home):
+                raise AgentTuiError("runtime_binding_changed")
+            client = self.serve_client_factory()
+            client._admit()
+            start_home = sess.get("origin") == "manual" and not await client.messages(remote_id, limit=1)
+            self._token(session_id, remote_id, start_home=start_home)
             pane = await self._pane(name)
             if pane and pane["pane_dead"]:
                 # A dead attach client is not a dead model task: serve still
@@ -345,11 +348,12 @@ class AgentTuiManager:
             t = time.time()
             with self.db.tx() as conn:
                 conn.execute(
-                    "INSERT INTO agent_runtime_bindings(session_id,remote_session_id,runtime_id,tmux_name,pane_id,pane_pid,pane_started_at,created_at,updated_at)"
-                    " VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET remote_session_id=excluded.remote_session_id,"
+                    "INSERT INTO agent_runtime_bindings(session_id,remote_session_id,runtime_id,engine_pid,engine_started_at,tmux_name,pane_id,pane_pid,pane_started_at,created_at,updated_at)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET remote_session_id=excluded.remote_session_id,"
+                    "engine_pid=excluded.engine_pid,engine_started_at=excluded.engine_started_at,"
                     "runtime_id=excluded.runtime_id,tmux_name=excluded.tmux_name,pane_id=excluded.pane_id,pane_pid=excluded.pane_pid,"
                     "pane_started_at=excluded.pane_started_at,updated_at=excluded.updated_at",
-                    (session_id, remote_id, runtime_id, name, pane["pane_id"], pane["pane_pid"], pane["pane_started_at"], t, t))
+                    (session_id, remote_id, runtime_id, engine_pid, engine_start, name, pane["pane_id"], pane["pane_pid"], pane["pane_started_at"], t, t))
             return self.public_binding(self._binding(session_id) or {})
 
     @staticmethod
@@ -411,13 +415,18 @@ class AgentTuiManager:
             if scheme.lower() != "basic":
                 raise ValueError()
             decoded = base64.b64decode(encoded, validate=True).decode()
-            _, token = decoded.split(":", 1)
+            username, token = decoded.split(":", 1)
         except (ValueError, UnicodeError):
             raise AgentTuiError("unauthorized") from None
-        sid = self._tokens.get(hashlib.sha256(token.encode()).hexdigest())
+        # The proxy and Web may be separate processes. A new pane's credential
+        # is resolved from its private SID file, never from a stale token cache.
+        sid = username if LOCAL_ID.fullmatch(username) else self._tokens.get(hashlib.sha256(token.encode()).hexdigest())
         if not sid:
             raise AgentTuiError("unauthorized")
-        config = _read_private(self._file(sid))
+        try:
+            config = _read_private(self._file(sid))
+        except AgentTuiError:
+            raise AgentTuiError("unauthorized") from None
         if not hmac.compare_digest(str(config.get("token") or ""), token):
             raise AgentTuiError("unauthorized")
         session = self._session(sid)
@@ -437,7 +446,7 @@ class AgentTuiManager:
         if isinstance(value, list):
             return [self._sanitize(item) for item in value]
         if isinstance(value, dict):
-            return {key: ("[redacted]" if re.search(r"(?i)(apikey|api_key|password|authorization|secret|token)$", str(key))
+            return {key: ("[redacted]" if re.search(r"(?i)(api[_-]?key|password|authorization|secret|token|private[_-]?key)$|^(key|auth)$", str(key))
                           else self._sanitize(item)) for key, item in value.items()}
         return value
 
@@ -450,19 +459,28 @@ class AgentTuiManager:
             method = request.method.upper()
             relative = path[len("/session/" + remote):] if path.startswith("/session/" + remote + "/") or path == "/session/" + remote else None
             if method in ("GET", "HEAD"):
-                if path == "/event":
-                    return await self._proxy_events(request, remote)
+                if path in ("/event", "/global/event"):
+                    return await self._proxy_events(request, remote, envelope=path == "/global/event")
                 if path in ("/permission", "/question", "/command", "/file/status", "/lsp", "/formatter", "/project"):
                     return web.json_response([])
                 if path == "/path":
                     return web.json_response({"home": self.home, "directory": self.workdir, "worktree": self.workdir})
                 if path == "/config":
                     return web.json_response({"permission": {"*": "deny"}, "agent": {},
-                                              "keybinds": {"editor_open": "none", "suspend": "none"}})
+                                              "default_agent": "ayana-readonly"})
                 if path == "/agent":
-                    return web.json_response([
-                        {"name": "ayana-readonly", "mode": "primary", "description": "Ayana 受限调查", "permission": {"*": "deny"}},
-                        {"name": "ayana-decision", "mode": "primary", "description": "Ayana 处置计划", "permission": {"*": "deny"}}])
+                    agents = await self._upstream("GET", path)
+                    return web.json_response(self._sanitize([a for a in agents if a.get("name") == "ayana-readonly"]))
+                if path in ("/provider/auth", "/experimental/resource"):
+                    return web.json_response({})
+                if path in ("/experimental/workspace", "/experimental/workspace/status", "/skill"):
+                    return web.json_response([])
+                if path in ("/permission/skip-all", "/permission/auto-approve-delete", "/question/never-ask"):
+                    return web.json_response(False)
+                if path == "/permission/ask-timeout":
+                    return web.json_response(None)
+                if path == "/experimental/console":
+                    return web.json_response({"consoleManagedProviders": [], "switchableOrgCount": 0})
                 if path == "/session":
                     info = await self._upstream("GET", "/session/" + remote)
                     return web.json_response([self._sanitize(info)] if isinstance(info, dict) else [])
@@ -471,19 +489,37 @@ class AgentTuiManager:
                     return web.json_response({remote: self._sanitize(info[remote])} if isinstance(info, dict) and remote in info else {})
                 if path in ("/provider", "/config/providers", "/mcp", "/vcs", "/project/current", "/global/health"):
                     return web.json_response(self._sanitize(await self._upstream(method, path)))
-                if relative is not None and (relative == "" or re.fullmatch(r"/(?:message(?:/[A-Za-z0-9_-]+)?|receipt/[A-Za-z0-9_-]+|children|todo|diff)", relative)):
+                if relative is not None and (relative == "" or re.fullmatch(r"/(?:message(?:/[A-Za-z0-9_-]+)?|receipt/[A-Za-z0-9_-]+|children|todo|diff|actors|task|recovery)", relative)):
                     query = dict(request.query)
                     if relative.startswith("/message") and "limit" not in query:
                         query["limit"] = "200"
                     return web.json_response(self._sanitize(await self._upstream(method, path, query=query)))
                 raise AgentTuiError("tui_route_forbidden")
-            if method == "POST" and relative in ("/message", "/prompt_async", "/abort"):
+            if method == "POST" and relative == "/predict":
+                # Native automatic input suggestions are optional. Do not spend
+                # model quota or create an untracked turn for a viewer.
+                return web.Response(status=204)
+            if method == "POST" and path == "/session":
+                # Native welcome page creates its first session on Enter. Bind
+                # that navigation to the RID already reserved by Ayana.
+                if self._session(sid).get("status") != "open":
+                    raise AgentTuiError("session_archived")
+                if not binding.get("controller_connection_id") or float(binding.get("control_expires_at") or 0) <= time.time():
+                    raise AgentTuiError("control_required")
+                raw = await request.read()
+                data = json.loads(raw) if raw else {}
+                if not isinstance(data, dict) or any(key not in ("title", "titleLocale", "directory") for key in data):
+                    raise AgentTuiError("tui_route_forbidden")
+                if await self.serve_client_factory().messages(remote, limit=1):
+                    raise AgentTuiError("native_turn_pending")
+                return web.json_response(self._sanitize(await self._upstream("GET", "/session/" + remote)))
+            if method == "POST" and relative in ("/prompt_async", "/abort"):
                 session = self._session(sid)
                 if session.get("status") != "open":
                     raise AgentTuiError("session_archived")
                 if not binding.get("controller_connection_id") or float(binding.get("control_expires_at") or 0) <= time.time():
                     raise AgentTuiError("control_required")
-                self._runtime()
+                runtime = self._runtime()
                 body = {} if relative == "/abort" else await request.json()
                 if not isinstance(body, dict):
                     raise AgentTuiError("invalid_prompt")
@@ -493,18 +529,44 @@ class AgentTuiManager:
                         raise AgentTuiError("invalid_prompt")
                     if any(not isinstance(part, dict) or part.get("type") != "text" or not isinstance(part.get("text"), str) for part in parts):
                         raise AgentTuiError("text_only_prompt")
+                    if not any(part["text"].strip() for part in parts):
+                        raise AgentTuiError("invalid_prompt")
                     if sum(len(part["text"]) for part in parts) > 20000:
                         raise AgentTuiError("prompt_too_large")
-                    body = {"parts": [{"type": "text", "text": part["text"]} for part in parts], "agent": "ayana-readonly"}
-                status, payload = await self._upstream(method, path, body=body, with_status=True)
+                    from .mimo_serve import native_id
+                    message_id = body.get("messageID")
+                    if message_id is not None:
+                        native_id(message_id)
+                    cleaned = []
+                    for part in parts:
+                        item = {"type": "text", "text": part["text"]}
+                        if part.get("id") is not None:
+                            native_id(part["id"])
+                            item["id"] = part["id"]
+                        cleaned.append(item)
+                    body = {"parts": cleaned, "agent": "ayana-readonly"}
+                    if message_id:
+                        body["messageID"] = message_id
+                    model = str(runtime.get("model") or "")
+                    if model:
+                        provider, sep, model_id = model.partition("/")
+                        if not sep or not provider or not model_id:
+                            raise AgentTuiError("provider_not_verified")
+                        body["model"] = {"providerID": provider, "modelID": model_id}
+                if relative == "/abort":
+                    status, payload = await self._upstream(method, path, body=body, with_status=True)
+                else:
+                    status, payload = await self._submit_prompt(sid, remote, path, body)
                 self.db.audit("web_user", binding.get("controller") or "", "agent_tui_prompt" if relative != "/abort" else "agent_tui_abort",
                               detail={"session_id": sid}, channel="web")
                 return web.Response(status=204) if status == 204 else web.json_response(self._sanitize(payload), status=status)
             raise AgentTuiError("tui_route_forbidden")
         except AgentTuiError as error:
-            status = 401 if error.code == "unauthorized" else 409 if error.code in ("control_required", "runtime_binding_changed") else 403
+            log.warning("native TUI request rejected code=%s method=%s route=%s", error.code, request.method, self._sanitize(request.path[:200]))
+            status = 401 if error.code == "unauthorized" else 409 if error.code in ("control_required", "runtime_binding_changed", "session_turn_busy", "native_turn_pending", "native_turn_unknown", "business_task_running") else 403
             return web.json_response({"name": "AyanaTuiRestricted", "data": {"message": error.code}}, status=status)
-        except Exception:
+        except Exception as error:
+            log.warning("native TUI protocol failure error=%s method=%s", type(error).__name__, request.method)
             return web.json_response({"name": "AyanaTuiUnavailable", "data": {"message": "native_backend_unavailable"}}, status=502)
 
     async def _upstream(self, method, path, *, body=None, query=None, with_status=False):
@@ -518,7 +580,7 @@ class AgentTuiManager:
         async with self._http.request(method, client.base_url + path, json=body, params=params, headers=headers,
                                       allow_redirects=False, timeout=ClientTimeout(total=20)) as response:
             if response.status >= 300:
-                raise AgentTuiError("native_backend_unavailable")
+                raise AgentTuiError("native_http_" + str(response.status))
             if response.status == 204:
                 return (204, {}) if with_status else {}
             try:
@@ -529,6 +591,44 @@ class AgentTuiManager:
                 raise AgentTuiError("native_response_too_large")
             payload = json.loads(raw) if raw else {}
             return (response.status, payload) if with_status else payload
+
+    async def _submit_prompt(self, sid: str, remote: str, path: str, body: dict) -> tuple[int, dict]:
+        from .duty_session import DutySessionManager, NativeTurnBusyError
+        duty = DutySessionManager(self.db)
+        try:
+            async with duty.async_turn(sid, timeout=0):
+                blockers = duty.native_admission_blockers(sid, include_business=True)
+                if blockers:
+                    raise AgentTuiError(blockers[0])
+                client = self.serve_client_factory()
+                client._admit()
+                from .mimo_serve import MimoServeError
+                try:
+                    await client.require_session_idle(remote)
+                except MimoServeError:
+                    raise AgentTuiError("native_turn_pending") from None
+                # Persist uncertainty before transport: a lost response never
+                # makes this session eligible for an automatic prompt replay.
+                duty.set_runtime_state(sid, "unknown", receipt_status="unknown")
+                try:
+                    status, payload = await self._upstream("POST", path, body=body, with_status=True)
+                except AgentTuiError as error:
+                    if error.code in ("native_http_400", "native_http_401", "native_http_403", "native_http_404", "native_http_422"):
+                        duty.set_runtime_state(sid, "idle", receipt_status="failed")
+                    raise
+                if status == 204:
+                    duty.set_runtime_state(sid, "idle", receipt_status="failed")
+                    raise AgentTuiError("native_turn_pending")
+                receipt_id = payload.get("receiptId") if isinstance(payload, dict) else None
+                if status != 202 or not isinstance(receipt_id, str) or not receipt_id:
+                    raise AgentTuiError("native_turn_unknown")
+                duty.record_receipt(sid, remote, receipt_id, origin="tui")
+                duty.set_runtime_state(sid, "running", receipt_id=receipt_id, receipt_status="accepted")
+                return status, payload
+        except NativeTurnBusyError as error:
+            raise AgentTuiError(error.blockers[0]) from None
+        except TimeoutError:
+            raise AgentTuiError("session_turn_busy") from None
 
     @staticmethod
     def _event_matches(value: dict, remote: str) -> bool:
@@ -544,23 +644,22 @@ class AgentTuiManager:
                 for child in item:
                     visit(child)
         visit(value)
+        if value.get("type") in ("session.created", "session.updated", "session.deleted"):
+            info = (value.get("properties") or {}).get("info") or {}
+            if isinstance(info, dict) and isinstance(info.get("id"), str):
+                found.append(info["id"])
         if not found:
-            # Server-level frames and some part deltas omit session IDs.
-            return value.get("type") in (
-                "server.connected", "server.heartbeat",
-                "message.part.delta", "message.part.updated", "message.updated",
-                "session.status", "session.updated",
-            )
-        return remote in found
+            return value.get("type") in ("server.connected", "server.heartbeat")
+        return all(item == remote for item in found)
 
-    async def _proxy_events(self, request, remote):
-        from aiohttp import web, ClientTimeout
+    async def _proxy_events(self, request, remote, *, envelope: bool = False):
+        from aiohttp import web, ClientTimeout, ClientError
         client = self.serve_client_factory()
         headers = client._headers({"Accept": "text/event-stream", "x-mimocode-directory": quote(self.workdir, safe="")})
         async with self._http.get(client.base_url + "/event", params={"directory": self.workdir}, headers=headers,
                                   allow_redirects=False, timeout=ClientTimeout(total=None, sock_connect=5)) as response:
             if response.status != 200:
-                raise AgentTuiError("native_backend_unavailable")
+                raise AgentTuiError("native_http_" + str(response.status))
             output = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
             await output.prepare(request)
             buffer = b""
@@ -577,9 +676,10 @@ class AgentTuiManager:
                         except (ValueError, UnicodeError):
                             continue
                         if isinstance(payload, dict) and self._event_matches(payload, remote):
-                            packet = "data: " + json.dumps(self._sanitize(payload), ensure_ascii=False) + "\n\n"
+                            value = {"directory": self.workdir, "payload": payload} if envelope else payload
+                            packet = "data: " + json.dumps(self._sanitize(value), ensure_ascii=False) + "\n\n"
                             await asyncio.wait_for(output.write(packet.encode()), timeout=10)
-            except (ConnectionError, asyncio.TimeoutError):
+            except (ConnectionError, asyncio.TimeoutError, ClientError):
                 pass
             return output
 
@@ -674,7 +774,7 @@ class AgentTuiManager:
                     if not isinstance(payload, dict):
                         continue
                     kind = payload.get("type")
-                    if kind == "ping":
+                    if kind in ("ping", "heartbeat"):
                         control = self._has_control(session_id, username, connection_id, renew=True)
                         await ws.send_json({"type": "control", "control": control})
                         continue
@@ -691,6 +791,18 @@ class AgentTuiManager:
                         continue
                     if kind == "release":
                         self.release_control(session_id, username, connection_id)
+                        continue
+                    if kind == "terminal_response":
+                        # Terminal capability/color/cursor reports are not user
+                        # keystrokes. Observers must answer native TUI probes;
+                        # no plain text, Return or encoded keyboard event passes.
+                        reply = payload.get("data")
+                        if isinstance(reply, str) and len(reply) <= 256 and TERMINAL_REPLY.fullmatch(reply):
+                            try:
+                                os.write(master, reply.encode())
+                            except (BlockingIOError, OSError):
+                                await ws.close(code=1013)
+                                break
                         continue
                     if kind != "input" or not isinstance(payload.get("data"), str):
                         continue
@@ -754,10 +866,14 @@ def launch_native_attach(state_dir: str, session_id: str) -> None:
     env.update(HOME=home, XDG_CONFIG_HOME=str(Path(home) / ".config"), XDG_DATA_HOME=str(Path(home) / ".local/share"),
                XDG_CACHE_HOME=str(Path(home) / ".cache"),
                PATH=os.pathsep.join([str(Path(binary).parent), "/usr/local/bin", "/usr/bin", "/bin"]), TERM="xterm-256color",
-               MIMOCODE_SERVER_USERNAME="ayana-tui", MIMOCODE_SERVER_PASSWORD=token,
+               MIMOCODE_SERVER_USERNAME=session_id, MIMOCODE_SERVER_PASSWORD=token,
+               MIMOCODE_DISABLE_MODELS_FETCH="1",
                EDITOR="/bin/false", VISUAL="/bin/false", BROWSER="/bin/false", AYANA_MCP_READONLY="1")
     os.chdir(workdir)
-    os.execvpe(binary, [binary, "attach", url, "--session", remote, "--dir", workdir], env)
+    args = [binary, "attach", url, "--dir", workdir]
+    if not config.get("start_home"):
+        args.extend(["--session", remote])
+    os.execvpe(binary, args, env)
 
 
 def main(argv=None) -> int:

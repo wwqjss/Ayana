@@ -340,6 +340,34 @@ class TestExecutionSafety(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"awaiting_approval:{action_id}", self.incident()["need_human_reason"])
         self.assertIn("inspect_remote_disk", self.incident()["need_human_reason"])
 
+    async def test_reconcile_preserves_old_action_when_generation_has_same_timestamp(self):
+        tick = now()
+        with patch("ayana.actions.now", return_value=tick), patch("ayana.db.now", return_value=tick):
+            action_id = self.proposal()
+            self.actions.approve(action_id, approver_id="admin")
+            self.db.execute("UPDATE incidents SET generation=2 WHERE id='inc1'")
+            self.db.event("generation_bumped", incident_id="inc1")
+            self.incidents.set_need_human("inc1", f"awaiting_approval:{action_id} rule=frps")
+            self.incidents.set_need_human("inc1", "inspect_remote_disk")
+            self.assertEqual(self.db.query_one("SELECT created_at FROM actions WHERE id=?", (action_id,))["created_at"],
+                             self.db.query_one("SELECT at FROM events WHERE type='generation_bumped'")["at"])
+            self.incidents.reconcile("inc1")
+        self.assertIn(f"awaiting_approval:{action_id}", self.incident()["need_human_reason"])
+        self.assertIn("inspect_remote_disk", self.incident()["need_human_reason"])
+
+    async def test_reconcile_clears_current_action_when_generation_has_same_timestamp(self):
+        tick = now()
+        with patch("ayana.actions.now", return_value=tick), patch("ayana.db.now", return_value=tick):
+            self.db.execute("UPDATE incidents SET generation=2 WHERE id='inc1'")
+            self.db.event("generation_bumped", incident_id="inc1")
+            action_id = self.proposal()
+            self.actions.approve(action_id, approver_id="admin")
+            self.incidents.set_need_human("inc1", f"awaiting_approval:{action_id} rule=frps")
+            self.incidents.set_need_human("inc1", "inspect_remote_disk")
+            self.incidents.reconcile("inc1")
+        self.assertNotIn(f"awaiting_approval:{action_id}", self.incident()["need_human_reason"])
+        self.assertIn("inspect_remote_disk", self.incident()["need_human_reason"])
+
     async def test_late_passed_verification_preserves_current_generation_obligation(self):
         action_id = self.proposal()
         baseline = now() - 5

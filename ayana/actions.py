@@ -114,6 +114,15 @@ def action_incident_block(store: Any, action: Any) -> tuple[str, str] | None:
     expected = (incident["object_id"] or "").strip()
     if expected and obj and expected not in (obj["id"], obj["name"]):
         return ("incident_mismatch", "关联事件的对象已改变")
+    return action_generation_block(store, row)
+
+
+def action_generation_block(store: Any, action: Any) -> tuple[str, str] | None:
+    """Use durable event order when wall-clock timestamps share a tick."""
+    row = dict(action)
+    incident_id = row.get("incident_id") or ""
+    if not incident_id:
+        return None
     generation = store.execute(
         "SELECT id,at FROM events WHERE incident_id=? AND type IN"
         " ('generation_bumped','incident_reopened','incident_opened') ORDER BY id DESC LIMIT 1",
@@ -1233,7 +1242,7 @@ class ActionService:
             ):
                 reject = ("binding_changed", "asset binding changed during identity wait")
 
-            if reject is None and now() - (fresh["approved_at"] or 0) > self.approval_ttl:
+            if reject is None and now() - (fresh["approved_at"] or 0) >= self.approval_ttl:
                 reject = ("approval_expired", "approval_ttl")
             if reject is None and fresh["approval_deadline"] and now() > float(fresh["approval_deadline"]):
                 reject = ("approval_expired", "approval_deadline")

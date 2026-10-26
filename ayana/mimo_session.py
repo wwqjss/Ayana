@@ -443,9 +443,12 @@ class MimoServeSessionClient(MimoSessionClient):
         detail = {"message_id": message_id, "receipt_id": ""}
         admitted = False
         submitted = False
+        announced = False
         try:
-            self._notify(remote_id, "running", detail)
             client._admit()
+            await client.require_session_idle(remote_id)
+            self._notify(remote_id, "running", detail)
+            announced = True
             submitted = True
             acknowledgement = await client.prompt_async(remote_id, prompt,
                 agent=DECISION_AGENT if self.decision_only else READONLY_AGENT,
@@ -468,9 +471,9 @@ class MimoServeSessionClient(MimoSessionClient):
                     if info.get("error"):
                         raise MimoSessionError("native_turn_failed", "Native model turn returned an error")
                     finish = str(info.get("finish") or "").lower()
-                    finished = bool(clock.get("completed")) and (
+                    finished = receipt_state == "completed" and bool(clock.get("completed")) and (
                         finish in ("stop", "end_turn", "length", "content_filter")
-                        or (receipt_state == "completed" and finish not in ("tool-calls", "tool_calls")))
+                        or finish not in ("tool-calls", "tool_calls"))
                     if finished:
                         parts = final.get("parts") or []
                         text = "\n".join(str(part.get("text") or "") for part in parts
@@ -486,14 +489,23 @@ class MimoServeSessionClient(MimoSessionClient):
             raise MimoSessionError("timeout", "Native turn remains owned by the server; no prompt was replayed or aborted")
         except (MimoServeError, MimoSessionError) as error:
             code = error.code
-            rejected = code in ("native_turn_failed", "native_empty_result", "turn_not_admitted", "invalid_prompt",
-                                "provider_not_verified", "runtime_changed", "http_400", "http_401", "http_403", "http_404", "redirect_rejected")
-            uncertain = (admitted or submitted) and not rejected
-            self._notify(remote_id, "unknown" if uncertain else "failed", {**detail, "error_code": code}, best_effort=True)
-            if isinstance(error, MimoSessionError): raise
+            terminal = code in ("native_turn_failed", "native_empty_result", "turn_not_admitted")
+            # A definitive HTTP rejection of the submission is safe to report
+            # as failed. A later missing receipt (e.g. after owner restart) is
+            # uncertain and must keep the no-replay blocker.
+            rejected = not admitted and code in (
+                "invalid_prompt", "provider_not_verified", "runtime_changed",
+                "session_busy", "session_state_unknown", "http_400", "http_401",
+                "http_403", "http_404", "http_409", "redirect_rejected")
+            uncertain = (admitted or submitted) and not (terminal or rejected)
+            if announced:
+                self._notify(remote_id, "unknown" if uncertain else "failed", {**detail, "error_code": code}, best_effort=True)
+            if isinstance(error, MimoSessionError):
+                raise
             raise MimoSessionError(code, error.message) from None
         except Exception:
-            self._notify(remote_id, "unknown" if admitted or submitted else "failed", {**detail, "error_code": "native_client_failed"}, best_effort=True)
+            if announced:
+                self._notify(remote_id, "unknown" if admitted or submitted else "failed", {**detail, "error_code": "native_client_failed"}, best_effort=True)
             raise MimoSessionError("native_client_failed", "Native model request could not be completed") from None
 
     def resume(self, remote_session_id: str, prompt: str, *, timeout: float | None = None,

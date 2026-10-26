@@ -301,7 +301,7 @@ class App:
             return "mimo"
 
         _serve_port = int(cfg.get("mimo_serve_port") or 6290)
-        _serve_pw = str(cfg.get("mimo_serve_password") or cfg.get("webhook_token") or "ayana-mimo")
+        _serve_pw = str(cfg.get("mimo_serve_password") or cfg.get("webhook_token") or "")
         self.mimo_serve = MimoServeManager(
             mimo_bin=_resolve_mimo_bin(),
             workdir=_native_paths["workdir"],
@@ -342,6 +342,7 @@ class App:
         def _mimo_ready():
             try:
                 _mimo_runtime()
+                self.mimo_serve.validate_runtime()
                 return True
             except Exception:
                 return False
@@ -349,13 +350,8 @@ class App:
         def _receipt(rid, receipt_id, message_id):
             row = self.db.query_one("SELECT id FROM duty_sessions WHERE remote_session_id=?", (rid,))
             if row:
+                self.duty.record_receipt(row["id"], rid, receipt_id, origin="automatic")
                 self.duty.set_runtime_state(row["id"], "running", receipt_id=receipt_id, receipt_status="accepted")
-                t = time.time()
-                self.db.execute(
-                    "INSERT INTO agent_runtime_receipts(receipt_id,session_id,remote_session_id,status,origin,created_at,updated_at) VALUES(?,?,?,?,?,?,?)"
-                    " ON CONFLICT(receipt_id) DO UPDATE SET status=excluded.status,updated_at=excluded.updated_at",
-                    (receipt_id, row["id"], rid, "accepted", "automatic", t, t),
-                )
 
         def _native_state(rid, state, detail):
             row = self.db.query_one("SELECT id FROM duty_sessions WHERE remote_session_id=?", (rid,))
@@ -366,6 +362,14 @@ class App:
                 self.db.execute("UPDATE agent_runtime_receipts SET status=?,updated_at=? WHERE receipt_id=?", (state, time.time(), receipt_id))
             if state == "unknown":
                 self.duty.set_runtime_state(row["id"], "unknown", receipt_id=receipt_id, receipt_status="unknown")
+            elif state in ("completed", "failed", "cancelled") and receipt_id:
+                pending = self.db.query_one(
+                    "SELECT 1 FROM agent_runtime_receipts WHERE session_id=? AND status IN ('accepted','pending','queued','running','unknown')",
+                    (row["id"],),
+                )
+                binding = self.db.query_one("SELECT receipt_id FROM agent_runtime_bindings WHERE session_id=?", (row["id"],))
+                if not pending and binding and binding["receipt_id"] == receipt_id:
+                    self.duty.set_runtime_state(row["id"], "idle", receipt_id=receipt_id, receipt_status=state)
 
         self.mimo_read_client = MimoServeSessionClient(
             mimo_bin=self.mimo_admin.mimo_bin, cwd=self.mimo_admin.workdir,
@@ -387,6 +391,7 @@ class App:
             mimo_bin=self.mimo_admin.mimo_bin, workdir=_native_paths["workdir"],
             home=_native_paths["home"], state_dir=str(Path(_native_paths["state_dir"]) / "tui"),
             proxy_port=int(cfg.get("agent_tui_proxy_port") or 6291), runtime_resolver=_mimo_runtime,
+            redactor=self.mimo_admin._redact,
         )
         # Manual chat shares the verified read-only client rather than a no_mimo bridge.
         self.session_bridge.mimo = self.mimo_read_client
@@ -779,9 +784,10 @@ class App:
         except Exception as e:  # noqa: BLE001
             log.warning("duty recover failed: %s", e)
         self._bg_tasks.append(asyncio.create_task(self._bg_duty_archives()))
-        # The terminal proxy belongs to Web; tmux and execution owner belong
-        # to the independent native runtime service.
-        if self.agent_tui is not None and bool(self.cfg.get("agent_tui_enabled", False)):
+        # Native SSE and its TUI stay with the external task owner. Web owns
+        # browser attachments only; a Web restart must not sever native SSE.
+        if (self.agent_tui is not None and bool(self.cfg.get("agent_tui_enabled", False))
+                and not bool(self.cfg.get("mimo_serve_external", False))):
             await self.agent_tui.start()
         self._bg_tasks.append(asyncio.create_task(self._bg_mimo_serve()))
         self._bg_tasks.append(asyncio.create_task(self._bg_native_receipts()))
@@ -1010,26 +1016,67 @@ class App:
                 except Exception:
                     pass
 
-    async def _bg_native_receipts(self) -> None:
+    async def _reconcile_native_receipts_once(self) -> None:
+        """Observe durable turns, including timed-out ones; never submit/replay."""
         from .mimo_serve import normalize_receipt_status
-        while not self._stop.is_set():
-            rows = self.db.query("SELECT * FROM agent_runtime_receipts WHERE status IN ('accepted','pending','queued','running') ORDER BY updated_at LIMIT 40")
-            for row in rows:
-                try:
-                    receipt = await self.mimo_serve.client().receipt(row["remote_session_id"], row["receipt_id"])
-                    status = normalize_receipt_status(receipt)
-                    if status not in ("completed", "failed", "cancelled"):
+        rows = self.db.query(
+            "SELECT * FROM agent_runtime_receipts WHERE status IN ('accepted','pending','queued','running','unknown') ORDER BY updated_at LIMIT 40"
+        )
+        candidates = {row["session_id"] for row in rows}
+        for row in rows:
+            try:
+                receipt = await self.mimo_serve.client().receipt(row["remote_session_id"], row["receipt_id"])
+                status = normalize_receipt_status(receipt)
+                if status in ("completed", "failed", "cancelled"):
+                    self.db.execute(
+                        "UPDATE agent_runtime_receipts SET status=?,updated_at=? WHERE receipt_id=? AND status IN ('accepted','pending','queued','running','unknown')",
+                        (status, time.time(), row["receipt_id"]),
+                    )
+                else:
+                    self.db.execute("UPDATE agent_runtime_receipts SET updated_at=? WHERE receipt_id=?", (time.time(), row["receipt_id"]))
+            except Exception:
+                # Even a missing receipt is uncertainty, never evidence of failure.
+                self.db.execute("UPDATE agent_runtime_receipts SET status='unknown',updated_at=? WHERE receipt_id=? AND status IN ('accepted','pending','queued','running','unknown')", (time.time(), row["receipt_id"]))
+        # A prior callback can finish the receipt before this observer sees it.
+        candidates.update(row["session_id"] for row in self.db.query(
+            "SELECT session_id FROM agent_runtime_bindings WHERE state IN ('running','busy','unknown') AND receipt_id<>''"
+        ))
+        if not candidates:
+            return
+        try:
+            statuses = await self.mimo_serve.client().session_status()
+            if not isinstance(statuses, dict): return
+        except Exception:
+            return
+        for sid in candidates:
+            try:
+                # Serialize the final check with all prompt submission paths.
+                with self.duty.turn(sid, timeout=0, require_idle=False):
+                    binding = self.db.query_one("SELECT * FROM agent_runtime_bindings WHERE session_id=?", (sid,))
+                    if not binding or not binding["receipt_id"]:
                         continue
-                    self.db.execute("UPDATE agent_runtime_receipts SET status=?,updated_at=? WHERE receipt_id=?", (status, time.time(), row["receipt_id"]))
-                    sid = row["session_id"]
-                    pending = self.db.query_one("SELECT 1 FROM agent_runtime_receipts WHERE session_id=? AND status IN ('accepted','pending','queued','running','unknown')", (sid,))
-                    active = self.db.query_one("SELECT 1 FROM investigation_jobs j JOIN session_incidents si ON si.incident_id=j.incident_id WHERE si.session_id=? AND j.status='running'", (sid,))
-                    if not pending and not active:
-                        self.duty.set_runtime_state(sid, "idle", receipt_id=row["receipt_id"], receipt_status=status)
-                        self.duty.maybe_start_archive_countdown(sid)
-                except Exception:
-                    # Lost observation is not a failed model task and never a replay.
-                    pass
+                    terminal = self.db.query_one("SELECT status FROM agent_runtime_receipts WHERE receipt_id=? AND session_id=?", (binding["receipt_id"], sid))
+                    if not terminal or terminal["status"] not in ("completed", "failed", "cancelled"):
+                        continue
+                    pending = self.db.query_one("SELECT 1 FROM agent_runtime_receipts WHERE session_id=? AND status NOT IN ('completed','done','succeeded','success','failed','cancelled','canceled','aborted','error','rejected')", (sid,))
+                    session = self.duty.get(sid)
+                    rid = str((session or {}).get("remote_session_id") or "")
+                    native = statuses.get(rid)
+                    idle = native is None or (isinstance(native, dict) and native.get("type") == "idle")
+                    if pending or not rid or not idle:
+                        continue
+                    self.duty.set_runtime_state(sid, "idle", receipt_id=binding["receipt_id"], receipt_status=terminal["status"])
+                    self.duty.maybe_start_archive_countdown(sid)
+            except TimeoutError:
+                # A live Ayana owner is still processing this session.
+                continue
+
+    async def _bg_native_receipts(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await self._reconcile_native_receipts_once()
+            except Exception:
+                log.exception("native receipt reconciliation failed")
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=2)
             except asyncio.TimeoutError:

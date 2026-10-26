@@ -12,7 +12,7 @@
 
 <link rel="stylesheet" href="/static/app.css?v=17">
 
-<link rel="stylesheet" href="/static/workbench.css?v=20261028c">
+<link rel="stylesheet" href="/static/workbench.css?v=20261027-native1">
 
 <link rel="stylesheet" href="/static/xterm/xterm.css">
 
@@ -464,35 +464,35 @@
             </div>
             <div class="aw-session-list" id="aw-session-list"></div>
           </aside>
-          <main class="aw-center" id="aw-center">
+          <section class="aw-center" id="aw-center" aria-label="MiMoCode 原生工作区">
             <div class="aw-chat-head" id="aw-chat-head">
               <div class="aw-title-row">
                 <div>
-                  <div class="aw-chat-title" id="aw-chat-title">选择或创建会话</div>
+                  <div class="aw-chat-title" id="aw-chat-title">MiMoCode 工作台</div>
                   <div class="aw-chat-meta" id="aw-chat-meta"></div>
                 </div>
                 <div class="aw-term-actions">
-                  <span id="aw-term-status" class="aw-term-status" title="原生 TUI 状态"></span>
+                  <span id="aw-term-status" class="aw-term-status" role="status">未接入</span>
                   <button type="button" class="btn ghost small hidden" id="aw-term-reconnect">重新接入</button>
-                  <button type="button" class="btn ghost small hidden" id="aw-term-acquire">接管控制</button>
+                  <button type="button" class="btn primary small hidden" id="aw-term-acquire">接管控制</button>
                   <button type="button" class="btn ghost small hidden" id="aw-term-release">释放控制</button>
-                  <button type="button" class="btn primary small" id="aw-term-btn">原生终端</button>
+                  <details class="aw-session-menu">
+                    <summary class="btn ghost small" aria-label="会话操作">···</summary>
+                    <div class="aw-menu-items">
+                      <button type="button" class="btn ghost small hidden" id="aw-term-disconnect">离开视图</button>
+                      <button type="button" class="btn ghost small hidden" id="aw-archive">归档会话</button>
+                      <button type="button" class="btn ghost small hidden" id="aw-reopen">续接为手动会话</button>
+                      <button type="button" class="btn danger small hidden" id="aw-term-stop">停止任务</button>
+                    </div>
+                  </details>
                 </div>
               </div>
             </div>
-            <div class="aw-chat-scroll" id="aw-chat-scroll">
-              <div class="aw-chat-empty muted">左侧选择会话，或点击「+ 新建会话」开始运维任务。</div>
-            </div>
-            <div id="aw-terminal" class="aw-terminal hidden">
-              <div class="aw-term-banner">同一运行任务 · 断开网页不中断后台执行 · 默认仅观察</div>
-              <div id="aw-live-strip" class="aw-live-strip hidden"></div>
+            <div id="aw-terminal" class="aw-terminal">
               <div id="aw-term-host" class="aw-term-host"></div>
+              <div id="aw-term-notice" class="aw-term-notice" role="status" aria-live="polite">选择或新建会话，直接进入 MiMoCode。</div>
             </div>
-            <div class="aw-composer" id="aw-composer">
-              <textarea id="aw-input" rows="2" placeholder="描述运维任务，或继续调查…"></textarea>
-              <button type="button" class="btn primary" id="aw-send">发送</button>
-            </div>
-          </main>
+          </section>
           <aside class="aw-right" id="aw-right">
             <div class="aw-section">
               <h4>任务进度</h4>
@@ -1282,9 +1282,9 @@
 
 <script src="/static/xterm/xterm-addon-fit.js"></script>
 
-<script src="/static/app.js?v=46"></script>
+<script src="/static/app.js?v=47-native1"></script>
 <script src="/static/settings.js?v=20261026"></script>
-<script src="/static/workbench.js?v=20261028c"></script>
+<script src="/static/workbench.js?v=20261027-native2"></script>
 
 </body>
 

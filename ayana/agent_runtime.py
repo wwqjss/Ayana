@@ -9,6 +9,28 @@ import sys
 
 log = logging.getLogger("ayana.agent_runtime")
 
+
+def runtime_is_quiescent(statuses: object, *, pending_receipts: bool, running_jobs: bool) -> bool:
+    """Only explicit idle native lanes and settled Ayana owners allow rotation."""
+    return (isinstance(statuses, dict) and not pending_receipts and not running_jobs
+            and all(isinstance(value, dict) and value.get("type") == "idle"
+                    for value in statuses.values()))
+
+
+async def _check_tmux_owner(tui) -> None:
+    """Never adopt panes from a Web/administrator process cgroup."""
+    result = await asyncio.to_thread(tui._tmux, "display-message", "-p", "#{pid}")
+    if result.returncode:
+        return
+    try:
+        pid = int(result.stdout.strip())
+        owner = Path(f"/proc/{pid}/cgroup").read_text()
+        current = Path("/proc/self/cgroup").read_text()
+        if pid <= 0 or owner != current:
+            raise ValueError()
+    except (OSError, ValueError):
+        raise RuntimeError("tmux_runtime_owner_mismatch") from None
+
 async def run(config_path: str) -> None:
     from .config import load_config
     from .db import Database
@@ -39,12 +61,19 @@ async def run(config_path: str) -> None:
                               port=int(cfg.get("mimo_serve_port") or 6290), username="mimocode", password=password,
                               runtime_resolver=resolver, runtime_attestation_path=paths["attestation"])
     tui = AgentTuiManager(db, manager.client, mimo_bin=binary, workdir=paths["workdir"], home=paths["home"],
-                          state_dir=str(Path(paths["state_dir"])/"tui"), runtime_resolver=resolver)
+                          state_dir=str(Path(paths["state_dir"])/"tui"), runtime_resolver=manager.validate_runtime,
+                          proxy_port=int(cfg.get("agent_tui_proxy_port") or 6291), redactor=admin._redact)
+    # A persistent server must originate in this independent unit. A socket
+    # left by the Web process requires an explicit drained deployment cutover.
+    await _check_tmux_owner(tui)
     await tui.bootstrap_tmux()
+    await _check_tmux_owner(tui)
     stop = asyncio.Event()
     for sig in (signal.SIGTERM, signal.SIGINT): asyncio.get_running_loop().add_signal_handler(sig, stop.set)
     last_error = ""
     try:
+        if bool(cfg.get("agent_tui_enabled", False)):
+            await tui.start()
         while not stop.is_set():
             try:
                 await manager.ensure_running()
@@ -57,10 +86,9 @@ async def run(config_path: str) -> None:
                     probe = MimoServeClient(base_url=manager.base_url, username=manager.username, password=password, directory=paths["workdir"])
                     try:
                         statuses = await probe.session_status()
-                        busy = any(isinstance(value, dict) and value.get("type") in ("busy", "retry") for value in statuses.values())
                         queued = db.query_one("SELECT 1 FROM agent_runtime_receipts WHERE status IN ('accepted','pending','queued','running','unknown')")
                         running = db.query_one("SELECT 1 FROM investigation_jobs WHERE status='running'")
-                        if not busy and not queued and not running:
+                        if runtime_is_quiescent(statuses, pending_receipts=bool(queued), running_jobs=bool(running)):
                             await manager.stop()
                             await manager.start()
                             last_error = ""
@@ -72,6 +100,7 @@ async def run(config_path: str) -> None:
             try: await asyncio.wait_for(stop.wait(), timeout=2)
             except asyncio.TimeoutError: pass
     finally:
+        await tui.stop()
         await manager.stop()
         db.close()
 

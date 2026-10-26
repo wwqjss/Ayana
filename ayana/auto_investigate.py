@@ -275,7 +275,10 @@ class AutoInvestigator:
             phase=str(row["phase"] or "")
             has_action=self.db.query_one("SELECT 1 FROM actions WHERE incident_id=? LIMIT 1",(incident_id,))
             has_write=self.db.query_one("SELECT 1 FROM session_write_ops WHERE incident_id=? LIMIT 1",(incident_id,))
-            safe_decision=(phase=="decision" and not has_action and not has_write and self._incident_is_current(incident_id,int(row["generation"] or 1)))
+            duty = getattr(self.bridge, "duty", None)
+            mapped = duty.session_for_incident(incident_id) if duty else None
+            native_blocked = bool(mapped and duty.native_admission_blockers(mapped["id"]))
+            safe_decision=(phase=="decision" and not has_action and not has_write and not native_blocked and self._incident_is_current(incident_id,int(row["generation"] or 1)))
             if safe_decision:
                 self.db.execute("UPDATE investigation_jobs SET status='queued',phase='resume_decision',lease_expires_at=0,last_error='resume_readonly_decision_after_restart',updated_at=? WHERE incident_id=? AND status='running' AND lease_expires_at<?",(t,incident_id,t));resumed+=1
             else:
@@ -369,8 +372,17 @@ class AutoInvestigator:
         mapping=await asyncio.to_thread(self.bridge.ensure_session,incident_id,generation=int(job.get("generation") or 1))
         if not mapping.get("ok"):return
         sid=mapping["session_id"]
-        async with duty.async_turn(sid,timeout=max(self.config.lease_ttl_sec,900),lease_sec=max(self.config.lease_ttl_sec,self.config.timeout_sec+self.config.decision_timeout_sec+600)):
-            await self._run_job_locked(incident_id,job)
+        from .duty_session import NativeTurnBusyError
+        try:
+            async with duty.async_turn(sid,timeout=max(self.config.lease_ttl_sec,900),lease_sec=max(self.config.lease_ttl_sec,self.config.timeout_sec+self.config.decision_timeout_sec+600)):
+                await self._run_job_locked(incident_id,job)
+        except (NativeTurnBusyError, TimeoutError):
+            # Keep the queued business work, without sending a second model turn
+            # into a still-running or uncertain native owner.
+            self.db.execute(
+                "UPDATE investigation_jobs SET status='queued',lease_expires_at=0,last_error='shared_session_busy',updated_at=? WHERE incident_id=? AND generation=? AND status='running'",
+                (now(), incident_id, generation),
+            )
 
     async def _run_job_locked(self, incident_id: str, job: dict[str, Any]) -> None:
         async with self._sem:

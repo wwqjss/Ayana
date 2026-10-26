@@ -203,6 +203,7 @@ function badge(text, cls) {
 
 /* ---- login（两阶段） ---- */
 function showLogin() {
+  if (typeof window.suspendAgentWorkbench === "function") window.suspendAgentWorkbench();
   if (typeof closeSettings === "function") closeSettings(true);
   if (typeof closeAccountMenu === "function") closeAccountMenu();
   $("login-view").classList.remove("hidden");
@@ -719,6 +720,7 @@ function activateTab(tab, focus, assetView) {
   }
   const valid = ["overview", "incidents", "monitor", "agent", "connections", "notify", "knowledge", "permissions", "audit"];
   if (!valid.includes(tab)) tab = "overview";
+  if (tab !== "agent" && typeof window.suspendAgentWorkbench === "function") window.suspendAgentWorkbench();
   state.tab = tab;
   state.focus = focus || "";
   state.assetView = !!assetView;

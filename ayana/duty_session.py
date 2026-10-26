@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
+import threading
 import time
 import uuid
 from contextlib import contextmanager, asynccontextmanager
@@ -28,6 +29,14 @@ log = __import__("logging").getLogger("ayana.duty_session")
 DEFAULT_ARCHIVE_DELAY_SEC = 300
 _TURN_OWNERS = contextvars.ContextVar("ayana_session_turns", default={})
 _RECEIPT_TERMINAL = frozenset(("completed","done","succeeded","success","failed","cancelled","canceled","aborted","error","rejected"))
+
+
+class NativeTurnBusyError(RuntimeError):
+    code = "session_busy"
+
+    def __init__(self, blockers: list[str]):
+        self.blockers = blockers
+        super().__init__("session_busy: " + ",".join(blockers))
 
 
 class DutySessionManager:
@@ -349,6 +358,41 @@ class DutySessionManager:
         if status not in _RECEIPT_TERMINAL:raise ValueError("receipt_terminal_status_required")
         self.db.execute("UPDATE agent_runtime_receipts SET status=?,updated_at=? WHERE receipt_id=?",(status,now(),receipt_id))
 
+    def native_admission_blockers(self, session_id: str, *, include_business: bool = False) -> list[str]:
+        """Check durable model ownership while the caller holds this session's turn.
+
+        A lease expiring, an HTTP timeout, or a disconnected viewer never proves
+        the native task ended. Known receipts are reconciled without replay by
+        the receipt monitor; missing receipts require explicit reconciliation.
+        """
+        session = self.get(session_id)
+        if not session or session.get("status") != "open":
+            return ["session_not_open"]
+        terminals = tuple(sorted(_RECEIPT_TERMINAL))
+        marks = ",".join("?" for _ in terminals)
+        blockers = []
+        if self.db.query_one(
+            "SELECT 1 FROM agent_runtime_receipts WHERE session_id=? AND status NOT IN (" + marks + ") LIMIT 1",
+            (session_id, *terminals),
+        ):
+            blockers.append("native_turn_pending")
+        binding = self.db.query_one("SELECT state,receipt_status FROM agent_runtime_bindings WHERE session_id=?", (session_id,))
+        if binding:
+            state = str(binding["state"] or "")
+            receipt_status = str(binding["receipt_status"] or "")
+            if state == "unknown" or receipt_status == "unknown":
+                blockers.append("native_turn_unknown")
+            elif receipt_status and receipt_status not in _RECEIPT_TERMINAL and receipt_status != "idle":
+                blockers.append("native_turn_pending")
+            elif state in ("running", "busy", "retry") and receipt_status not in _RECEIPT_TERMINAL:
+                blockers.append("native_turn_pending")
+        if include_business and self.db.query_one(
+            "SELECT 1 FROM investigation_jobs j JOIN session_incidents si ON si.incident_id=j.incident_id WHERE si.session_id=? AND j.status='running' LIMIT 1",
+            (session_id,),
+        ):
+            blockers.append("business_task_running")
+        return list(dict.fromkeys(blockers))
+
     def _turn_key(self, session_id: str):
         return (str(Path(self.db.path).resolve()),session_id)
 
@@ -367,17 +411,43 @@ class DutySessionManager:
         self.db.execute("DELETE FROM agent_session_turns WHERE session_id=? AND owner=?",(session_id,owner))
 
     @contextmanager
-    def turn(self, session_id: str, *, timeout: float = 120, lease_sec: float = 900):
+    def _renew_turn(self, session_id: str, owner: str, lease_sec: float):
+        stop = threading.Event()
+        duration = max(1, lease_sec)
+        def heartbeat():
+            while not stop.wait(min(30, duration / 3)):
+                try:
+                    t = now()
+                    self.db.execute(
+                        "UPDATE agent_session_turns SET expires_at=?,updated_at=? WHERE session_id=? AND owner=?",
+                        (t + duration, t, session_id, owner),
+                    )
+                except Exception:
+                    log.exception("session turn lease renewal failed session_id=%s", session_id)
+        thread = threading.Thread(target=heartbeat, name="ayana-session-lease", daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join(timeout=1)
+
+    @contextmanager
+    def turn(self, session_id: str, *, timeout: float = 120, lease_sec: float = 900, require_idle: bool = True):
         key=self._turn_key(session_id);existing=_TURN_OWNERS.get().get(key)
         if existing:
             yield existing;return
         owner=uuid.uuid4().hex;self._acquire_turn(session_id,owner,timeout,lease_sec)
         token=_TURN_OWNERS.set({**_TURN_OWNERS.get(),key:owner})
-        try:yield owner
+        try:
+            blockers = self.native_admission_blockers(session_id) if require_idle else []
+            if blockers: raise NativeTurnBusyError(blockers)
+            with self._renew_turn(session_id, owner, lease_sec):
+                yield owner
         finally:_TURN_OWNERS.reset(token);self._release_turn(session_id,owner)
 
     @asynccontextmanager
-    async def async_turn(self, session_id: str, *, timeout: float = 120, lease_sec: float = 900):
+    async def async_turn(self, session_id: str, *, timeout: float = 120, lease_sec: float = 900, require_idle: bool = True):
         key=self._turn_key(session_id);existing=_TURN_OWNERS.get().get(key)
         if existing:
             yield existing;return
@@ -389,7 +459,11 @@ class DutySessionManager:
             finally:await asyncio.to_thread(self._release_turn,session_id,owner)
             raise
         token=_TURN_OWNERS.set({**_TURN_OWNERS.get(),key:owner})
-        try:yield owner
+        try:
+            blockers = self.native_admission_blockers(session_id) if require_idle else []
+            if blockers: raise NativeTurnBusyError(blockers)
+            with self._renew_turn(session_id, owner, lease_sec):
+                yield owner
         finally:
             _TURN_OWNERS.reset(token)
             await asyncio.to_thread(self._release_turn,session_id,owner)

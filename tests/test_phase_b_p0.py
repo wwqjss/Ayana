@@ -8,6 +8,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -279,6 +280,22 @@ class TestP002DispatchGate(unittest.TestCase):
 
         with self.assertRaises(ActionError) as ctx:
             asyncio.run(run())
+        self.assertEqual(ctx.exception.code, "approval_expired")
+        self.assertFalse(nt.exec_calls)
+
+    def test_zero_approval_ttl_rejects_dispatch_with_an_identical_clock_tick(self):
+        tmp, db, policy, nt, prom, gate, actions = make_env()
+        self.addCleanup(close_env, tmp, db)
+        actions.approval_ttl = 0
+        with patch("ayana.actions.now", return_value=2000000000.0):
+            prop = actions.propose(
+                asset_id="nerv", object_id="frps", capability="service.restart",
+                proposer_type="web_user", proposer_id="admin",
+                mode="manual", template_id="tmpl_service_restart",
+            )
+            actions.approve(prop["id"], approver_type="web_user", approver_id="admin")
+            with self.assertRaises(ActionError) as ctx:
+                asyncio.run(actions.execute(prop["id"], actor_type="web_user", actor_id="admin"))
         self.assertEqual(ctx.exception.code, "approval_expired")
         self.assertFalse(nt.exec_calls)
 

@@ -1,0 +1,42 @@
+# Independent native task owner. Stopping/restarting the Web unit leaves this
+# unit and its MiMo server/tmux panes running. Drain tasks before runtime restart.
+[Unit]
+Description=Ayana native MiMo task runtime
+After=network-online.target
+Wants=network-online.target
+Before=ayana.service
+
+[Service]
+Type=simple
+User=ayana
+Group=ayana
+WorkingDirectory=/var/lib/ayana/agent-workspace
+ExecStart=/opt/ayana/.venv/bin/python -m ayana.agent_runtime /etc/ayana/config.json
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=30
+UMask=0077
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/ayana
+Environment=HOME=/var/lib/ayana
+Environment=XDG_CONFIG_HOME=/var/lib/ayana/.config
+Environment=XDG_DATA_HOME=/var/lib/ayana/.local/share
+Environment=XDG_STATE_HOME=/var/lib/ayana/.local/state
+Environment=XDG_CACHE_HOME=/var/lib/ayana/.cache
+Environment=LANG=C.UTF-8
+UnsetEnvironment=MIMOCODE_HOME
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ayana
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

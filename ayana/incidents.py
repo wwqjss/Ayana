@@ -563,18 +563,19 @@ class IncidentService:
             " ('generation_bumped','incident_reopened','incident_opened')"
             " ORDER BY id DESC LIMIT 1", (inc_id,),
         )
-        cutoff = float(generation["at"]) if generation else 0.0
         if (generation or gen == 1) and inc.get("need_human") and "awaiting_approval:" in (inc.get("need_human_reason") or ""):
             decided = self.db.query(
-                "SELECT a.id FROM actions a WHERE a.incident_id=? AND a.created_at>=?"
+                "SELECT a.* FROM actions a WHERE a.incident_id=?"
                 " AND a.state IN ('approved','dispatched','success','failure','unknown','cancelled','expired','rejected')"
                 " AND (a.approved_at IS NOT NULL OR a.state IN ('cancelled','expired','rejected')"
                 " OR EXISTS (SELECT 1 FROM verifications v WHERE v.action_id=a.id"
                 " AND v.status='passed' AND (v.generation IS NULL OR v.generation=?)))",
-                (inc_id, cutoff, gen),
+                (inc_id, gen),
             )
+            from .actions import action_generation_block
             for action in decided:
-                self.clear_awaiting_approval(inc_id, action["id"])
+                if action_generation_block(self.db, action) is None:
+                    self.clear_awaiting_approval(inc_id, action["id"])
             inc = dict(self.db.query_one("SELECT * FROM incidents WHERE id=?", (inc_id,)))
 
         firing = self.db.query_one(

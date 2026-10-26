@@ -52,17 +52,36 @@ def native_id(value: str) -> str:
 
 
 def normalize_receipt_status(data: dict[str, Any]) -> str:
-    """Normalize explicit native queue states; unknown never means success."""
-    if not isinstance(data, dict): return "unknown"
-    value: Any = data.get("status") or data.get("state") or data.get("phase") or ""
+    """Normalize native receipt state and outcome without assuming success.
+
+    MiMo 0.1.16 settles both successful and failed turns. ``settled`` alone
+    cannot release a task lease or count as successful business completion.
+    """
+    if not isinstance(data, dict):
+        return "unknown"
+    value: Any = data.get("state") or data.get("status") or data.get("phase") or ""
     if isinstance(value, dict):
         value = value.get("type") or value.get("status") or value.get("state") or value.get("_tag") or value.get("tag") or ""
     value = str(value).lower().replace("-", "_")
-    if value in ("accepted", "queued", "admitted", "pending"): return "pending"
-    if value in ("running", "active", "in_progress"): return "running"
-    if value in ("completed", "succeeded", "success", "done"): return "completed"
-    if value in ("failed", "error", "rejected"): return "failed"
-    if value in ("cancelled", "canceled", "aborted"): return "cancelled"
+    if value == "settled":
+        outcome = data.get("outcome")
+        if outcome == "success" and data.get("consumed") is True:
+            return "completed"
+        if outcome == "assistant_error":
+            return "failed"
+        if outcome in ("interrupted", "never_ran"):
+            return "cancelled"
+        return "unknown"
+    if value in ("accepted", "queued", "admitted", "pending"):
+        return "pending"
+    if value in ("claimed", "running", "active", "in_progress"):
+        return "running"
+    if value in ("completed", "succeeded", "success", "done"):
+        return "completed"
+    if value in ("failed", "error", "rejected"):
+        return "failed"
+    if value in ("cancelled", "canceled", "aborted"):
+        return "cancelled"
     return "unknown"
 
 
@@ -188,6 +207,11 @@ class MimoServeClient:
         data = await self._request("GET", f"/session/{native_id(session_id)}/receipt/{native_id(receipt_id)}")
         if not isinstance(data, dict):
             raise MimoServeError("invalid_receipt", "MiMo receipt must be an object")
+        if data.get("id") not in (None, receipt_id):
+            raise MimoServeError("receipt_binding_mismatch", "Native receipt identity does not match this turn")
+        lane = data.get("lane")
+        if lane is not None and (not isinstance(lane, dict) or lane.get("sessionID") != session_id):
+            raise MimoServeError("receipt_binding_mismatch", "Native receipt belongs to another session")
         return data
 
     @staticmethod
@@ -232,7 +256,20 @@ class MimoServeClient:
         data = await self._request("GET", "/session/status")
         if not isinstance(data, dict):
             raise MimoServeError("invalid_response", "MiMo status must be an object")
-        return data.get(session_id) or {"type": "idle"} if session_id else data
+        if not session_id:
+            return data
+        # Native /session/status omits idle lanes. An explicitly malformed or
+        # unknown state must never be silently converted to idle.
+        value = data.get(session_id, {"type": "idle"})
+        if not isinstance(value, dict) or value.get("type") not in ("idle", "busy", "retry"):
+            raise MimoServeError("session_state_unknown", "Native task state cannot be verified")
+        return value
+
+    async def require_session_idle(self, session_id: str) -> None:
+        native_id(session_id)
+        status = await self.session_status(session_id)
+        if status.get("type") != "idle":
+            raise MimoServeError("session_busy", "This native session already owns an active task")
 
     async def archive_session(self, session_id: str, *, archived: bool = True) -> dict[str, Any]:
         self._admit()

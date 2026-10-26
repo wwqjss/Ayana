@@ -1,203 +1,89 @@
-/* Agent 工作台：三栏会话 / 对话 / 任务信息。使用 app.js 全局 api/el/showModal。 */
+/* One native MiMoCode workspace; Ayana renders business state only. */
 (function () {
-  const appApi = (typeof window.api === "function") ? window.api.bind(window) : null;
-  const appEl = (typeof window.el === "function") ? window.el : null;
-  const appShowModal = (typeof window.showModal === "function") ? window.showModal : null;
-  const appCloseModal = (typeof window.closeModal === "function") ? window.closeModal : null;
-
+  const appApi = typeof window.api === "function" ? window.api.bind(window) : null;
+  const appEl = typeof window.el === "function" ? window.el : null;
+  const appShowModal = typeof window.showModal === "function" ? window.showModal : null;
+  const appCloseModal = typeof window.closeModal === "function" ? window.closeModal : null;
   const state = {
-    sessions: [],
-    currentId: "",
-    detail: null,
-    settings: null,
-    pollTimer: null,
-    lastEventId: 0,
-    collapsedLeft: false,
-    collapsedRight: false,
-    // 实时流
-    liveTimer: null,
-    liveSince: 0,
-    busy: false,
-    busySince: 0,
-    thinkingTimer: null,
-    liveTexts: {},      // partId -> {text, kind, tool, done}
-    liveOrder: [],
+    sessions: [], currentId: "", detail: null, settings: null,
+    active: false, generation: 0, mount: 0, pollTimer: null, polling: false,
+    collapsedLeft: false, collapsedRight: false,
   };
-
-  function $(id) {
-    return document.getElementById(id);
-  }
-
+  const term = {
+    ws: null, xterm: null, fit: null, observer: null, connectionId: "",
+    control: false, ready: false, rendered: false, connecting: false,
+    sessionId: "", attempt: 0, pingTimer: null, paintTimer: null,
+  };
+  const $ = (id) => document.getElementById(id);
   function el(tag, attrs = {}, children = []) {
     if (appEl) return appEl(tag, attrs, children);
-    const n = document.createElement(tag);
-    Object.entries(attrs || {}).forEach(([k, v]) => {
-      if (k === "class") n.className = v;
-      else if (k === "text") n.textContent = v;
-      else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2), v);
-      else if (v !== undefined && v !== null) n.setAttribute(k, v);
+    const node = document.createElement(tag);
+    Object.entries(attrs).forEach(([key, value]) => {
+      if (key === "class") node.className = value;
+      else if (key === "text") node.textContent = value;
+      else if (key.startsWith("on") && typeof value === "function") node.addEventListener(key.slice(2), value);
+      else if (value !== null && value !== undefined) node.setAttribute(key, value);
     });
-    (children || []).forEach((c) => n.appendChild(typeof c === "string" ? document.createTextNode(c) : c));
-    return n;
+    children.forEach((child) => node.appendChild(typeof child === "string" ? document.createTextNode(child) : child));
+    return node;
   }
-
-  async function api(path, opts = {}) {
-    if (appApi) return appApi(path, opts);
-    const res = await fetch(path, {
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
-      ...opts,
-    });
-    try {
-      return await res.json();
-    } catch {
-      return { ok: false, error: "bad_json" };
-    }
+  async function api(path, options = {}) {
+    if (appApi) return appApi(path, options);
+    const response = await fetch(path, { credentials: "same-origin", headers: { "Content-Type": "application/json" }, ...options });
+    try { return await response.json(); } catch (_) { return { ok: false, error: "bad_response" }; }
   }
-
-  function fmtTime(ts) {
-    if (!ts) return "";
-    const d = new Date(Number(ts) * 1000);
-    if (Number.isNaN(d.getTime())) return "";
-    return d.toLocaleString("zh-CN", { hour12: false });
+  function fmtTime(timestamp) {
+    if (!timestamp) return "";
+    const date = new Date(Number(timestamp) * 1000);
+    return Number.isNaN(date.getTime()) ? "" : date.toLocaleString("zh-CN", { hour12: false });
   }
+  const current = (sid, generation) => state.active && state.currentId === sid && state.generation === generation;
+  const sessionPath = (sid) => "/api/agent/sessions/" + encodeURIComponent(sid);
+  const manageable = () => !!state.detail && (state.detail.can_prepare === true || state.detail.can_control === true || (state.detail.can_prepare === undefined && state.detail.can_control === undefined));
+  const openSession = () => state.detail && state.detail.session && state.detail.session.status === "open";
 
-  function esc(s) {
-    return String(s == null ? "" : s)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
+  function notice(text = "", failure = false) {
+    const box = $("aw-term-notice");
+    if (!box) return;
+    box.textContent = text;
+    box.classList.toggle("hidden", !text);
+    box.classList.toggle("error", failure);
   }
-
-  // ---- 左栏：会话列表 ----
   function renderSessionList() {
     const root = $("aw-session-list");
     if (!root) return;
     root.innerHTML = "";
-    if (!state.sessions.length) {
-      root.appendChild(el("div", { class: "aw-muted", text: "暂无会话" }));
-      return;
-    }
     const groups = [
-      { key: "auto-open", label: "自动值班", items: [] },
-      { key: "manual-open", label: "手动会话", items: [] },
-      { key: "history", label: "历史", items: [] },
+      ["自动值班", state.sessions.filter((item) => item.status === "open" && item.origin === "auto")],
+      ["手动会话", state.sessions.filter((item) => item.status === "open" && item.origin === "manual")],
+      ["历史", state.sessions.filter((item) => item.status !== "open" || !["auto", "manual"].includes(item.origin))],
     ];
-    state.sessions.forEach((s) => {
-      if (s.status === "open" && s.origin === "auto") groups[0].items.push(s);
-      else if (s.status === "open" && s.origin === "manual") groups[1].items.push(s);
-      else groups[2].items.push(s);
-    });
-    groups.forEach((g) => {
-      if (!g.items.length) return;
-      root.appendChild(el("div", { class: "aw-group-label", text: g.label }));
-      g.items.forEach((s) => {
-        const active = s.id === state.currentId;
-        const item = el("button", {
-          type: "button",
-          class: "aw-session-item" + (active ? " active" : ""),
-          onclick: () => selectSession(s.id),
+    if (!state.sessions.length) root.appendChild(el("div", { class: "aw-muted", text: "暂无会话" }));
+    groups.forEach(([label, items]) => {
+      if (!items.length) return;
+      root.appendChild(el("div", { class: "aw-group-label", text: label }));
+      items.forEach((item) => {
+        const button = el("button", {
+          type: "button", class: "aw-session-item" + (item.id === state.currentId ? " active" : ""),
+          onclick: () => selectSession(item.id),
+          "aria-current": item.id === state.currentId ? "true" : "false",
         }, [
-          el("div", { class: "aw-session-title", text: s.title || s.id }),
-          el("div", { class: "aw-session-meta", text: `${fmtTime(s.updated_at || s.created_at)} · ${s.incident_count || 0} 个工单` }),
+          el("div", { class: "aw-session-title", text: item.title || item.id }),
+          el("div", { class: "aw-session-meta", text: `${fmtTime(item.updated_at || item.created_at)} · ${item.incident_count || 0} 个工单` }),
         ]);
-        if (s.archive_due_at > 0) {
-          item.appendChild(el("div", { class: "aw-session-badge warn", text: "即将归档" }));
-        } else if (s.status === "archived") {
-          item.appendChild(el("div", { class: "aw-session-badge", text: "已归档" }));
-        }
-        root.appendChild(item);
+        if (item.archive_due_at > 0) button.appendChild(el("div", { class: "aw-session-badge warn", text: "归档缓冲中" }));
+        else if (item.status === "archived") button.appendChild(el("div", { class: "aw-session-badge", text: "已归档" }));
+        root.appendChild(button);
       });
     });
   }
-
-  // ---- 中栏：对话流 ----
-  function renderMessages() {
-    const root = $("aw-chat-scroll");
-    if (!root) return;
-    const d = state.detail;
-    if (!d || !d.session) {
-      root.innerHTML = '<div class="aw-chat-empty muted">左侧选择会话，或点击「+ 新建会话」开始运维任务。</div>';
-      return;
-    }
-    const keepScroll = root.scrollTop;
-    const nearBottom = root.scrollHeight - root.scrollTop - root.clientHeight < 80;
-    root.innerHTML = "";
-    const msgs = d.messages || [];
-    if (!msgs.length) {
-      root.appendChild(el("div", { class: "aw-chat-empty muted", text: "会话已就绪。输入任务开始调查，或点右上「原生终端」进入同一运行任务。" }));
-    }
-    msgs.forEach((m) => {
-      root.appendChild(renderMessage(m));
-    });
-    (d.events || []).forEach((ev) => {
-      if (ev.type === "session_created" || ev.type === "incident_joined" || ev.type === "archive_scheduled") {
-        root.appendChild(el("div", { class: "aw-sys-event", text: ev.title || ev.type }));
-      }
-    });
-    if (nearBottom) root.scrollTop = root.scrollHeight;
-    else root.scrollTop = keepScroll;
-  }
-
-  function renderMessage(m) {
-    const role = m.role || "assistant";
-    const kind = m.kind || "text";
-    const cls = role === "user" ? "user" : role === "system" ? "system error" : "assistant";
-    const wrap = el("div", { class: "aw-msg " + cls + " kind-" + kind });
-    const roleLabel = role === "user" ? "你" : role === "system" ? "系统" : "Agent";
-    wrap.appendChild(el("div", { class: "aw-msg-role", text: roleLabel }));
-    if (m.title) wrap.appendChild(el("div", { class: "aw-msg-title", text: m.title }));
-    const body = el("div", { class: "aw-msg-body" });
-    const text = m.body || "";
-    if (kind === "error" || role === "system") {
-      body.appendChild(el("div", { class: "aw-msg-text", text: text || "（无输出）" }));
-    } else if (text.length > 600) {
-      const pre = el("pre", { class: "aw-log collapsed", text: text.slice(0, 600) + "…" });
-      const btn = el("button", {
-        type: "button",
-        class: "btn ghost small",
-        text: "展开完整日志",
-        onclick: () => {
-          pre.classList.toggle("collapsed");
-          pre.textContent = pre.classList.contains("collapsed") ? text.slice(0, 600) + "…" : text;
-          btn.textContent = pre.classList.contains("collapsed") ? "展开完整日志" : "折叠";
-        },
-      });
-      body.appendChild(pre);
-      body.appendChild(btn);
-    } else if (kind === "mimo_result" || kind === "tool") {
-      body.appendChild(el("pre", { class: "aw-log", text: text || "（无输出）" }));
-    } else {
-      body.appendChild(el("div", { class: "aw-msg-text", text: text }));
-    }
-    wrap.appendChild(body);
-    wrap.appendChild(el("div", { class: "aw-msg-time", text: fmtTime(m.created_at) }));
-    return wrap;
-  }
-
   function renderHeader() {
-    const d = state.detail;
-    const title = $("aw-chat-title");
-    const meta = $("aw-chat-meta");
-    if (!title || !meta) return;
-    if (!d || !d.session) {
-      title.textContent = "选择或创建会话";
-      meta.textContent = "";
-      return;
-    }
-    const s = d.session;
-    title.textContent = s.title || s.id;
-    const bits = [
-      s.origin === "auto" ? "自动值班" : "手动",
-      s.status === "open" ? "进行中" : "已归档",
-      fmtTime(s.created_at),
-    ];
-    if (s.archive_due_at > 0) bits.push("归档倒计时中");
-    meta.textContent = bits.join(" · ");
+    const session = state.detail && state.detail.session;
+    const title = $("aw-chat-title"), meta = $("aw-chat-meta");
+    if (title) title.textContent = session ? session.title || session.id : "MiMoCode 工作台";
+    if (meta) meta.textContent = session ? [session.origin === "auto" ? "自动值班" : "手动会话", session.status === "open" ? "进行中" : "已归档", session.archive_due_at > 0 ? "归档缓冲中" : ""].filter(Boolean).join(" · ") : "";
+    updateTermUi();
   }
-
-  // ---- 右栏 ----
   function renderRight() {
     const d = state.detail;
     const prog = $("aw-progress");
@@ -269,6 +155,7 @@
         ]);
         pend.appendChild(row);
       });
+      pend.querySelectorAll("button").forEach((button) => { button.disabled = !manageable() || !openSession(); });
     }
     if (res) {
       res.innerHTML = "";
@@ -282,315 +169,119 @@
     }
   }
 
-  async function approveWrite(w) {
-    const r = await api("/api/agent/pending-writes/approve", {
-      method: "POST",
-      body: JSON.stringify({ incident_id: w.incident_id, action_key: w.action_key }),
-    });
-    if (!r.ok) alert(r.message || r.error || "批准失败");
-    await loadDetail(state.currentId);
-  }
 
-  async function rejectWrite(w) {
-    const r = await api("/api/agent/pending-writes/reject", {
-      method: "POST",
-      body: JSON.stringify({ incident_id: w.incident_id, action_key: w.action_key, reason: "human_rejected" }),
-    });
-    if (!r.ok) alert(r.message || r.error || "拒绝失败");
-    await loadDetail(state.currentId);
+  const pendingDecisions = new Set();
+  async function decide(path, body, key) {
+    if (pendingDecisions.has(key)) return;
+    pendingDecisions.add(key);
+    const sid = state.currentId, generation = state.generation;
+    try {
+      const result = await api(path, { method: "POST", body: JSON.stringify(body) });
+      if (!result || !result.ok) alert(result && (result.message || result.error) || "操作未完成，请查看当前状态。");
+      if (current(sid, generation)) await loadDetail(sid, generation);
+    } catch (_) { alert("请求未完成，请刷新核对操作状态。不要重复提交未确认的执行请求。"); }
+    finally { pendingDecisions.delete(key); }
   }
-
-  async function approveAction(a) {
-    const r = await api(`/api/actions/${a.id}/decision`, {
-      method: "POST",
-      body: JSON.stringify({ decision: "execute_once" }),
-    });
-    if (!r.ok) alert(r.message || r.error || "批准失败");
-    await loadDetail(state.currentId);
+  function approveWrite(write) {
+    if (pendingDecisions.has("write:" + write.action_key)) return;
+    if (!confirm("批准该操作？执行仍受 Ayana 权限与审计约束。")) return;
+    return decide("/api/agent/pending-writes/approve", { incident_id: write.incident_id, action_key: write.action_key }, "write:" + write.action_key);
   }
-
-  async function rejectAction(a) {
-    const r = await api(`/api/actions/${a.id}/reject`, {
-      method: "POST",
-      body: JSON.stringify({ reason: "human_rejected" }),
-    });
-    if (!r.ok) alert(r.message || r.error || "拒绝失败");
-    await loadDetail(state.currentId);
+  function rejectWrite(write) {
+    return decide("/api/agent/pending-writes/reject", { incident_id: write.incident_id, action_key: write.action_key, reason: "human_rejected" }, "write:" + write.action_key);
   }
-
-  // ---- 数据加载 ----
+  function approveAction(action) {
+    if (pendingDecisions.has("action:" + action.id)) return;
+    const totp = prompt("动态验证码（若账号已启用 2FA，否则留空）:", "");
+    if (totp === null) return;
+    return decide("/api/actions/" + encodeURIComponent(action.id) + "/decision", { decision: "execute_once", totp }, "action:" + action.id);
+  }
+  function rejectAction(action) {
+    return decide("/api/actions/" + encodeURIComponent(action.id) + "/reject", { reason: "human_rejected" }, "action:" + action.id);
+  }
   async function loadSessions() {
-    const r = await api("/api/agent/sessions?limit=50");
-    if (r && r.ok) {
-      state.sessions = r.sessions || [];
-      if (r.settings) state.settings = r.settings;
+    const mount = state.mount;
+    const result = await api("/api/agent/sessions?limit=100");
+    if (!state.active || state.mount !== mount) return false;
+    if (!result || !result.ok) return false;
+    state.sessions = result.sessions || [];
+    if (result.settings) state.settings = result.settings;
+    renderSessionList();
+    return true;
+  }
+  async function loadDetail(sid, generation = state.generation) {
+    if (!sid) return false;
+    const result = await api(sessionPath(sid));
+    if (!current(sid, generation)) return false;
+    if (!result || !result.ok) {
+      notice(result && (result.message || result.error) || "无法读取会话。", true);
+      return false;
     }
-    renderSessionList();
+    state.detail = result;
+    renderHeader(); renderRight(); renderSessionList();
+    return true;
   }
-
-  async function loadDetail(sid) {
-    if (!sid) return;
-    const r = await api("/api/agent/sessions/" + encodeURIComponent(sid));
-    if (!r || !r.ok) return;
-    state.detail = r;
-    state.currentId = sid;
-    renderHeader();
-    renderMessages();
-    renderRight();
-    renderSessionList();
-  }
-
   async function selectSession(sid) {
-    if (term.sessionId && sid !== term.sessionId) {
-      disconnectTerminal();
-      if (term.visible) showTerminalPanel(false);
-    }
+    const generation = ++state.generation;
+    disconnectTerminal();
     state.currentId = sid;
-    state.lastEventId = 0;
-    state.liveTexts = {};
-    state.liveOrder = [];
-    state.liveSince = Date.now() / 1000;
-    renderSessionList();
-    await loadDetail(sid);
-  }
-
-  async function createSession() {
-    const title = prompt("会话标题（可留空）", "") || "";
-    const promptText = prompt("初始任务描述（可留空，稍后在对话中输入）", "") || "";
-    const r = await api("/api/agent/sessions", {
-      method: "POST",
-      body: JSON.stringify({ title, prompt: promptText }),
-    });
-    if (!r || !r.ok) {
-      alert(r && (r.message || r.error) || "创建失败");
-      return;
-    }
-    await loadSessions();
-    await selectSession(r.session_id);
-  }
-
-  async function sendPrompt() {
-    const input = $("aw-input");
-    if (!input || !state.currentId) return;
-    const text = input.value.trim();
-    if (!text) return;
-    const sid = state.currentId;
-    input.value = "";
-    // 乐观展示
-    const scroll = $("aw-chat-scroll");
-    if (scroll) {
-      scroll.appendChild(el("div", { class: "aw-msg user pending" }, [
-        el("div", { class: "aw-msg-role", text: "你" }),
-        el("div", { class: "aw-msg-text", text }),
-        el("div", { class: "aw-msg-time", text: "已发送" }),
-      ]));
-      scroll.scrollTop = scroll.scrollHeight;
-    }
-    // 不阻塞输入框；按钮变停止
-    setBusy(true);
+    state.detail = null;
+    renderHeader(); renderRight(); renderSessionList();
+    notice("正在读取会话…");
     try {
-      const r = await api(`/api/agent/sessions/${encodeURIComponent(sid)}/prompt`, {
-        method: "POST",
-        body: JSON.stringify({ prompt: text }),
-      });
-      if (!r || !r.ok) {
-        const msg = (r && (r.message || r.error)) || "发送失败";
-        if (scroll) {
-          scroll.appendChild(el("div", { class: "aw-msg system error" }, [
-            el("div", { class: "aw-msg-role", text: "系统" }),
-            el("div", { class: "aw-msg-title", text: "发送失败" }),
-            el("div", { class: "aw-msg-text", text: msg }),
-          ]));
-          scroll.scrollTop = scroll.scrollHeight;
-        }
-        setBusy(false);
-      } else {
-        state.liveSince = Date.now();
-        startLive();
-        await loadDetail(sid);
-      }
-    } catch (e) {
-      if (scroll) {
-        scroll.appendChild(el("div", { class: "aw-msg system error" }, [
-          el("div", { class: "aw-msg-role", text: "系统" }),
-          el("div", { class: "aw-msg-text", text: "网络错误：" + (e && e.message ? e.message : e) }),
-        ]));
-      }
-      setBusy(false);
+      if (await loadDetail(sid, generation)) await connectTerminal(sid, generation);
+    } catch (_) {
+      if (current(sid, generation)) notice("会话暂不可达，请重试。", true);
     }
   }
-
-  function setBusy(on) {
-    state.busy = !!on;
-    const btn = $("aw-send");
-    if (!btn) return;
-    if (on) {
-      state.busySince = Date.now();
-      btn.textContent = "停止";
-      btn.classList.add("danger");
-      btn.onclick = abortCurrent;
-    } else {
-      btn.textContent = "发送";
-      btn.classList.remove("danger");
-      btn.onclick = sendPrompt;
-      if (state.thinkingTimer) clearInterval(state.thinkingTimer);
-      state.thinkingTimer = null;
-    }
+  function createSession() {
+    if (!appShowModal) { notice("会话创建面板暂不可用。", true); return; }
+    const input = el("input", { type: "text", maxlength: "120", placeholder: "会话标题（可留空）", "aria-label": "会话标题" });
+    const error = el("p", { class: "aw-muted", role: "status" });
+    const save = el("button", { type: "button", class: "btn primary", text: "创建会话", onclick: async () => {
+      if (save.disabled) return;
+      save.disabled = true;
+      const mount = state.mount;
+      try {
+        const result = await api("/api/agent/sessions", { method: "POST", body: JSON.stringify({ title: input.value.trim() }) });
+        if (!state.active || mount !== state.mount) return;
+        if (!result || !result.ok) { error.textContent = result && (result.message || result.error) || "创建失败"; return; }
+        if (appCloseModal) appCloseModal();
+        await loadSessions();
+        if (state.active && mount === state.mount) await selectSession(result.session_id);
+      } catch (_) { error.textContent = "创建请求未完成，请核对左侧会话列表。"; }
+      finally { save.disabled = false; }
+    } });
+    appShowModal("新建手动会话", [el("div", { class: "form-col" }, [input, el("p", { class: "aw-muted", text: "创建后直接进入 MiMoCode，在原生输入框中开始任务。" }), error, save])]);
   }
-
   async function abortCurrent() {
-    if (!state.currentId) return;
+    const sid = state.currentId, generation = state.generation;
+    if (!sid || !confirm("停止当前 MiMo 任务？断开页面无需停止任务。")) return;
     try {
-      await api(`/api/agent/sessions/${encodeURIComponent(state.currentId)}/abort`, {
-        method: "POST",
-        body: JSON.stringify({}),
-      });
-    } catch (e) { /* ignore */ }
-    setBusy(false);
-    renderStatusLine("已停止");
-    await loadDetail(state.currentId);
+      const result = await api(sessionPath(sid) + "/abort", { method: "POST", body: "{}" });
+      if (!current(sid, generation)) return;
+      if (!result || !result.ok) notice(result && (result.message || result.error) || "停止请求未确认。", true);
+      else notice("已发送停止请求，正在核对任务状态。");
+      await loadDetail(sid, generation);
+    } catch (_) { if (current(sid, generation)) notice("停止请求未确认，请检查任务状态。", true); }
   }
-
-  function renderStatusLine(text) {
-    let bar = $("aw-status-bar");
-    const head = $("aw-title-row") || $("aw-chat-head");
-    if (!head) return;
-    if (!bar) {
-      bar = el("div", { id: "aw-status-bar", class: "aw-status-bar" });
-      const actions = head.querySelector(".aw-term-actions");
-      if (actions) actions.insertBefore(bar, actions.firstChild);
-      else head.appendChild(bar);
-    }
-    if (!text) {
-      bar.classList.add("hidden");
-      bar.textContent = "";
-      return;
-    }
-    bar.classList.remove("hidden");
-    bar.textContent = text;
-  }
-
-  function startLive() {
-    stopLive();
-    state.liveSince = state.liveSince || Date.now();
-    // 计时器：正在思考 Ns
-    state.thinkingTimer = setInterval(() => {
-      if (!state.busy) return;
-      const sec = Math.round((Date.now() - state.busySince) / 1000);
-      const last = state.liveOrder.length ? state.liveOrder[state.liveOrder.length - 1] : null;
-      const hint = last && last.tool ? `正在执行 ${last.tool}` : "正在思考";
-      renderStatusLine(`${hint}  ${sec}s`);
-    }, 1000);
-    renderStatusLine("正在思考  0s");
-    state.liveTimer = setInterval(pullLiveEvents, 1000);
-    pullLiveEvents();
-  }
-
-  function stopLive() {
-    if (state.liveTimer) clearInterval(state.liveTimer);
-    state.liveTimer = null;
-    if (state.thinkingTimer) clearInterval(state.thinkingTimer);
-    state.thinkingTimer = null;
-  }
-
-  async function pullLiveEvents() {
-    try {
-      const r = await api(`/api/agent/events?after=${encodeURIComponent(state.liveSince || 0)}`);
-      if (!r || !r.ok) return;
-      state.liveSince = r.server_time || Date.now() / 1000;
-      const evs = r.events || [];
-      let touched = false;
-      evs.forEach((ev) => {
-        if (ev.kind === "status") {
-          if (ev.status === "busy") {
-            if (!state.busy) setBusy(true);
-          } else if (ev.status && ev.status !== "busy") {
-            setBusy(false);
-            renderStatusLine(ev.status === "idle" ? "" : ev.status);
-            touched = true;
-          }
-        } else if (ev.kind === "delta" && ev.delta) {
-          const p = state.liveTexts[ev.part_id] || { text: "", kind: "text", tool: "" };
-          p.text += (ev.delta == null ? "" : String(ev.delta));
-          state.liveTexts[ev.part_id] = p;
-          if (!state.liveOrder.find((x) => x.id === ev.part_id)) {
-            state.liveOrder.push({ id: ev.part_id, kind: p.kind, tool: p.tool, msg: ev.message_id });
-          }
-          renderLiveStream();
-          touched = true;
-        } else if (ev.kind === "part") {
-          const p = state.liveTexts[ev.part_id] || {};
-          p.kind = ev.part_type || p.kind || "text";
-          p.tool = ev.tool || p.tool || "";
-          if (ev.text != null && ev.text !== "") p.text = String(ev.text);
-          p.done = !!(ev.state && String(ev.state).indexOf("end") >= 0) || p.kind === "step-finish";
-          state.liveTexts[ev.part_id] = p;
-          if (!state.liveOrder.find((x) => x.id === ev.part_id)) {
-            state.liveOrder.push({ id: ev.part_id, kind: p.kind, tool: p.tool, msg: ev.message_id });
-          }
-          renderLiveStream();
-          touched = true;
-        }
-      });
-      if (touched && state.busy) {
-        const scroll = $("aw-chat-scroll");
-        if (scroll) scroll.scrollTop = scroll.scrollHeight;
-      }
-      // 无事件且超过 5 分钟则解除 busy，防卡死
-      if (state.busy && Date.now() - state.busySince > 5 * 60 * 1000) {
-        setBusy(false);
-        renderStatusLine("超时未完成，可重试");
-      }
-    } catch (e) { /* poll ignore */ }
-  }
-
-  function renderLiveStream() {
-    renderLiveStrip();
-    let box = $("aw-live-stream");
-    const scroll = $("aw-chat-scroll");
-    if (!scroll) return;
-    if (!box) {
-      box = el("div", { id: "aw-live-stream", class: "aw-live-stream" });
-      scroll.appendChild(box);
-    }
-    box.innerHTML = "";
-    state.liveOrder.slice(-6).forEach((item) => {
-      const p = state.liveTexts[item.id] || {};
-      const kind = p.kind || item.kind || "text";
-      const card = el("div", { class: "aw-live-card k-" + kind });
-      if (kind === "step-start") {
-        card.appendChild(el("div", { class: "aw-live-title", text: "· 开始一步" }));
-      } else if (kind === "step-finish") {
-        card.appendChild(el("div", { class: "aw-live-title", text: "· 完成一步" }));
-      } else if (kind === "reasoning") {
-        card.appendChild(el("div", { class: "aw-live-title", text: "思考" }));
-        card.appendChild(el("div", { class: "aw-live-text", text: (p.text || "").slice(0, 500) || "…" }));
-      } else if (kind === "tool" || kind === "tool-call" || kind === "tool_use") {
-        card.appendChild(el("div", { class: "aw-live-title", text: "工具 " + (p.tool || "") }));
-        const pre = el("pre", { class: "aw-log collapsed", text: (p.text || "").slice(0, 400) || "…" });
-        card.appendChild(pre);
-      } else {
-        card.appendChild(el("div", { class: "aw-live-title", text: "Agent" }));
-        card.appendChild(el("div", { class: "aw-live-text", text: p.text || "…" }));
-      }
-      box.appendChild(card);
-    });
-    scroll.scrollTop = scroll.scrollHeight;
-  }
-
   async function archiveCurrent() {
-    if (!state.currentId) return;
-    if (!confirm("归档该会话？历史仍可查看。")) return;
-    const r = await api(`/api/agent/sessions/${encodeURIComponent(state.currentId)}/archive`, {
-      method: "POST",
-      body: JSON.stringify({}),
-    });
-    if (!r || !r.ok) alert((r && (r.message || r.error)) || "归档失败");
-    await loadSessions();
-    await loadDetail(state.currentId);
+    const sid = state.currentId, generation = state.generation;
+    if (!sid || !confirm("归档当前会话？仍有运行任务或待审批时将保留会话。")) return;
+    const result = await api(sessionPath(sid) + "/archive", { method: "POST", body: "{}" });
+    if (!current(sid, generation)) return;
+    if (!result || !result.ok) notice(result && (result.message || result.error) || "当前会话暂不能归档。", true);
+    await loadSessions(); await loadDetail(sid, generation);
   }
-
-  // ---- Agent 设置 ----
+  async function reopenCurrent() {
+    const sid = state.currentId, generation = state.generation;
+    if (!sid || !confirm("将此历史会话续接为手动会话？自动值班会话继续独立运行。")) return;
+    const result = await api(sessionPath(sid) + "/reopen", { method: "POST", body: "{}" });
+    if (!current(sid, generation)) return;
+    if (!result || !result.ok) { notice(result && (result.message || result.error) || "续接失败。", true); return; }
+    await loadSessions();
+    if (current(sid, generation)) await selectSession(sid);
+  }
   async function openAgentSettings() {
     const r = await api("/api/agent/settings");
     const settings = (r && r.settings) || {};
@@ -643,445 +334,245 @@
     }
   }
 
-  // ---- 轮询实时更新 ----
-  function startPoll() {
-    stopPoll();
-    state.pollTimer = setInterval(async () => {
-      if (state.currentId) await loadDetail(state.currentId);
-      await loadSessions();
-    }, 15000);
-    startLive();
-  }
-
-  function stopPoll() {
-    if (state.pollTimer) clearInterval(state.pollTimer);
-    state.pollTimer = null;
-    stopLive();
-  }
-
-  // ---- 布局 ----
-  function toggleLeft() {
-    state.collapsedLeft = !state.collapsedLeft;
-    const left = $("aw-left");
-    const wb = $("agent-workbench");
-    if (left) left.classList.toggle("collapsed", state.collapsedLeft);
-    if (wb) wb.classList.toggle("left-collapsed", state.collapsedLeft);
-  }
-
-  function toggleRight() {
-    state.collapsedRight = !state.collapsedRight;
-    const right = $("aw-right");
-    const wb = $("agent-workbench");
-    if (right) right.classList.toggle("collapsed", state.collapsedRight);
-    if (wb) wb.classList.toggle("right-collapsed", state.collapsedRight);
-  }
-
-  function bind() {
-    const nb = $("aw-new-session");
-    if (nb) nb.onclick = createSession;
-    const sb = $("aw-send");
-    if (sb) sb.onclick = sendPrompt;
-    const input = $("aw-input");
-    if (input) {
-      input.addEventListener("keydown", (e) => {
-        if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-          e.preventDefault();
-          sendPrompt();
-        }
-      });
-    }
-    const st = $("aw-settings-btn");
-    if (st) st.onclick = openAgentSettings;
-    const tl = $("aw-toggle-left");
-    if (tl) tl.onclick = toggleLeft;
-    const tr = $("aw-toggle-right");
-    if (tr) tr.onclick = toggleRight;
-    const head = $("aw-chat-head");
-    if (head) {
-      head.addEventListener("dblclick", () => {
-        if (state.currentId && confirm("归档当前会话？")) archiveCurrent();
-      });
-    }
-    const host = $("aw-term-host");
-    if (host) {
-      host.addEventListener("mousedown", () => {
-        if (term.visible && term.ready && !term.control) {
-          acquireControl();
-        }
-        if (term.xterm) {
-          term.xterm.focus();
-        }
-      });
-    }
-    const tb = $("aw-term-btn");
-    if (tb) tb.onclick = toggleTerminal;
-    window.addEventListener("resize", () => {
-      if (term.visible) fitTerminal();
-    });
-    const acq = $("aw-term-acquire");
-    if (acq) acq.onclick = acquireControl;
-    const rel = $("aw-term-release");
-    if (rel) rel.onclick = releaseControl;
-    const reconn = $("aw-term-reconnect");
-    if (reconn) reconn.onclick = () => connectTerminal();
-  }
-
-  async function renderAgentWorkbench() {
-    bind();
-    await loadSessions();
-    if (!state.currentId && state.sessions.length) {
-      const open = state.sessions.find((s) => s.status === "open") || state.sessions[0];
-      if (open) await selectSession(open.id);
-    } else if (state.currentId) {
-      await loadDetail(state.currentId);
-    }
-    startPoll();
-  }
-
-
-  // ---- 原生 TUI 终端（观察默认 / 控制权显式接管）----
-  const term = {
-    ws: null,
-    xterm: null,
-    fit: null,
-    connectionId: "",
-    control: false,
-    ready: false,
-    visible: false,
-    pingTimer: null,
-    sessionId: "",
-    onDataBound: false,
-    onResizeBound: false,
-  };
-
-  function ensureXterm() {
-    const T = window.Terminal || (window.xterm && window.xterm.Terminal);
-    const Fit = window.FitAddon && (window.FitAddon.FitAddon || window.FitAddon);
-    if (!T) {
-      renderStatusLine('xterm.js 未加载，终端不可用。请强刷页面后重试。');
-      return null;
-    }
-    if (!term.xterm) {
-      term.xterm = new T({
-        cursorBlink: true,
-        fontSize: 12,
-        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-        theme: { background: "#0b0d11", foreground: "#c9d1d9", cursor: "#6cb6ff" },
-        scrollback: 200,
-        convertEol: true,
-        disableStdin: false,
-      });
-      if (Fit) {
-        term.fit = new Fit();
-        term.xterm.loadAddon(term.fit);
-      }
-    }
-    return term.xterm;
-  }
-
-  function fitTerminal() {
-    if (!term.fit || !term.xterm) return;
-    try {
-      term.fit.fit();
-    } catch (e) { /* ignore */ }
-    if (term.xterm && term.ws && term.ws.readyState === 1) {
-      try {
-        const cols = Math.max(40, term.xterm.cols || 80);
-        const rows = Math.max(16, term.xterm.rows || 30);
-        term.ws.send(JSON.stringify({ type: "resize", cols, rows }));
-      } catch (e) { /* ignore */ }
-    }
-  }
-
-
-  function cleanLiveText(raw) {
-    let text = String(raw || "").replace(/^undefined/i, "").replace(/\s+/g, " ").trim();
-    if (text.length > 140) text = text.slice(0, 140) + "…";
-    return text || "…";
-  }
-
-  function renderLiveStrip() {
-    const strip = $("aw-live-strip");
-    if (!strip) return;
-    if (!term.visible) {
-      strip.classList.add("hidden");
-      return;
-    }
-    const items = state.liveOrder.slice(-3);
-    if (!items.length) {
-      strip.classList.add("hidden");
-      return;
-    }
-    strip.classList.remove("hidden");
-    strip.innerHTML = "";
-    items.forEach((item) => {
-      const p = state.liveTexts[item.id] || {};
-      const kind = p.kind || item.kind || "text";
-      const label = kind === "reasoning" ? "思考"
-        : (kind === "tool" || kind === "tool-call" || kind === "tool_use") ? ("工具 " + (p.tool || ""))
-        : kind === "step-start" ? "一步"
-        : kind === "step-finish" ? "完成"
-        : "Agent";
-      strip.appendChild(el("div", {
-        class: "aw-live-chip k-" + kind,
-        text: label + " · " + cleanLiveText(p.text),
-      }));
-    });
-  }
-
-  function showTerminalPanel(show) {
-    const panel = $("aw-terminal");
-    const chat = $("aw-chat-scroll");
-    const composer = $("aw-composer");
-    const center = $("aw-center");
-    if (!panel) return;
-    term.visible = !!show;
-    panel.classList.toggle("hidden", !show);
-    if (center) center.classList.toggle("terminal-mode", !!show);
-    if (chat) chat.classList.toggle("hidden", show);
-    if (composer) composer.classList.toggle("hidden", show);
-    const btn = $("aw-term-btn");
-    if (btn) btn.textContent = show ? "返回对话" : "原生终端";
-    if (show) {
-      const t = ensureXterm();
-      const host = $("aw-term-host");
-      if (t && host && !t.element) t.open(host);
-      // layout settles after flex show; fit twice to avoid a short first frame
-      requestAnimationFrame(() => {
-        fitTerminal();
-        setTimeout(fitTerminal, 60);
-      });
-    }
-    updateTermUi();
-  }
 
   function updateTermUi() {
     const status = $("aw-term-status");
     if (status) {
-      const bits = [];
-      if (!term.visible) bits.push("终端未打开");
-      else if (term.ready) bits.push("已接入");
-      else bits.push("未接入");
-      bits.push(term.control ? "控制中" : "观察");
-      status.textContent = bits.join(" · ");
-      status.classList.toggle("control", !!term.control);
-      status.classList.toggle("ready", !!term.ready);
+      status.textContent = term.connecting ? "接入中" : term.ready && term.rendered ? term.control ? "控制中" : "观察" : term.ready ? "等待原生画面" : "未接入";
+      status.classList.toggle("ready", term.ready && term.rendered);
+      status.classList.toggle("control", term.control);
     }
-    const acq = $("aw-term-acquire");
-    const rel = $("aw-term-release");
-    const reconn = $("aw-term-reconnect");
-    if (acq) acq.classList.toggle("hidden", !(term.visible && term.ready && !term.control));
-    if (rel) rel.classList.toggle("hidden", !(term.visible && term.control));
-    if (reconn) reconn.classList.toggle("hidden", !(term.visible && !term.ready));
+    const toggle = (id, visible) => { const node = $(id); if (node) node.classList.toggle("hidden", !visible); };
+    const admin = manageable(), open = openSession();
+    toggle("aw-term-acquire", term.ready && !term.control && admin && open);
+    toggle("aw-term-release", term.ready && term.control);
+    toggle("aw-term-reconnect", !!state.currentId && !term.connecting && !term.ready);
+    toggle("aw-term-disconnect", term.ready || term.connecting);
+    toggle("aw-term-stop", !!state.currentId && admin && open);
+    toggle("aw-archive", !!state.currentId && admin && open);
+    toggle("aw-reopen", !!state.detail && admin && !open);
   }
-
+  function fitTerminal() {
+    if (!term.xterm || !state.active) return;
+    try { if (term.fit) term.fit.fit(); } catch (_) {}
+    const socket = term.ws;
+    if (socket && socket.readyState === 1 && term.ready) {
+      socket.send(JSON.stringify({ type: "resize", cols: Math.max(40, term.xterm.cols || 80), rows: Math.max(12, term.xterm.rows || 24) }));
+    }
+  }
   function disconnectTerminal() {
-    if (term.pingTimer) {
-      clearInterval(term.pingTimer);
-      term.pingTimer = null;
-    }
+    ++term.attempt;
+    if (term.pingTimer) clearInterval(term.pingTimer);
+    if (term.paintTimer) clearTimeout(term.paintTimer);
+    term.pingTimer = term.paintTimer = null;
+    if (term.observer) term.observer.disconnect();
+    term.observer = null;
     if (term.ws) {
-      try { term.ws.onclose = null; term.ws.onmessage = null; term.ws.close(); } catch (e) {}
-      term.ws = null;
+      term.ws.onopen = term.ws.onmessage = term.ws.onclose = term.ws.onerror = null;
+      term.ws.close();
     }
-    term.ready = false;
-    term.control = false;
+    term.ws = null;
+    if (term.xterm) term.xterm.dispose();
+    term.xterm = term.fit = null;
+    const host = $("aw-term-host");
+    if (host) host.innerHTML = "";
     term.connectionId = "";
+    term.sessionId = "";
+    term.control = term.ready = term.rendered = term.connecting = false;
     updateTermUi();
   }
-
-  function termWriteLine(msg) {
-    const t = term.xterm;
-    if (t) {
-      try { t.writeln("\r\n[" + msg + "]"); } catch (e) {}
-    }
-  }
-
-  function bindTermIo() {
-    const t = ensureXterm();
-    if (!t) return;
-    if (!term.onDataBound) {
-      term.onDataBound = true;
-      t.onData((data) => {
-        if (!term.ws || term.ws.readyState !== 1) return;
-        if (!term.control) {
-          // Observe-only until an operator explicitly takes the keyboard.
-          renderStatusLine("观察模式 · 点「接管控制」后可输入");
-          acquireControl().then(() => {
-            if (term.control && term.ws && term.ws.readyState === 1) {
-              term.ws.send(JSON.stringify({ type: "input", data }));
-              if (term.xterm) term.xterm.focus();
-            }
-          });
-          return;
-        }
-        term.ws.send(JSON.stringify({ type: "input", data }));
-      });
-    }
-    if (!term.onResizeBound) {
-      term.onResizeBound = true;
-      t.onResize(({ cols, rows }) => {
-        if (!term.ws || term.ws.readyState !== 1 || !term.control) return;
-        try { term.ws.send(JSON.stringify({ type: "resize", cols, rows })); } catch (e) {}
-      });
-    }
-  }
-
-  async function connectTerminal() {
-    const sid = state.currentId;
-    if (!sid) return;
-    term.sessionId = sid;
+  async function connectTerminal(sid = state.currentId, generation = state.generation) {
+    if (!sid || !current(sid, generation)) return;
     disconnectTerminal();
-    const t = ensureXterm();
-    if (t) {
-      try { t.reset(); t.clear(); } catch (e) {}
-    }
-    let prep;
+    const attempt = term.attempt;
+    const valid = () => current(sid, generation) && term.attempt === attempt;
+    term.sessionId = sid; term.connecting = true;
+    notice("正在接入该会话的 MiMoCode…"); updateTermUi();
+    let prepared;
     try {
-      prep = await api(`/api/agent/sessions/${encodeURIComponent(sid)}/terminal`, {
-        method: "POST",
-        body: JSON.stringify({}),
-      });
-    } catch (e) {
-      termWriteLine("原生运行服务不可达：" + (e && e.message ? e.message : e));
-      updateTermUi();
+      prepared = await api(sessionPath(sid) + "/terminal", state.detail && state.detail.can_prepare === false ? {} : { method: "POST", body: "{}" });
+    } catch (_) {
+      if (valid()) { term.connecting = false; notice("原生运行服务暂不可达，任务和历史已保留。", true); updateTermUi(); }
       return;
     }
-    if (!prep || !prep.ok) {
-      const msg = (prep && (prep.message || prep.error)) || "原生运行服务暂不可用，任务和历史记录已保留。";
-      termWriteLine(msg);
-      renderStatusLine("接入失败: " + msg);
-      updateTermUi();
-      return;
+    if (!valid()) return;
+    if (!prepared || !prepared.ok) {
+      term.connecting = false;
+      notice(prepared && (prepared.message || prepared.error) || "无法接入原生会话。任务和历史已保留。", true);
+      updateTermUi(); return;
     }
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const url = `${proto}//${location.host}/ws/agent-terminal?session_id=${encodeURIComponent(sid)}`;
-    let ws;
+    const Terminal = window.Terminal || window.xterm && window.xterm.Terminal;
+    const Fit = window.FitAddon && (window.FitAddon.FitAddon || window.FitAddon);
+    if (!Terminal) { term.connecting = false; notice("原生界面组件未加载，请刷新页面。", true); updateTermUi(); return; }
+    let terminal, socket;
     try {
-      ws = new WebSocket(url);
-    } catch (e) {
-      termWriteLine("无法建立终端连接");
-      updateTermUi();
-      return;
-    }
-    term.ws = ws;
-    ws.binaryType = "arraybuffer";
-    ws.onmessage = (ev) => {
-      if (typeof ev.data === "string") {
-        try {
-          const msg = JSON.parse(ev.data);
-          if (msg.type === "ready") {
-            term.connectionId = msg.connection_id || "";
-            term.control = !!msg.control;
-            term.ready = true;
-            bindTermIo();
-            updateTermUi();
-            fitTerminal();
-            setTimeout(fitTerminal, 80);
-            setTimeout(fitTerminal, 240);
-            return;
-          }
-          if (msg.type === "control") {
-            term.control = !!msg.control;
-            updateTermUi();
-            return;
-          }
-        } catch (e) { /* ignore */ }
-        return;
-      }
-      if (term.xterm && ev.data instanceof ArrayBuffer) {
-        term.xterm.write(new Uint8Array(ev.data));
-      }
-    };
-    ws.onclose = (ev) => {
-      term.ready = false;
-      term.control = false;
-      const code = ev && ev.code ? ev.code : 0;
-      if (code === 1013) termWriteLine("视图连接已断开，后台任务继续执行。点击「重新接入」回到同一任务。");
-      else if (code === 4403) termWriteLine("会话权限已变更，连接已关闭。");
-      else if (term.visible) termWriteLine("连接已关闭。任务仍在运行，可重新接入。");
-      updateTermUi();
-    };
-    ws.onerror = () => {};
-    term.pingTimer = setInterval(() => {
-      if (term.ws && term.ws.readyState === 1) {
-        try { term.ws.send(JSON.stringify({ type: "ping" })); } catch (e) {}
-      }
-    }, 15000);
-    updateTermUi();
-  }
-
-  async function openNativeTerminal() {
-    const sid = state.currentId;
-    if (!sid) {
-      alert("请先选择会话");
-      return;
-    }
-    const d = state.detail;
-    const session = d && d.session;
-    if (session && session.status !== "open") {
-      if (!session.remote_session_id) {
-        alert("该历史会话没有原生会话绑定，可在右侧查看关联记录。");
-        return;
-      }
-      if (!confirm("会话已归档。续接为手动会话后才能接入终端，是否继续？")) return;
-      const r = await api(`/api/agent/sessions/${encodeURIComponent(sid)}/reopen`, {
-        method: "POST",
-        body: JSON.stringify({}),
-      });
-      if (!r || !r.ok) {
-        alert((r && (r.message || r.error)) || "续接失败");
-        return;
-      }
-      await loadSessions();
-      await loadDetail(sid);
-    }
-    showTerminalPanel(true);
-    await connectTerminal();
-  }
-
-  async function acquireControl() {
-    if (!state.currentId) return;
-    if (!term.connectionId || !term.ready) {
-      renderStatusLine("终端尚未就绪，稍后重试");
-      return;
-    }
-    const r = await api(`/api/agent/sessions/${encodeURIComponent(state.currentId)}/terminal/control`, {
-      method: "POST",
-      body: JSON.stringify({ action: "acquire", connection_id: term.connectionId }),
+    terminal = new Terminal({
+      cursorBlink: true, fontSize: 13, fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+      theme: { background: "#0a0a0a", foreground: "#d5d5d5", cursor: "#ff8547" },
+      // Keep device replies active; user instructions are gated below and
+      // independently by the server's exclusive controller lease.
+      scrollback: 2000, disableStdin: false, convertEol: false,
     });
-    if (!r || !r.ok) {
-      alert((r && (r.message || r.error)) || "无法取得控制权，可能已由其他窗口持有。");
+    term.xterm = terminal;
+    if (Fit) { term.fit = new Fit(); terminal.loadAddon(term.fit); }
+    terminal.open($("aw-term-host"));
+    socket = new WebSocket(`${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws/agent-terminal?session_id=${encodeURIComponent(sid)}`);
+    term.ws = socket; socket.binaryType = "arraybuffer";
+    } catch (_) {
+      disconnectTerminal(); notice("无法创建原生视图，请刷新后重试。", true); return;
+    }
+    terminal.onData((data) => {
+      if (!valid() || term.ws !== socket || !term.ready || socket.readyState !== 1) return;
+      const reply = /^(?:\x1b\[(?:[?>]?[0-9;]*c|[0-9]+;[0-9]+R|[0-9;]+t|\?[0-9]+u)|\x1b\](?:10|11);rgb:[0-9a-f/]+(?:\x07|\x1b\\))$/i;
+      if (data.length <= 256 && reply.test(data)) {
+        socket.send(JSON.stringify({ type: "terminal_response", data }));
+        return;
+      }
+      if (!term.control) return;
+      socket.send(JSON.stringify({ type: "input", data }));
+    });
+    terminal.onResize(({ cols, rows }) => {
+      if (valid() && term.ws === socket && term.ready && socket.readyState === 1) socket.send(JSON.stringify({ type: "resize", cols, rows }));
+    });
+    const frame = () => valid() && term.ws === socket;
+    socket.onmessage = (event) => {
+      if (!frame()) return;
+      if (typeof event.data === "string") {
+        let message;
+        try { message = JSON.parse(event.data); } catch (_) { return; }
+        if (message.type === "ready") {
+          term.connectionId = message.connection_id || "";
+          term.control = !!message.control;
+          term.ready = true; term.connecting = false;
+          notice(term.rendered ? "" : "已附着，正在等待 MiMoCode 原生画面…");
+          updateTermUi(); fitTerminal();
+          term.paintTimer = setTimeout(() => {
+            if (frame() && !term.rendered) notice("尚未收到原生画面，请重新接入。后台任务未停止。", true);
+          }, 12000);
+        } else if (message.type === "control") {
+          term.control = !!message.control; updateTermUi();
+        } else if (message.type === "error") {
+          notice(message.message || message.error || "原生连接异常，请核对任务状态。", true);
+        }
+        return;
+      }
+      if (event.data instanceof ArrayBuffer && event.data.byteLength) {
+        term.rendered = true;
+        terminal.write(new Uint8Array(event.data));
+        if (term.ready) notice("");
+        updateTermUi();
+      }
+    };
+    socket.onclose = (event) => {
+      if (!frame()) return;
+      term.ready = term.control = term.connecting = false;
+      if (term.pingTimer) clearInterval(term.pingTimer);
+      term.pingTimer = null;
+      if (term.paintTimer) clearTimeout(term.paintTimer);
+      term.paintTimer = null;
+      notice(event && event.code === 4403 ? "会话权限已变更，连接已关闭。" : "当前视图已断开，后台任务继续执行。重新接入可回到同一会话。", true);
+      updateTermUi();
+    };
+    socket.onerror = () => { if (frame()) notice("原生视图连接异常，请重新接入。", true); };
+    term.pingTimer = setInterval(() => {
+      if (frame() && socket.readyState === 1) socket.send(JSON.stringify({ type: "ping" }));
+    }, 15000);
+    if (typeof ResizeObserver === "function") {
+      term.observer = new ResizeObserver(() => { if (frame()) fitTerminal(); });
+      term.observer.observe($("aw-term-host"));
+    }
+    requestAnimationFrame(() => { if (frame()) fitTerminal(); });
+    updateTermUi();
+  }
+  async function acquireControl() {
+    const sid = state.currentId, generation = state.generation;
+    const connectionId = term.connectionId, attempt = term.attempt;
+    if (!term.ready || !connectionId || !manageable() || !openSession()) return;
+    const button = $("aw-term-acquire");
+    if (button && button.disabled) return;
+    if (button) button.disabled = true;
+    try {
+      const result = await api(sessionPath(sid) + "/terminal/control", { method: "POST", body: JSON.stringify({ action: "acquire", connection_id: connectionId }) });
+      if (!current(sid, generation) || term.attempt !== attempt || term.connectionId !== connectionId) return;
+      if (!result || !result.ok) { notice(result && (result.message || result.error) || "无法取得控制权，可能已由其他窗口持有。", true); return; }
+      term.control = true; updateTermUi(); notice("");
+      if (term.xterm) term.xterm.focus();
+      fitTerminal();
+    } catch (_) { if (current(sid, generation) && term.attempt === attempt) notice("控制权请求未完成，请重新核对。", true); }
+    finally { if (button) button.disabled = false; }
+  }
+  async function releaseControl() {
+    const sid = state.currentId, generation = state.generation, attempt = term.attempt;
+    const connectionId = term.connectionId;
+    term.control = false; updateTermUi();
+    if (!sid || !connectionId) return;
+    try {
+      const result = await api(sessionPath(sid) + "/terminal/control", { method: "POST", body: JSON.stringify({ action: "release", connection_id: connectionId }) });
+      if (current(sid, generation) && term.attempt === attempt && (!result || !result.ok)) notice("释放请求未确认，键盘已在当前页面停用。", true);
+    } catch (_) { if (current(sid, generation) && term.attempt === attempt) notice("释放请求未确认，键盘已在当前页面停用。", true); }
+  }
+  function stopPoll() {
+    if (state.pollTimer) clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+  function startPoll() {
+    if (state.pollTimer) return;
+    state.pollTimer = setInterval(async () => {
+      if (!state.active || state.polling) return;
+      state.polling = true;
+      const sid = state.currentId, generation = state.generation;
+      try { await loadSessions(); if (current(sid, generation)) await loadDetail(sid, generation); }
+      catch (_) { /* A business-state refresh never replaces native output. */ }
+      finally { state.polling = false; }
+    }, 10000);
+  }
+  function toggleColumn(side) {
+    if (side === "right" && window.matchMedia && window.matchMedia("(max-width: 800px)").matches) {
+      $("agent-workbench").classList.toggle("right-mobile-open");
       return;
     }
-    term.control = true;
-    updateTermUi();
-    renderStatusLine("已接管控制 · 可直接输入");
-    if (term.xterm) term.xterm.focus();
-    fitTerminal();
+    const property = side === "left" ? "collapsedLeft" : "collapsedRight";
+    state[property] = !state[property];
+    $("aw-" + side).classList.toggle("collapsed", state[property]);
+    $("agent-workbench").classList.toggle(side + "-collapsed", state[property]);
+    requestAnimationFrame(fitTerminal);
   }
-
-  async function releaseControl() {
-    if (!term.connectionId || !state.currentId) return;
+  let bound = false;
+  function bind() {
+    if (bound) return;
+    bound = true;
+    const handlers = {
+      "aw-new-session": createSession, "aw-settings-btn": openAgentSettings,
+      "aw-term-reconnect": () => connectTerminal(), "aw-term-acquire": acquireControl,
+      "aw-term-release": releaseControl, "aw-term-stop": abortCurrent,
+      "aw-term-disconnect": () => { disconnectTerminal(); notice("已离开当前视图，后台任务继续执行。"); },
+      "aw-archive": archiveCurrent, "aw-reopen": reopenCurrent,
+      "aw-toggle-left": () => toggleColumn("left"), "aw-toggle-right": () => toggleColumn("right"),
+    };
+    Object.entries(handlers).forEach(([id, callback]) => { const node = $(id); if (node) node.onclick = callback; });
+    window.addEventListener("resize", fitTerminal);
+    window.addEventListener("pagehide", suspendAgentWorkbench);
+  }
+  async function renderAgentWorkbench() {
+    bind();
+    if (!state.active) { state.active = true; ++state.mount; }
+    const mount = state.mount;
     try {
-      await api(`/api/agent/sessions/${encodeURIComponent(state.currentId)}/terminal/control`, {
-        method: "POST",
-        body: JSON.stringify({ action: "release", connection_id: term.connectionId }),
-      });
-    } catch (e) { /* ignore */ }
-    term.control = false;
-    updateTermUi();
+      await loadSessions();
+      if (!state.active || state.mount !== mount) return;
+      const selected = state.sessions.find((item) => item.id === state.currentId);
+      const next = selected || state.sessions.find((item) => item.status === "open" && item.origin === "auto") || state.sessions[0];
+      if (!next) { notice("选择或新建会话，直接进入 MiMoCode。"); renderHeader(); }
+      else if (state.currentId !== next.id || !term.sessionId) await selectSession(next.id);
+      else await loadDetail(next.id);
+      if (state.active && state.mount === mount) startPoll();
+    } catch (_) { if (state.active && state.mount === mount) notice("工作台暂不可达，请刷新重试。", true); }
   }
-
-  function toggleTerminal() {
-    if (term.visible) {
-      disconnectTerminal();
-      showTerminalPanel(false);
-    } else {
-      openNativeTerminal();
-    }
+  function suspendAgentWorkbench() {
+    state.active = false; ++state.mount; ++state.generation;
+    stopPoll(); disconnectTerminal();
   }
-
   window.renderAgentWorkbench = renderAgentWorkbench;
+  window.suspendAgentWorkbench = suspendAgentWorkbench;
   window.agentWorkbenchState = state;
 })();
