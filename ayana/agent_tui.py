@@ -544,7 +544,14 @@ class AgentTuiManager:
                 for child in item:
                     visit(child)
         visit(value)
-        return bool(found and all(item == remote for item in found)) or (not found and value.get("type") in ("server.connected", "server.heartbeat"))
+        if not found:
+            # Server-level frames and some part deltas omit session IDs.
+            return value.get("type") in (
+                "server.connected", "server.heartbeat",
+                "message.part.delta", "message.part.updated", "message.updated",
+                "session.status", "session.updated",
+            )
+        return remote in found
 
     async def _proxy_events(self, request, remote):
         from aiohttp import web, ClientTimeout

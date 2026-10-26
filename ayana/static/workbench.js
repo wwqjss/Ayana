@@ -543,6 +543,7 @@
   }
 
   function renderLiveStream() {
+    renderLiveStrip();
     let box = $("aw-live-stream");
     const scroll = $("aw-chat-scroll");
     if (!scroll) return;
@@ -786,9 +787,40 @@
     }
     if (term.xterm && term.ws && term.ws.readyState === 1) {
       try {
-        term.ws.send(JSON.stringify({ type: "resize", cols: term.xterm.cols, rows: term.xterm.rows }));
+        const cols = Math.max(80, Math.min(term.xterm.cols, 160));
+        const rows = Math.max(24, Math.min(term.xterm.rows, 42));
+        term.ws.send(JSON.stringify({ type: "resize", cols, rows }));
       } catch (e) { /* ignore */ }
     }
+  }
+
+
+  function renderLiveStrip() {
+    const strip = $("aw-live-strip");
+    if (!strip) return;
+    if (!term.visible) {
+      strip.classList.add("hidden");
+      return;
+    }
+    const items = state.liveOrder.slice(-5);
+    if (!items.length) {
+      strip.classList.add("hidden");
+      return;
+    }
+    strip.classList.remove("hidden");
+    strip.innerHTML = "";
+    items.forEach((item) => {
+      const p = state.liveTexts[item.id] || {};
+      const kind = p.kind || item.kind || "text";
+      const label = kind === "reasoning" ? "思考"
+        : (kind === "tool" || kind === "tool-call" || kind === "tool_use") ? ("工具 " + (p.tool || ""))
+        : kind === "step-start" ? "开始一步"
+        : kind === "step-finish" ? "完成一步"
+        : "Agent";
+      const text = (p.text || "").replace(/\s+/g, " ").trim().slice(0, 160) || "…";
+      strip.appendChild(el("div", { class: "aw-live-chip k-" + kind, text: label + " · " + text }));
+    });
+    strip.scrollTop = strip.scrollHeight;
   }
 
   function showTerminalPanel(show) {
