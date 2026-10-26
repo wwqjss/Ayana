@@ -1723,22 +1723,29 @@ class WebApp:
         prompt = str((body or {}).get("prompt") or "").strip()
         if not prompt:
             return _json({"ok": False, "error": "prompt_required"}, 400)
+        # 先落库用户消息：MiMo 失败也保留输入痕迹
+        duty.add_message(sid, role="user", kind="prompt", title="", body=prompt[:4000])
         duty.record_event(sid, type="user_prompt", title="用户消息", payload={"len": len(prompt)})
         try:
             sent = await asyncio.to_thread(bridge.prompt_remote, "", prompt, session_id=sid)
         except Exception as e:  # noqa: BLE001
+            duty.add_message(sid, role="system", kind="error", title="发送失败", body=str(e)[:500])
             return _json({"ok": False, "error": "prompt_failed", "message": str(e)[:200]}, 502)
         if not sent.get("ok"):
-            # 尝试先建远端
             try:
                 attached = await asyncio.to_thread(bridge.attach_remote, "", session_id=sid)
                 if attached.get("ok"):
                     sent = await asyncio.to_thread(bridge.prompt_remote, "", prompt, session_id=sid)
             except Exception as e:  # noqa: BLE001
-                return _json({"ok": False, "error": "prompt_failed", "message": str(e)[:200]}, 502)
+                sent = {"ok": False, "error": "prompt_failed", "message": str(e)[:200]}
+        if not sent.get("ok"):
+            err = str(sent.get("message") or sent.get("error") or "prompt_failed")
+            duty.add_message(sid, role="system", kind="error", title="Agent 未响应", body=err[:500])
+            duty.record_event(sid, type="prompt_failed", title="Agent 未响应", payload={"error": err[:120]})
+            return _json({"ok": False, "error": sent.get("error") or "prompt_failed", "message": err[:200], "session_id": sid}, 502)
         self.db.audit("web_user", sess["username"], "agent_session_prompt",
                       detail={"session_id": sid, "len": len(prompt)}, channel="web")
-        return _json({"ok": True, "result": sent})
+        return _json({"ok": True, "result": sent, "session_id": sid})
 
     async def api_agent_session_archive(self, request: web.Request) -> web.Response:
         sess = self._require_admin(request)

@@ -135,12 +135,16 @@
   function renderMessage(m) {
     const role = m.role || "assistant";
     const kind = m.kind || "text";
-    const wrap = el("div", { class: "aw-msg " + (role === "user" ? "user" : "assistant") + " kind-" + kind });
-    wrap.appendChild(el("div", { class: "aw-msg-role", text: role === "user" ? "你" : "Agent" }));
+    const cls = role === "user" ? "user" : role === "system" ? "system error" : "assistant";
+    const wrap = el("div", { class: "aw-msg " + cls + " kind-" + kind });
+    const roleLabel = role === "user" ? "你" : role === "system" ? "系统" : "Agent";
+    wrap.appendChild(el("div", { class: "aw-msg-role", text: roleLabel }));
     if (m.title) wrap.appendChild(el("div", { class: "aw-msg-title", text: m.title }));
     const body = el("div", { class: "aw-msg-body" });
     const text = m.body || "";
-    if (text.length > 600) {
+    if (kind === "error" || role === "system") {
+      body.appendChild(el("div", { class: "aw-msg-text", text: text || "（无输出）" }));
+    } else if (text.length > 600) {
       const pre = el("pre", { class: "aw-log collapsed", text: text.slice(0, 600) + "…" });
       const btn = el("button", {
         type: "button",
@@ -355,18 +359,59 @@
     if (!input || !state.currentId) return;
     const text = input.value.trim();
     if (!text) return;
+    const sid = state.currentId;
     input.value = "";
-    const r = await api(`/api/agent/sessions/${encodeURIComponent(state.currentId)}/prompt`, {
-      method: "POST",
-      body: JSON.stringify({ prompt: text }),
-    });
-    if (!r || !r.ok) {
-      alert((r && (r.message || r.error)) || "发送失败");
-      input.value = text;
-      return;
+    // 乐观展示用户消息
+    const scroll = $("aw-chat-scroll");
+    if (scroll) {
+      const pending = el("div", { class: "aw-msg user pending" }, [
+        el("div", { class: "aw-msg-role", text: "你" }),
+        el("div", { class: "aw-msg-text", text }),
+        el("div", { class: "aw-msg-time", text: "发送中…" }),
+      ]);
+      scroll.appendChild(pending);
+      scroll.scrollTop = scroll.scrollHeight;
     }
-    await loadDetail(state.currentId);
-    await loadSessions();
+    // 发送中禁用
+    const btn = $("aw-send");
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "发送中…";
+    }
+    try {
+      const r = await api(`/api/agent/sessions/${encodeURIComponent(sid)}/prompt`, {
+        method: "POST",
+        body: JSON.stringify({ prompt: text }),
+      });
+      if (!r || !r.ok) {
+        const msg = (r && (r.message || r.error)) || "发送失败";
+        // 内联错误气泡
+        if (scroll) {
+          const errBox = el("div", { class: "aw-msg system error" }, [
+            el("div", { class: "aw-msg-role", text: "系统" }),
+            el("div", { class: "aw-msg-title", text: "发送失败" }),
+            el("div", { class: "aw-msg-text", text: msg }),
+          ]);
+          scroll.appendChild(errBox);
+          scroll.scrollTop = scroll.scrollHeight;
+        }
+      }
+      // 无论成败都刷新，以拉取已落库的消息/错误
+      await loadDetail(sid);
+      await loadSessions();
+    } catch (e) {
+      if (scroll) {
+        scroll.appendChild(el("div", { class: "aw-msg system error" }, [
+          el("div", { class: "aw-msg-role", text: "系统" }),
+          el("div", { class: "aw-msg-text", text: "网络错误：" + (e && e.message ? e.message : e) }),
+        ]));
+      }
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "发送";
+      }
+    }
   }
 
   async function archiveCurrent() {

@@ -328,14 +328,7 @@ class SessionBridge:
         )
         text = getattr(remote, "text", "") or ""
         raw_events = getattr(remote, "raw_events", None) or []
-        self.duty.add_message(
-            session_id,
-            role="user",
-            kind="prompt",
-            title="调查指令",
-            body=prompt[:4000],
-            incident_id=incident_id,
-        )
+        # 用户消息由调用方先落库；此处只记 Agent 响应
         self.duty.add_message(
             session_id,
             role="assistant",
