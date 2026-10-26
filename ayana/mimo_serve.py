@@ -187,6 +187,15 @@ class MimoServeManager:
         env["MIMOCODE_SERVER_USERNAME"] = self.username
         if self.workdir:
             env.setdefault("HOME", self.workdir)
+        else:
+            env.setdefault("HOME", "/var/lib/ayana")
+        # 确保 mimo 及其 node 依赖可解析
+        extra = []
+        binp = self.mimo_bin if os.path.isabs(self.mimo_bin) else ""
+        if binp:
+            extra.append(os.path.dirname(binp))
+        extra += ["/var/lib/ayana/.mimocode/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+        env["PATH"] = os.pathsep.join(extra + [env.get("PATH", "")])
         return env
 
     async def ensure_running(self) -> dict[str, Any]:

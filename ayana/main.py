@@ -284,10 +284,24 @@ class App:
         # MiMoCode serve：实时交互（prompt_async + SSE）
         from .mimo_serve import MimoServeManager
 
+        def _resolve_mimo_bin() -> str:
+            cand = str(cfg.get("mimo_bin") or "")
+            if cand and os.path.exists(cand):
+                return cand
+            for p in (
+                str(Path.home() / ".mimocode/bin/mimo"),
+                str(Path("/var/lib/ayana/.mimocode/bin/mimo")),
+                str(Path("/usr/local/bin/mimo")),
+                "mimo",
+            ):
+                if p == "mimo" or os.path.exists(p):
+                    return p
+            return "mimo"
+
         _serve_port = int(cfg.get("mimo_serve_port") or 6290)
         _serve_pw = str(cfg.get("mimo_serve_password") or cfg.get("webhook_token") or "ayana-mimo")
         self.mimo_serve = MimoServeManager(
-            mimo_bin=str(cfg.get("mimo_bin") or "mimo"),
+            mimo_bin=_resolve_mimo_bin(),
             workdir=str(cfg.get("mimo_workdir") or ""),
             host="127.0.0.1",
             port=_serve_port,
