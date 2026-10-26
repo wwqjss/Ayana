@@ -453,11 +453,13 @@
 
   function renderStatusLine(text) {
     let bar = $("aw-status-bar");
-    const head = $("aw-chat-head");
+    const head = $("aw-title-row") || $("aw-chat-head");
     if (!head) return;
     if (!bar) {
       bar = el("div", { id: "aw-status-bar", class: "aw-status-bar" });
-      head.appendChild(bar);
+      const actions = head.querySelector(".aw-term-actions");
+      if (actions) actions.insertBefore(bar, actions.firstChild);
+      else head.appendChild(bar);
     }
     if (!text) {
       bar.classList.add("hidden");
@@ -509,7 +511,7 @@
           }
         } else if (ev.kind === "delta" && ev.delta) {
           const p = state.liveTexts[ev.part_id] || { text: "", kind: "text", tool: "" };
-          p.text += ev.delta;
+          p.text += (ev.delta == null ? "" : String(ev.delta));
           state.liveTexts[ev.part_id] = p;
           if (!state.liveOrder.find((x) => x.id === ev.part_id)) {
             state.liveOrder.push({ id: ev.part_id, kind: p.kind, tool: p.tool, msg: ev.message_id });
@@ -520,7 +522,7 @@
           const p = state.liveTexts[ev.part_id] || {};
           p.kind = ev.part_type || p.kind || "text";
           p.tool = ev.tool || p.tool || "";
-          if (ev.text) p.text = ev.text;
+          if (ev.text != null && ev.text !== "") p.text = String(ev.text);
           p.done = !!(ev.state && String(ev.state).indexOf("end") >= 0) || p.kind === "step-finish";
           state.liveTexts[ev.part_id] = p;
           if (!state.liveOrder.find((x) => x.id === ev.part_id)) {
@@ -782,18 +784,21 @@
     try {
       term.fit.fit();
     } catch (e) { /* ignore */ }
-    if (term.xterm) {
-      try { term.xterm.scrollToBottom(); } catch (e) { /* ignore */ }
-    }
     if (term.xterm && term.ws && term.ws.readyState === 1) {
       try {
-        const cols = Math.max(80, Math.min(term.xterm.cols, 160));
-        const rows = Math.max(24, Math.min(term.xterm.rows, 42));
+        const cols = Math.max(40, term.xterm.cols || 80);
+        const rows = Math.max(16, term.xterm.rows || 30);
         term.ws.send(JSON.stringify({ type: "resize", cols, rows }));
       } catch (e) { /* ignore */ }
     }
   }
 
+
+  function cleanLiveText(raw) {
+    let text = String(raw || "").replace(/^undefined/i, "").replace(/\s+/g, " ").trim();
+    if (text.length > 140) text = text.slice(0, 140) + "…";
+    return text || "…";
+  }
 
   function renderLiveStrip() {
     const strip = $("aw-live-strip");
@@ -802,7 +807,7 @@
       strip.classList.add("hidden");
       return;
     }
-    const items = state.liveOrder.slice(-5);
+    const items = state.liveOrder.slice(-3);
     if (!items.length) {
       strip.classList.add("hidden");
       return;
@@ -814,13 +819,14 @@
       const kind = p.kind || item.kind || "text";
       const label = kind === "reasoning" ? "思考"
         : (kind === "tool" || kind === "tool-call" || kind === "tool_use") ? ("工具 " + (p.tool || ""))
-        : kind === "step-start" ? "开始一步"
-        : kind === "step-finish" ? "完成一步"
+        : kind === "step-start" ? "一步"
+        : kind === "step-finish" ? "完成"
         : "Agent";
-      const text = (p.text || "").replace(/\s+/g, " ").trim().slice(0, 160) || "…";
-      strip.appendChild(el("div", { class: "aw-live-chip k-" + kind, text: label + " · " + text }));
+      strip.appendChild(el("div", {
+        class: "aw-live-chip k-" + kind,
+        text: label + " · " + cleanLiveText(p.text),
+      }));
     });
-    strip.scrollTop = strip.scrollHeight;
   }
 
   function showTerminalPanel(show) {
