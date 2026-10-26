@@ -28,6 +28,7 @@ LOCAL_ID = re.compile(r"sess_[A-Za-z0-9_-]{1,80}\Z")
 REMOTE_ID = re.compile(r"ses_[A-Za-z0-9_-]{1,160}\Z")
 MAX_INPUT = 16384
 MAX_BODY = 131072
+MAX_UPSTREAM_BYTES = 8 * 1024 * 1024
 CONTROL_SECONDS = 60.0
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS agent_runtime_bindings (
@@ -318,11 +319,15 @@ class AgentTuiManager:
             self._token(session_id, remote_id)
             pane = await self._pane(name)
             if pane and pane["pane_dead"]:
-                raise AgentTuiError("tui_exited")
+                # A dead attach client is not a dead model task: serve still
+                # owns the remote session. Drop the viewport and reattach.
+                await asyncio.to_thread(self._tmux, "kill-session", "-t", name)
+                pane = None
             if pane and existing and existing.get("pane_started_at") and (
                 int(existing.get("pane_pid") or 0) != pane["pane_pid"] or str(existing["pane_started_at"]) != pane["pane_started_at"]
             ):
-                raise AgentTuiError("runtime_identity_changed")
+                await asyncio.to_thread(self._tmux, "kill-session", "-t", name)
+                pane = None
             if not pane:
                 package_root = str(Path(__file__).resolve().parents[1])
                 env_prefix = "PYTHONPATH=" + package_root + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")
@@ -467,7 +472,10 @@ class AgentTuiManager:
                 if path in ("/provider", "/config/providers", "/mcp", "/vcs", "/project/current", "/global/health"):
                     return web.json_response(self._sanitize(await self._upstream(method, path)))
                 if relative is not None and (relative == "" or re.fullmatch(r"/(?:message(?:/[A-Za-z0-9_-]+)?|receipt/[A-Za-z0-9_-]+|children|todo|diff)", relative)):
-                    return web.json_response(self._sanitize(await self._upstream(method, path, query=request.query)))
+                    query = dict(request.query)
+                    if relative.startswith("/message") and "limit" not in query:
+                        query["limit"] = "200"
+                    return web.json_response(self._sanitize(await self._upstream(method, path, query=query)))
                 raise AgentTuiError("tui_route_forbidden")
             if method == "POST" and relative in ("/message", "/prompt_async", "/abort"):
                 session = self._session(sid)
@@ -514,10 +522,10 @@ class AgentTuiManager:
             if response.status == 204:
                 return (204, {}) if with_status else {}
             try:
-                raw = await response.content.readexactly(2_000_001)
+                raw = await response.content.readexactly(MAX_UPSTREAM_BYTES + 1)
             except asyncio.IncompleteReadError as error:
                 raw = error.partial
-            if len(raw) > 2_000_000:
+            if len(raw) > MAX_UPSTREAM_BYTES:
                 raise AgentTuiError("native_response_too_large")
             payload = json.loads(raw) if raw else {}
             return (response.status, payload) if with_status else payload

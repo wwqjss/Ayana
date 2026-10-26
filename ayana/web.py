@@ -1693,7 +1693,12 @@ class WebApp:
             self.db.audit("web_user", user["username"], "agent_terminal_prepared", detail={"session_id": sid}, channel="web")
             return _json({"ok": True, "binding": binding, "mode": "observe"})
         except Exception as error:
-            log.warning("agent terminal prepare failed sid=%s: %s", sid, error)
+            code = getattr(error, "code", "") or type(error).__name__
+            log.warning("agent terminal prepare failed sid=%s code=%s error=%s", sid, code, error)
+            if code in ("provider_not_verified", "runtime_changed"):
+                return _json({"ok": False, "error": code, "message": "当前模型配置尚未验证，请到设置中心完成运行时校验后再接入。"}, 503)
+            if code in ("tui_start_failed", "tmux_not_installed", "tmux_unavailable", "tmux_runtime_not_started"):
+                return _json({"ok": False, "error": code, "message": "原生终端运行环境未就绪，请联系管理员检查 tmux 与 agent-runtime。"}, 503)
             return self._agent_runtime_failure()
 
     async def api_agent_terminal_status(self, request: web.Request) -> web.Response:
