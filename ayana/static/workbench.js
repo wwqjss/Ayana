@@ -699,6 +699,17 @@
         if (state.currentId && confirm("归档当前会话？")) archiveCurrent();
       });
     }
+    const host = $("aw-term-host");
+    if (host) {
+      host.addEventListener("mousedown", () => {
+        if (term.visible && term.ready && !term.control) {
+          acquireControl();
+        }
+        if (term.xterm) {
+          term.xterm.focus();
+        }
+      });
+    }
     const tb = $("aw-term-btn");
     if (tb) tb.onclick = toggleTerminal;
     window.addEventListener("resize", () => {
@@ -753,9 +764,9 @@
         fontSize: 12,
         fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
         theme: { background: "#0b0d11", foreground: "#c9d1d9", cursor: "#6cb6ff" },
-        scrollback: 5000,
+        scrollback: 200,
         convertEol: true,
-        disableStdin: true,
+        disableStdin: false,
       });
       if (Fit) {
         term.fit = new Fit();
@@ -770,6 +781,9 @@
     try {
       term.fit.fit();
     } catch (e) { /* ignore */ }
+    if (term.xterm) {
+      try { term.xterm.scrollToBottom(); } catch (e) { /* ignore */ }
+    }
     if (term.xterm && term.ws && term.ws.readyState === 1) {
       try {
         term.ws.send(JSON.stringify({ type: "resize", cols: term.xterm.cols, rows: term.xterm.rows }));
@@ -852,7 +866,17 @@
       term.onDataBound = true;
       t.onData((data) => {
         if (!term.ws || term.ws.readyState !== 1) return;
-        if (!term.control) return;
+        if (!term.control) {
+          // Observe-only until an operator explicitly takes the keyboard.
+          renderStatusLine("观察模式 · 点「接管控制」后可输入");
+          acquireControl().then(() => {
+            if (term.control && term.ws && term.ws.readyState === 1) {
+              term.ws.send(JSON.stringify({ type: "input", data }));
+              if (term.xterm) term.xterm.focus();
+            }
+          });
+          return;
+        }
         term.ws.send(JSON.stringify({ type: "input", data }));
       });
     }
@@ -863,7 +887,6 @@
         try { term.ws.send(JSON.stringify({ type: "resize", cols, rows })); } catch (e) {}
       });
     }
-    if (t.options) t.options.disableStdin = !term.control;
   }
 
   async function connectTerminal() {
@@ -873,7 +896,7 @@
     disconnectTerminal();
     const t = ensureXterm();
     if (t) {
-      try { t.clear(); } catch (e) {}
+      try { t.reset(); t.clear(); } catch (e) {}
     }
     let prep;
     try {
@@ -917,11 +940,11 @@
             updateTermUi();
             fitTerminal();
             setTimeout(fitTerminal, 80);
+            setTimeout(fitTerminal, 240);
             return;
           }
           if (msg.type === "control") {
             term.control = !!msg.control;
-            if (term.xterm && term.xterm.options) term.xterm.options.disableStdin = !term.control;
             updateTermUi();
             return;
           }
@@ -980,7 +1003,11 @@
   }
 
   async function acquireControl() {
-    if (!term.connectionId || !state.currentId) return;
+    if (!state.currentId) return;
+    if (!term.connectionId || !term.ready) {
+      renderStatusLine("终端尚未就绪，稍后重试");
+      return;
+    }
     const r = await api(`/api/agent/sessions/${encodeURIComponent(state.currentId)}/terminal/control`, {
       method: "POST",
       body: JSON.stringify({ action: "acquire", connection_id: term.connectionId }),
@@ -990,9 +1017,10 @@
       return;
     }
     term.control = true;
-    if (term.xterm && term.xterm.options) term.xterm.options.disableStdin = false;
     updateTermUi();
+    renderStatusLine("已接管控制 · 可直接输入");
     if (term.xterm) term.xterm.focus();
+    fitTerminal();
   }
 
   async function releaseControl() {
@@ -1004,7 +1032,6 @@
       });
     } catch (e) { /* ignore */ }
     term.control = false;
-    if (term.xterm && term.xterm.options) term.xterm.options.disableStdin = true;
     updateTermUi();
   }
 

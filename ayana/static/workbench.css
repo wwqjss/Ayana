@@ -597,3 +597,12 @@
   flex: 0 0 auto;
   white-space: nowrap;
 }
+
+
+/* 实时 TUI 不显示历史滚动条，避免“内容沉底”观感 */
+.aw-term-host .xterm .xterm-viewport {
+  overflow-y: hidden !important;
+}
+.aw-term-host .xterm .xterm-screen {
+  overflow: hidden !important;
+}
