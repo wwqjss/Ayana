@@ -12,7 +12,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import json
+import time
+import uuid
+from contextlib import contextmanager, asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from .db import new_id, now
@@ -20,6 +26,8 @@ from .db import new_id, now
 log = __import__("logging").getLogger("ayana.duty_session")
 
 DEFAULT_ARCHIVE_DELAY_SEC = 300
+_TURN_OWNERS = contextvars.ContextVar("ayana_session_turns", default={})
+_RECEIPT_TERMINAL = frozenset(("completed","done","succeeded","success","failed","cancelled","canceled","aborted","error","rejected"))
 
 
 class DutySessionManager:
@@ -155,20 +163,15 @@ class DutySessionManager:
         return {"ok": True, "action": "created", "session_id": sid, "origin": origin, "title": title}
 
     def ensure_auto_session(self, incident_id: str = "") -> dict[str, Any]:
-        """首条告警建自动值班会话；已有 open 的自动会话则复用。并发下收敛到单会话。"""
-        existing = self.open_auto_session()
-        if existing:
-            self.cancel_archive(existing["id"])
-            return {"ok": True, "action": "reused", **existing}
-        try:
-            return self.create(origin="auto", title="自动值班", created_by="system")
-        except Exception:
-            # 并发创建撞车：复用赢家
-            existing = self.open_auto_session()
+        """Reserve the one automatic slot in a SQLite write transaction."""
+        with self.db.tx() as conn:
+            if not conn.in_transaction: conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute("SELECT * FROM duty_sessions WHERE origin='auto' AND status='open' ORDER BY created_at DESC LIMIT 1").fetchone()
             if existing:
-                self.cancel_archive(existing["id"])
-                return {"ok": True, "action": "reused", **existing}
-            raise
+                sid = existing["id"]
+                conn.execute("UPDATE duty_sessions SET archive_due_at=0,updated_at=? WHERE id=?", (now(),sid))
+                return {"ok":True,"action":"reused",**dict(existing),"session_id":sid,"archive_due_at":0}
+            return self.create(origin="auto", title="自动值班", created_by="system")
 
     def join_incident(
         self,
@@ -181,15 +184,16 @@ class DutySessionManager:
             return {"ok": False, "error": "session_id_and_incident_id_required"}
         t = now()
         with self.db.tx() as conn:
+            if not conn.in_transaction: conn.execute("BEGIN IMMEDIATE")
+            sess = conn.execute("SELECT status FROM duty_sessions WHERE id=?", (session_id,)).fetchone()
+            if not sess or sess["status"] != "open":
+                return {"ok":False,"error":"session_not_open"}
             conn.execute(
-                "INSERT OR IGNORE INTO session_incidents(session_id, incident_id, generation, joined_at)"
-                " VALUES(?,?,?,?)",
-                (session_id, incident_id, int(generation or 1), t),
+                "INSERT INTO session_incidents(session_id,incident_id,generation,joined_at) VALUES(?,?,?,?)"
+                " ON CONFLICT(session_id,incident_id) DO UPDATE SET generation=excluded.generation",
+                (session_id,incident_id,int(generation or 1),t),
             )
-            conn.execute(
-                "UPDATE duty_sessions SET updated_at=?, last_activity_at=?, archive_due_at=0 WHERE id=?",
-                (t, t, session_id),
-            )
+            conn.execute("UPDATE duty_sessions SET updated_at=?,last_activity_at=?,archive_due_at=0 WHERE id=?",(t,t,session_id))
         self.record_event(
             session_id,
             incident_id=incident_id,
@@ -238,68 +242,157 @@ class DutySessionManager:
             )
         self.record_event(session_id, type="archive_cancelled", title="新告警取消归档倒计时")
 
-    def maybe_start_archive_countdown(self, session_id: str) -> dict[str, Any]:
-        """关联 Incident 全部终态则启动倒计时；否则取消倒计时。"""
-        sess = self.get(session_id)
-        if not sess or sess.get("status") != "open":
-            return {"ok": False, "error": "session_not_open"}
+    def archive_blockers(self, session_id: str) -> list[str]:
+        """Business and runtime facts, never a UI-only busy flag."""
+        blockers = []
         incs = self.incidents(session_id)
-        open_count = sum(1 for i in incs if (i.get("status") or "") == "open")
-        if not incs:
-            # 无关联工单的手动会话不自动归档
-            return {"ok": True, "action": "noop", "reason": "no_incidents"}
-        if open_count > 0:
-            self.cancel_archive(session_id)
-            return {"ok": True, "action": "keep_open", "open_incidents": open_count}
-        t = now()
-        delay = self.archive_delay_sec()
-        due = t + delay
-        with self.db.tx() as conn:
-            conn.execute(
-                "UPDATE duty_sessions SET archive_due_at=?, updated_at=?, last_activity_at=? WHERE id=?",
-                (due, t, t, session_id),
+        ids = [row["incident_id"] for row in incs]
+        if any((row.get("status") or "open") == "open" for row in incs): blockers.append("open_incidents")
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            checks = (
+                ("actions", "SELECT 1 FROM actions WHERE incident_id IN ("+placeholders+") AND state IN ('proposed','approved','dispatched','unknown') LIMIT 1"),
+                ("pending_jobs", "SELECT 1 FROM investigation_jobs WHERE incident_id IN ("+placeholders+") AND status IN ('queued','running') LIMIT 1"),
+                ("pending_verification", "SELECT 1 FROM verifications WHERE incident_id IN ("+placeholders+") AND status IN ('pending','running') LIMIT 1"),
             )
-        self.record_event(
-            session_id,
-            type="archive_scheduled",
-            title=f"全部工单已关闭，{int(delay)}s 后归档",
-            payload={"archive_due_at": due, "delay_sec": delay},
-        )
-        return {"ok": True, "action": "countdown", "archive_due_at": due, "delay_sec": delay}
+            for label,sql in checks:
+                if self.db.query_one(sql,tuple(ids)): blockers.append(label)
+            sql = "SELECT 1 FROM session_write_ops WHERE (session_id=? OR incident_id IN ("+placeholders+")) AND status IN ('awaiting_approval','claimed','unknown') LIMIT 1"
+            if self.db.query_one(sql,(session_id,*ids)): blockers.append("pending_writes")
+        elif self.db.query_one("SELECT 1 FROM session_write_ops WHERE session_id=? AND status IN ('awaiting_approval','claimed','unknown') LIMIT 1",(session_id,)):
+            blockers.append("pending_writes")
+        terminals=tuple(sorted(_RECEIPT_TERMINAL));marks=",".join("?" for _ in terminals)
+        if self.db.query_one("SELECT 1 FROM agent_runtime_receipts WHERE session_id=? AND status NOT IN ("+marks+") LIMIT 1",(session_id,*terminals)):
+            blockers.append("receipt_pending")
+        runtime = self.db.query_one("SELECT state,receipt_status FROM agent_runtime_bindings WHERE session_id=?",(session_id,))
+        if runtime:
+            if runtime["state"] not in ("idle","ready","stopped","archived"): blockers.append("runtime_busy")
+            if runtime["receipt_status"] and runtime["receipt_status"] not in ("completed","done","failed","cancelled","aborted","error","idle"):
+                blockers.append("receipt_pending")
+        if self.db.query_one("SELECT 1 FROM agent_session_turns WHERE session_id=? AND expires_at>?",(session_id,now())):
+            blockers.append("turn_active")
+        return blockers
+
+    def maybe_start_archive_countdown(self, session_id: str) -> dict[str, Any]:
+        """Only the automatic duty slot rotates; repeated closes preserve due time."""
+        with self.db.tx() as conn:
+            if not conn.in_transaction: conn.execute("BEGIN IMMEDIATE")
+            sess = self.get(session_id)
+            if not sess or sess.get("status") != "open": return {"ok":False,"error":"session_not_open"}
+            if sess.get("origin") != "auto" or not self.incidents(session_id):
+                return {"ok":True,"action":"noop","reason":"manual_or_no_incidents"}
+            blockers = self.archive_blockers(session_id)
+            if blockers:
+                self.cancel_archive(session_id)
+                return {"ok":True,"action":"keep_open","blockers":blockers}
+            existing = float(sess.get("archive_due_at") or 0)
+            if existing > 0:
+                return {"ok":True,"action":"countdown","archive_due_at":existing,"delay_sec":self.archive_delay_sec()}
+            t = now();delay = max(0,self.archive_delay_sec());due = t + delay
+            conn.execute("UPDATE duty_sessions SET archive_due_at=?,updated_at=? WHERE id=? AND status='open' AND archive_due_at=0",(due,t,session_id))
+            self.record_event(session_id,type="archive_scheduled",title=f"全部工单已结束，{int(delay)}s 后归档",payload={"archive_due_at":due,"delay_sec":delay})
+            return {"ok":True,"action":"countdown","archive_due_at":due,"delay_sec":delay}
 
     def tick_archives(self) -> dict[str, Any]:
-        """到期归档。服务启动/定时调用。"""
-        t = now()
-        rows = self.db.query(
-            "SELECT * FROM duty_sessions WHERE status='open' AND archive_due_at>0 AND archive_due_at<=?",
-            (t,),
-        )
         archived = []
-        for row in rows:
-            row = dict(row)
-            sid = row["id"]
+        for row in self.db.query("SELECT id FROM duty_sessions WHERE origin='auto' AND status='open' AND archive_due_at>0 AND archive_due_at<=?",(now(),)):
+            sid=row["id"]
             with self.db.tx() as conn:
-                conn.execute(
-                    "UPDATE duty_sessions SET status='archived', archived_at=?, archive_due_at=0, updated_at=?"
-                    " WHERE id=? AND status='open'",
-                    (t, t, sid),
-                )
-            self.record_event(sid, type="session_archived", title="会话已归档")
-            archived.append(sid)
-        return {"ok": True, "archived": archived}
+                if not conn.in_transaction: conn.execute("BEGIN IMMEDIATE")
+                current = self.get(sid)
+                if not current or current["status"] != "open" or not 0 < float(current["archive_due_at"] or 0) <= now(): continue
+                if self.archive_blockers(sid): self.cancel_archive(sid);continue
+                t=now()
+                cur=conn.execute("UPDATE duty_sessions SET status='archived',archived_at=?,archive_due_at=0,updated_at=? WHERE id=? AND status='open' AND archive_due_at=?",(t,t,sid,current["archive_due_at"]))
+                if cur.rowcount==1:
+                    self.record_event(sid,type="session_archived",title="会话已归档");archived.append(sid)
+        return {"ok":True,"archived":archived}
 
     def archive_session(self, session_id: str, *, reason: str = "manual") -> dict[str, Any]:
-        t = now()
         with self.db.tx() as conn:
-            cur = conn.execute(
-                "UPDATE duty_sessions SET status='archived', archived_at=?, archive_due_at=0, updated_at=?"
-                " WHERE id=? AND status='open'",
-                (t, t, session_id),
-            )
-            changed = cur.rowcount == 1
-        if changed:
-            self.record_event(session_id, type="session_archived", title=f"会话归档（{reason}）")
-        return {"ok": True, "changed": changed, "session_id": session_id}
+            if not conn.in_transaction: conn.execute("BEGIN IMMEDIATE")
+            blockers=self.archive_blockers(session_id)
+            if blockers:return {"ok":False,"error":"session_busy","blockers":blockers}
+            t=now()
+            cur=conn.execute("UPDATE duty_sessions SET status='archived',archived_at=?,archive_due_at=0,updated_at=? WHERE id=? AND status='open'",(t,t,session_id))
+            changed=cur.rowcount==1
+            if changed:self.record_event(session_id,type="session_archived",title=f"会话归档（{reason}）")
+            return {"ok":True,"changed":changed,"session_id":session_id}
+
+    def reopen_session(self, session_id: str, *, actor: str = "web", as_manual: bool = True) -> dict[str, Any]:
+        with self.db.tx() as conn:
+            if not conn.in_transaction: conn.execute("BEGIN IMMEDIATE")
+            row=self.get(session_id)
+            if not row:return {"ok":False,"error":"not_found"}
+            if row["status"]=="open" and row["origin"]!="legacy_auto":return {"ok":True,"changed":False,"session_id":session_id}
+            if not as_manual:return {"ok":False,"error":"history_requires_manual_reopen"}
+            conn.execute("UPDATE duty_sessions SET status='open',origin='manual',archive_due_at=0,archived_at=0,updated_at=? WHERE id=?",(now(),session_id))
+            self.record_event(session_id,type="session_reopened",title="手动续接历史会话",payload={"actor":actor})
+            return {"ok":True,"changed":True,"session_id":session_id}
+
+    def set_runtime_state(self, session_id: str, state: str, *, receipt_id: str = "", receipt_status: str = "") -> None:
+        if not self.get(session_id): raise ValueError("session_not_found")
+        t=now()
+        self.db.execute("INSERT INTO agent_runtime_bindings(session_id,state,receipt_id,receipt_status,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET state=excluded.state,receipt_id=excluded.receipt_id,receipt_status=excluded.receipt_status,updated_at=excluded.updated_at",(session_id,str(state)[:40],str(receipt_id)[:200],str(receipt_status)[:40],t,t))
+
+    def record_receipt(self, session_id: str, remote_session_id: str, receipt_id: str, *, status: str = "accepted", origin: str = "auto") -> None:
+        if not session_id or not remote_session_id or not receipt_id:raise ValueError("receipt_binding_required")
+        with self.db.tx() as conn:
+            if not conn.in_transaction:conn.execute("BEGIN IMMEDIATE")
+            current=conn.execute("SELECT session_id,remote_session_id FROM agent_runtime_receipts WHERE receipt_id=?",(receipt_id,)).fetchone()
+            if current and (current["session_id"]!=session_id or current["remote_session_id"]!=remote_session_id):raise ValueError("receipt_binding_conflict")
+            t=now()
+            conn.execute("INSERT INTO agent_runtime_receipts(receipt_id,session_id,remote_session_id,status,origin,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(receipt_id) DO UPDATE SET updated_at=excluded.updated_at",(receipt_id,session_id,remote_session_id,str(status)[:40],str(origin)[:40],t,t))
+            conn.execute("UPDATE duty_sessions SET archive_due_at=0,updated_at=? WHERE id=?",(t,session_id))
+
+    def finish_receipt(self, receipt_id: str, status: str) -> None:
+        if status not in _RECEIPT_TERMINAL:raise ValueError("receipt_terminal_status_required")
+        self.db.execute("UPDATE agent_runtime_receipts SET status=?,updated_at=? WHERE receipt_id=?",(status,now(),receipt_id))
+
+    def _turn_key(self, session_id: str):
+        return (str(Path(self.db.path).resolve()),session_id)
+
+    def _acquire_turn(self, session_id: str, owner: str, timeout: float, lease_sec: float) -> None:
+        deadline=time.monotonic()+max(0,timeout)
+        while True:
+            t=now()
+            with self.db.tx() as conn:
+                if not conn.in_transaction:conn.execute("BEGIN IMMEDIATE")
+                cur=conn.execute("INSERT INTO agent_session_turns(session_id,owner,expires_at,updated_at) VALUES(?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET owner=excluded.owner,expires_at=excluded.expires_at,updated_at=excluded.updated_at WHERE agent_session_turns.expires_at<=? OR agent_session_turns.owner=?",(session_id,owner,t+max(1,lease_sec),t,t,owner))
+                if cur.rowcount==1:return
+            if time.monotonic()>=deadline:raise TimeoutError("session_turn_busy")
+            time.sleep(min(0.03,max(0,deadline-time.monotonic())))
+
+    def _release_turn(self, session_id: str, owner: str) -> None:
+        self.db.execute("DELETE FROM agent_session_turns WHERE session_id=? AND owner=?",(session_id,owner))
+
+    @contextmanager
+    def turn(self, session_id: str, *, timeout: float = 120, lease_sec: float = 900):
+        key=self._turn_key(session_id);existing=_TURN_OWNERS.get().get(key)
+        if existing:
+            yield existing;return
+        owner=uuid.uuid4().hex;self._acquire_turn(session_id,owner,timeout,lease_sec)
+        token=_TURN_OWNERS.set({**_TURN_OWNERS.get(),key:owner})
+        try:yield owner
+        finally:_TURN_OWNERS.reset(token);self._release_turn(session_id,owner)
+
+    @asynccontextmanager
+    async def async_turn(self, session_id: str, *, timeout: float = 120, lease_sec: float = 900):
+        key=self._turn_key(session_id);existing=_TURN_OWNERS.get().get(key)
+        if existing:
+            yield existing;return
+        owner=uuid.uuid4().hex
+        task=asyncio.create_task(asyncio.to_thread(self._acquire_turn,session_id,owner,timeout,lease_sec))
+        try:await asyncio.shield(task)
+        except BaseException:
+            try:await task
+            finally:await asyncio.to_thread(self._release_turn,session_id,owner)
+            raise
+        token=_TURN_OWNERS.set({**_TURN_OWNERS.get(),key:owner})
+        try:yield owner
+        finally:
+            _TURN_OWNERS.reset(token)
+            await asyncio.to_thread(self._release_turn,session_id,owner)
 
     def recover(self) -> dict[str, Any]:
         """重启恢复：校验倒计时与状态一致性。"""

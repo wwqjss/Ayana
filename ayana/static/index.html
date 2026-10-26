@@ -466,11 +466,26 @@
           </aside>
           <main class="aw-center" id="aw-center">
             <div class="aw-chat-head" id="aw-chat-head">
-              <div class="aw-chat-title" id="aw-chat-title">选择或创建会话</div>
-              <div class="aw-chat-meta" id="aw-chat-meta"></div>
+              <div class="aw-title-row">
+                <div>
+                  <div class="aw-chat-title" id="aw-chat-title">选择或创建会话</div>
+                  <div class="aw-chat-meta" id="aw-chat-meta"></div>
+                </div>
+                <div class="aw-term-actions">
+                  <span id="aw-term-status" class="aw-term-status" title="原生 TUI 状态"></span>
+                  <button type="button" class="btn ghost small hidden" id="aw-term-reconnect">重新接入</button>
+                  <button type="button" class="btn ghost small hidden" id="aw-term-acquire">接管控制</button>
+                  <button type="button" class="btn ghost small hidden" id="aw-term-release">释放控制</button>
+                  <button type="button" class="btn primary small" id="aw-term-btn">原生终端</button>
+                </div>
+              </div>
             </div>
             <div class="aw-chat-scroll" id="aw-chat-scroll">
               <div class="aw-chat-empty muted">左侧选择会话，或点击「+ 新建会话」开始运维任务。</div>
+            </div>
+            <div id="aw-terminal" class="aw-terminal hidden">
+              <div class="aw-term-banner">同一运行任务 · 断开网页不中断后台执行 · 默认仅观察</div>
+              <div id="aw-term-host" class="aw-term-host"></div>
             </div>
             <div class="aw-composer" id="aw-composer">
               <textarea id="aw-input" rows="2" placeholder="描述运维任务，或继续调查…"></textarea>

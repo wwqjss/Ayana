@@ -341,6 +341,10 @@
   }
 
   async function selectSession(sid) {
+    if (term.sessionId && sid !== term.sessionId) {
+      disconnectTerminal();
+      if (term.visible) showTerminalPanel(false);
+    }
     state.currentId = sid;
     state.lastEventId = 0;
     state.liveTexts = {};
@@ -695,6 +699,14 @@
         if (state.currentId && confirm("归档当前会话？")) archiveCurrent();
       });
     }
+    const tb = $("aw-term-btn");
+    if (tb) tb.onclick = toggleTerminal;
+    const acq = $("aw-term-acquire");
+    if (acq) acq.onclick = acquireControl;
+    const rel = $("aw-term-release");
+    if (rel) rel.onclick = releaseControl;
+    const reconn = $("aw-term-reconnect");
+    if (reconn) reconn.onclick = () => connectTerminal();
   }
 
   async function renderAgentWorkbench() {
@@ -707,6 +719,280 @@
       await loadDetail(state.currentId);
     }
     startPoll();
+  }
+
+
+  // ---- 原生 TUI 终端（观察默认 / 控制权显式接管）----
+  const term = {
+    ws: null,
+    xterm: null,
+    fit: null,
+    connectionId: "",
+    control: false,
+    ready: false,
+    visible: false,
+    pingTimer: null,
+    sessionId: "",
+    onDataBound: false,
+    onResizeBound: false,
+  };
+
+  function ensureXterm() {
+    const T = window.Terminal || (window.xterm && window.xterm.Terminal);
+    const Fit = window.FitAddon && (window.FitAddon.FitAddon || window.FitAddon);
+    if (!T) return null;
+    if (!term.xterm) {
+      term.xterm = new T({
+        cursorBlink: true,
+        fontSize: 12,
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+        theme: { background: "#0b0d11", foreground: "#c9d1d9", cursor: "#6cb6ff" },
+        scrollback: 5000,
+        convertEol: true,
+        disableStdin: true,
+      });
+      if (Fit) {
+        term.fit = new Fit();
+        term.xterm.loadAddon(term.fit);
+      }
+    }
+    return term.xterm;
+  }
+
+  function showTerminalPanel(show) {
+    const panel = $("aw-terminal");
+    const chat = $("aw-chat-scroll");
+    const composer = $("aw-composer");
+    if (!panel) return;
+    term.visible = !!show;
+    panel.classList.toggle("hidden", !show);
+    if (chat) chat.classList.toggle("hidden", show);
+    if (composer) composer.classList.toggle("hidden", show);
+    const btn = $("aw-term-btn");
+    if (btn) btn.textContent = show ? "返回对话" : "原生终端";
+    if (show) {
+      const t = ensureXterm();
+      const host = $("aw-term-host");
+      if (t && host && t.element && t.element.parentElement !== host) {
+        // already opened elsewhere; keep instance
+      } else if (t && host && !t.element) {
+        t.open(host);
+      }
+      if (term.fit) setTimeout(() => { try { term.fit.fit(); } catch (e) {} }, 30);
+    }
+    updateTermUi();
+  }
+
+  function updateTermUi() {
+    const status = $("aw-term-status");
+    if (status) {
+      const bits = [];
+      if (!term.visible) bits.push("终端未打开");
+      else if (term.ready) bits.push("已接入");
+      else bits.push("未接入");
+      bits.push(term.control ? "控制中" : "观察");
+      status.textContent = bits.join(" · ");
+      status.classList.toggle("control", !!term.control);
+      status.classList.toggle("ready", !!term.ready);
+    }
+    const acq = $("aw-term-acquire");
+    const rel = $("aw-term-release");
+    const reconn = $("aw-term-reconnect");
+    if (acq) acq.classList.toggle("hidden", !(term.visible && term.ready && !term.control));
+    if (rel) rel.classList.toggle("hidden", !(term.visible && term.control));
+    if (reconn) reconn.classList.toggle("hidden", !(term.visible && !term.ready));
+  }
+
+  function disconnectTerminal() {
+    if (term.pingTimer) {
+      clearInterval(term.pingTimer);
+      term.pingTimer = null;
+    }
+    if (term.ws) {
+      try { term.ws.onclose = null; term.ws.onmessage = null; term.ws.close(); } catch (e) {}
+      term.ws = null;
+    }
+    term.ready = false;
+    term.control = false;
+    term.connectionId = "";
+    updateTermUi();
+  }
+
+  function termWriteLine(msg) {
+    const t = term.xterm;
+    if (t) {
+      try { t.writeln("\r\n[" + msg + "]"); } catch (e) {}
+    }
+  }
+
+  function bindTermIo() {
+    const t = ensureXterm();
+    if (!t) return;
+    if (!term.onDataBound) {
+      term.onDataBound = true;
+      t.onData((data) => {
+        if (!term.ws || term.ws.readyState !== 1) return;
+        if (!term.control) return;
+        term.ws.send(JSON.stringify({ type: "input", data }));
+      });
+    }
+    if (!term.onResizeBound) {
+      term.onResizeBound = true;
+      t.onResize(({ cols, rows }) => {
+        if (!term.ws || term.ws.readyState !== 1 || !term.control) return;
+        try { term.ws.send(JSON.stringify({ type: "resize", cols, rows })); } catch (e) {}
+      });
+    }
+    if (t.options) t.options.disableStdin = !term.control;
+  }
+
+  async function connectTerminal() {
+    const sid = state.currentId;
+    if (!sid) return;
+    term.sessionId = sid;
+    disconnectTerminal();
+    const t = ensureXterm();
+    if (t) {
+      try { t.clear(); } catch (e) {}
+    }
+    let prep;
+    try {
+      prep = await api(`/api/agent/sessions/${encodeURIComponent(sid)}/terminal`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+    } catch (e) {
+      termWriteLine("原生运行服务不可达：" + (e && e.message ? e.message : e));
+      updateTermUi();
+      return;
+    }
+    if (!prep || !prep.ok) {
+      const msg = (prep && (prep.message || prep.error)) || "原生运行服务暂不可用，任务和历史记录已保留。";
+      termWriteLine(msg);
+      updateTermUi();
+      return;
+    }
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const url = `${proto}//${location.host}/ws/agent-terminal?session_id=${encodeURIComponent(sid)}`;
+    let ws;
+    try {
+      ws = new WebSocket(url);
+    } catch (e) {
+      termWriteLine("无法建立终端连接");
+      updateTermUi();
+      return;
+    }
+    term.ws = ws;
+    ws.binaryType = "arraybuffer";
+    ws.onmessage = (ev) => {
+      if (typeof ev.data === "string") {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === "ready") {
+            term.connectionId = msg.connection_id || "";
+            term.control = !!msg.control;
+            term.ready = true;
+            bindTermIo();
+            updateTermUi();
+            if (term.xterm && term.fit) setTimeout(() => { try { term.fit.fit(); } catch (e) {} }, 30);
+            return;
+          }
+          if (msg.type === "control") {
+            term.control = !!msg.control;
+            if (term.xterm && term.xterm.options) term.xterm.options.disableStdin = !term.control;
+            updateTermUi();
+            return;
+          }
+        } catch (e) { /* ignore */ }
+        return;
+      }
+      if (term.xterm && ev.data instanceof ArrayBuffer) {
+        term.xterm.write(new Uint8Array(ev.data));
+      }
+    };
+    ws.onclose = (ev) => {
+      term.ready = false;
+      term.control = false;
+      const code = ev && ev.code ? ev.code : 0;
+      if (code === 1013) termWriteLine("视图连接已断开，后台任务继续执行。点击「重新接入」回到同一任务。");
+      else if (code === 4403) termWriteLine("会话权限已变更，连接已关闭。");
+      else if (term.visible) termWriteLine("连接已关闭。任务仍在运行，可重新接入。");
+      updateTermUi();
+    };
+    ws.onerror = () => {};
+    term.pingTimer = setInterval(() => {
+      if (term.ws && term.ws.readyState === 1) {
+        try { term.ws.send(JSON.stringify({ type: "ping" })); } catch (e) {}
+      }
+    }, 15000);
+    updateTermUi();
+  }
+
+  async function openNativeTerminal() {
+    const sid = state.currentId;
+    if (!sid) {
+      alert("请先选择会话");
+      return;
+    }
+    const d = state.detail;
+    const session = d && d.session;
+    if (session && session.status !== "open") {
+      if (!session.remote_session_id) {
+        alert("该历史会话没有原生会话绑定，可在右侧查看关联记录。");
+        return;
+      }
+      if (!confirm("会话已归档。续接为手动会话后才能接入终端，是否继续？")) return;
+      const r = await api(`/api/agent/sessions/${encodeURIComponent(sid)}/reopen`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      if (!r || !r.ok) {
+        alert((r && (r.message || r.error)) || "续接失败");
+        return;
+      }
+      await loadSessions();
+      await loadDetail(sid);
+    }
+    showTerminalPanel(true);
+    await connectTerminal();
+  }
+
+  async function acquireControl() {
+    if (!term.connectionId || !state.currentId) return;
+    const r = await api(`/api/agent/sessions/${encodeURIComponent(state.currentId)}/terminal/control`, {
+      method: "POST",
+      body: JSON.stringify({ action: "acquire", connection_id: term.connectionId }),
+    });
+    if (!r || !r.ok) {
+      alert((r && (r.message || r.error)) || "无法取得控制权，可能已由其他窗口持有。");
+      return;
+    }
+    term.control = true;
+    if (term.xterm && term.xterm.options) term.xterm.options.disableStdin = false;
+    updateTermUi();
+    if (term.xterm) term.xterm.focus();
+  }
+
+  async function releaseControl() {
+    if (!term.connectionId || !state.currentId) return;
+    try {
+      await api(`/api/agent/sessions/${encodeURIComponent(state.currentId)}/terminal/control`, {
+        method: "POST",
+        body: JSON.stringify({ action: "release", connection_id: term.connectionId }),
+      });
+    } catch (e) { /* ignore */ }
+    term.control = false;
+    if (term.xterm && term.xterm.options) term.xterm.options.disableStdin = true;
+    updateTermUi();
+  }
+
+  function toggleTerminal() {
+    if (term.visible) {
+      disconnectTerminal();
+      showTerminalPanel(false);
+    } else {
+      openNativeTerminal();
+    }
   }
 
   window.renderAgentWorkbench = renderAgentWorkbench;

@@ -267,21 +267,25 @@ class AutoInvestigator:
         return {"ok": True, "action": "queued", "generation": gen}
 
     def recover(self) -> dict[str, Any]:
-        """重启恢复：running 且租约过期 → failed（不自动重放，避免卡死/重复）。"""
-        t = now()
-        rows = self.db.query(
-            "SELECT * FROM investigation_jobs WHERE status='running'"
-        )
-        n = 0
-        for r in rows:
-            if float(r["lease_expires_at"] or 0) < t:
-                self.db.execute(
-                    "UPDATE investigation_jobs SET status='failed', last_error=?, updated_at=?"
-                    " WHERE incident_id=? AND status='running'",
-                    ("lease_expired_after_restart", t, r["incident_id"]),
-                )
-                n += 1
-        return {"ok": True, "expired": n}
+        """Recover expired owners without replaying uncertain execution."""
+        t=now();expired=0;resumed=0
+        for row in self.db.query("SELECT * FROM investigation_jobs WHERE status='running'"):
+            incident_id=row["incident_id"]
+            if incident_id in self._running or float(row["lease_expires_at"] or 0)>=t:continue
+            phase=str(row["phase"] or "")
+            has_action=self.db.query_one("SELECT 1 FROM actions WHERE incident_id=? LIMIT 1",(incident_id,))
+            has_write=self.db.query_one("SELECT 1 FROM session_write_ops WHERE incident_id=? LIMIT 1",(incident_id,))
+            safe_decision=(phase=="decision" and not has_action and not has_write and self._incident_is_current(incident_id,int(row["generation"] or 1)))
+            if safe_decision:
+                self.db.execute("UPDATE investigation_jobs SET status='queued',phase='resume_decision',lease_expires_at=0,last_error='resume_readonly_decision_after_restart',updated_at=? WHERE incident_id=? AND status='running' AND lease_expires_at<?",(t,incident_id,t));resumed+=1
+            else:
+                reason="closed_loop_interrupted_requires_review" if phase in ("decision","execution") else "lease_expired_after_restart"
+                self.db.execute("UPDATE investigation_jobs SET status='failed',phase='interrupted',last_error=?,lease_expires_at=0,updated_at=? WHERE incident_id=? AND status='running' AND lease_expires_at<?",(reason,t,incident_id,t))
+                if phase in ("decision","execution") and self.ops_loop:
+                    try:self.ops_loop.escalate(incident_id,reason=reason)
+                    except Exception:log.exception("failed to escalate interrupted closed loop")
+            expired+=1
+        return {"ok":True,"expired":expired,"resumed_readonly_decisions":resumed}
 
     def ready_jobs(self, limit: int = 10) -> list[dict[str, Any]]:
         rows = self.db.query(
@@ -309,6 +313,7 @@ class AutoInvestigator:
         """处理若干排队任务，返回完成数。"""
         if not self.config.enabled or self._stop.is_set():
             return 0
+        self.recover()
         # Missing/changed credentials leave jobs queued without consuming a round.
         if not self._runtime_ready():
             return 0
@@ -354,6 +359,20 @@ class AutoInvestigator:
         self._stop.set()
 
     async def _run_job(self, incident_id: str, job: dict[str, Any]) -> None:
+        current=self._row(incident_id);generation=int(job.get("generation") or 1)
+        if not current or current.get("status")!="running" or int(current.get("generation") or 1)!=generation:return
+        if not self._incident_is_current(incident_id,generation):
+            self._finish(incident_id,"failed",generation=generation,reason="incident_changed_before_run",rounds=int(job.get("rounds") or 0));return
+        duty=getattr(self.bridge,"duty",None)
+        if duty is None:
+            await self._run_job_locked(incident_id,job);return
+        mapping=await asyncio.to_thread(self.bridge.ensure_session,incident_id,generation=int(job.get("generation") or 1))
+        if not mapping.get("ok"):return
+        sid=mapping["session_id"]
+        async with duty.async_turn(sid,timeout=max(self.config.lease_ttl_sec,900),lease_sec=max(self.config.lease_ttl_sec,self.config.timeout_sec+self.config.decision_timeout_sec+600)):
+            await self._run_job_locked(incident_id,job)
+
+    async def _run_job_locked(self, incident_id: str, job: dict[str, Any]) -> None:
         async with self._sem:
             generation = int(job.get("generation") or 1)
             current = self._row(incident_id)
@@ -368,11 +387,17 @@ class AutoInvestigator:
             if rounds >= self.config.max_rounds:
                 self._finish(incident_id, "failed", generation=generation, reason="max_rounds_exceeded", rounds=rounds)
                 return
+            resume_decision = current.get("phase") == "resume_decision"
             try:
-                result = await asyncio.wait_for(
-                    self._investigate(incident_id, round_no=rounds + 1),
-                    timeout=self.config.timeout_sec,
-                )
+                if resume_decision:
+                    result = json.loads(current.get("last_conclusion_json") or "{}")
+                    if not isinstance(result,dict) or result.get("status") not in ("completed","partial"):raise ValueError("invalid_decision_checkpoint")
+                else:
+                    self.db.execute("UPDATE investigation_jobs SET phase='investigation' WHERE incident_id=? AND generation=? AND status='running'",(incident_id,generation))
+                    result = await asyncio.wait_for(
+                        self._investigate(incident_id, round_no=rounds + 1),
+                        timeout=self.config.timeout_sec,
+                    )
             except asyncio.TimeoutError:
                 self._finish(
                     incident_id,
@@ -403,8 +428,9 @@ class AutoInvestigator:
                 job_status,
                 generation=generation,
                 conclusion=result,
-                rounds=rounds + 1,
+                rounds=rounds if resume_decision else rounds + 1,
                 duration=now() - started,
+                continue_loop=bool(self.config.closed_loop and status in ("completed", "partial")),
             )
             # P6.1：调查完成 → 同一 Incident 进入自治决策/处置/结案
             if accepted and self.config.closed_loop and status in ("completed", "partial"):
@@ -419,6 +445,9 @@ class AutoInvestigator:
                             )
                     except Exception:
                         pass
+
+            if accepted and self.config.closed_loop and status in ("completed", "partial"):
+                self.db.execute("UPDATE investigation_jobs SET status=?,phase='complete',lease_expires_at=0,updated_at=? WHERE incident_id=? AND generation=? AND status='running'",(job_status,now(),incident_id,generation))
 
     async def _investigate(self, incident_id: str, *, round_no: int) -> dict[str, Any]:
         if self.mimo is None or self.bridge is None:
@@ -658,6 +687,7 @@ class AutoInvestigator:
         asset_id = str(decision.get("asset_id") or "")
         if not asset_id and inc_row is not None:
             asset_id = str(inc_row["asset_id"] or "")
+        self.db.execute("UPDATE investigation_jobs SET phase='execution',updated_at=? WHERE incident_id=? AND generation=? AND status='running'",(now(),incident_id,generation))
         res = await self.ops_loop.run_action_and_verify(
             incident_id=incident_id,
             asset_id=asset_id,
@@ -697,6 +727,7 @@ class AutoInvestigator:
         reason: str = "",
         rounds: int = 0,
         duration: float = 0.0,
+        continue_loop: bool = False,
     ) -> bool:
         t = now()
         payload = conclusion or {}
@@ -719,14 +750,16 @@ class AutoInvestigator:
         with self.db.tx() as conn:
             cur = conn.execute(
                 "UPDATE investigation_jobs SET status=?, rounds=?, last_error=?,"
-                " last_result_status=?, last_conclusion_json=?, lease_expires_at=0, updated_at=?"
+                " last_result_status=?, last_conclusion_json=?, phase=?, lease_expires_at=CASE WHEN ? THEN lease_expires_at ELSE 0 END, updated_at=?"
                 " WHERE incident_id=? AND generation=? AND status='running'",
                 (
-                    status,
+                    "running" if continue_loop else status,
                     rounds,
                     (reason or payload.get("raw_excerpt") or "")[:300],
                     str(payload.get("status") or status),
                     json.dumps(payload, ensure_ascii=False, default=str),
+                    "decision" if continue_loop else "complete",
+                    int(continue_loop),
                     t,
                     incident_id,
                     generation,

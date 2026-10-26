@@ -32,7 +32,8 @@ class PromptVersionTests(unittest.TestCase):
         self.assertEqual([item['key'] for item in overview['items']],['investigation','decision','constraints'])
         self.assertTrue(all(item['current']['is_default'] for item in overview['items']))
         self.assertEqual(self.store.current('investigation')['text'],CONCLUSION_PROMPT)
-        self.assertEqual(self.db.schema_version(),22)
+        from ayana.db import SCHEMA_VERSION
+        self.assertEqual(self.db.schema_version(),SCHEMA_VERSION)
 
     def test_save_and_restore_create_independent_audited_versions(self):
         first=self.store.save('investigation','first investigation',actor='admin')

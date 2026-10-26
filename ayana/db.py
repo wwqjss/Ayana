@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 
 class MigrationError(RuntimeError):
@@ -1128,6 +1128,60 @@ CREATE INDEX IF NOT EXISTS idx_session_events_sid ON session_events(session_id, 
     )
 
 
+def _migrate_v23_native_runtime(conn: sqlite3.Connection) -> None:
+    """Persistent native bindings and one automatic duty slot; retain old history."""
+    # Older builds could leave several open automatic sessions. Preserve every
+    # row, native ID and Incident link, but only one is the current duty slot.
+    rows = conn.execute("SELECT id FROM duty_sessions WHERE origin='auto' AND status='open' ORDER BY created_at DESC,id DESC").fetchall()
+    for row in rows[1:]:
+        sid = row["id"]
+        conn.execute("UPDATE duty_sessions SET origin='legacy_auto' WHERE id=?", (sid,))
+        conn.execute("INSERT INTO session_events(session_id,type,title,payload_json,created_at) VALUES(?,?,?,?,?)",
+                     (sid,"migration_preserved","旧值班会话保留为历史上下文",'{"migration":23}',now()))
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_auto_session ON duty_sessions(origin) WHERE origin='auto' AND status='open'")
+    conn.executescript("""
+CREATE TABLE IF NOT EXISTS agent_runtime_bindings (
+  session_id TEXT PRIMARY KEY,
+  remote_session_id TEXT NOT NULL DEFAULT '',
+  runtime_id TEXT NOT NULL DEFAULT '',
+  engine_pid INTEGER NOT NULL DEFAULT 0,
+  engine_started_at TEXT NOT NULL DEFAULT '',
+  tmux_name TEXT UNIQUE,
+  pane_id TEXT NOT NULL DEFAULT '',
+  pane_pid INTEGER NOT NULL DEFAULT 0,
+  pane_started_at TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL DEFAULT 'idle',
+  receipt_id TEXT NOT NULL DEFAULT '',
+  receipt_status TEXT NOT NULL DEFAULT '',
+  controller TEXT NOT NULL DEFAULT '',
+  controller_connection_id TEXT NOT NULL DEFAULT '',
+  control_token_hash TEXT NOT NULL DEFAULT '',
+  control_expires_at REAL NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL DEFAULT 0,
+  updated_at REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS agent_session_turns (
+  session_id TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  expires_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS agent_runtime_receipts (
+  receipt_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  remote_session_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'accepted',
+  origin TEXT NOT NULL DEFAULT 'auto',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_receipts_session_status ON agent_runtime_receipts(session_id,status);
+""")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(investigation_jobs)")}
+    if "phase" not in columns:
+        conn.execute("ALTER TABLE investigation_jobs ADD COLUMN phase TEXT NOT NULL DEFAULT 'queued'")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_v1_baseline,
     2: _migrate_v2_p0_p1_columns,
@@ -1151,6 +1205,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     20: _migrate_v20_investigation_jobs,
     21: _migrate_v21_ops_loop,
     22: _migrate_v22_duty_sessions,
+    23: _migrate_v23_native_runtime,
 }
 
 _MIGRATION_NAMES = {
@@ -1176,6 +1231,7 @@ _MIGRATION_NAMES = {
     20: "investigation_jobs",
     21: "ops_loop_state",
     22: "duty_sessions",
+    23: "native_runtime_bindings",
 }
 
 

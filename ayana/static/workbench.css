@@ -349,3 +349,59 @@
   .agent-workbench { gap: 8px; }
   .aw-msg { max-width: 100%; }
 }
+
+
+/* 原生 TUI 终端 */
+.aw-title-row {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+.aw-term-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.aw-term-status {
+  font-size: 11px;
+  color: var(--dim, #8b93a7);
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--bg2, #1c1f26);
+  white-space: nowrap;
+}
+.aw-term-status.ready { color: var(--acc, #6cb6ff); }
+.aw-term-status.control {
+  color: var(--warn, #f0ad4e);
+  background: rgba(240, 173, 78, 0.12);
+}
+.aw-terminal {
+  flex: 1;
+  min-height: 360px;
+  display: flex;
+  flex-direction: column;
+  background: #0b0d11;
+  border-top: 1px solid var(--line, #2a2e38);
+  position: relative;
+}
+.aw-terminal.hidden { display: none; }
+.aw-term-banner {
+  font-size: 11px;
+  color: var(--dim, #8b93a7);
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--line, #2a2e38);
+  background: rgba(108, 182, 255, 0.06);
+}
+.aw-term-host {
+  flex: 1;
+  min-height: 320px;
+  padding: 8px;
+  overflow: hidden;
+}
+.aw-term-host .terminal,
+.aw-term-host .xterm {
+  height: 100%;
+}

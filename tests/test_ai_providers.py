@@ -51,7 +51,8 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
             discovery.assert_not_awaited()
         self.assertEqual("\n".join(self.db._connect().iterdump()),before,scenario)
         self.assertEqual(self.db._connect().total_changes,changes)
-        self.assertEqual(self.db.schema_version(), 22)
+        from ayana.db import SCHEMA_VERSION
+        self.assertEqual(self.db.schema_version(), SCHEMA_VERSION)
         self.assertEqual(self.db.query_one("SELECT ciphertext FROM ai_provider_keys")["ciphertext"],"opaque-historical-value")
         self.assertNotIn("test-only",str(error.exception))
 

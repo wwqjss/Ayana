@@ -209,12 +209,12 @@ class RetirementHistoryTests(unittest.TestCase):
                 return {table: [dict(row) for row in database.query("SELECT * FROM " + table + " ORDER BY rowid")] for table in tables}
             before = rows(db)
             ddl = [tuple(row) for row in db.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name")]
-            self.assertEqual(int(db.query_one("SELECT value FROM meta WHERE key='schema_version'")["value"]), 22)
+            self.assertEqual(int(db.query_one("SELECT value FROM meta WHERE key='schema_version'")["value"]), SCHEMA_VERSION)
             db.close()
             reopened = Database(path)
             try:
-                self.assertEqual(SCHEMA_VERSION, 22)
-                self.assertEqual(int(reopened.query_one("SELECT value FROM meta WHERE key='schema_version'")["value"]), 22)
+                self.assertGreaterEqual(SCHEMA_VERSION, 22)
+                self.assertEqual(int(reopened.query_one("SELECT value FROM meta WHERE key='schema_version'")["value"]), SCHEMA_VERSION)
                 self.assertEqual(rows(reopened), before)
                 self.assertEqual([tuple(row) for row in reopened.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name")], ddl)
                 snapshot = LegacyHistory(reopened).snapshot("history-inc")

@@ -132,6 +132,7 @@ class WebApp:
         duty=None,
         session_bridge=None,
         mimo_serve=None,
+        agent_tui=None,
         mimo_events=None,
         alertmanager_webhook_path: str = "/hooks/alertmanager",
     ):
@@ -168,6 +169,7 @@ class WebApp:
         self.duty = duty
         self.session_bridge = session_bridge
         self.mimo_serve = mimo_serve
+        self.agent_tui = agent_tui
         self.mimo_events = mimo_events
         # Legacy kwargs remain accepted for older callers, but no live service is retained.
         from .legacy_history import LegacyHistory
@@ -245,6 +247,11 @@ class WebApp:
         app.router.add_get("/api/agent/events", self.api_agent_events)
         app.router.add_get("/api/agent/serve-status", self.api_agent_serve_status)
         app.router.add_post("/api/agent/sessions/{sid}/archive", self.api_agent_session_archive)
+        app.router.add_post("/api/agent/sessions/{sid}/reopen", self.api_agent_session_reopen)
+        app.router.add_post("/api/agent/sessions/{sid}/terminal", self.api_agent_terminal_prepare)
+        app.router.add_get("/api/agent/sessions/{sid}/terminal", self.api_agent_terminal_status)
+        app.router.add_post("/api/agent/sessions/{sid}/terminal/control", self.api_agent_terminal_control)
+        app.router.add_get("/ws/agent-terminal", self.ws_agent_terminal)
         app.router.get("/api/agent/sessions/{sid}/events", self.api_agent_session_events)
         app.router.add_get("/api/agent/settings", self.api_agent_settings_get)
         app.router.add_post("/api/agent/settings", self.api_agent_settings_post)
@@ -1623,6 +1630,122 @@ class WebApp:
     def _bridge(self):
         return getattr(self, "session_bridge", None) or getattr(self.incidents, "session_bridge", None)
 
+    def _agent_session_visible(self, user: dict, session: dict) -> bool:
+        if not session:
+            return False
+        duty = self._duty()
+        if not duty:
+            return False
+        assets = {str(row.get("asset_id") or "") for row in duty.incidents(session["id"])} - {""}
+        visible = self._visible_asset_ids(user)
+        if assets and not assets.issubset(visible):
+            return False
+        if session.get("origin") == "manual":
+            return bool(user.get("is_admin") or session.get("created_by") == user.get("username"))
+        return bool(user.get("is_admin") or assets)
+
+    def _agent_session_require(self, user: dict, sid: str, *, control: bool = False) -> dict:
+        duty = self._duty()
+        session = duty.get(sid) if duty else None
+        if not session or not self._agent_session_visible(user, session):
+            raise web.HTTPNotFound(text=json.dumps({"ok": False, "error": "session_unavailable"}), content_type="application/json")
+        if control and not user.get("is_admin"):
+            raise web.HTTPForbidden(text=json.dumps({"ok": False, "error": "permission_denied"}), content_type="application/json")
+        return session
+
+    async def _agent_remote_ready(self, sid: str) -> dict:
+        import asyncio
+        from .mimo_session import READONLY_AGENT
+        duty = self._duty()
+        bridge = self._bridge()
+        if not duty or not bridge or not getattr(bridge, "mimo", None):
+            raise ValueError("runtime_unavailable")
+        if not self.mimo_serve:
+            raise ValueError("runtime_unavailable")
+        await self.mimo_serve.ensure_running()
+        async with duty.async_turn(sid):
+            session = duty.get(sid)
+            if not session:
+                raise ValueError("session_unavailable")
+            rid = str(session.get("remote_session_id") or "")
+            if not rid:
+                remote = await asyncio.to_thread(bridge.mimo.allocate, title=session.get("title") or "Ayana")
+                rid = remote.remote_session_id
+                bridge._set_remote(sid, remote_session_id=rid, status="active", model=remote.model)
+            return {"session": duty.get(sid), "remote_session_id": rid, "agent": READONLY_AGENT}
+
+    @staticmethod
+    def _agent_runtime_failure() -> web.Response:
+        return _json({"ok": False, "error": "runtime_unavailable", "message": "原生运行服务暂不可用，或当前模型配置尚未验证。任务和历史记录已保留。"}, 503)
+
+    async def api_agent_terminal_prepare(self, request: web.Request) -> web.Response:
+        user = self._require_admin(request); self._check_csrf(request, user)
+        sid = request.match_info.get("sid") or ""
+        session = self._agent_session_require(user, sid, control=True)
+        manager = getattr(self, "agent_tui", None)
+        if manager is None:
+            return self._agent_runtime_failure()
+        if session.get("status") != "open" and not session.get("remote_session_id"):
+            return _json({"ok": False, "error": "archived_without_remote", "message": "该历史会话没有原生会话绑定，可在右侧查看关联记录。"}, 409)
+        try:
+            ready = await self._agent_remote_ready(sid)
+            binding = await manager.ensure(sid, ready["remote_session_id"])
+            self.db.audit("web_user", user["username"], "agent_terminal_prepared", detail={"session_id": sid}, channel="web")
+            return _json({"ok": True, "binding": binding, "mode": "observe"})
+        except Exception:
+            return self._agent_runtime_failure()
+
+    async def api_agent_terminal_status(self, request: web.Request) -> web.Response:
+        user = self._require_auth(request); sid = request.match_info.get("sid") or ""
+        self._agent_session_require(user, sid)
+        manager = getattr(self, "agent_tui", None)
+        return _json(await manager.status(sid)) if manager else _json({"ok": True, "attached": False, "binding": None})
+
+    async def api_agent_terminal_control(self, request: web.Request) -> web.Response:
+        user = self._require_admin(request); self._check_csrf(request, user)
+        sid = request.match_info.get("sid") or ""
+        session = self._agent_session_require(user, sid, control=True)
+        if session.get("status") != "open":
+            return _json({"ok": False, "error": "session_archived", "message": "请先续接历史会话再取得控制权。"}, 409)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError): body = None
+        if not isinstance(body, dict) or body.get("action") not in ("acquire", "release") or not isinstance(body.get("connection_id"), str):
+            return _json({"ok": False, "error": "bad_request"}, 400)
+        manager = getattr(self, "agent_tui", None)
+        if not manager: return self._agent_runtime_failure()
+        try:
+            operation = manager.acquire_control if body["action"] == "acquire" else manager.release_control
+            result = operation(sid, user["username"], body["connection_id"])
+            import inspect
+            if inspect.isawaitable(result): result = await result
+            self.db.audit("web_user", user["username"], "agent_terminal_"+body["action"], detail={"session_id": sid}, channel="web")
+            return _json({"ok": True, **(result or {})})
+        except Exception:
+            return _json({"ok": False, "error": "control_unavailable", "message": "控制权当前不可用，可能已由其他窗口持有。"}, 409)
+
+    async def api_agent_session_reopen(self, request: web.Request) -> web.Response:
+        user = self._require_admin(request); self._check_csrf(request, user)
+        sid = request.match_info.get("sid") or ""
+        self._agent_session_require(user, sid, control=True)
+        result = self._duty().reopen_session(sid, actor=user["username"], as_manual=True)
+        return _json(result, 200 if result.get("ok") else 409)
+
+    async def ws_agent_terminal(self, request: web.Request) -> web.StreamResponse:
+        # Upgrade only after authentication, Origin and complete session ACL.
+        user = self._require_auth(request)
+        origin = request.headers.get("Origin", "")
+        if not origin or not _origin_allowed(origin, request.headers.get("Host", "")):
+            raise web.HTTPForbidden(text="origin rejected")
+        sid = str(request.rel_url.query.get("session_id") or "")
+        self._agent_session_require(user, sid)
+        manager = getattr(self, "agent_tui", None)
+        if not manager: return self._agent_runtime_failure()
+        async def authorize():
+            current = self._session(request)
+            return bool(current and current.get("username") == user.get("username") and self._agent_session_visible(current, self._duty().get(sid)))
+        return await manager.websocket(request, sid, authorize=authorize, username=user["username"])
+
     async def api_agent_sessions(self, request: web.Request) -> web.Response:
         sess = self._require_auth(request)
         duty = self._duty()
@@ -1634,6 +1757,8 @@ class WebApp:
         rows = duty.list_sessions(status=status, origin=origin, limit=limit)
         out = []
         for r in rows:
+            if not self._agent_session_visible(sess, r):
+                continue
             incs = duty.incidents(r.get("id") or "")
             open_n = sum(1 for i in incs if (i.get("status") or "") == "open")
             out.append({
@@ -1677,9 +1802,7 @@ class WebApp:
         sid = request.match_info.get("sid") or ""
         if not duty:
             return _json({"ok": False, "error": "duty_unavailable"}, 503)
-        s = duty.get(sid)
-        if not s:
-            return _json({"ok": False, "error": "not_found"}, 404)
+        s = self._agent_session_require(sess, sid)
         incs = duty.incidents(sid)
         msgs = duty.messages(sid, limit=200)
         events = duty.events(sid, limit=100)
@@ -1688,7 +1811,7 @@ class WebApp:
             bridge = self._bridge()
             if bridge:
                 pending_writes = bridge.list_pending_writes(limit=20)
-                pending_writes = [w for w in pending_writes if w.get("session_id") == sid or not w.get("session_id")]
+                pending_writes = [w for w in pending_writes if w.get("session_id") == sid]
         except Exception:
             pending_writes = []
         pending_actions = []
@@ -1702,6 +1825,8 @@ class WebApp:
             ]
         except Exception:
             pending_actions = []
+        linked = {row["incident_id"] for row in incs}
+        pending_actions = [row for row in pending_actions if row.get("incident_id") in linked]
         return _json({
             "ok": True,
             "session": s,
@@ -1713,58 +1838,29 @@ class WebApp:
         })
 
     async def api_agent_session_prompt(self, request: web.Request) -> web.Response:
-        """非阻塞发送：prompt_async 立即返回，过程经 /api/agent/events 轮询。"""
-        sess = self._require_admin(request)
-        self._check_csrf(request, sess)
-        duty = self._duty()
+        from .mimo_session import READONLY_AGENT
+        user = self._require_admin(request); self._check_csrf(request, user)
         sid = request.match_info.get("sid") or ""
-        if not duty:
-            return _json({"ok": False, "error": "unavailable"}, 503)
-        s = duty.get(sid)
-        if not s:
-            return _json({"ok": False, "error": "not_found"}, 404)
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        prompt = str((body or {}).get("prompt") or "").strip()
-        if not prompt:
+        session = self._agent_session_require(user, sid, control=True)
+        if session.get("status") != "open":
+            return _json({"ok": False, "error": "session_archived", "message": "请先续接历史会话。"}, 409)
+        try: body = await request.json()
+        except (ValueError, TypeError): body = None
+        if not isinstance(body, dict) or not isinstance(body.get("prompt"), str) or not 0 < len(body["prompt"].strip()) <= 20000:
             return _json({"ok": False, "error": "prompt_required"}, 400)
-        # 先落库用户消息
-        duty.add_message(sid, role="user", kind="prompt", title="", body=prompt[:4000])
-        duty.record_event(sid, type="user_prompt", title="用户消息", payload={"len": len(prompt)})
-
-        serve = getattr(self, "mimo_serve", None)
-        if serve is None:
-            duty.add_message(sid, role="system", kind="error", title="发送失败", body="MiMoCode serve 未接入")
-            return _json({"ok": False, "error": "serve_unavailable"}, 503)
-        client = serve.client()
-        remote_id = (s.get("remote_session_id") or "").strip()
+        prompt = body["prompt"].strip()
+        duty = self._duty()
+        duty.add_message(sid, role="user", kind="prompt", title="", body=prompt)
         try:
-            if not remote_id:
-                created = await client.create_session(title=s.get("title") or "ayana")
-                remote_id = created["session_id"]
-                with self.db.tx() as conn:
-                    conn.execute(
-                        "UPDATE duty_sessions SET remote_session_id=?, remote_status='active',"
-                        " remote_updated_at=?, updated_at=? WHERE id=?",
-                        (remote_id, time.time(), time.time(), sid),
-                    )
-                duty.record_event(sid, type="mimo_session", title="MiMo 会话已建立",
-                                  payload={"remote_session_id": remote_id})
-            await client.prompt_async(remote_id, prompt)
-        except Exception as e:  # noqa: BLE001
-            err = str(e)[:200]
-            duty.add_message(sid, role="system", kind="error", title="发送失败", body=err)
-            duty.record_event(sid, type="prompt_failed", title="发送失败", payload={"error": err})
-            return _json({"ok": False, "error": "prompt_failed", "message": err, "session_id": sid}, 502)
-        self.db.audit("web_user", sess["username"], "agent_session_prompt",
-                      detail={"session_id": sid, "remote_session_id": remote_id, "len": len(prompt)}, channel="web")
-        # 202：已接收，过程看 events
-        return web.json_response(
-            {"ok": True, "accepted": True, "session_id": sid, "remote_session_id": remote_id},
-            status=202,
-        )
+            ready = await self._agent_remote_ready(sid)
+            rid = ready["remote_session_id"]
+            receipt = await self.mimo_serve.client().prompt_async(rid, prompt, agent=READONLY_AGENT)
+            duty.set_runtime_state(sid, "running", receipt_id=receipt.get("receipt_id") or receipt.get("receiptId") or "", receipt_status="accepted")
+        except Exception:
+            duty.add_message(sid, role="system", kind="error", title="发送失败", body="原生运行服务或已验证模型配置暂不可用。")
+            return self._agent_runtime_failure()
+        self.db.audit("web_user", user["username"], "agent_session_prompt", detail={"session_id": sid,"remote_session_id": rid,"len": len(prompt)}, channel="web")
+        return _json({"ok": True, "accepted": True, "session_id": sid, "remote_session_id": rid, "receipt": receipt}, 202)
 
     async def api_agent_session_abort(self, request: web.Request) -> web.Response:
         sess = self._require_admin(request)

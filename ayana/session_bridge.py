@@ -71,9 +71,11 @@ class SessionBridge:
         gen = int(generation if generation is not None else (inc["generation"] or 1))
 
         existing = self.duty.session_for_incident(incident_id)
-        if existing and existing.get("status") == "open":
+        if existing and existing.get("status") == "open" and existing.get("origin") == "auto":
             self.duty.cancel_archive(existing["id"])
-            self.duty.join_incident(existing["id"], incident_id, generation=gen)
+            joined = self.duty.join_incident(existing["id"], incident_id, generation=gen)
+            if not joined.get("ok"):
+                return self._ensure_session_locked(incident_id, generation=gen)
             return {
                 "ok": True,
                 "action": "reused",
@@ -90,7 +92,9 @@ class SessionBridge:
         if not sid:
             return {"ok": False, "error": "session_create_failed", "incident_id": incident_id}
         self.duty.cancel_archive(sid)
-        self.duty.join_incident(sid, incident_id, generation=gen)
+        joined = self.duty.join_incident(sid, incident_id, generation=gen)
+        if not joined.get("ok"):
+            return self._ensure_session_locked(incident_id, generation=gen)
         # Incident 时间线痕迹（兼容旧 session_opened 事件）
         try:
             self.db.event(
@@ -190,7 +194,16 @@ class SessionBridge:
                 ),
             )
 
-    def attach_remote(
+    def attach_remote(self, incident_id: str = "", *, session_id: str = "", title: str = "", prompt: str = "", force_new: bool = False, timeout: float | None = None) -> dict[str, Any]:
+        if not session_id and incident_id:
+            ensured=self.ensure_session(incident_id)
+            if not ensured.get("ok"):return ensured
+            session_id=str(ensured.get("session_id") or "")
+        if not session_id:return {"ok":False,"error":"session_id_required"}
+        with self.duty.turn(session_id,timeout=timeout or 120,lease_sec=max(900,(timeout or 120)+120)):
+            return self._attach_remote_locked(incident_id,session_id=session_id,title=title,prompt=prompt,force_new=force_new,timeout=timeout)
+
+    def _attach_remote_locked(
         self,
         incident_id: str = "",
         *,
@@ -212,6 +225,8 @@ class SessionBridge:
         if not sess:
             return {"ok": False, "error": "session_not_found", "session_id": session_id}
 
+        if sess.get("status") != "open":
+            return {"ok":False,"error":"session_archived","session_id":session_id}
         base = {"local_session_id": session_id, "incident_id": incident_id, "session_id": session_id}
         if self.mimo is None:
             self._set_remote(session_id, status="none")
@@ -239,7 +254,14 @@ class SessionBridge:
             prompt = base_prompt
         title = title or sess.get("title") or (f"inc:{incident_id}" if incident_id else "ayana-session")
         try:
-            remote = self.mimo.create(title=title, prompt=prompt, timeout=timeout)
+            if callable(getattr(type(self.mimo), "allocate", None)):
+                allocated = self.mimo.allocate(title=title, timeout=timeout)
+                rid = str(getattr(allocated,"remote_session_id","") or "")
+                if not rid:raise ValueError("mimo_session_allocation_failed")
+                self._set_remote(session_id,remote_session_id=rid,status="active",model=getattr(allocated,"model","") or "")
+                remote = self.mimo.resume(rid, prompt, timeout=timeout)
+            else:
+                remote = self.mimo.create(title=title, prompt=prompt, timeout=timeout)
         except Exception as e:  # noqa: BLE001
             code = getattr(e, "code", "error")
             self._set_remote(
@@ -283,7 +305,19 @@ class SessionBridge:
             "raw_events": getattr(remote, "raw_events", None) or [],
         }
 
-    def prompt_remote(
+    def prompt_remote(self, incident_id: str = "", prompt: str = "", *, session_id: str = "", timeout: float | None = None) -> dict[str, Any]:
+        if not session_id and incident_id:
+            mapped=self.duty.session_for_incident(incident_id)
+            session_id=str((mapped or {}).get("id") or "")
+            if not session_id:
+                ensured=self.ensure_session(incident_id)
+                if not ensured.get("ok"):return ensured
+                session_id=str(ensured.get("session_id") or "")
+        if not session_id:return {"ok":False,"error":"session_id_required"}
+        with self.duty.turn(session_id,timeout=timeout or 120,lease_sec=max(900,(timeout or 120)+120)):
+            return self._prompt_remote_locked(incident_id,prompt,session_id=session_id,timeout=timeout)
+
+    def _prompt_remote_locked(
         self,
         incident_id: str = "",
         prompt: str = "",
@@ -304,6 +338,7 @@ class SessionBridge:
         sess = self.duty.get(session_id)
         if not sess:
             return {"ok": False, "error": "not_found"}
+        if sess.get("status") != "open":return {"ok":False,"error":"session_archived"}
         rid = sess.get("remote_session_id") or ""
         if not rid:
             attached = self.attach_remote(session_id=session_id, incident_id=incident_id, timeout=timeout)
@@ -721,36 +756,20 @@ class SessionBridge:
             out.append(d)
         return out
 
-    def approve_pending_write(
-        self,
-        incident_id: str,
-        action_key: str,
-        *,
-        approved_by: str = "",
-    ) -> dict[str, Any]:
-        """批准待写：转 claimed，供调用方执行。已批准/已完成不重复。"""
-        row = self.db.query_one(
-            "SELECT * FROM session_write_ops WHERE incident_id=? AND action_key=?",
-            (incident_id, action_key),
-        )
-        if not row:
-            return {"ok": False, "error": "not_found"}
-        st = row["status"]
-        if st == "done":
-            return {"ok": False, "error": "already_done", "action_key": action_key}
-        if st == "claimed":
-            return {"ok": False, "error": "in_flight", "action_key": action_key}
-        if st != "awaiting_approval":
-            return {"ok": False, "error": "not_pending", "status": st, "action_key": action_key}
-        t = now()
-        lease = t + self._lease_seconds()
+    def approve_pending_write(self, incident_id: str, action_key: str, *, approved_by: str = "") -> dict[str, Any]:
+        """A successful atomic claim is the only authorization to dispatch."""
         with self.db.tx() as conn:
-            conn.execute(
-                "UPDATE session_write_ops SET status='claimed', updated_at=?, lease_expires_at=?,"
-                " claimed_by=?, result=? WHERE incident_id=? AND action_key=? AND status='awaiting_approval'",
-                (now(), lease, (approved_by or "human")[:64], row["result"] or "", incident_id, action_key),
-            )
-        return {"ok": True, "claimed": True, "action_key": action_key, "params": self._params_of(row)}
+            if not conn.in_transaction:conn.execute("BEGIN IMMEDIATE")
+            row=conn.execute("SELECT * FROM session_write_ops WHERE incident_id=? AND action_key=?",(incident_id,action_key)).fetchone()
+            if not row:return {"ok":False,"error":"not_found"}
+            state=row["status"]
+            if state!="awaiting_approval":
+                error="already_done" if state=="done" else "in_flight" if state=="claimed" else "not_pending"
+                return {"ok":False,"error":error,"status":state,"action_key":action_key}
+            t=now()
+            cur=conn.execute("UPDATE session_write_ops SET status='claimed',updated_at=?,lease_expires_at=?,claimed_by=? WHERE incident_id=? AND action_key=? AND status='awaiting_approval'",(t,t+self._lease_seconds(),(approved_by or "human")[:64],incident_id,action_key))
+            if cur.rowcount!=1:return {"ok":False,"error":"in_flight","action_key":action_key}
+            return {"ok":True,"claimed":True,"action_key":action_key,"params":self._params_of(row)}
 
     def reject_pending_write(
         self,

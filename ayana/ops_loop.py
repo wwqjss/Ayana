@@ -39,29 +39,20 @@ class OpsLoop:
         self.constraints = constraints
 
     def _state(self, incident_id: str) -> dict[str, Any]:
-        row = self.db.query_one(
-            "SELECT * FROM ops_loop_state WHERE incident_id=?", (incident_id,)
-        )
-        if row:
-            return dict(row)
-        self.db.execute(
-            "INSERT INTO ops_loop_state(incident_id, generation, rounds, no_progress_rounds,"
-            " same_plan_failures, last_plan_sig, status, updated_at)"
-            " VALUES(?,?,?,?,?,?,?,?)",
-            (incident_id, 1, 0, 0, 0, "", "idle", now()),
-        )
-        row = self.db.query_one(
-            "SELECT * FROM ops_loop_state WHERE incident_id=?", (incident_id,)
-        )
-        return dict(row) if row else {
-            "incident_id": incident_id,
-            "generation": 1,
-            "rounds": 0,
-            "no_progress_rounds": 0,
-            "same_plan_failures": 0,
-            "last_plan_sig": "",
-            "status": "idle",
-        }
+        with self.db.tx() as conn:
+            if not conn.in_transaction:conn.execute("BEGIN IMMEDIATE")
+            incident=conn.execute("SELECT generation FROM incidents WHERE id=?",(incident_id,)).fetchone()
+            generation=int(incident["generation"] or 1) if incident else 1
+            row=conn.execute("SELECT * FROM ops_loop_state WHERE incident_id=?",(incident_id,)).fetchone()
+            if row and int(row["generation"] or 1)==generation:return dict(row)
+            if row:
+                self.db.event("ops_loop_generation_reset","新一代工单使用新的处置预算",incident_id=incident_id,payload={"previous_generation":row["generation"],"generation":generation,"previous_status":row["status"],"previous_rounds":row["rounds"]})
+            conn.execute("INSERT INTO ops_loop_state(incident_id,generation,rounds,no_progress_rounds,same_plan_failures,last_plan_sig,status,stop_reason,last_result,updated_at) VALUES(?,?,0,0,0,'','idle','','',?) ON CONFLICT(incident_id) DO UPDATE SET generation=excluded.generation,rounds=0,no_progress_rounds=0,same_plan_failures=0,last_plan_sig='',status='idle',stop_reason='',last_result='',updated_at=excluded.updated_at",(incident_id,generation,now()))
+            return dict(conn.execute("SELECT * FROM ops_loop_state WHERE incident_id=?",(incident_id,)).fetchone())
+
+    def _same_generation(self, incident_id: str, generation: int) -> bool:
+        row=self.db.query_one("SELECT generation FROM incidents WHERE id=?",(incident_id,))
+        return not row or int(row["generation"] or 1)==generation
 
     def _save(self, incident_id: str, **fields: Any) -> None:
         if not fields:
@@ -171,6 +162,7 @@ class OpsLoop:
             return {"ok": False, "error": "actions_unavailable"}
         # P6.2 执行前硬限制：达到上限不再派发，强制转人工
         st = self._state(incident_id)
+        generation=int(st.get("generation") or 1)
         if st.get("status") in ("need_human", "stopped", "done"):
             return {
                 "ok": False,
@@ -208,12 +200,14 @@ class OpsLoop:
             )
         except Exception as e:  # noqa: BLE001
             code = getattr(e, "code", "exec_failed")
+            if not self._same_generation(incident_id,generation):return {"ok":False,"skipped":"stale_generation","error":code}
             self.note_round(
                 incident_id, progressed=False, plan_sig=plan_sig or capability,
                 write_ok=False, result=str(e)[:300],
             )
             return {"ok": False, "error": code, "message": str(e)[:300]}
 
+        if not self._same_generation(incident_id,generation):return {"ok":False,"skipped":"stale_generation","action_id":res.get("id") or res.get("action_id") or ""}
         if res.get("approval_required") or res.get("state") == "proposed":
             # 人工审批开启：只提案，不计入失败轮次
             self.db.event(
@@ -239,6 +233,7 @@ class OpsLoop:
                 verify = await self.actions.verify(action_id)
             except Exception as e:  # noqa: BLE001
                 verify = {"ok": False, "error": str(e)[:200]}
+        if not self._same_generation(incident_id,generation):return {"ok":False,"skipped":"stale_generation","action_id":action_id,"state":state,"verify":verify}
         v_ok = bool(verify.get("ok")) or verify.get("status") == "passed"
         progressed = ok and v_ok
         self.note_round(

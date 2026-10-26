@@ -283,6 +283,8 @@ class App:
         self.duty = DutySessionManager(self.db)
         # MiMoCode serve：实时交互（prompt_async + SSE）
         from .mimo_serve import MimoServeManager
+        from .mimo_runtime_config import runtime_paths, verified_runtime
+        _native_paths = runtime_paths(cfg)
 
         def _resolve_mimo_bin() -> str:
             cand = str(cfg.get("mimo_bin") or "")
@@ -302,7 +304,10 @@ class App:
         _serve_pw = str(cfg.get("mimo_serve_password") or cfg.get("webhook_token") or "ayana-mimo")
         self.mimo_serve = MimoServeManager(
             mimo_bin=_resolve_mimo_bin(),
-            workdir=str(cfg.get("mimo_workdir") or ""),
+            workdir=_native_paths["workdir"],
+            home=_native_paths["home"],
+            runtime_attestation_path=_native_paths["attestation"],
+            managed_externally=bool(cfg.get("mimo_serve_external", False)),
             host="127.0.0.1",
             port=_serve_port,
             username="mimocode",
@@ -310,44 +315,29 @@ class App:
         )
         self.mimo_event_pump = None
         self.mimo_live_events = []
+        self.agent_tui = None
         # P2 薄桥：只做映射/复用/幂等，不做自动处置（旧自治仍禁用）
         self.session_bridge = SessionBridge(self.db, knowledge=self.knowledge, duty=self.duty)
         self.incidents.session_bridge = self.session_bridge
         # P6.2: one verified provider and one MCP/DB binding for all runtime clients.
         from .mimo_admin import MimoAdmin
-        from .mimo_session import MimoSessionClient
+        from .mimo_session import MimoServeSessionClient
 
         _ai_cfg = InvestConfig.from_dict(cfg.get("auto_investigate") or {})
         _code_root = str(Path(__file__).resolve().parents[1])
         _config_base = str(Path(cfg.get("base_dir") or _code_root).resolve())
         self.mimo_admin = MimoAdmin(
             mimo_bin=str(cfg.get("mimo_bin") or _ai_cfg.mimo_bin or "mimo"),
-            workdir=str(cfg.get("mimo_workdir") or _code_root),
+            workdir=_native_paths["workdir"],
             serve_url=str(cfg.get("mimo_serve_url") or ""),
             unit_name=str(cfg.get("mimo_unit") or ""),
         )
 
         def _mimo_runtime():
-            runtime = self.mimo_admin.runtime_configuration(self.db)
-            overlay = dict(runtime.get("config") or {})
-            overlay["mcp"] = {
-                **(overlay.get("mcp") or {}),
-                "ayana": {
-                    "type": "local", "enabled": True,
-                    "command": [sys.executable, "-m", "ayana.mcp_server", _config_base],
-                    "environment": {
-                        "AYANA_MCP_DB_PATH": str(Path(self.db.path).resolve()),
-                        "PYTHONPATH": _code_root + os.pathsep + os.environ.get("PYTHONPATH", ""),
-                    },
-                },
-            }
-            return {
-                **runtime, "config": overlay,
-                "environment": {
-                    "AYANA_MCP_DB_PATH": str(Path(self.db.path).resolve()),
-                    "PYTHONPATH": _code_root + os.pathsep + os.environ.get("PYTHONPATH", ""),
-                },
-            }
+            return verified_runtime(cfg, self.db, self.mimo_admin)
+
+        self.mimo_serve.runtime_resolver = _mimo_runtime
+        self.mimo_runtime = _mimo_runtime
 
         def _mimo_ready():
             try:
@@ -356,15 +346,47 @@ class App:
             except Exception:
                 return False
 
-        self.mimo_read_client = MimoSessionClient(
+        def _receipt(rid, receipt_id, message_id):
+            row = self.db.query_one("SELECT id FROM duty_sessions WHERE remote_session_id=?", (rid,))
+            if row:
+                self.duty.set_runtime_state(row["id"], "running", receipt_id=receipt_id, receipt_status="accepted")
+                t = time.time()
+                self.db.execute(
+                    "INSERT INTO agent_runtime_receipts(receipt_id,session_id,remote_session_id,status,origin,created_at,updated_at) VALUES(?,?,?,?,?,?,?)"
+                    " ON CONFLICT(receipt_id) DO UPDATE SET status=excluded.status,updated_at=excluded.updated_at",
+                    (receipt_id, row["id"], rid, "accepted", "automatic", t, t),
+                )
+
+        def _native_state(rid, state, detail):
+            row = self.db.query_one("SELECT id FROM duty_sessions WHERE remote_session_id=?", (rid,))
+            if not row:
+                return
+            receipt_id = detail.get("receipt_id") or ""
+            if receipt_id:
+                self.db.execute("UPDATE agent_runtime_receipts SET status=?,updated_at=? WHERE receipt_id=?", (state, time.time(), receipt_id))
+            if state == "unknown":
+                self.duty.set_runtime_state(row["id"], "unknown", receipt_id=receipt_id, receipt_status="unknown")
+
+        self.mimo_read_client = MimoServeSessionClient(
             mimo_bin=self.mimo_admin.mimo_bin, cwd=self.mimo_admin.workdir,
             readonly_env=True, default_timeout=_ai_cfg.timeout_sec,
-            runtime_resolver=_mimo_runtime,
+            serve_url=self.mimo_serve.base_url, serve_username="mimocode", serve_password=_serve_pw,
+            runtime_resolver=_mimo_runtime, admission_guard=self.mimo_serve.validate_runtime,
+            on_receipt=_receipt, on_state=_native_state,
         )
-        self.mimo_decision_client = MimoSessionClient(
+        self.mimo_decision_client = MimoServeSessionClient(
             mimo_bin=self.mimo_admin.mimo_bin, cwd=self.mimo_admin.workdir,
             decision_only=True, default_timeout=max(_ai_cfg.decision_timeout_sec, _ai_cfg.timeout_sec),
-            runtime_resolver=_mimo_runtime,
+            serve_url=self.mimo_serve.base_url, serve_username="mimocode", serve_password=_serve_pw,
+            runtime_resolver=_mimo_runtime, admission_guard=self.mimo_serve.validate_runtime,
+            on_receipt=_receipt, on_state=_native_state,
+        )
+        from .agent_tui import AgentTuiManager
+        self.agent_tui = AgentTuiManager(
+            self.db, serve_client_factory=self.mimo_serve.client,
+            mimo_bin=self.mimo_admin.mimo_bin, workdir=_native_paths["workdir"],
+            home=_native_paths["home"], state_dir=str(Path(_native_paths["state_dir"]) / "tui"),
+            proxy_port=int(cfg.get("agent_tui_proxy_port") or 6291), runtime_resolver=_mimo_runtime,
         )
         # Manual chat shares the verified read-only client rather than a no_mimo bridge.
         self.session_bridge.mimo = self.mimo_read_client
@@ -577,6 +599,7 @@ class App:
             duty=self.duty,
             session_bridge=self.session_bridge,
             mimo_serve=self.mimo_serve,
+            agent_tui=self.agent_tui,
             mimo_events=lambda: getattr(self, "mimo_live_events", []),
             alertmanager_webhook_path=cfg.get("alertmanager_webhook_path") or "/hooks/alertmanager",
         )
@@ -756,8 +779,12 @@ class App:
         except Exception as e:  # noqa: BLE001
             log.warning("duty recover failed: %s", e)
         self._bg_tasks.append(asyncio.create_task(self._bg_duty_archives()))
-        # MiMoCode serve：拉起 + SSE 事件泵
+        # The terminal proxy belongs to Web; tmux and execution owner belong
+        # to the independent native runtime service.
+        if self.agent_tui is not None and bool(self.cfg.get("agent_tui_enabled", False)):
+            await self.agent_tui.start()
         self._bg_tasks.append(asyncio.create_task(self._bg_mimo_serve()))
+        self._bg_tasks.append(asyncio.create_task(self._bg_native_receipts()))
         # P4.3：只读调查 worker（独立于旧自治）
         if self.auto_investigator is not None:
             self._bg_tasks.append(asyncio.create_task(self.auto_investigator.run_forever()))
@@ -799,6 +826,8 @@ class App:
                 pass
         await self._stop.wait()
         log.info("shutting down")
+        if self.agent_tui is not None:
+            await self.agent_tui.stop()
         if getattr(self, "nodewatch", None):
             try:
                 await self.nodewatch.stop()
@@ -980,6 +1009,31 @@ class App:
                     await self.mimo_serve.ensure_running()
                 except Exception:
                     pass
+
+    async def _bg_native_receipts(self) -> None:
+        from .mimo_serve import normalize_receipt_status
+        while not self._stop.is_set():
+            rows = self.db.query("SELECT * FROM agent_runtime_receipts WHERE status IN ('accepted','pending','queued','running') ORDER BY updated_at LIMIT 40")
+            for row in rows:
+                try:
+                    receipt = await self.mimo_serve.client().receipt(row["remote_session_id"], row["receipt_id"])
+                    status = normalize_receipt_status(receipt)
+                    if status not in ("completed", "failed", "cancelled"):
+                        continue
+                    self.db.execute("UPDATE agent_runtime_receipts SET status=?,updated_at=? WHERE receipt_id=?", (status, time.time(), row["receipt_id"]))
+                    sid = row["session_id"]
+                    pending = self.db.query_one("SELECT 1 FROM agent_runtime_receipts WHERE session_id=? AND status IN ('accepted','pending','queued','running','unknown')", (sid,))
+                    active = self.db.query_one("SELECT 1 FROM investigation_jobs j JOIN session_incidents si ON si.incident_id=j.incident_id WHERE si.session_id=? AND j.status='running'", (sid,))
+                    if not pending and not active:
+                        self.duty.set_runtime_state(sid, "idle", receipt_id=row["receipt_id"], receipt_status=status)
+                        self.duty.maybe_start_archive_countdown(sid)
+                except Exception:
+                    # Lost observation is not a failed model task and never a replay.
+                    pass
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                pass
 
     async def _bg_duty_archives(self) -> None:
         """值班会话归档倒计时 tick + 标题刷新。"""
