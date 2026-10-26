@@ -770,7 +770,7 @@
     try {
       term.fit.fit();
     } catch (e) { /* ignore */ }
-    if (term.xterm && term.ws && term.ws.readyState === 1 && term.control) {
+    if (term.xterm && term.ws && term.ws.readyState === 1) {
       try {
         term.ws.send(JSON.stringify({ type: "resize", cols: term.xterm.cols, rows: term.xterm.rows }));
       } catch (e) { /* ignore */ }

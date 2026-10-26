@@ -672,8 +672,8 @@ class AgentTuiManager:
                         await ws.send_json({"type": "control", "control": control})
                         continue
                     if kind == "resize":
-                        if not self._has_control(session_id, username, connection_id, renew=True):
-                            continue
+                        # Viewport size is not an Agent instruction; observers
+                        # may resize so the native TUI fills the browser pane.
                         try:
                             cols = max(20, min(400, int(payload.get("cols", 120))))
                             rows = max(5, min(200, int(payload.get("rows", 36))))
