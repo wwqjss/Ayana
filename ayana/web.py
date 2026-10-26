@@ -1692,7 +1692,8 @@ class WebApp:
             binding = await manager.ensure(sid, ready["remote_session_id"])
             self.db.audit("web_user", user["username"], "agent_terminal_prepared", detail={"session_id": sid}, channel="web")
             return _json({"ok": True, "binding": binding, "mode": "observe"})
-        except Exception:
+        except Exception as error:
+            log.warning("agent terminal prepare failed sid=%s: %s", sid, error)
             return self._agent_runtime_failure()
 
     async def api_agent_terminal_status(self, request: web.Request) -> web.Response:

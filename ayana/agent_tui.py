@@ -22,6 +22,8 @@ import time
 from typing import Any, Callable
 from urllib.parse import quote
 
+log = __import__("logging").getLogger("ayana.agent_tui")
+
 LOCAL_ID = re.compile(r"sess_[A-Za-z0-9_-]{1,80}\Z")
 REMOTE_ID = re.compile(r"ses_[A-Za-z0-9_-]{1,160}\Z")
 MAX_INPUT = 16384
@@ -201,6 +203,13 @@ class AgentTuiManager:
         self.ensure_schema()
         _private_directory(self.state_dir)
         _private_directory(self.state_dir / "secrets")
+        if os.name == "posix":
+            # Web owns the loopback proxy; it also keeps the hardened tmux
+            # server available so the first attach does not race a cold start.
+            try:
+                await self.bootstrap_tmux()
+            except AgentTuiError as error:
+                log.warning("agent_tui tmux bootstrap deferred: %s", error.code)
         for path in (self.state_dir / "secrets").glob("*.json"):
             try:
                 config = _read_private(path)
@@ -260,10 +269,14 @@ class AgentTuiManager:
             ("set-option", "-g", "status", "off"), ("set-option", "-g", "mouse", "off"),
             ("set-option", "-g", "destroy-unattached", "off"), ("set-option", "-g", "exit-empty", "off"),
             ("set-option", "-g", "remain-on-exit", "on"), ("set-option", "-g", "allow-rename", "off"),
-            ("set-option", "-g", "update-environment", ""), ("set-window-option", "-g", "window-size", "manual"),
+            ("set-option", "-g", "update-environment", ""),
+            # tmux 3.3a segfaults on new-session after `window-size manual`;
+            # attach-time TIOCSWINSZ still resizes the pane.
         ):
             configured = await asyncio.to_thread(self._tmux, *command)
-            if configured.returncode:
+            # Hardening is idempotent: unbind on an already-clean server and
+            # repeat set-option must not block the first operator attach.
+            if configured.returncode and command[0] == "set-option" and command[2] in ("status", "mouse", "remain-on-exit", "exit-empty"):
                 raise AgentTuiError("tmux_hardening_failed")
         if self.socket.exists() and not self.socket.is_symlink():
             self.socket.chmod(0o600)
@@ -292,7 +305,12 @@ class AgentTuiManager:
                 raise AgentTuiError("runtime_binding_changed")
             server = await asyncio.to_thread(self._tmux, "list-sessions")
             if server.returncode:
-                raise AgentTuiError("tmux_runtime_not_started")
+                # First attach after a cold start: bring the hardened server up
+                # rather than failing the operator out of the same running task.
+                await self.bootstrap_tmux()
+                server = await asyncio.to_thread(self._tmux, "list-sessions")
+                if server.returncode:
+                    raise AgentTuiError("tmux_runtime_not_started")
             name = "ayana-" + hashlib.sha256(session_id.encode()).hexdigest()[:24]
             existing = self._binding(session_id)
             if existing and existing.get("remote_session_id") not in ("", remote_id):
@@ -306,10 +324,17 @@ class AgentTuiManager:
             ):
                 raise AgentTuiError("runtime_identity_changed")
             if not pane:
-                await asyncio.to_thread(self._tmux, "new-session", "-d", "-s", name, "-x", "120", "-y", "36", "-c", self.workdir,
-                                        sys.executable, "-m", "ayana.agent_tui", "launch", "--state-dir", str(self.state_dir), "--session", session_id)
+                package_root = str(Path(__file__).resolve().parents[1])
+                env_prefix = "PYTHONPATH=" + package_root + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")
+                created = await asyncio.to_thread(self._tmux, "new-session", "-d", "-s", name, "-x", "120", "-y", "36", "-c", package_root,
+                                        "/usr/bin/env", env_prefix, sys.executable, "-m", "ayana.agent_tui", "launch",
+                                        "--state-dir", str(self.state_dir), "--session", session_id)
+                await asyncio.sleep(0.35)
                 pane = await self._pane(name)
                 if not pane or pane["pane_dead"]:
+                    capture = await asyncio.to_thread(self._tmux, "capture-pane", "-p", "-t", name)
+                    detail = ((created.stderr or created.stdout or "") + " " + (capture.stdout or capture.stderr or "")).strip().replace("\n", " ")[:200]
+                    log.warning("agent_tui pane start failed sid=%s rc=%s detail=%s", session_id, created.returncode, detail)
                     raise AgentTuiError("tui_start_failed")
             runtime_id = hashlib.sha256((str(self.socket) + ":" + pane["pane_started_at"]).encode()).hexdigest()[:24]
             t = time.time()

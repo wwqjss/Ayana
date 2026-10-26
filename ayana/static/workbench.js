@@ -740,7 +740,10 @@
   function ensureXterm() {
     const T = window.Terminal || (window.xterm && window.xterm.Terminal);
     const Fit = window.FitAddon && (window.FitAddon.FitAddon || window.FitAddon);
-    if (!T) return null;
+    if (!T) {
+      renderStatusLine('xterm.js 未加载，终端不可用。请强刷页面后重试。');
+      return null;
+    }
     if (!term.xterm) {
       term.xterm = new T({
         cursorBlink: true,
@@ -869,6 +872,7 @@
     if (!prep || !prep.ok) {
       const msg = (prep && (prep.message || prep.error)) || "原生运行服务暂不可用，任务和历史记录已保留。";
       termWriteLine(msg);
+      renderStatusLine("接入失败: " + msg);
       updateTermUi();
       return;
     }
