@@ -691,7 +691,7 @@ function currentTabFromHash() {
   const h = (location.hash || "").replace(/^#/, "");
   const assetM = h.match(/^assets\/(.+)$/);
   if (assetM) return { tab: "overview", focus: assetM[1], assetView: true };
-  const m = h.match(/^(overview|incidents|monitor|checks|promconfig|messages|connections|notify|knowledge|permissions|audit)(?:\/(.+))?$/);
+  const m = h.match(/^(overview|incidents|monitor|agent|checks|promconfig|messages|connections|notify|knowledge|permissions|audit)(?:\/(.+))?$/);
   return m ? { tab: m[1], focus: m[2] || "", assetView: false } : { tab: "overview", focus: "", assetView: false };
 }
 
@@ -717,7 +717,7 @@ function activateTab(tab, focus, assetView) {
     tab = "monitor";
     queueMicrotask(() => setMonitorSub("checks"));
   }
-  const valid = ["overview", "incidents", "monitor", "connections", "notify", "knowledge", "permissions", "audit"];
+  const valid = ["overview", "incidents", "monitor", "agent", "connections", "notify", "knowledge", "permissions", "audit"];
   if (!valid.includes(tab)) tab = "overview";
   state.tab = tab;
   state.focus = focus || "";
@@ -889,6 +889,9 @@ async function refreshTab() {
     else await renderMonitor();
   }
   if (state.tab === "connections") await renderConnections();
+  if (state.tab === "agent" && typeof window.renderAgentWorkbench === "function") {
+    await window.renderAgentWorkbench();
+  }
   if (state.tab === "notify") {
     if (state.notifySub === "messages") await renderMessages();
     else await renderNotify();

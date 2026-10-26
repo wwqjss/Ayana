@@ -432,11 +432,25 @@ class OpsTools:
         channel: str,
         classified: str,
     ) -> dict[str, Any]:
-        """统一受控写：claim → 执行 → 确定结果/unknown → 审计。"""
+        """统一受控写：审批门 → claim → 执行 → 确定结果/unknown → 审计。"""
         from .actions import classify_exec_result
 
         br = getattr(self.ctx, "session_bridge", None)
-        # 无 Incident 的 ad-hoc 写归入 _mcp_ 命名空间，保证幂等键唯一
+        duty = getattr(self.ctx, "duty", None)
+        require_human = True
+        if duty is not None:
+            try:
+                require_human = bool(duty.require_human_approval())
+            except Exception:
+                require_human = True
+        else:
+            db = getattr(self.ctx, "db", None)
+            try:
+                row = db.query_one("SELECT value FROM agent_settings WHERE key='require_human_approval'") if db else None
+                if row is not None:
+                    require_human = str(row["value"] or "1") not in ("0", "false", "False", "")
+            except Exception:
+                require_human = True
         incident_id = str(getattr(self.ctx, "mcp_incident_scope", "") or "_mcp_")
         action_key = ""
         if br is not None:
@@ -447,6 +461,30 @@ class OpsTools:
                     {"command": command, "channel": channel, "classified": classified},
                     context="mcp-host-exec",
                 )
+                if require_human:
+                    pending = br.pending_write(
+                        incident_id,
+                        action_key,
+                        target=asset_id,
+                        params={"command": command[:500], "channel": channel, "timeout": timeout},
+                        claimed_by="mcp_agent",
+                    )
+                    if not pending.get("ok") and pending.get("error") != "already_pending":
+                        return {
+                            "ok": False,
+                            "error": pending.get("error") or "pending_failed",
+                            "detail": pending,
+                            "action_key": action_key,
+                        }
+                    self._audit_write(asset_id, command, "awaiting_approval", "human approval required")
+                    return {
+                        "ok": False,
+                        "error": "approval_required",
+                        "message": "写操作已记录，等待人工批准后执行",
+                        "action_key": action_key,
+                        "pending": True,
+                        "incident_id": incident_id,
+                    }
                 claim = br.claim_write(
                     incident_id,
                     action_key,

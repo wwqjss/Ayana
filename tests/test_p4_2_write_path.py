@@ -77,6 +77,12 @@ class TestClassifyShell(unittest.TestCase):
 class TestMcpControlledWrite(unittest.TestCase):
     def setUp(self):
         self.tmp, self.db = make_db()
+        # 本组用例验证写路径机制（claim/审计/幂等）；关闭人工审批以直接执行
+        self.db.execute(
+            "INSERT OR REPLACE INTO agent_settings(key,value,updated_at,updated_by)"
+            " VALUES('require_human_approval','0',?, 'test')",
+            (now(),),
+        )
         self.transport = FakeTransport()
         self.bridge = SessionBridge(self.db)
         self.tools = OpsTools(
@@ -187,6 +193,30 @@ class TestMcpControlledWrite(unittest.TestCase):
         )
         self.assertTrue(a["ok"] and b["ok"])
         self.assertNotEqual(a["action_key"], b["action_key"])
+
+    def test_human_approval_blocks_write_until_approved(self):
+        self.db.execute(
+            "INSERT OR REPLACE INTO agent_settings(key,value,updated_at,updated_by)"
+            " VALUES('require_human_approval','1',?, 'test')",
+            (now(),),
+        )
+        out = asyncio.run(
+            self.tools.call(
+                "host.exec",
+                {"asset_id": "nerv", "command": "systemctl restart frps", "channel": "write"},
+            )
+        )
+        self.assertFalse(out["ok"])
+        self.assertEqual(out.get("error"), "approval_required")
+        self.assertTrue(out.get("pending"))
+        self.assertEqual(self.transport.calls, [])
+        key = out.get("action_key")
+        self.assertTrue(key)
+        approved = self.bridge.approve_pending_write("_mcp_", key, approved_by="alice")
+        self.assertTrue(approved["ok"])
+        # 批准后执行
+        self.bridge.complete_write("_mcp_", key, ok=True, result="ok")
+        self.assertTrue(self.bridge.is_write_done("_mcp_", key))
 
 
 class TestActionServiceWriteOps(unittest.TestCase):

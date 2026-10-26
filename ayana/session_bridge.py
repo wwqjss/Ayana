@@ -1,133 +1,139 @@
-"""Incident → Session 薄桥（SpeedSupreme P2）。
+"""Incident → Session 薄桥（SpeedSupreme P2 + 工作台一会话多 Incident）。
 
 分工：
 - Incident 管事实（告警、状态、恢复证据）
-- Session 管调查（上下文、过程、决策痕迹）
+- Session（duty_session）管调查上下文、过程、决策痕迹；一会话可关联多 Incident
 - Execution 管动作（审批/执行/审计/验证 —— 仍由 ActionService 负责）
 
-本模块只做四件事，多了算失败：
-1. 建/找 session（同 incident 复用，不重复创建）
+本模块只做：
+1. 建/找会话并挂接 Incident（自动值班复用 open 会话）
 2. 生成结构化 prompt
-3. 记 incident_id ↔ session_id 映射（落库，重启可恢复）
+3. 记 session_id ↔ incident_id 映射（落库，重启可恢复）
 4. 写操作幂等台账（同一 action_key 不重复执行已完成写）
+5. 关联 MiMo 远端会话（按 session，不按 incident）
 
 禁止：第二套 Agent Runtime / 调度状态机 / Planner / 自动处置决策。
-旧 Council 自治保持禁用，不因 P2 重新启用。
 """
 
 from __future__ import annotations
 
 import json
 import re
-import time
+import threading
 from typing import Any
 
 from .db import new_id, now
+from .duty_session import DutySessionManager
 
 
 class SessionBridge:
-    """薄桥：映射、复用、幂等。无调度、无决策。
+    """薄桥：映射、复用、幂等。无调度、无决策。"""
 
-    P3：本地 sess_* 为 Ayana 稳定标识；MiMo 远端 ses_* 单独记账。
-    远端失效只重建远端，不丢本地调查记录，也不重放写操作。
-    """
-
-    def __init__(self, db: Any, knowledge: Any = None, mimo: Any = None):
+    def __init__(self, db: Any, knowledge: Any = None, mimo: Any = None, duty: DutySessionManager | None = None):
         self.db = db
         self.knowledge = knowledge
         self.mimo = mimo  # MimoSessionClient | None
+        self.duty = duty or DutySessionManager(db)
+        self._ensure_lock = threading.Lock()
 
     # ---- 映射 / 会话 ----
 
     def get_mapping(self, incident_id: str) -> dict[str, Any] | None:
-        row = self.db.query_one(
-            "SELECT * FROM incident_session WHERE incident_id=?", (incident_id,)
-        )
-        return dict(row) if row else None
+        """兼容旧接口：返回该 Incident 所属会话（含远端字段）。"""
+        sess = self.duty.session_for_incident(incident_id)
+        if not sess:
+            return None
+        inc = self.db.query_one("SELECT generation FROM incidents WHERE id=?", (incident_id,))
+        inc_d = dict(inc) if inc else {}
+        gen = int(inc_d.get("generation") or 1)
+        return {
+            "incident_id": incident_id,
+            "generation": gen,
+            "session_id": sess.get("id") or "",
+            "status": "open" if sess.get("status") == "open" else "closed",
+            "prompt": sess.get("prompt") or "",
+            "created_at": sess.get("created_at") or 0,
+            "updated_at": sess.get("updated_at") or 0,
+            **self._remote_fields(sess),
+        }
 
     def ensure_session(self, incident_id: str, *, generation: int | None = None) -> dict[str, Any]:
-        """新 Incident 自动建 session；已有则复用（重复告警不重复创建）。"""
+        """挂接 Incident 到自动值班会话（一会话多 Incident）。并发下收敛单会话。"""
         if not incident_id:
             raise ValueError("incident_id required")
-        existing = self.get_mapping(incident_id)
-        if existing:
-            if generation is not None and int(existing.get("generation") or 1) != int(generation):
-                # 升级/新一代：保留同一 session，只推进 generation（可重复调查）
-                with self.db.tx() as conn:
-                    conn.execute(
-                        "UPDATE incident_session SET generation=?, updated_at=? WHERE incident_id=?",
-                        (int(generation), now(), incident_id),
-                    )
-                existing = self.get_mapping(incident_id)
-            return {"ok": True, "action": "reused", **existing, **self._remote_fields(existing)}
+        with self._ensure_lock:
+            return self._ensure_session_locked(incident_id, generation=generation)
 
+    def _ensure_session_locked(self, incident_id: str, *, generation: int | None = None) -> dict[str, Any]:
         inc = self.db.query_one("SELECT * FROM incidents WHERE id=?", (incident_id,))
         if not inc:
             return {"ok": False, "error": "incident_not_found", "incident_id": incident_id}
         gen = int(generation if generation is not None else (inc["generation"] or 1))
-        sid = new_id("sess")
-        prompt = self.build_prompt(incident_id)
-        t = now()
-        try:
-            with self.db.tx() as conn:
-                conn.execute(
-                    "INSERT INTO incident_session(incident_id, generation, session_id, status, prompt,"
-                    " created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
-                    (incident_id, gen, sid, "open", prompt, t, t),
-                )
-                conn.execute(
-                    "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
-                    (
-                        incident_id,
-                        t,
-                        "session_opened",
-                        f"session {sid}",
-                        json.dumps({"session_id": sid, "generation": gen}, ensure_ascii=False),
-                    ),
-                )
-        except Exception:
-            # 并发下 UNIQUE 撞车 → 复用已有，保证单会话
-            existing = self.get_mapping(incident_id)
-            if existing:
-                return {"ok": True, "action": "reused", **existing, **self._remote_fields(existing)}
-            raise
-        created = self.get_mapping(incident_id) or {}
-        return {"ok": True, "action": "created", **created, **self._remote_fields(created)}
 
-    def close_session(self, incident_id: str, *, reason: str = "") -> dict[str, Any]:
-        m = self.get_mapping(incident_id)
-        if not m:
-            return {"ok": False, "error": "not_found"}
+        existing = self.duty.session_for_incident(incident_id)
+        if existing and existing.get("status") == "open":
+            self.duty.cancel_archive(existing["id"])
+            self.duty.join_incident(existing["id"], incident_id, generation=gen)
+            return {
+                "ok": True,
+                "action": "reused",
+                "incident_id": incident_id,
+                "generation": gen,
+                "session_id": existing["id"],
+                "status": "open",
+                **self._remote_fields(existing),
+            }
+
+        # 新告警：进入 open 自动值班会话，没有则创建
+        sess = self.duty.ensure_auto_session(incident_id)
+        sid = sess.get("session_id") or sess.get("id") or ""
+        if not sid:
+            return {"ok": False, "error": "session_create_failed", "incident_id": incident_id}
+        self.duty.cancel_archive(sid)
+        self.duty.join_incident(sid, incident_id, generation=gen)
+        # Incident 时间线痕迹（兼容旧 session_opened 事件）
+        try:
+            self.db.event(
+                "session_opened",
+                f"session {sid}",
+                incident_id=incident_id,
+                payload={"session_id": sid, "generation": gen},
+            )
+        except Exception:
+            pass
+        prompt = self.build_prompt(incident_id)
         with self.db.tx() as conn:
             conn.execute(
-                "UPDATE incident_session SET status='closed', updated_at=? WHERE incident_id=?",
-                (now(), incident_id),
+                "UPDATE duty_sessions SET prompt=?, updated_at=? WHERE id=?",
+                (prompt, now(), sid),
             )
-            conn.execute(
-                "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
-                (
-                    incident_id,
-                    now(),
-                    "session_closed",
-                    reason or "closed",
-                    json.dumps({"session_id": m.get("session_id")}, ensure_ascii=False),
-                ),
-            )
-        return {"ok": True, "action": "closed", **self.get_mapping(incident_id)}
+        return {
+            "ok": True,
+            "action": sess.get("action", "created"),
+            "incident_id": incident_id,
+            "generation": gen,
+            "session_id": sid,
+            "status": "open",
+            "prompt": prompt,
+            **self._remote_fields(self.duty.get(sid) or {}),
+        }
+
+    def close_session(self, incident_id: str, *, reason: str = "") -> dict[str, Any]:
+        """兼容旧接口：Incident 关闭时推进会话归档倒计时，不立刻关会话。"""
+        sess = self.duty.session_for_incident(incident_id)
+        if not sess:
+            return {"ok": False, "error": "not_found"}
+        sid = sess["id"]
+        res = self.duty.maybe_start_archive_countdown(sid)
+        return {"ok": True, "action": "countdown_or_keep", "session_id": sid, **res}
+
+    def archive_session(self, session_id: str, *, reason: str = "manual") -> dict[str, Any]:
+        return self.duty.archive_session(session_id, reason=reason)
 
     def list_sessions(self, status: str = "", limit: int = 50) -> list[dict[str, Any]]:
-        if status:
-            rows = self.db.query(
-                "SELECT * FROM incident_session WHERE status=? ORDER BY updated_at DESC LIMIT ?",
-                (status, limit),
-            )
-        else:
-            rows = self.db.query(
-                "SELECT * FROM incident_session ORDER BY updated_at DESC LIMIT ?", (limit,)
-            )
-        return [dict(r) for r in rows]
+        return self.duty.list_sessions(status=status, limit=limit)
 
-    # ---- MiMo 远端会话（P3）----
+    # ---- MiMo 远端会话（按 duty_session）----
 
     def _remote_fields(self, mapping: dict[str, Any]) -> dict[str, Any]:
         history = mapping.get("remote_history") or "[]"
@@ -146,7 +152,7 @@ class SessionBridge:
 
     def _set_remote(
         self,
-        incident_id: str,
+        session_id: str,
         *,
         remote_session_id: str = "",
         status: str = "none",
@@ -154,7 +160,7 @@ class SessionBridge:
         last_error: str = "",
         keep_history: bool = True,
     ) -> None:
-        m = self.get_mapping(incident_id)
+        m = self.duty.get(session_id)
         if not m:
             return
         hist: list[dict[str, Any]] = []
@@ -166,13 +172,12 @@ class SessionBridge:
         old = m.get("remote_session_id") or ""
         if old and old != remote_session_id:
             hist.append({"id": old, "status": m.get("remote_status") or "", "at": now()})
-        # 只保留最近 10 条历史，且不含密钥
         hist = hist[-10:]
         with self.db.tx() as conn:
             conn.execute(
-                "UPDATE incident_session SET remote_session_id=?, remote_status=?,"
-                " remote_model=?, remote_last_error=?, remote_history=?, remote_updated_at=?"
-                " WHERE incident_id=?",
+                "UPDATE duty_sessions SET remote_session_id=?, remote_status=?,"
+                " remote_model=?, remote_last_error=?, remote_history=?, remote_updated_at=?, updated_at=?"
+                " WHERE id=?",
                 (
                     remote_session_id,
                     status,
@@ -180,58 +185,65 @@ class SessionBridge:
                     (last_error or "")[:300],
                     json.dumps(hist, ensure_ascii=False),
                     now(),
-                    incident_id,
+                    now(),
+                    session_id,
                 ),
             )
 
     def attach_remote(
         self,
-        incident_id: str,
+        incident_id: str = "",
         *,
+        session_id: str = "",
         title: str = "",
         prompt: str = "",
         force_new: bool = False,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        """本地 Session 关联 MiMo 远端会话。
+        """把会话关联到 MiMo 远端。incident_id 或 session_id 二选一。"""
+        if not session_id and incident_id:
+            ensured = self.ensure_session(incident_id)
+            if not ensured.get("ok"):
+                return ensured
+            session_id = str(ensured.get("session_id") or "")
+        if not session_id:
+            return {"ok": False, "error": "session_id_required"}
+        sess = self.duty.get(session_id)
+        if not sess:
+            return {"ok": False, "error": "session_not_found", "session_id": session_id}
 
-        - 已有且存活 → 复用（重复告警/重启恢复）
-        - 远端失效/缺失 → 保留历史，受控新建（绝不假装 resume）
-        - mimo 未接入 → remote_status=none，不阻断事件主流程
-        prompt 可覆盖首轮内容（默认用自动生成的调查 prompt）。
-        """
-        m = self.ensure_session(incident_id)
-        if not m.get("ok"):
-            return m
-        base = {
-            "local_session_id": m.get("session_id"),
-            "incident_id": incident_id,
-        }
+        base = {"local_session_id": session_id, "incident_id": incident_id, "session_id": session_id}
         if self.mimo is None:
-            self._set_remote(incident_id, status="none")
+            self._set_remote(session_id, status="none")
             return {**base, "ok": True, "action": "no_mimo", "remote_session_id": ""}
 
-        rid = m.get("remote_session_id") or ""
+        rid = sess.get("remote_session_id") or ""
         if rid and not force_new:
             try:
                 alive = self.mimo.exists(rid)
             except Exception as e:  # noqa: BLE001
-                self._set_remote(incident_id, remote_session_id=rid, status="error", last_error=str(e))
+                self._set_remote(session_id, remote_session_id=rid, status="error", last_error=str(e))
                 return {**base, "ok": False, "action": "probe_failed", "remote_session_id": rid, "error": str(e)}
             if alive:
-                self._set_remote(incident_id, remote_session_id=rid, status="active", model=getattr(self.mimo, "model", ""))
+                self._set_remote(session_id, remote_session_id=rid, status="active", model=getattr(self.mimo, "model", ""))
                 return {**base, "ok": True, "action": "reused", "remote_session_id": rid}
-            # 远端失效：保留历史后新建
-            self._set_remote(incident_id, remote_session_id=rid, status="missing", last_error="remote missing")
+            self._set_remote(session_id, remote_session_id=rid, status="missing", last_error="remote missing")
 
-        prompt = (prompt or "").strip() or m.get("prompt") or self.build_prompt(incident_id)
-        title = title or f"inc:{incident_id}"
+        if not prompt:
+            base_prompt = (sess.get("prompt") or "").strip()
+            if not base_prompt:
+                if incident_id:
+                    base_prompt = self.build_prompt(incident_id)
+                else:
+                    base_prompt = self.build_session_prompt(session_id)
+            prompt = base_prompt
+        title = title or sess.get("title") or (f"inc:{incident_id}" if incident_id else "ayana-session")
         try:
             remote = self.mimo.create(title=title, prompt=prompt, timeout=timeout)
         except Exception as e:  # noqa: BLE001
             code = getattr(e, "code", "error")
             self._set_remote(
-                incident_id,
+                session_id,
                 remote_session_id=rid,
                 status="timeout" if code == "timeout" else "error",
                 last_error=str(e),
@@ -246,38 +258,55 @@ class SessionBridge:
             }
 
         self._set_remote(
-            incident_id,
+            session_id,
             remote_session_id=getattr(remote, "remote_session_id", "") or "",
             status=getattr(remote, "status", "") or "active",
             model=getattr(remote, "model", "") or "",
             last_error=getattr(remote, "last_error", "") or "",
+        )
+        self.duty.add_message(
+            session_id,
+            role="assistant",
+            kind="mimo_result",
+            title="MiMo 会话已建立",
+            body=(getattr(remote, "text", "") or "")[:8000],
+            payload={"remote_session_id": getattr(remote, "remote_session_id", ""), "raw_events": (getattr(remote, "raw_events", None) or [])[:50]},
+            incident_id=incident_id,
         )
         return {
             **base,
             "ok": True,
             "action": "created",
             "remote_session_id": getattr(remote, "remote_session_id", ""),
-            "remote_status": getattr(remote, "status", ""),
-            # P4.3 E2E：结论 JSON 可能很长，不能截断到 500
+            "remote_status": getattr(remote, "status", "") or "active",
             "text": (getattr(remote, "text", "") or ""),
+            "raw_events": getattr(remote, "raw_events", None) or [],
         }
 
     def prompt_remote(
         self,
-        incident_id: str,
-        prompt: str,
+        incident_id: str = "",
+        prompt: str = "",
         *,
+        session_id: str = "",
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        """向已关联远端会话追加调查 prompt（不重放历史工具调用）。"""
-        m = self.get_mapping(incident_id)
-        if not m:
-            return {"ok": False, "error": "not_found"}
+        if not session_id and incident_id:
+            sess = self.duty.session_for_incident(incident_id)
+            session_id = (sess or {}).get("id") or ""
+            if not session_id:
+                ensured = self.ensure_session(incident_id)
+                session_id = str(ensured.get("session_id") or "")
+        if not session_id:
+            return {"ok": False, "error": "session_id_required"}
         if self.mimo is None:
             return {"ok": False, "error": "mimo_unavailable"}
-        rid = m.get("remote_session_id") or ""
+        sess = self.duty.get(session_id)
+        if not sess:
+            return {"ok": False, "error": "not_found"}
+        rid = sess.get("remote_session_id") or ""
         if not rid:
-            attached = self.attach_remote(incident_id, timeout=timeout)
+            attached = self.attach_remote(session_id=session_id, incident_id=incident_id, timeout=timeout)
             if not attached.get("ok"):
                 return attached
             rid = attached.get("remote_session_id") or ""
@@ -286,28 +315,58 @@ class SessionBridge:
         except Exception as e:  # noqa: BLE001
             code = getattr(e, "code", "error")
             if code == "session_missing":
-                self._set_remote(incident_id, remote_session_id=rid, status="missing", last_error=str(e))
+                self._set_remote(session_id, remote_session_id=rid, status="missing", last_error=str(e))
                 return {"ok": False, "error": "session_missing", "remote_session_id": rid}
-            self._set_remote(incident_id, remote_session_id=rid, status="error", last_error=str(e))
+            self._set_remote(session_id, remote_session_id=rid, status="error", last_error=str(e))
             return {"ok": False, "error": code, "message": str(e)}
         self._set_remote(
-            incident_id,
+            session_id,
             remote_session_id=getattr(remote, "remote_session_id", "") or rid,
             status=getattr(remote, "status", "") or "active",
             model=getattr(remote, "model", "") or "",
             last_error=getattr(remote, "last_error", "") or "",
         )
+        text = getattr(remote, "text", "") or ""
+        raw_events = getattr(remote, "raw_events", None) or []
+        self.duty.add_message(
+            session_id,
+            role="user",
+            kind="prompt",
+            title="调查指令",
+            body=prompt[:4000],
+            incident_id=incident_id,
+        )
+        self.duty.add_message(
+            session_id,
+            role="assistant",
+            kind="mimo_result",
+            title="MiMo 响应",
+            body=text[:8000],
+            payload={"raw_events": raw_events[:50], "remote_session_id": getattr(remote, "remote_session_id", "") or rid},
+            incident_id=incident_id,
+        )
+        for ev in raw_events[:20]:
+            et = str(ev.get("type") or "")
+            if et in ("tool_call", "tool_use", "tool_result", "step", "error"):
+                self.duty.record_event(
+                    session_id,
+                    type=et,
+                    title=str(ev.get("part", {}).get("tool") or ev.get("tool") or et)[:80],
+                    incident_id=incident_id,
+                    payload=ev if isinstance(ev, dict) else {},
+                )
         return {
             "ok": True,
+            "session_id": session_id,
             "remote_session_id": getattr(remote, "remote_session_id", "") or rid,
-            "text": (getattr(remote, "text", "") or ""),
-            "remote_status": getattr(remote, "status", ""),
+            "text": text,
+            "remote_status": getattr(remote, "status", "") or "",
+            "raw_events": raw_events,
         }
 
     # ---- Prompt ----
 
     def build_prompt(self, incident_id: str) -> str:
-        """结构化 prompt：告警摘要、对象、knowledge 命中、上一阶段 note。"""
         inc = self.db.query_one("SELECT * FROM incidents WHERE id=?", (incident_id,))
         if not inc:
             return f"incident {incident_id} not found"
@@ -323,6 +382,7 @@ class SessionBridge:
             "## 任务",
             "调查并恢复服务；SSH 成功 ≠ 恢复，必须指标/探针验证。",
             "流程：knowledge.query → host.exec(read) + metrics.query → 最小修复 → 验证 → incident.note。",
+            "若发现与同一会话内其它故障同源，合并处理并在 note 中说明关联。",
             "",
         ]
         if self.knowledge is not None:
@@ -335,7 +395,6 @@ class SessionBridge:
                     lines += ["## Knowledge 命中", "（无 active 命中）", ""]
             except Exception:
                 lines += ["## Knowledge 命中", "（检索失败）", ""]
-        # 上一阶段 note（最近 5 条 agent_note）
         notes = self.db.query(
             "SELECT title, at FROM events WHERE incident_id=? AND type IN ('agent_note','session_opened')"
             " ORDER BY id DESC LIMIT 5",
@@ -348,16 +407,36 @@ class SessionBridge:
             lines.append("")
         return "\n".join(lines)
 
+    def build_session_prompt(self, session_id: str) -> str:
+        incs = self.duty.incidents(session_id)
+        if not incs:
+            return "你是值班运维 Agent。用户将描述运维任务，请调查并给出可核对证据。"
+        lines = ["# 值班会话", f"关联 Incident {len(incs)} 个：", ""]
+        for i in incs:
+            lines.append(
+                f"- {i.get('incident_id')}: {i.get('title')} "
+                f"[{i.get('severity')}/{i.get('status')}] asset={i.get('asset_id')} object={i.get('object_id')}"
+            )
+        lines += [
+            "",
+            "## 任务",
+            "判断这些故障是否同源；同源合并处理，异源分别调查。",
+            "SSH 成功 ≠ 恢复，必须指标/探针验证。写操作需按当前审批策略执行。",
+        ]
+        return "\n".join(lines)
+
     def refresh_prompt(self, incident_id: str) -> str:
         prompt = self.build_prompt(incident_id)
-        with self.db.tx() as conn:
-            conn.execute(
-                "UPDATE incident_session SET prompt=?, updated_at=? WHERE incident_id=?",
-                (prompt, now(), incident_id),
-            )
+        sess = self.duty.session_for_incident(incident_id)
+        if sess:
+            with self.db.tx() as conn:
+                conn.execute(
+                    "UPDATE duty_sessions SET prompt=?, updated_at=? WHERE id=?",
+                    (prompt, now(), sess["id"]),
+                )
         return prompt
 
-    # ---- 写操作幂等（P4.1：unknown 态 / 租约 / 原子 claim）----
+    # ---- 写操作幂等 ----
 
     def make_action_key(
         self,
@@ -367,7 +446,6 @@ class SessionBridge:
         *,
         context: str = "",
     ) -> str:
-        """规范化幂等键：绑定目标 + 动作 + 参数 + 上下文，非 Agent 随意字符串。"""
         import hashlib
 
         canonical = json.dumps(
@@ -389,6 +467,10 @@ class SessionBridge:
     def _lease_seconds(self) -> float:
         return float(getattr(self, "lease_ttl_sec", 120.0))
 
+    def _session_id_for(self, incident_id: str) -> str:
+        sess = self.duty.session_for_incident(incident_id)
+        return (sess or {}).get("id") or ""
+
     def claim_write(
         self,
         incident_id: str,
@@ -399,19 +481,9 @@ class SessionBridge:
         claimed_by: str = "",
         retry_safe: bool = False,
     ) -> dict[str, Any]:
-        """占用一次写操作。语义：
-
-        - claimed（租约有效）→ 拒绝（in_flight）
-        - claimed（租约过期）→ 置 unknown 并拒绝（租约过期 ≠ 未执行）
-        - done → 永久拒绝
-        - unknown → 拒绝（需人工核验）
-        - failed → 仅 retry_safe=True 才可再 claim
-        - released → 可再 claim
-        """
         if not incident_id or not action_key:
             raise ValueError("incident_id and action_key required")
-        m = self.get_mapping(incident_id)
-        sid = (m or {}).get("session_id") or ""
+        sid = self._session_id_for(incident_id)
         t = now()
         lease = t + self._lease_seconds()
         params_hash = ""
@@ -485,7 +557,6 @@ class SessionBridge:
                     "action_key": action_key,
                     "status": st,
                 }
-            # 租约过期 ≠ 未执行：转入 unknown，禁止自动重放
             with self.db.tx() as conn:
                 conn.execute(
                     "UPDATE session_write_ops SET status='unknown', result=?, updated_at=?"
@@ -509,7 +580,6 @@ class SessionBridge:
                 "error": "retry_requires_confirmed_safe",
             }
 
-        # released / failed(retry_safe)：原子条件更新，防并发双 claim
         with self.db.tx() as conn:
             cur = conn.execute(
                 "UPDATE session_write_ops SET status='claimed', updated_at=?, lease_expires_at=?,"
@@ -520,7 +590,6 @@ class SessionBridge:
             changed = cur.rowcount == 1
         if changed:
             return {"ok": True, "claimed": True, "action_key": action_key, "already_done": False, "retry": True}
-        # 竞态失败：再读一次
         row2 = self.db.query_one(
             "SELECT status, result FROM session_write_ops WHERE incident_id=? AND action_key=?",
             (incident_id, action_key),
@@ -539,7 +608,6 @@ class SessionBridge:
     def complete_write(
         self, incident_id: str, action_key: str, *, ok: bool, result: str = ""
     ) -> dict[str, Any]:
-        """记录确定结果。ok=False 仅用于「已确认失败/未生效」。"""
         status = "done" if ok else "failed"
         with self.db.tx() as conn:
             conn.execute(
@@ -552,7 +620,6 @@ class SessionBridge:
     def mark_unknown(
         self, incident_id: str, action_key: str, *, reason: str = "unknown_result"
     ) -> dict[str, Any]:
-        """结果未知（超时/断连/进程异常）→ unknown，禁止自动重放。"""
         with self.db.tx() as conn:
             conn.execute(
                 "UPDATE session_write_ops SET status='unknown', result=?, updated_at=?, lease_expires_at=0"
@@ -564,7 +631,6 @@ class SessionBridge:
     def release_write(
         self, incident_id: str, action_key: str, *, confirmed_safe: bool = False, reason: str = ""
     ) -> dict[str, Any]:
-        """释放以允许重试。仅 confirmed_safe=True 才放行 failed/unknown 之外的重试窗口。"""
         row = self.db.query_one(
             "SELECT status FROM session_write_ops WHERE incident_id=? AND action_key=?",
             (incident_id, action_key),
@@ -597,3 +663,122 @@ class SessionBridge:
             (incident_id,),
         )
         return [dict(r) for r in rows]
+
+    # ---- 人工审批挂起（工作台）----
+
+    def pending_write(
+        self,
+        incident_id: str,
+        action_key: str,
+        *,
+        target: str = "",
+        params: dict[str, Any] | None = None,
+        claimed_by: str = "",
+    ) -> dict[str, Any]:
+        """登记待人工批准的写操作。已存在 pending/done 则不重复。"""
+        if not incident_id or not action_key:
+            raise ValueError("incident_id and action_key required")
+        existing = self.db.query_one(
+            "SELECT status FROM session_write_ops WHERE incident_id=? AND action_key=?",
+            (incident_id, action_key),
+        )
+        if existing:
+            st = existing["status"]
+            if st == "awaiting_approval":
+                return {"ok": True, "action": "already_pending", "action_key": action_key}
+            return {"ok": False, "error": "already_exists", "status": st, "action_key": action_key}
+        sid = self._session_id_for(incident_id)
+        t = now()
+        with self.db.tx() as conn:
+            conn.execute(
+                "INSERT INTO session_write_ops("
+                " id, incident_id, session_id, action_key, status, result,"
+                " created_at, updated_at, lease_expires_at, target, params_hash, claimed_by)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    new_id("wop"),
+                    incident_id,
+                    sid,
+                    action_key,
+                    "awaiting_approval",
+                    json.dumps(params or {}, ensure_ascii=False)[:2000],
+                    t,
+                    t,
+                    0,
+                    (target or "")[:120],
+                    "",
+                    (claimed_by or "")[:64],
+                ),
+            )
+        return {"ok": True, "action": "pending", "action_key": action_key}
+
+    def list_pending_writes(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self.db.query(
+            "SELECT * FROM session_write_ops WHERE status='awaiting_approval'"
+            " ORDER BY created_at DESC LIMIT ?",
+            (int(limit),),
+        )
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["params"] = json.loads(d.get("result") or "{}")
+            except Exception:
+                d["params"] = {}
+            out.append(d)
+        return out
+
+    def approve_pending_write(
+        self,
+        incident_id: str,
+        action_key: str,
+        *,
+        approved_by: str = "",
+    ) -> dict[str, Any]:
+        """批准待写：转 claimed，供调用方执行。已批准/已完成不重复。"""
+        row = self.db.query_one(
+            "SELECT * FROM session_write_ops WHERE incident_id=? AND action_key=?",
+            (incident_id, action_key),
+        )
+        if not row:
+            return {"ok": False, "error": "not_found"}
+        st = row["status"]
+        if st == "done":
+            return {"ok": False, "error": "already_done", "action_key": action_key}
+        if st == "claimed":
+            return {"ok": False, "error": "in_flight", "action_key": action_key}
+        if st != "awaiting_approval":
+            return {"ok": False, "error": "not_pending", "status": st, "action_key": action_key}
+        t = now()
+        lease = t + self._lease_seconds()
+        with self.db.tx() as conn:
+            conn.execute(
+                "UPDATE session_write_ops SET status='claimed', updated_at=?, lease_expires_at=?,"
+                " claimed_by=?, result=? WHERE incident_id=? AND action_key=? AND status='awaiting_approval'",
+                (now(), lease, (approved_by or "human")[:64], row["result"] or "", incident_id, action_key),
+            )
+        return {"ok": True, "claimed": True, "action_key": action_key, "params": self._params_of(row)}
+
+    def reject_pending_write(
+        self,
+        incident_id: str,
+        action_key: str,
+        *,
+        reason: str = "human_rejected",
+    ) -> dict[str, Any]:
+        with self.db.tx() as conn:
+            conn.execute(
+                "UPDATE session_write_ops SET status='failed', result=?, updated_at=?"
+                " WHERE incident_id=? AND action_key=? AND status='awaiting_approval'",
+                (f"rejected:{(reason or '')[:120]}", now(), incident_id, action_key),
+            )
+        return {"ok": True, "status": "failed", "action_key": action_key}
+
+    @staticmethod
+    def _params_of(row: Any) -> dict[str, Any]:
+        try:
+            raw = row["result"] if "result" in row.keys() else ""
+            data = json.loads(raw or "{}")
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}

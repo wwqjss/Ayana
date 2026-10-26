@@ -171,6 +171,18 @@ class ActionService:
             return await self.transport.exec(asset_id, tokens, timeout=timeout)
         raise ActionError("ssh_required", "native SSH transport not configured")
 
+    def _require_human_approval(self) -> bool:
+        """Agent 设置总开关：需要人工审批（默认开）。"""
+        try:
+            row = self.db.query_one(
+                "SELECT value FROM agent_settings WHERE key='require_human_approval'"
+            )
+            if not row:
+                return True
+            return str(row["value"] or "1") not in ("0", "false", "False", "")
+        except Exception:
+            return True
+
     # ------------------------------------------------------------------
     # 提案
     # ------------------------------------------------------------------
@@ -238,9 +250,10 @@ class ActionService:
             self._assert_incident_matches(incident_id, asset_id, obj)
 
         # 自动语义与人工语义分开（P1-01：服务端三态）
-        # final: mode=autonomous 退役 Agent Ceiling 与三态自治限制；
-        # 人工 Web/QQ 仍走 Policy。硬保护（能力目录/对象绑定/host key/幂等）不变。
-        if mode == "autonomous":
+        # 工作台：require_human_approval 开启时，autonomous 仍走人工审批门；
+        # 关闭时保留 P6 自动闭环（硬保护：能力目录/对象绑定/host key/幂等不变）。
+        require_human = self._require_human_approval()
+        if mode == "autonomous" and not require_human:
             decision = {
                 "decision": "automatic",
                 "allowed": True,
@@ -250,6 +263,40 @@ class ActionService:
                 "rule": None,
                 "agent_ceiling": None,
             }
+        elif mode == "autonomous" and require_human:
+            # 人工审批开启：提案等待人工。Policy 禁止规则仍生效，但不要求预授权 allow。
+            decision = {
+                "decision": "approval_required",
+                "allowed": True,
+                "require_approval": True,
+                "auto_allowed": False,
+                "reason": "require_human_approval",
+                "rule": None,
+                "agent_ceiling": None,
+            }
+            try:
+                probe = self.policy.effective_decision(
+                    subject_type=proposer_type,
+                    subject_id=proposer_id,
+                    capability=capability,
+                    asset_id=asset_id,
+                    object_id=obj["id"],
+                    auto=False,
+                )
+                if probe.get("decision") == "forbidden" or (
+                    probe.get("matched_rule") or {}
+                ).get("allow") is False:
+                    decision = {
+                        "decision": "forbidden",
+                        "allowed": False,
+                        "require_approval": True,
+                        "auto_allowed": False,
+                        "reason": probe.get("reason") or "policy_forbidden",
+                        "rule": probe.get("matched_rule"),
+                        "agent_ceiling": probe.get("agent_ceiling"),
+                    }
+            except Exception:
+                pass
         else:
             decision = self.policy.effective_decision(
                 subject_type=proposer_type,
@@ -367,8 +414,8 @@ class ActionService:
             )
         state = "proposed"
         require_approval = decision.get("require_approval", True)
-        # autonomous：系统即批，无需常规人工审批（人工 Web/QQ 路径不变）
-        if mode == "autonomous":
+        # 仅在「关闭人工审批」时 autonomous 系统即批
+        if mode == "autonomous" and not require_human and not require_approval:
             require_approval = False
             self._system_approve_autonomous(
                 aid, incident_id=incident_id, asset_id=asset_id, object_id=obj["id"],
@@ -437,7 +484,7 @@ class ActionService:
         incident_id: str = "",
         actor_id: str = "mimo_agent",
     ) -> dict[str, Any]:
-        """MiMoCode 闭环：提案（系统批准）→ 执行。硬保护仍在 execute。"""
+        """MiMoCode 闭环：提案 →（可选人工审批）→ 执行。硬保护仍在 execute。"""
         proposed = self.propose(
             asset_id=asset_id,
             object_id=object_id,
@@ -449,6 +496,15 @@ class ActionService:
             proposer_id=actor_id,
             mode="autonomous",
         )
+        if proposed.get("state") == "proposed" and proposed.get("require_approval"):
+            return {
+                "id": proposed["id"],
+                "state": "proposed",
+                "approval_required": True,
+                "require_approval": True,
+                "tokens": proposed.get("tokens") or [],
+                "message": "等待人工批准后执行",
+            }
         return await self.execute(
             proposed["id"],
             actor_type="agent",
@@ -1183,7 +1239,7 @@ class ActionService:
                 reject = ("approval_expired", "approval_deadline")
 
             # 唯一派发门：当前 Policy 复查（P0-02）
-            # autonomous：退役 Ceiling/三态，不在此复查 Policy；人工仍复查。
+            # 工作台：无论是否人工审批，Policy 禁止规则始终生效。
             action_mode = (fresh["mode"] or "manual") if "mode" in fresh.keys() else "manual"
             if reject is None and action_mode in ("auto", "reviewed") and fresh["incident_id"]:
                 from .incidents import IncidentService
@@ -1191,7 +1247,10 @@ class ActionService:
                 blocked = IncidentService(self.db).source_block_reason(fresh["incident_id"])
                 if blocked:
                     reject = (_source_block_code(blocked), blocked)
-            if reject is None and action_mode != "autonomous":
+            require_human_now = self._require_human_approval()
+            # 人工审批关闭时，autonomous 不查 Policy（权限=SSH 账号 + 能力目录硬保护）；
+            # 开启时走人工审批，Policy 在 ApprovalService.decide 强制。
+            if reject is None and not (action_mode == "autonomous" and not require_human_now):
                 for subject_type, subject_id in (
                     (fresh["proposer_type"] or "web_user", fresh["proposer_id"] or "system"),
                     (fresh["approver_type"] or "", fresh["approver_id"] or ""),

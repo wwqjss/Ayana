@@ -285,20 +285,22 @@ class TestExecutionLifecycle(unittest.TestCase):
     def test_parallel_incidents_isolated(self):
         insert_incident(self.db, "inc_a")
         insert_incident(self.db, "inc_b")
-        # Parallel calls are not ordered. Bind each scripted reply to its
-        # Incident, as real independent MiMo sessions are, rather than popping
-        # a shared FIFO that accidentally assigns A/B by thread scheduling.
+        # 工作台模型：多个 Incident 共享同一值班会话（一个 MiMo 远端会话），
+        # 但 investigation_jobs / 结论 / 写台账按 Incident 独立。
         entered = threading.Barrier(2)
         def create(*, title, prompt, timeout=None):
-            incident_id = title.removeprefix("inv:")
-            symptoms = {"inc_a": "A", "inc_b": "B"}[incident_id]
-            self.assertIn(f"## Incident {incident_id} (", prompt)
-            entered.wait(timeout=2)
             self.mimo.calls.append(("create", title, prompt))
-            return type("R", (), {"remote_session_id": f"ses_{incident_id}", "status": "active",
-                                  "text": json.dumps({"status":"completed", "root_cause":"unknown", "symptoms":symptoms}),
+            return type("R", (), {"remote_session_id": "ses_duty1", "status": "active",
+                                  "text": json.dumps({"status":"completed", "root_cause":"unknown", "symptoms":"shared"}),
                                   "model":"test-model"})()
         self.mimo.create = create
+        def resume(remote_session_id, prompt, *, timeout=None, expect_existing=True):
+            self.mimo.calls.append(("resume", remote_session_id, prompt))
+            return type("R", (), {"remote_session_id": remote_session_id, "status": "active",
+                                  "text": json.dumps({"status":"completed", "root_cause":"unknown", "symptoms":"shared"}),
+                                  "model":"test-model"})()
+        self.mimo.resume = resume
+        self.mimo.exists = lambda rid: True
         self.ai.offer("inc_a")
         self.ai.offer("inc_b")
         _run_tick(self.ai)
@@ -306,12 +308,19 @@ class TestExecutionLifecycle(unittest.TestCase):
             "SELECT COUNT(*) n FROM events WHERE type='auto_investigation'"
         )
         self.assertEqual(n["n"], 2)
-        for incident_id, symptoms in (("inc_a", "A"), ("inc_b", "B")):
+        # 两个 Incident 的任务各自完成
+        for incident_id in ("inc_a", "inc_b"):
             row = self.db.query_one("SELECT * FROM investigation_jobs WHERE incident_id=?", (incident_id,))
             self.assertEqual(row["status"], "done")
-            self.assertEqual(json.loads(row["last_conclusion_json"])["symptoms"], symptoms)
-            mapping = self.bridge.get_mapping(incident_id)
-            self.assertEqual(mapping["remote_session_id"], f"ses_{incident_id}")
+        # 同属一个值班会话
+        sid_a = (self.bridge.get_mapping("inc_a") or {}).get("session_id")
+        sid_b = (self.bridge.get_mapping("inc_b") or {}).get("session_id")
+        self.assertTrue(sid_a)
+        self.assertEqual(sid_a, sid_b)
+        # 共享远端会话
+        remote = (self.bridge.get_mapping("inc_a") or {}).get("remote_session_id")
+        self.assertTrue(remote)
+        self.assertEqual((self.bridge.get_mapping("inc_b") or {}).get("remote_session_id"), remote)
 
     def test_new_generation_runs_after_previous_round_budget_exhausted(self):
         self.ai.offer("inc_1")

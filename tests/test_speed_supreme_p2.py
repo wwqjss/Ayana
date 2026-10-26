@@ -92,8 +92,11 @@ class TestSessionBridge(unittest.TestCase):
         self.assertEqual(errors, [])
         sids = {r["session_id"] for r in results if r.get("ok")}
         self.assertEqual(len(sids), 1, f"concurrent must converge, got {sids}")
-        row = self.db.query_one("SELECT COUNT(*) AS n FROM incident_session")
-        self.assertEqual(row["n"], 1)
+        # 新模型：duty_sessions + session_incidents 多对多
+        n_sess = self.db.query_one("SELECT COUNT(*) AS n FROM duty_sessions")
+        self.assertEqual(n_sess["n"], 1)
+        n_link = self.db.query_one("SELECT COUNT(*) AS n FROM session_incidents")
+        self.assertEqual(n_link["n"], 1)
 
     def test_restart_recovers_mapping(self):
         insert_incident(self.db)
@@ -196,8 +199,18 @@ class TestSessionBridge(unittest.TestCase):
         insert_incident(self.db)
         self.bridge.ensure_session("inc_1")
         self.incidents.close_manual("inc_1", "done")
+        # 新模型：关单启动归档倒计时，不立刻关会话
         m = self.bridge.get_mapping("inc_1")
-        self.assertEqual(m["status"], "closed")
+        self.assertEqual(m["status"], "open")
+        sess = self.bridge.duty.session_for_incident("inc_1")
+        self.assertGreater(float(sess.get("archive_due_at") or 0), 0)
+        # 倒计时到期归档
+        self.db.execute(
+            "UPDATE duty_sessions SET archive_due_at=? WHERE id=?",
+            (now() - 1, sess["id"]),
+        )
+        self.bridge.duty.tick_archives()
+        self.assertEqual(self.bridge.duty.get(sess["id"])["status"], "archived")
 
 
 class TestMcpSessionTools(unittest.IsolatedAsyncioTestCase):

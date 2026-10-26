@@ -12,6 +12,8 @@
 
 <link rel="stylesheet" href="/static/app.css?v=17">
 
+<link rel="stylesheet" href="/static/workbench.css?v=20261028">
+
 <link rel="stylesheet" href="/static/xterm/xterm.css">
 
 </head>
@@ -114,6 +116,7 @@
         <button data-tab="incidents" class="tab">事件</button>
 
         <button data-tab="monitor" class="tab">资源</button>
+        <button data-tab="agent" class="tab">Agent</button>
         <button data-tab="connections" class="tab">连接</button>
 
         <button data-tab="notify" class="tab">通知</button>
@@ -452,6 +455,50 @@
 
 
 
+      <section id="tab-agent" class="tab-panel hidden">
+        <div id="agent-workbench" class="agent-workbench">
+          <aside class="aw-left" id="aw-left">
+            <div class="aw-left-head">
+              <button type="button" class="btn primary small" id="aw-new-session">+ 新建会话</button>
+              <button type="button" class="btn ghost small" id="aw-settings-btn" title="Agent 设置">设置</button>
+            </div>
+            <div class="aw-session-list" id="aw-session-list"></div>
+          </aside>
+          <main class="aw-center" id="aw-center">
+            <div class="aw-chat-head" id="aw-chat-head">
+              <div class="aw-chat-title" id="aw-chat-title">选择或创建会话</div>
+              <div class="aw-chat-meta" id="aw-chat-meta"></div>
+            </div>
+            <div class="aw-chat-scroll" id="aw-chat-scroll">
+              <div class="aw-chat-empty muted">左侧选择会话，或点击「+ 新建会话」开始运维任务。</div>
+            </div>
+            <div class="aw-composer" id="aw-composer">
+              <textarea id="aw-input" rows="2" placeholder="描述运维任务，或继续调查…"></textarea>
+              <button type="button" class="btn primary" id="aw-send">发送</button>
+            </div>
+          </main>
+          <aside class="aw-right" id="aw-right">
+            <div class="aw-section">
+              <h4>任务进度</h4>
+              <div id="aw-progress" class="aw-muted">—</div>
+            </div>
+            <div class="aw-section">
+              <h4>关联告警 / Incident</h4>
+              <div id="aw-incidents"></div>
+            </div>
+            <div class="aw-section">
+              <h4>待审批</h4>
+              <div id="aw-pending"></div>
+            </div>
+            <div class="aw-section">
+              <h4>执行与验证</h4>
+              <div id="aw-results"></div>
+            </div>
+          </aside>
+          <button type="button" class="aw-toggle aw-toggle-left" id="aw-toggle-left" title="折叠左栏">☰</button>
+          <button type="button" class="aw-toggle aw-toggle-right" id="aw-toggle-right" title="折叠右栏">▤</button>
+        </div>
+      </section>
       <section id="tab-connections" class="tab-panel hidden">
 
         <div class="card">
@@ -1221,6 +1268,7 @@
 
 <script src="/static/app.js?v=46"></script>
 <script src="/static/settings.js?v=20261026"></script>
+<script src="/static/workbench.js?v=20261028"></script>
 
 </body>
 

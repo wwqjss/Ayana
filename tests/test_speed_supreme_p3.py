@@ -134,13 +134,20 @@ class TestRemoteSessionMapping(unittest.TestCase):
         insert_incident(self.db, "inc_2", asset="kanata", obj="mysql")
         a = self.bridge.attach_remote("inc_1")
         b = self.bridge.attach_remote("inc_2")
-        self.assertNotEqual(a["local_session_id"], b["local_session_id"])
-        self.assertNotEqual(a["remote_session_id"], b["remote_session_id"])
+        # 工作台模型：同一值班会话承载多 Incident（同一 MiMo 远端）
+        self.assertEqual(a["local_session_id"], b["local_session_id"])
+        self.assertEqual(a["remote_session_id"], b["remote_session_id"])
+        # 但 Incident 事实与写台账彼此独立
+        self.bridge.claim_write("inc_1", "k1")
+        self.bridge.complete_write("inc_1", "k1", ok=True, result="ok")
+        self.assertTrue(self.bridge.is_write_done("inc_1", "k1"))
+        self.assertFalse(self.bridge.is_write_done("inc_2", "k1"))
+        self.assertEqual(len(self.bridge.write_ops("inc_1")), 1)
+        self.assertEqual(len(self.bridge.write_ops("inc_2")), 0)
+        # 调查 prompt 覆盖两个故障，由 Agent 判断关联
         self.bridge.prompt_remote("inc_1", "investigate frps")
         self.bridge.prompt_remote("inc_2", "investigate mysql")
-        # 互不串线
-        for sid, prompt in self.mimo.resumed:
-            self.assertNotIn("mysql", prompt if sid == a["remote_session_id"] else "frps")
+        self.assertGreaterEqual(len(self.mimo.resumed), 1)
 
     def test_prompt_uses_resume_not_recreate(self):
         insert_incident(self.db)

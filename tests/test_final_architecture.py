@@ -91,6 +91,13 @@ class AutonomousActionTests(unittest.IsolatedAsyncioTestCase):
             transport=self.transport, verify_timeout=1,
         )
 
+    def _set_approval(self, on: bool) -> None:
+        self.db.execute(
+            "INSERT OR REPLACE INTO agent_settings(key, value, updated_at, updated_by)"
+            " VALUES('require_human_approval', ?, ?, 'test')",
+            ("1" if on else "0", 0),
+        )
+
     def tearDown(self):
         try:
             self.db.execute("PRAGMA optimize")
@@ -99,6 +106,7 @@ class AutonomousActionTests(unittest.IsolatedAsyncioTestCase):
         self.tmp.cleanup()
 
     async def test_autonomous_skips_policy_and_three_state(self):
+        self._set_approval(False)
         res = self.actions.propose(
             asset_id="host", object_id="obj", capability="service.restart",
             incident_id="inc1", mode="autonomous", reason="restore",
@@ -109,8 +117,25 @@ class AutonomousActionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res["decision"], "automatic")
         self.assertIn("ceiling", res["effective_decision"].get("reason", ""))
 
+    async def test_require_human_approval_blocks_auto_execute(self):
+        self._set_approval(True)
+        res = self.actions.propose(
+            asset_id="host", object_id="obj", capability="service.restart",
+            incident_id="inc1", mode="autonomous", reason="restore",
+            proposer_type="agent", proposer_id="mimo_agent",
+        )
+        self.assertEqual(res["state"], "proposed")
+        self.assertTrue(res["require_approval"])
+        exec_res = await self.actions.autonomous_execute(
+            asset_id="host", object_id="obj", capability="service.restart",
+            incident_id="inc1", actor_id="mimo_agent",
+        )
+        self.assertTrue(exec_res.get("approval_required"))
+        self.assertEqual(exec_res.get("state"), "proposed")
+
     async def test_manual_still_requires_template_and_policy(self):
-        # manual 必须走 Policy；autonomous 不调用 Policy
+        self._set_approval(False)
+        # manual 必须走 Policy；autonomous(关审批) 不调用 Policy
         calls = {"n": 0}
 
         class CountingPolicy(FakePolicy):
@@ -119,7 +144,6 @@ class AutonomousActionTests(unittest.IsolatedAsyncioTestCase):
                 return super().effective_decision(**kw)
 
         self.actions.policy = CountingPolicy()
-        # 即使有默认 template，manual 仍应触发 policy.effective_decision
         try:
             self.actions.propose(
                 asset_id="host", object_id="obj", capability="service.restart",
@@ -127,7 +151,7 @@ class AutonomousActionTests(unittest.IsolatedAsyncioTestCase):
             )
         except ActionError as e:
             self.assertIn(e.code, ("template_required", "denied", "runbook_required", "bad_mode"))
-        self.assertGreaterEqual(calls["n"], 0)  # policy 可被调用；关键是 autonomous 不调用
+        self.assertGreaterEqual(calls["n"], 0)
         calls["n"] = 0
         self.actions.propose(
             asset_id="host", object_id="obj", capability="service.restart",
@@ -136,6 +160,7 @@ class AutonomousActionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls["n"], 0)
 
     async def test_autonomous_execute_records_audit(self):
+        self._set_approval(False)
         res = await self.actions.autonomous_execute(
             asset_id="host", object_id="obj", capability="service.restart",
             incident_id="inc1", actor_id="mimo_agent",

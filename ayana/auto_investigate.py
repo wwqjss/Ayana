@@ -668,6 +668,11 @@ class AutoInvestigator:
             plan_sig=str(decision.get("plan_sig") or ""),
         )
         out["action"] = res
+        if res.get("approval_required"):
+            out["result"] = "awaiting_approval"
+            out["action_id"] = res.get("action_id") or ""
+            # 不 escalate：等人批后再继续
+            return out
         closed = self.ops_loop.maybe_close(incident_id)
         out["close"] = closed
         # 证据不足 / 失败且未恢复 → 转人工

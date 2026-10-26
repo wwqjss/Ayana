@@ -214,6 +214,22 @@ class OpsLoop:
             )
             return {"ok": False, "error": code, "message": str(e)[:300]}
 
+        if res.get("approval_required") or res.get("state") == "proposed":
+            # 人工审批开启：只提案，不计入失败轮次
+            self.db.event(
+                "action_proposed",
+                f"awaiting_approval:{capability}",
+                incident_id=incident_id,
+                payload={"action_id": res.get("id"), "capability": capability, "plan_sig": plan_sig},
+            )
+            return {
+                "ok": False,
+                "approval_required": True,
+                "action_id": res.get("id") or "",
+                "state": "proposed",
+                "message": res.get("message") or "等待人工批准",
+            }
+
         state = str(res.get("state") or "")
         action_id = res.get("id") or res.get("action_id") or ""
         ok = state == "success"

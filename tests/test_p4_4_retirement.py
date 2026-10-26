@@ -96,9 +96,12 @@ class RetirementFlowTests(unittest.IsolatedAsyncioTestCase):
                 episode = db.query_one("SELECT * FROM alert_episodes")
                 incident_id = episode["incident_id"]
                 self.assertTrue(incident_id)
-                session = db.query_one("SELECT * FROM incident_session WHERE incident_id=?", (incident_id,))
+                # 新模型：session_incidents + duty_sessions
+                link = db.query_one("SELECT * FROM session_incidents WHERE incident_id=?", (incident_id,))
+                self.assertIsNotNone(link)
+                session = db.query_one("SELECT * FROM duty_sessions WHERE id=?", (link["session_id"],))
                 self.assertIsNotNone(session)
-                self.assertTrue(session["session_id"].startswith("sess_"))
+                self.assertTrue(session["id"].startswith("sess_"))
                 job = db.query_one("SELECT * FROM investigation_jobs WHERE incident_id=?", (incident_id,))
                 self.assertEqual((job["status"], job["generation"], job["rounds"]), ("queued", 1, 0))
                 ingest.ingest_webhook(payload)
@@ -206,12 +209,12 @@ class RetirementHistoryTests(unittest.TestCase):
                 return {table: [dict(row) for row in database.query("SELECT * FROM " + table + " ORDER BY rowid")] for table in tables}
             before = rows(db)
             ddl = [tuple(row) for row in db.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name")]
-            self.assertEqual(int(db.query_one("SELECT value FROM meta WHERE key='schema_version'")["value"]), 21)
+            self.assertEqual(int(db.query_one("SELECT value FROM meta WHERE key='schema_version'")["value"]), 22)
             db.close()
             reopened = Database(path)
             try:
-                self.assertEqual(SCHEMA_VERSION, 21)
-                self.assertEqual(int(reopened.query_one("SELECT value FROM meta WHERE key='schema_version'")["value"]), 21)
+                self.assertEqual(SCHEMA_VERSION, 22)
+                self.assertEqual(int(reopened.query_one("SELECT value FROM meta WHERE key='schema_version'")["value"]), 22)
                 self.assertEqual(rows(reopened), before)
                 self.assertEqual([tuple(row) for row in reopened.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name")], ddl)
                 snapshot = LegacyHistory(reopened).snapshot("history-inc")

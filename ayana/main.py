@@ -277,8 +277,12 @@ class App:
         except Exception as e:
             log.warning("load prometheus_url meta failed: %s", e)
         self.incidents = IncidentService(self.db)
+        # 工作台：值班/手动会话生命周期
+        from .duty_session import DutySessionManager
+
+        self.duty = DutySessionManager(self.db)
         # P2 薄桥：只做映射/复用/幂等，不做自动处置（旧自治仍禁用）
-        self.session_bridge = SessionBridge(self.db, knowledge=self.knowledge)
+        self.session_bridge = SessionBridge(self.db, knowledge=self.knowledge, duty=self.duty)
         self.incidents.session_bridge = self.session_bridge
         # P6.2: one verified provider and one MCP/DB binding for all runtime clients.
         from .mimo_admin import MimoAdmin
@@ -337,7 +341,7 @@ class App:
         self.session_bridge.mimo = self.mimo_read_client
         self.auto_investigator = None
         if _ai_cfg.enabled:
-            _ai_bridge = SessionBridge(self.db, knowledge=self.knowledge, mimo=self.mimo_read_client)
+            _ai_bridge = SessionBridge(self.db, knowledge=self.knowledge, mimo=self.mimo_read_client, duty=self.duty)
             self.auto_investigator = AutoInvestigator(
                 self.db, knowledge=self.knowledge, mimo=self.mimo_read_client,
                 bridge=_ai_bridge, config=_ai_cfg, mimo_write=self.mimo_decision_client,
@@ -541,6 +545,8 @@ class App:
             ops_loop=self.ops_loop,
             ops_constraints=self.ops_constraints,
             mimo_admin=self.mimo_admin,
+            duty=self.duty,
+            session_bridge=self.session_bridge,
             alertmanager_webhook_path=cfg.get("alertmanager_webhook_path") or "/hooks/alertmanager",
         )
         self._stop = asyncio.Event()
@@ -713,6 +719,12 @@ class App:
         self._bg_tasks.append(asyncio.create_task(self._bg_outbox()))
         self._bg_tasks.append(asyncio.create_task(self._bg_reconcile()))
         self._bg_tasks.append(asyncio.create_task(self._bg_correlate()))
+        # 工作台：会话归档倒计时恢复 + 周期 tick
+        try:
+            self.duty.recover()
+        except Exception as e:  # noqa: BLE001
+            log.warning("duty recover failed: %s", e)
+        self._bg_tasks.append(asyncio.create_task(self._bg_duty_archives()))
         # P4.3：只读调查 worker（独立于旧自治）
         if self.auto_investigator is not None:
             self._bg_tasks.append(asyncio.create_task(self.auto_investigator.run_forever()))
@@ -869,6 +881,28 @@ class App:
             except Exception as e:
                 log.warning("AM reconcile failed: %s", e)
             await asyncio.sleep(60)
+
+    async def _bg_duty_archives(self) -> None:
+        """值班会话归档倒计时 tick + 标题刷新。"""
+        while not self._stop.is_set():
+            try:
+                self.duty.tick_archives()
+            except Exception as e:  # noqa: BLE001
+                log.warning("duty tick_archives failed: %s", e)
+            try:
+                for sess in self.duty.list_sessions(status="open", origin="auto", limit=5):
+                    sid = sess.get("id") or ""
+                    if not sid:
+                        continue
+                    title = self.duty.auto_title_from_incidents(sid)
+                    if title and title != (sess.get("title") or ""):
+                        self.duty.update_title(sid, title)
+            except Exception as e:  # noqa: BLE001
+                log.warning("duty title refresh failed: %s", e)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                pass
 
     async def _bg_maintenance(self) -> None:
         """Expire manual proposals and permission changes without legacy agents."""

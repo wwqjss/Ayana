@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 
 class MigrationError(RuntimeError):
@@ -1010,6 +1010,124 @@ CREATE TABLE IF NOT EXISTS ops_loop_state (
 """)
 
 
+def _migrate_v22_duty_sessions(conn: sqlite3.Connection) -> None:
+    """值班/手动会话：一会话多 Incident + 归档倒计时 + Agent 设置。"""
+    conn.executescript("""
+CREATE TABLE IF NOT EXISTS duty_sessions (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL DEFAULT '',
+  origin TEXT NOT NULL DEFAULT 'auto',
+  status TEXT NOT NULL DEFAULT 'open',
+  remote_session_id TEXT NOT NULL DEFAULT '',
+  remote_status TEXT NOT NULL DEFAULT 'none',
+  remote_model TEXT NOT NULL DEFAULT '',
+  remote_last_error TEXT NOT NULL DEFAULT '',
+  remote_history TEXT NOT NULL DEFAULT '[]',
+  remote_updated_at REAL NOT NULL DEFAULT 0,
+  prompt TEXT NOT NULL DEFAULT '',
+  created_by TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  last_activity_at REAL NOT NULL DEFAULT 0,
+  archive_due_at REAL NOT NULL DEFAULT 0,
+  archived_at REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_duty_sessions_status ON duty_sessions(status, origin);
+
+CREATE TABLE IF NOT EXISTS session_incidents (
+  session_id TEXT NOT NULL,
+  incident_id TEXT NOT NULL,
+  generation INTEGER NOT NULL DEFAULT 1,
+  joined_at REAL NOT NULL,
+  PRIMARY KEY (session_id, incident_id)
+);
+CREATE INDEX IF NOT EXISTS idx_session_incidents_inc ON session_incidents(incident_id);
+
+CREATE TABLE IF NOT EXISTS agent_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT '',
+  updated_at REAL NOT NULL DEFAULT 0,
+  updated_by TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS session_messages (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'assistant',
+  kind TEXT NOT NULL DEFAULT 'text',
+  title TEXT NOT NULL DEFAULT '',
+  body TEXT NOT NULL DEFAULT '',
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  incident_id TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_messages_sid ON session_messages(session_id, created_at);
+
+CREATE TABLE IF NOT EXISTS session_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  incident_id TEXT NOT NULL DEFAULT '',
+  type TEXT NOT NULL DEFAULT 'info',
+  title TEXT NOT NULL DEFAULT '',
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_events_sid ON session_events(session_id, id);
+""")
+    rows = conn.execute(
+        "SELECT incident_id, generation, session_id, status, prompt, created_at, updated_at,"
+        " remote_session_id, remote_status, remote_model, remote_last_error, remote_history,"
+        " remote_updated_at FROM incident_session"
+    ).fetchall()
+    for row in rows:
+        row = dict(row)
+        sid = row.get("session_id") or ""
+        if not sid:
+            continue
+        status = "open" if (row.get("status") or "open") == "open" else "archived"
+        conn.execute(
+            "INSERT OR IGNORE INTO duty_sessions("
+            " id, title, origin, status, remote_session_id, remote_status, remote_model,"
+            " remote_last_error, remote_history, remote_updated_at, prompt, created_by,"
+            " created_at, updated_at, last_activity_at, archive_due_at, archived_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                sid,
+                f"inc:{row.get('incident_id') or ''}",
+                "auto",
+                status,
+                row.get("remote_session_id") or "",
+                row.get("remote_status") or "none",
+                row.get("remote_model") or "",
+                row.get("remote_last_error") or "",
+                row.get("remote_history") or "[]",
+                float(row.get("remote_updated_at") or 0),
+                row.get("prompt") or "",
+                "system",
+                float(row.get("created_at") or 0),
+                float(row.get("updated_at") or 0),
+                float(row.get("updated_at") or 0),
+                0,
+                float(row.get("updated_at") or 0) if status == "archived" else 0,
+            ),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO session_incidents(session_id, incident_id, generation, joined_at)"
+            " VALUES(?,?,?,?)",
+            (sid, row.get("incident_id") or "", int(row.get("generation") or 1), float(row.get("created_at") or 0)),
+        )
+    conn.execute(
+        "INSERT OR IGNORE INTO agent_settings(key, value, updated_at, updated_by)"
+        " VALUES('require_human_approval','1',?, 'system')",
+        (now(),),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO agent_settings(key, value, updated_at, updated_by)"
+        " VALUES('archive_delay_sec','300',?, 'system')",
+        (now(),),
+    )
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_v1_baseline,
     2: _migrate_v2_p0_p1_columns,
@@ -1032,6 +1150,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     19: _migrate_v19_write_ops_unknown_lease,
     20: _migrate_v20_investigation_jobs,
     21: _migrate_v21_ops_loop,
+    22: _migrate_v22_duty_sessions,
 }
 
 _MIGRATION_NAMES = {
@@ -1056,6 +1175,7 @@ _MIGRATION_NAMES = {
     19: "write_ops_unknown_lease",
     20: "investigation_jobs",
     21: "ops_loop_state",
+    22: "duty_sessions",
 }
 
 

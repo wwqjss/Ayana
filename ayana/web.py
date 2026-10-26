@@ -129,6 +129,8 @@ class WebApp:
         ops_loop=None,
         ops_constraints=None,
         mimo_admin=None,
+        duty=None,
+        session_bridge=None,
         alertmanager_webhook_path: str = "/hooks/alertmanager",
     ):
         self.db = db
@@ -161,6 +163,8 @@ class WebApp:
         self.ops_loop = ops_loop
         self.ops_constraints = ops_constraints
         self.mimo_admin = mimo_admin
+        self.duty = duty
+        self.session_bridge = session_bridge
         # Legacy kwargs remain accepted for older callers, but no live service is retained.
         from .legacy_history import LegacyHistory
 
@@ -228,6 +232,19 @@ class WebApp:
         app.router.add_post("/api/mimo/provider", self.api_mimo_provider_apply)
         app.router.add_post("/api/mimo/provider/clear", self.api_mimo_provider_clear)
         app.router.add_post("/api/mimo/chat", self.api_mimo_chat)
+        # Agent 工作台：会话 / 消息 / 设置 / 待审批
+        app.router.add_get("/api/agent/sessions", self.api_agent_sessions)
+        app.router.add_post("/api/agent/sessions", self.api_agent_session_create)
+        app.router.add_get("/api/agent/sessions/{sid}", self.api_agent_session_detail)
+        app.router.add_post("/api/agent/sessions/{sid}/prompt", self.api_agent_session_prompt)
+        app.router.add_post("/api/agent/sessions/{sid}/archive", self.api_agent_session_archive)
+        app.router.get("/api/agent/sessions/{sid}/events", self.api_agent_session_events)
+        app.router.add_get("/api/agent/settings", self.api_agent_settings_get)
+        app.router.add_post("/api/agent/settings", self.api_agent_settings_post)
+        app.router.add_get("/api/agent/pending-writes", self.api_agent_pending_writes)
+        app.router.add_post("/api/agent/pending-writes/approve", self.api_agent_pending_approve)
+        app.router.add_post("/api/agent/pending-writes/reject", self.api_agent_pending_reject)
+        app.router.add_get("/api/agent/pending-actions", self.api_agent_pending_actions)
         app.router.add_get("/api/executions", self.api_executions)
         app.router.add_get("/api/overview", self.api_overview)
         app.router.add_get("/api/assets", self.api_assets)
@@ -1590,6 +1607,302 @@ class WebApp:
         self.db.audit("web_user", sess["username"], "mimo_chat",
                       detail={"incident_id": inc_id, "prompt_len": len(prompt)}, channel="web")
         return _json({"ok": True, "session": attached, "prompt_result": sent})
+
+    # ---- Agent 工作台 API ----
+
+    def _duty(self):
+        return getattr(self, "duty", None) or getattr(self.incidents, "duty", None)
+
+    def _bridge(self):
+        return getattr(self, "session_bridge", None) or getattr(self.incidents, "session_bridge", None)
+
+    async def api_agent_sessions(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        duty = self._duty()
+        if not duty:
+            return _json({"ok": False, "error": "duty_unavailable"}, 503)
+        status = str(request.rel_url.query.get("status") or "").strip()
+        origin = str(request.rel_url.query.get("origin") or "").strip()
+        limit = min(100, int(request.rel_url.query.get("limit") or 50))
+        rows = duty.list_sessions(status=status, origin=origin, limit=limit)
+        out = []
+        for r in rows:
+            incs = duty.incidents(r.get("id") or "")
+            open_n = sum(1 for i in incs if (i.get("status") or "") == "open")
+            out.append({
+                "id": r.get("id"),
+                "title": r.get("title") or "",
+                "origin": r.get("origin") or "auto",
+                "status": r.get("status") or "open",
+                "created_at": r.get("created_at") or 0,
+                "updated_at": r.get("updated_at") or 0,
+                "last_activity_at": r.get("last_activity_at") or 0,
+                "archive_due_at": r.get("archive_due_at") or 0,
+                "archived_at": r.get("archived_at") or 0,
+                "remote_status": r.get("remote_status") or "none",
+                "incident_count": len(incs),
+                "open_incident_count": open_n,
+            })
+        return _json({"ok": True, "sessions": out, "settings": duty.settings()})
+
+    async def api_agent_session_create(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        duty = self._duty()
+        if not duty:
+            return _json({"ok": False, "error": "duty_unavailable"}, 503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        title = str(body.get("title") or "").strip()
+        prompt = str(body.get("prompt") or "").strip()
+        res = duty.create(origin="manual", title=title, created_by=sess.get("username") or "web", prompt=prompt)
+        self.db.audit("web_user", sess["username"], "agent_session_create",
+                      detail={"session_id": res.get("session_id"), "title": title}, channel="web")
+        return _json(res)
+
+    async def api_agent_session_detail(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        duty = self._duty()
+        sid = request.match_info.get("sid") or ""
+        if not duty:
+            return _json({"ok": False, "error": "duty_unavailable"}, 503)
+        s = duty.get(sid)
+        if not s:
+            return _json({"ok": False, "error": "not_found"}, 404)
+        incs = duty.incidents(sid)
+        msgs = duty.messages(sid, limit=200)
+        events = duty.events(sid, limit=100)
+        pending_writes = []
+        try:
+            bridge = self._bridge()
+            if bridge:
+                pending_writes = bridge.list_pending_writes(limit=20)
+                pending_writes = [w for w in pending_writes if w.get("session_id") == sid or not w.get("session_id")]
+        except Exception:
+            pending_writes = []
+        pending_actions = []
+        try:
+            pending_actions = [
+                dict(r) for r in self.db.query(
+                    "SELECT id, incident_id, asset_id, object_id, capability, state, mode,"
+                    " proposer_type, proposer_id, reason, created_at, approval_deadline"
+                    " FROM actions WHERE state='proposed' ORDER BY created_at DESC LIMIT 20"
+                )
+            ]
+        except Exception:
+            pending_actions = []
+        return _json({
+            "ok": True,
+            "session": s,
+            "incidents": incs,
+            "messages": msgs,
+            "events": events,
+            "pending_writes": pending_writes,
+            "pending_actions": pending_actions,
+        })
+
+    async def api_agent_session_prompt(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        duty = self._duty()
+        bridge = self._bridge()
+        sid = request.match_info.get("sid") or ""
+        if not duty or not bridge:
+            return _json({"ok": False, "error": "unavailable"}, 503)
+        s = duty.get(sid)
+        if not s:
+            return _json({"ok": False, "error": "not_found"}, 404)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        prompt = str((body or {}).get("prompt") or "").strip()
+        if not prompt:
+            return _json({"ok": False, "error": "prompt_required"}, 400)
+        duty.record_event(sid, type="user_prompt", title="用户消息", payload={"len": len(prompt)})
+        try:
+            sent = await asyncio.to_thread(bridge.prompt_remote, "", prompt, session_id=sid)
+        except Exception as e:  # noqa: BLE001
+            return _json({"ok": False, "error": "prompt_failed", "message": str(e)[:200]}, 502)
+        if not sent.get("ok"):
+            # 尝试先建远端
+            try:
+                attached = await asyncio.to_thread(bridge.attach_remote, "", session_id=sid)
+                if attached.get("ok"):
+                    sent = await asyncio.to_thread(bridge.prompt_remote, "", prompt, session_id=sid)
+            except Exception as e:  # noqa: BLE001
+                return _json({"ok": False, "error": "prompt_failed", "message": str(e)[:200]}, 502)
+        self.db.audit("web_user", sess["username"], "agent_session_prompt",
+                      detail={"session_id": sid, "len": len(prompt)}, channel="web")
+        return _json({"ok": True, "result": sent})
+
+    async def api_agent_session_archive(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        duty = self._duty()
+        sid = request.match_info.get("sid") or ""
+        if not duty:
+            return _json({"ok": False, "error": "duty_unavailable"}, 503)
+        res = duty.archive_session(sid, reason="manual")
+        self.db.audit("web_user", sess["username"], "agent_session_archive",
+                      detail={"session_id": sid}, channel="web")
+        return _json(res)
+
+    async def api_agent_session_events(self, request: web.Request) -> web.Response:
+        sess = self._require_auth(request)
+        duty = self._duty()
+        sid = request.match_info.get("sid") or ""
+        if not duty:
+            return _json({"ok": False, "error": "duty_unavailable"}, 503)
+        after_id = int(request.rel_url.query.get("after_id") or 0)
+        events = duty.events(sid, after_id=after_id, limit=100)
+        return _json({"ok": True, "events": events})
+
+    async def api_agent_settings_get(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        duty = self._duty()
+        if not duty:
+            return _json({"ok": False, "error": "duty_unavailable"}, 503)
+        settings = duty.settings()
+        ssh_accounts = []
+        try:
+            if self.ssh_store:
+                for ep in self.ssh_store.list_endpoints():
+                    ssh_accounts.append({
+                        "asset_id": ep.get("asset_id"),
+                        "role": ep.get("role"),
+                        "username": ep.get("username"),
+                        "credential_id": ep.get("credential_id"),
+                        "enabled": bool(ep.get("enabled")),
+                        "host": ep.get("host"),
+                    })
+        except Exception:
+            ssh_accounts = []
+        return _json({"ok": True, "settings": settings, "ssh_endpoints": ssh_accounts})
+
+    async def api_agent_settings_post(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        duty = self._duty()
+        if not duty:
+            return _json({"ok": False, "error": "duty_unavailable"}, 503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            return _json({"ok": False, "error": "bad_json"}, 400)
+        allowed = {
+            "require_human_approval",
+            "archive_delay_sec",
+            "ssh_investigate_role",
+            "ssh_execute_role",
+        }
+        changed = {}
+        actor = sess.get("username") or "web"
+        for key, value in body.items():
+            if key not in allowed:
+                continue
+            if key == "require_human_approval":
+                val = "1" if value in (True, 1, "1", "true", "True") else "0"
+            else:
+                val = str(value)
+            duty.set_setting(key, val, actor=actor)
+            changed[key] = val
+        self.db.audit("web_user", actor, "agent_settings_saved",
+                      detail={"changed": changed}, channel="web")
+        return _json({"ok": True, "changed": changed, "settings": duty.settings()})
+
+    async def api_agent_pending_writes(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        bridge = self._bridge()
+        if not bridge:
+            return _json({"ok": False, "error": "bridge_unavailable"}, 503)
+        return _json({"ok": True, "pending": bridge.list_pending_writes(limit=50)})
+
+    async def api_agent_pending_approve(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        bridge = self._bridge()
+        if not bridge:
+            return _json({"ok": False, "error": "bridge_unavailable"}, 503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        inc_id = str((body or {}).get("incident_id") or "").strip()
+        action_key = str((body or {}).get("action_key") or "").strip()
+        if not inc_id or not action_key:
+            return _json({"ok": False, "error": "incident_id_and_action_key_required"}, 400)
+        approved = bridge.approve_pending_write(inc_id, action_key, approved_by=sess.get("username") or "web")
+        if not approved.get("ok"):
+            return _json(approved, 400)
+        params = approved.get("params") or {}
+        command = str(params.get("command") or "")
+        channel = str(params.get("channel") or "write")
+        timeout = params.get("timeout")
+        try:
+            timeout_f = float(timeout) if timeout is not None else None
+        except (TypeError, ValueError):
+            timeout_f = None
+        result: dict[str, Any] = {"approved": True}
+        row = self.db.query_one(
+            "SELECT target, result FROM session_write_ops WHERE incident_id=? AND action_key=?",
+            (inc_id, action_key),
+        )
+        asset_id = (row["target"] if row else "") or ""
+        if command and asset_id and self.transport is not None:
+            try:
+                from .actions import classify_exec_result
+                res = await self.transport.exec_shell(asset_id, command, timeout_f, channel=channel)
+                state, detail = classify_exec_result(res)
+                if state == "unknown":
+                    bridge.mark_unknown(inc_id, action_key, reason=detail or "unknown")
+                else:
+                    bridge.complete_write(inc_id, action_key, ok=(state == "success"), result=(detail or "")[:500])
+                result.update({"exec_state": state, "detail": (detail or "")[:300]})
+            except Exception as e:  # noqa: BLE001
+                bridge.mark_unknown(inc_id, action_key, reason=str(e)[:120])
+                result["exec_error"] = str(e)[:200]
+        else:
+            # 无命令参数：仅批准状态，调用方稍后执行
+            result["note"] = "approved_without_inline_exec"
+        self.db.audit("web_user", sess["username"], "pending_write_approved",
+                      detail={"incident_id": inc_id, "action_key": action_key, "result": result}, channel="web")
+        return _json({"ok": True, **result})
+
+    async def api_agent_pending_reject(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        bridge = self._bridge()
+        if not bridge:
+            return _json({"ok": False, "error": "bridge_unavailable"}, 503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        inc_id = str((body or {}).get("incident_id") or "").strip()
+        action_key = str((body or {}).get("action_key") or "").strip()
+        reason = str((body or {}).get("reason") or "human_rejected")
+        if not inc_id or not action_key:
+            return _json({"ok": False, "error": "incident_id_and_action_key_required"}, 400)
+        res = bridge.reject_pending_write(inc_id, action_key, reason=reason)
+        self.db.audit("web_user", sess["username"], "pending_write_rejected",
+                      detail={"incident_id": inc_id, "action_key": action_key}, channel="web")
+        return _json(res)
+
+    async def api_agent_pending_actions(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        rows = self.db.query(
+            "SELECT id, incident_id, asset_id, object_id, capability, state, mode,"
+            " proposer_type, proposer_id, reason, created_at, approval_deadline, params_json"
+            " FROM actions WHERE state='proposed' ORDER BY created_at DESC LIMIT 50"
+        )
+        return _json({"ok": True, "actions": [dict(r) for r in rows]})
 
     async def api_executions(self, request: web.Request) -> web.Response:
         """统一查询 actions + session_write_ops（关联 Incident/资产）。"""

@@ -152,6 +152,12 @@ class ClosedLoopE2E(unittest.IsolatedAsyncioTestCase):
         self.db = Database(Path(self.tmp.name) / "t.db")
         ensure_ops_loop_schema(self.db)
         _seed(self.db)
+        # 闭环 E2E：关闭人工审批以验证 P6 自动路径
+        self.db.execute(
+            "INSERT OR REPLACE INTO agent_settings(key, value, updated_at, updated_by)"
+            " VALUES('require_human_approval','0',?, 'test')",
+            (now(),),
+        )
         self.incidents = IncidentService(self.db)
         self.transport = FakeTransport(ok=True)
         self.prom = FakeProm(healthy=True)
@@ -352,9 +358,35 @@ class ClosedLoopE2E(unittest.IsolatedAsyncioTestCase):
         agent = self._make_agent(conclusion)
         await self._run_one(agent)
         ops = self.db.query("SELECT action_key, status FROM session_write_ops")
-        # 若 write_ops 已挂上则 unknown/done 禁重放；至少 actions 无重复 dispatch
         states = [r["state"] for r in self.db.query("SELECT state FROM actions WHERE mode='autonomous'")]
         self.assertLessEqual(states.count("dispatched"), 1)
+
+    async def test_human_approval_gate_blocks_auto_execute(self):
+        self.db.execute(
+            "INSERT OR REPLACE INTO agent_settings(key, value, updated_at, updated_by)"
+            " VALUES('require_human_approval','1',?, 'test')",
+            (now(),),
+        )
+        conclusion = {
+            "status": "completed",
+            "root_cause": "service down",
+            "facts": [{"claim": "down", "evidence": "probe"}],
+            "suggested_action": {
+                "capability": "service.restart",
+                "object_id": "obj",
+                "plan_sig": "restart-frps",
+                "evidence_ok": True,
+            },
+            "remote_session_id": "ses_1",
+        }
+        agent = self._make_agent(conclusion)
+        await self._run_one(agent)
+        # 应停在 proposed，不得自动派发
+        rows = list(self.db.query("SELECT state FROM actions WHERE mode='autonomous'"))
+        self.assertTrue(rows, "should create proposed action")
+        for r in rows:
+            self.assertEqual(r["state"], "proposed")
+        self.assertFalse(list(self.db.query("SELECT id FROM actions WHERE mode='autonomous' AND state='dispatched'")))
 
 
 if __name__ == "__main__":
