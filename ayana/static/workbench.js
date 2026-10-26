@@ -14,6 +14,14 @@
     lastEventId: 0,
     collapsedLeft: false,
     collapsedRight: false,
+    // 实时流
+    liveTimer: null,
+    liveSince: 0,
+    busy: false,
+    busySince: 0,
+    thinkingTimer: null,
+    liveTexts: {},      // partId -> {text, kind, tool, done}
+    liveOrder: [],
   };
 
   function $(id) {
@@ -335,6 +343,9 @@
   async function selectSession(sid) {
     state.currentId = sid;
     state.lastEventId = 0;
+    state.liveTexts = {};
+    state.liveOrder = [];
+    state.liveSince = Date.now() / 1000;
     renderSessionList();
     await loadDetail(sid);
   }
@@ -361,23 +372,18 @@
     if (!text) return;
     const sid = state.currentId;
     input.value = "";
-    // 乐观展示用户消息
+    // 乐观展示
     const scroll = $("aw-chat-scroll");
     if (scroll) {
-      const pending = el("div", { class: "aw-msg user pending" }, [
+      scroll.appendChild(el("div", { class: "aw-msg user pending" }, [
         el("div", { class: "aw-msg-role", text: "你" }),
         el("div", { class: "aw-msg-text", text }),
-        el("div", { class: "aw-msg-time", text: "发送中…" }),
-      ]);
-      scroll.appendChild(pending);
+        el("div", { class: "aw-msg-time", text: "已发送" }),
+      ]));
       scroll.scrollTop = scroll.scrollHeight;
     }
-    // 发送中禁用
-    const btn = $("aw-send");
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = "发送中…";
-    }
+    // 不阻塞输入框；按钮变停止
+    setBusy(true);
     try {
       const r = await api(`/api/agent/sessions/${encodeURIComponent(sid)}/prompt`, {
         method: "POST",
@@ -385,20 +391,20 @@
       });
       if (!r || !r.ok) {
         const msg = (r && (r.message || r.error)) || "发送失败";
-        // 内联错误气泡
         if (scroll) {
-          const errBox = el("div", { class: "aw-msg system error" }, [
+          scroll.appendChild(el("div", { class: "aw-msg system error" }, [
             el("div", { class: "aw-msg-role", text: "系统" }),
             el("div", { class: "aw-msg-title", text: "发送失败" }),
             el("div", { class: "aw-msg-text", text: msg }),
-          ]);
-          scroll.appendChild(errBox);
+          ]));
           scroll.scrollTop = scroll.scrollHeight;
         }
+        setBusy(false);
+      } else {
+        state.liveSince = Date.now();
+        startLive();
+        await loadDetail(sid);
       }
-      // 无论成败都刷新，以拉取已落库的消息/错误
-      await loadDetail(sid);
-      await loadSessions();
     } catch (e) {
       if (scroll) {
         scroll.appendChild(el("div", { class: "aw-msg system error" }, [
@@ -406,12 +412,163 @@
           el("div", { class: "aw-msg-text", text: "网络错误：" + (e && e.message ? e.message : e) }),
         ]));
       }
-    } finally {
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = "发送";
-      }
+      setBusy(false);
     }
+  }
+
+  function setBusy(on) {
+    state.busy = !!on;
+    const btn = $("aw-send");
+    if (!btn) return;
+    if (on) {
+      state.busySince = Date.now();
+      btn.textContent = "停止";
+      btn.classList.add("danger");
+      btn.onclick = abortCurrent;
+    } else {
+      btn.textContent = "发送";
+      btn.classList.remove("danger");
+      btn.onclick = sendPrompt;
+      if (state.thinkingTimer) clearInterval(state.thinkingTimer);
+      state.thinkingTimer = null;
+    }
+  }
+
+  async function abortCurrent() {
+    if (!state.currentId) return;
+    try {
+      await api(`/api/agent/sessions/${encodeURIComponent(state.currentId)}/abort`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+    } catch (e) { /* ignore */ }
+    setBusy(false);
+    renderStatusLine("已停止");
+    await loadDetail(state.currentId);
+  }
+
+  function renderStatusLine(text) {
+    let bar = $("aw-status-bar");
+    const head = $("aw-chat-head");
+    if (!head) return;
+    if (!bar) {
+      bar = el("div", { id: "aw-status-bar", class: "aw-status-bar" });
+      head.appendChild(bar);
+    }
+    if (!text) {
+      bar.classList.add("hidden");
+      bar.textContent = "";
+      return;
+    }
+    bar.classList.remove("hidden");
+    bar.textContent = text;
+  }
+
+  function startLive() {
+    stopLive();
+    state.liveSince = state.liveSince || Date.now();
+    // 计时器：正在思考 Ns
+    state.thinkingTimer = setInterval(() => {
+      if (!state.busy) return;
+      const sec = Math.round((Date.now() - state.busySince) / 1000);
+      const last = state.liveOrder.length ? state.liveOrder[state.liveOrder.length - 1] : null;
+      const hint = last && last.tool ? `正在执行 ${last.tool}` : "正在思考";
+      renderStatusLine(`${hint}  ${sec}s`);
+    }, 1000);
+    renderStatusLine("正在思考  0s");
+    state.liveTimer = setInterval(pullLiveEvents, 1000);
+    pullLiveEvents();
+  }
+
+  function stopLive() {
+    if (state.liveTimer) clearInterval(state.liveTimer);
+    state.liveTimer = null;
+    if (state.thinkingTimer) clearInterval(state.thinkingTimer);
+    state.thinkingTimer = null;
+  }
+
+  async function pullLiveEvents() {
+    try {
+      const r = await api(`/api/agent/events?after=${encodeURIComponent(state.liveSince || 0)}`);
+      if (!r || !r.ok) return;
+      state.liveSince = r.server_time || Date.now() / 1000;
+      const evs = r.events || [];
+      let touched = false;
+      evs.forEach((ev) => {
+        if (ev.kind === "status") {
+          if (ev.status === "busy") {
+            if (!state.busy) setBusy(true);
+          } else if (ev.status && ev.status !== "busy") {
+            setBusy(false);
+            renderStatusLine(ev.status === "idle" ? "" : ev.status);
+            touched = true;
+          }
+        } else if (ev.kind === "delta" && ev.delta) {
+          const p = state.liveTexts[ev.part_id] || { text: "", kind: "text", tool: "" };
+          p.text += ev.delta;
+          state.liveTexts[ev.part_id] = p;
+          if (!state.liveOrder.find((x) => x.id === ev.part_id)) {
+            state.liveOrder.push({ id: ev.part_id, kind: p.kind, tool: p.tool, msg: ev.message_id });
+          }
+          renderLiveStream();
+          touched = true;
+        } else if (ev.kind === "part") {
+          const p = state.liveTexts[ev.part_id] || {};
+          p.kind = ev.part_type || p.kind || "text";
+          p.tool = ev.tool || p.tool || "";
+          if (ev.text) p.text = ev.text;
+          p.done = !!(ev.state && String(ev.state).indexOf("end") >= 0) || p.kind === "step-finish";
+          state.liveTexts[ev.part_id] = p;
+          if (!state.liveOrder.find((x) => x.id === ev.part_id)) {
+            state.liveOrder.push({ id: ev.part_id, kind: p.kind, tool: p.tool, msg: ev.message_id });
+          }
+          renderLiveStream();
+          touched = true;
+        }
+      });
+      if (touched && state.busy) {
+        const scroll = $("aw-chat-scroll");
+        if (scroll) scroll.scrollTop = scroll.scrollHeight;
+      }
+      // 无事件且超过 5 分钟则解除 busy，防卡死
+      if (state.busy && Date.now() - state.busySince > 5 * 60 * 1000) {
+        setBusy(false);
+        renderStatusLine("超时未完成，可重试");
+      }
+    } catch (e) { /* poll ignore */ }
+  }
+
+  function renderLiveStream() {
+    let box = $("aw-live-stream");
+    const scroll = $("aw-chat-scroll");
+    if (!scroll) return;
+    if (!box) {
+      box = el("div", { id: "aw-live-stream", class: "aw-live-stream" });
+      scroll.appendChild(box);
+    }
+    box.innerHTML = "";
+    state.liveOrder.slice(-6).forEach((item) => {
+      const p = state.liveTexts[item.id] || {};
+      const kind = p.kind || item.kind || "text";
+      const card = el("div", { class: "aw-live-card k-" + kind });
+      if (kind === "step-start") {
+        card.appendChild(el("div", { class: "aw-live-title", text: "· 开始一步" }));
+      } else if (kind === "step-finish") {
+        card.appendChild(el("div", { class: "aw-live-title", text: "· 完成一步" }));
+      } else if (kind === "reasoning") {
+        card.appendChild(el("div", { class: "aw-live-title", text: "思考" }));
+        card.appendChild(el("div", { class: "aw-live-text", text: (p.text || "").slice(0, 500) || "…" }));
+      } else if (kind === "tool" || kind === "tool-call" || kind === "tool_use") {
+        card.appendChild(el("div", { class: "aw-live-title", text: "工具 " + (p.tool || "") }));
+        const pre = el("pre", { class: "aw-log collapsed", text: (p.text || "").slice(0, 400) || "…" });
+        card.appendChild(pre);
+      } else {
+        card.appendChild(el("div", { class: "aw-live-title", text: "Agent" }));
+        card.appendChild(el("div", { class: "aw-live-text", text: p.text || "…" }));
+      }
+      box.appendChild(card);
+    });
+    scroll.scrollTop = scroll.scrollHeight;
   }
 
   async function archiveCurrent() {
@@ -485,12 +642,14 @@
     state.pollTimer = setInterval(async () => {
       if (state.currentId) await loadDetail(state.currentId);
       await loadSessions();
-    }, 8000);
+    }, 15000);
+    startLive();
   }
 
   function stopPoll() {
     if (state.pollTimer) clearInterval(state.pollTimer);
     state.pollTimer = null;
+    stopLive();
   }
 
   // ---- 布局 ----

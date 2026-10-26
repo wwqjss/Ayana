@@ -131,6 +131,8 @@ class WebApp:
         mimo_admin=None,
         duty=None,
         session_bridge=None,
+        mimo_serve=None,
+        mimo_events=None,
         alertmanager_webhook_path: str = "/hooks/alertmanager",
     ):
         self.db = db
@@ -165,6 +167,8 @@ class WebApp:
         self.mimo_admin = mimo_admin
         self.duty = duty
         self.session_bridge = session_bridge
+        self.mimo_serve = mimo_serve
+        self.mimo_events = mimo_events
         # Legacy kwargs remain accepted for older callers, but no live service is retained.
         from .legacy_history import LegacyHistory
 
@@ -237,6 +241,9 @@ class WebApp:
         app.router.add_post("/api/agent/sessions", self.api_agent_session_create)
         app.router.add_get("/api/agent/sessions/{sid}", self.api_agent_session_detail)
         app.router.add_post("/api/agent/sessions/{sid}/prompt", self.api_agent_session_prompt)
+        app.router.add_post("/api/agent/sessions/{sid}/abort", self.api_agent_session_abort)
+        app.router.add_get("/api/agent/events", self.api_agent_events)
+        app.router.add_get("/api/agent/serve-status", self.api_agent_serve_status)
         app.router.add_post("/api/agent/sessions/{sid}/archive", self.api_agent_session_archive)
         app.router.get("/api/agent/sessions/{sid}/events", self.api_agent_session_events)
         app.router.add_get("/api/agent/settings", self.api_agent_settings_get)
@@ -1706,12 +1713,12 @@ class WebApp:
         })
 
     async def api_agent_session_prompt(self, request: web.Request) -> web.Response:
+        """非阻塞发送：prompt_async 立即返回，过程经 /api/agent/events 轮询。"""
         sess = self._require_admin(request)
         self._check_csrf(request, sess)
         duty = self._duty()
-        bridge = self._bridge()
         sid = request.match_info.get("sid") or ""
-        if not duty or not bridge:
+        if not duty:
             return _json({"ok": False, "error": "unavailable"}, 503)
         s = duty.get(sid)
         if not s:
@@ -1723,29 +1730,101 @@ class WebApp:
         prompt = str((body or {}).get("prompt") or "").strip()
         if not prompt:
             return _json({"ok": False, "error": "prompt_required"}, 400)
-        # 先落库用户消息：MiMo 失败也保留输入痕迹
+        # 先落库用户消息
         duty.add_message(sid, role="user", kind="prompt", title="", body=prompt[:4000])
         duty.record_event(sid, type="user_prompt", title="用户消息", payload={"len": len(prompt)})
+
+        serve = getattr(self, "mimo_serve", None)
+        if serve is None:
+            duty.add_message(sid, role="system", kind="error", title="发送失败", body="MiMoCode serve 未接入")
+            return _json({"ok": False, "error": "serve_unavailable"}, 503)
+        client = serve.client()
+        remote_id = (s.get("remote_session_id") or "").strip()
         try:
-            sent = await asyncio.to_thread(bridge.prompt_remote, "", prompt, session_id=sid)
+            if not remote_id:
+                created = await client.create_session(title=s.get("title") or "ayana")
+                remote_id = created["session_id"]
+                with self.db.tx() as conn:
+                    conn.execute(
+                        "UPDATE duty_sessions SET remote_session_id=?, remote_status='active',"
+                        " remote_updated_at=?, updated_at=? WHERE id=?",
+                        (remote_id, time.time(), time.time(), sid),
+                    )
+                duty.record_event(sid, type="mimo_session", title="MiMo 会话已建立",
+                                  payload={"remote_session_id": remote_id})
+            await client.prompt_async(remote_id, prompt)
         except Exception as e:  # noqa: BLE001
-            duty.add_message(sid, role="system", kind="error", title="发送失败", body=str(e)[:500])
-            return _json({"ok": False, "error": "prompt_failed", "message": str(e)[:200]}, 502)
-        if not sent.get("ok"):
-            try:
-                attached = await asyncio.to_thread(bridge.attach_remote, "", session_id=sid)
-                if attached.get("ok"):
-                    sent = await asyncio.to_thread(bridge.prompt_remote, "", prompt, session_id=sid)
-            except Exception as e:  # noqa: BLE001
-                sent = {"ok": False, "error": "prompt_failed", "message": str(e)[:200]}
-        if not sent.get("ok"):
-            err = str(sent.get("message") or sent.get("error") or "prompt_failed")
-            duty.add_message(sid, role="system", kind="error", title="Agent 未响应", body=err[:500])
-            duty.record_event(sid, type="prompt_failed", title="Agent 未响应", payload={"error": err[:120]})
-            return _json({"ok": False, "error": sent.get("error") or "prompt_failed", "message": err[:200], "session_id": sid}, 502)
+            err = str(e)[:200]
+            duty.add_message(sid, role="system", kind="error", title="发送失败", body=err)
+            duty.record_event(sid, type="prompt_failed", title="发送失败", payload={"error": err})
+            return _json({"ok": False, "error": "prompt_failed", "message": err, "session_id": sid}, 502)
         self.db.audit("web_user", sess["username"], "agent_session_prompt",
-                      detail={"session_id": sid, "len": len(prompt)}, channel="web")
-        return _json({"ok": True, "result": sent, "session_id": sid})
+                      detail={"session_id": sid, "remote_session_id": remote_id, "len": len(prompt)}, channel="web")
+        # 202：已接收，过程看 events
+        return web.json_response(
+            {"ok": True, "accepted": True, "session_id": sid, "remote_session_id": remote_id},
+            status=202,
+        )
+
+    async def api_agent_session_abort(self, request: web.Request) -> web.Response:
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        duty = self._duty()
+        sid = request.match_info.get("sid") or ""
+        if not duty:
+            return _json({"ok": False, "error": "unavailable"}, 503)
+        s = duty.get(sid)
+        if not s:
+            return _json({"ok": False, "error": "not_found"}, 404)
+        serve = getattr(self, "mimo_serve", None)
+        remote_id = (s.get("remote_session_id") or "").strip()
+        if not serve or not remote_id:
+            return _json({"ok": False, "error": "no_remote_session"}, 400)
+        try:
+            await serve.client().abort(remote_id)
+        except Exception as e:  # noqa: BLE001
+            return _json({"ok": False, "error": "abort_failed", "message": str(e)[:200]}, 502)
+        duty.record_event(sid, type="aborted", title="用户停止")
+        self.db.audit("web_user", sess["username"], "agent_session_abort",
+                      detail={"session_id": sid}, channel="web")
+        return _json({"ok": True, "session_id": sid})
+
+    async def api_agent_events(self, request: web.Request) -> web.Response:
+        """实时事件轮询：after=unix_ts 增量。前端 1s 轮询即可获得流式体验。"""
+        self._require_auth(request)
+        after = float(request.rel_url.query.get("after") or 0)
+        sess_filter = str(request.rel_url.query.get("session_id") or "").strip()
+        live = []
+        fn = getattr(self, "mimo_events", None)
+        if callable(fn):
+            try:
+                live = fn() or []
+            except Exception:
+                live = []
+        out = []
+        for ev in live:
+            try:
+                ts = float(ev.get("at") or 0)
+            except Exception:
+                ts = 0
+            if ts <= after:
+                continue
+            if sess_filter and ev.get("session_id") and ev.get("session_id") != sess_filter:
+                # mimo session id 过滤；无 id 的保留
+                continue
+            out.append(ev)
+        return _json({"ok": True, "events": out[-80:], "server_time": time.time()})
+
+    async def api_agent_serve_status(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        serve = getattr(self, "mimo_serve", None)
+        if not serve:
+            return _json({"ok": False, "error": "not_configured"})
+        try:
+            h = await serve.client().health()
+        except Exception as e:  # noqa: BLE001
+            h = {"ok": False, "error": str(e)[:120]}
+        return _json({"ok": True, "base_url": serve.base_url, "health": h})
 
     async def api_agent_session_archive(self, request: web.Request) -> web.Response:
         sess = self._require_admin(request)

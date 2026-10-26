@@ -281,6 +281,21 @@ class App:
         from .duty_session import DutySessionManager
 
         self.duty = DutySessionManager(self.db)
+        # MiMoCode serve：实时交互（prompt_async + SSE）
+        from .mimo_serve import MimoServeManager
+
+        _serve_port = int(cfg.get("mimo_serve_port") or 6290)
+        _serve_pw = str(cfg.get("mimo_serve_password") or cfg.get("webhook_token") or "ayana-mimo")
+        self.mimo_serve = MimoServeManager(
+            mimo_bin=str(cfg.get("mimo_bin") or "mimo"),
+            workdir=str(cfg.get("mimo_workdir") or ""),
+            host="127.0.0.1",
+            port=_serve_port,
+            username="mimocode",
+            password=_serve_pw,
+        )
+        self.mimo_event_pump = None
+        self.mimo_live_events = []
         # P2 薄桥：只做映射/复用/幂等，不做自动处置（旧自治仍禁用）
         self.session_bridge = SessionBridge(self.db, knowledge=self.knowledge, duty=self.duty)
         self.incidents.session_bridge = self.session_bridge
@@ -547,6 +562,8 @@ class App:
             mimo_admin=self.mimo_admin,
             duty=self.duty,
             session_bridge=self.session_bridge,
+            mimo_serve=self.mimo_serve,
+            mimo_events=lambda: getattr(self, "mimo_live_events", []),
             alertmanager_webhook_path=cfg.get("alertmanager_webhook_path") or "/hooks/alertmanager",
         )
         self._stop = asyncio.Event()
@@ -725,6 +742,8 @@ class App:
         except Exception as e:  # noqa: BLE001
             log.warning("duty recover failed: %s", e)
         self._bg_tasks.append(asyncio.create_task(self._bg_duty_archives()))
+        # MiMoCode serve：拉起 + SSE 事件泵
+        self._bg_tasks.append(asyncio.create_task(self._bg_mimo_serve()))
         # P4.3：只读调查 worker（独立于旧自治）
         if self.auto_investigator is not None:
             self._bg_tasks.append(asyncio.create_task(self.auto_investigator.run_forever()))
@@ -881,6 +900,72 @@ class App:
             except Exception as e:
                 log.warning("AM reconcile failed: %s", e)
             await asyncio.sleep(60)
+
+    async def _bg_mimo_serve(self) -> None:
+        """拉起 mimo serve 并订阅 SSE，事件落库 + 环形缓冲供前端轮询。"""
+        from .mimo_serve import MimoEventPump, translate_event
+
+        try:
+            await self.mimo_serve.ensure_running()
+            log.info("mimo serve ready at %s", self.mimo_serve.base_url)
+        except Exception as e:  # noqa: BLE001
+            log.warning("mimo serve start failed: %s", e)
+
+        def _on_event(ev: dict) -> None:
+            try:
+                t = translate_event(ev)
+                if not t:
+                    return
+                self.mimo_live_events.append({"at": time.time(), **t})
+                if len(self.mimo_live_events) > 400:
+                    self.mimo_live_events = self.mimo_live_events[-250:]
+                sid = t.get("session_id") or ""
+                # 关联 duty session（remote_session_id）
+                if sid:
+                    row = self.db.query_one(
+                        "SELECT id FROM duty_sessions WHERE remote_session_id=?", (sid,)
+                    )
+                    if row:
+                        duty_sid = row["id"]
+                        if t.get("kind") == "part" and t.get("part_type") in (
+                            "text", "tool", "tool-call", "tool_use", "step-start", "step-finish", "reasoning",
+                        ):
+                            self.duty.record_event(
+                                duty_sid,
+                                type=t.get("part_type") or "part",
+                                title=(t.get("tool") or t.get("part_type") or "")[:80],
+                                payload={"part_id": t.get("part_id"), "text": (t.get("text") or "")[:500]},
+                            )
+                        elif t.get("kind") == "delta" and t.get("field") == "text":
+                            self.duty.record_event(
+                                duty_sid,
+                                type="delta",
+                                title="",
+                                payload={"part_id": t.get("part_id"), "delta": (t.get("delta") or "")[:200]},
+                            )
+                        elif t.get("kind") == "session_updated" and t.get("title"):
+                            try:
+                                self.duty.update_title(duty_sid, t["title"])
+                            except Exception:
+                                pass
+            except Exception as e:  # noqa: BLE001
+                log.debug("event persist failed: %s", e)
+
+        client = self.mimo_serve.client()
+        pump = MimoEventPump(client, on_event=_on_event)
+        self.mimo_event_pump = pump
+        while not self._stop.is_set():
+            try:
+                await pump.run_forever()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.warning("mimo event pump crashed: %s", e)
+                await asyncio.sleep(5)
+                try:
+                    await self.mimo_serve.ensure_running()
+                except Exception:
+                    pass
 
     async def _bg_duty_archives(self) -> None:
         """值班会话归档倒计时 tick + 标题刷新。"""

@@ -259,6 +259,62 @@
 
 .aw-muted { color: var(--dim, #8b93a7); font-size: 12px; }
 
+/* 实时状态条 + 流式卡片 */
+.aw-status-bar {
+  margin-top: 8px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: rgba(108, 182, 255, 0.1);
+  color: var(--acc, #6cb6ff);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.aw-status-bar.hidden { display: none; }
+
+.aw-live-stream {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+.aw-live-card {
+  border-left: 2px solid var(--acc, #6cb6ff);
+  padding: 8px 10px;
+  background: rgba(108, 182, 255, 0.06);
+  border-radius: 0 8px 8px 0;
+}
+.aw-live-card.k-tool, .aw-live-card.k-tool-call, .aw-live-card.k-tool_use {
+  border-left-color: var(--warn, #f0ad4e);
+  background: rgba(240, 173, 78, 0.08);
+}
+.aw-live-card.k-reasoning {
+  border-left-color: var(--dim, #8b93a7);
+  background: rgba(139, 147, 167, 0.08);
+  opacity: 0.85;
+}
+.aw-live-card.k-step-start, .aw-live-card.k-step-finish {
+  border-left-color: var(--line, #2a2e38);
+  background: transparent;
+  padding: 2px 8px;
+}
+.aw-live-title {
+  font-size: 11px;
+  color: var(--dim, #8b93a7);
+  margin-bottom: 4px;
+}
+.aw-live-text {
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.btn.danger {
+  background: rgba(240, 78, 78, 0.2);
+  border-color: rgba(240, 78, 78, 0.5);
+  color: #ff8a8a;
+}
+
 .aw-toggle {
   position: absolute;
   top: 8px;
