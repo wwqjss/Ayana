@@ -126,7 +126,7 @@
     root.innerHTML = "";
     const msgs = d.messages || [];
     if (!msgs.length) {
-      root.appendChild(el("div", { class: "aw-chat-empty muted", text: "会话已创建，等待 Agent 响应…" }));
+      root.appendChild(el("div", { class: "aw-chat-empty muted", text: "会话已就绪。输入任务开始调查，或点右上「原生终端」进入同一运行任务。" }));
     }
     msgs.forEach((m) => {
       root.appendChild(renderMessage(m));
