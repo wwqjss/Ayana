@@ -247,6 +247,13 @@
     state.detail = result;
     if (result.can_control === false) term.control = false;
     adoptPermissions(result.effective_permissions);
+    if (!term.ready && !term.connecting) {
+      try {
+        const viewport = await api(sessionPath(sid) + "/terminal");
+        if (current(sid, generation)) state.viewport = viewport && viewport.ok ? viewport : null;
+      } catch (_) { if (current(sid, generation)) state.viewport = null; }
+      renderTerminalIdle();
+    }
     renderHeader(); renderRight(); renderSessionList();
     return true;
   }
@@ -255,13 +262,16 @@
     disconnectTerminal();
     state.currentId = sid;
     state.permissions = null; state.permissionBusy = false;
-    state.detail = null;
+    state.detail = null; state.viewport = null;
     state.taskEventVersion = 0; state.lifecycleBusy = false;
     taskFeedback("");
     renderHeader(); renderRight(); renderSessionList();
     notice("正在读取会话…");
     try {
-      if (await loadDetail(sid, generation)) await connectTerminal(sid, generation);
+      if (await loadDetail(sid, generation)) {
+        renderTerminalIdle();
+        notice("点击「连接会话」接入 MiMoCode。");
+      }
     } catch (_) {
       if (current(sid, generation)) notice("会话暂不可达，请重试。", true);
     }
@@ -284,7 +294,7 @@
       } catch (_) { error.textContent = "创建请求未完成，请核对左侧会话列表。"; }
       finally { save.disabled = false; }
     } });
-    appShowModal("新建手动会话", [el("div", { class: "form-col" }, [input, el("p", { class: "aw-muted", text: "创建后直接进入 MiMoCode，在原生输入框中开始任务。" }), error, save])]);
+    appShowModal("新建手动会话", [el("div", { class: "form-col" }, [input, el("p", { class: "aw-muted", text: "创建后点击「连接会话」进入 MiMoCode，在原生输入框中开始任务。" }), error, save])]);
   }
   async function abortCurrent() {
     const sid = state.currentId, generation = state.generation;
@@ -559,7 +569,7 @@
     const status = $("aw-term-status");
     if (status) {
       const mode = state.permissions ? (state.permissions.access_mode === "readwrite" ? "读写" : "只读") : "权限待确认";
-      status.textContent = term.connecting ? "接入中" : term.ready && term.rendered ? (term.control ? "控制中" : "观察")+"·"+mode : term.ready ? "等待原生画面" : "未接入";
+      status.textContent = term.connecting ? "接入中" : term.ready && term.rendered ? (term.control ? "控制中" : "观察")+"·"+mode : term.ready ? "等待原生画面" : (state.viewport && state.viewport.released_at ? "已释放，可连接" : "未接入");
       status.classList.toggle("ready", term.ready && term.rendered);
       status.classList.toggle("control", term.control);
     }
@@ -634,6 +644,19 @@
     term.sessionId = "";
     term.resizeCols = term.resizeRows = 0;
     term.control = term.ready = term.rendered = term.connecting = false;
+    updateTermUi();
+  }
+  function renderTerminalIdle() {
+    const host = $("aw-term-host");
+    if (!host || term.ready || term.connecting) return;
+    host.innerHTML = "";
+    const viewport = state.viewport;
+    if (viewport && viewport.last_capture) {
+      const pre = document.createElement("pre");
+      pre.className = "aw-term-snapshot";
+      pre.textContent = viewport.last_capture;
+      host.appendChild(pre);
+    }
     updateTermUi();
   }
   async function connectTerminal(sid = state.currentId, generation = state.generation) {
@@ -837,7 +860,7 @@
       "aw-new-session": createSession, "aw-settings-btn": openAgentSettings,
       "aw-term-reconnect": () => connectTerminal(), "aw-term-acquire": acquireControl,
       "aw-term-release": releaseControl, "aw-term-stop": abortCurrent,
-      "aw-term-disconnect": () => { disconnectTerminal(); notice("已离开当前视图，后台任务继续执行。"); },
+      "aw-term-disconnect": () => { disconnectTerminal(); renderTerminalIdle(); notice("已离开当前视图，后台任务继续执行。"); },
       "aw-archive": archiveCurrent, "aw-reopen": reopenCurrent,
       "aw-pause-duty": () => lifecycleAction("pause"), "aw-resume-duty": () => lifecycleAction("resume-duty"),
       "aw-recover-task": () => lifecycleAction("recover"), "aw-delete-session": () => lifecycleAction("delete"),
@@ -861,7 +884,7 @@
       if (!state.active || state.mount !== mount) return;
       const selected = state.sessions.find((item) => item.id === state.currentId);
       const next = selected || state.sessions.find((item) => item.status === "open" && item.origin === "auto") || state.sessions[0];
-      if (!next) { notice("选择或新建会话，直接进入 MiMoCode。"); renderHeader(); }
+      if (!next) { notice("选择或新建会话后，点击「连接会话」进入 MiMoCode。"); renderHeader(); }
       else if (state.currentId !== next.id || !term.sessionId) await selectSession(next.id);
       else await loadDetail(next.id);
       if (state.active && state.mount === mount) startPoll();

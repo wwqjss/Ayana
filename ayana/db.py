@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 
 class MigrationError(RuntimeError):
@@ -1223,6 +1223,16 @@ def _migrate_v25_session_lifecycle(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE TABLE IF NOT EXISTS agent_work_targets (asset_id TEXT NOT NULL, object_id TEXT NOT NULL, session_id TEXT NOT NULL, updated_at REAL NOT NULL, PRIMARY KEY(asset_id,object_id))")
 
 
+def _migrate_v26_viewport_release(conn: sqlite3.Connection) -> None:
+    """Viewport leases: last terminal snapshot and release time; '' tmux names must be NULL."""
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(agent_runtime_bindings)")}
+    for column, definition in (("last_capture", "TEXT NOT NULL DEFAULT ''"), ("released_at", "REAL NOT NULL DEFAULT 0")):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE agent_runtime_bindings ADD COLUMN {column} {definition}")
+    # UNIQUE(tmux_name) admits only one empty string; "no viewport" is NULL.
+    conn.execute("UPDATE agent_runtime_bindings SET tmux_name=NULL WHERE tmux_name=''")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_v1_baseline,
     2: _migrate_v2_p0_p1_columns,
@@ -1249,6 +1259,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     23: _migrate_v23_native_runtime,
     24: _migrate_v24_agent_authority,
     25: _migrate_v25_session_lifecycle,
+    26: _migrate_v26_viewport_release,
 }
 
 _MIGRATION_NAMES = {
@@ -1277,6 +1288,7 @@ _MIGRATION_NAMES = {
     23: "native_runtime_bindings",
     24: "live_session_authority",
     25: "native_guidance_and_session_lifecycle",
+    26: "viewport_release_lifecycle",
 }
 
 

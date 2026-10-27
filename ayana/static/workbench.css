@@ -49,6 +49,8 @@ main:has(#tab-agent.tab-panel:not(.hidden)) { max-width: none !important; paddin
 .aw-term-host { position: absolute; inset: 6px; overflow: hidden; background: #0a0a0a; }
 .aw-term-host .terminal, .aw-term-host .xterm { height: 100%; }
 .aw-term-host .xterm-viewport { background: #0a0a0a !important; scrollbar-width: thin; scrollbar-color: #3d4652 transparent; }
+.aw-term-snapshot { margin: 0; padding: 8px 10px; height: 100%; overflow: auto; background: #0a0a0a; color: #d5d5d5;
+  font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre; scrollbar-width: thin; scrollbar-color: #3d4652 transparent; }
 .aw-term-notice { position: absolute; z-index: 2; inset: 0; display: flex; align-items: center; justify-content: center; padding: 32px; text-align: center; font-size: 13px; line-height: 1.8; color: #a3adbc; background: rgba(10,10,10,.95); }
 .aw-term-notice.error { color: #e5b988; }
 .aw-term-notice.hidden { display: none !important; }

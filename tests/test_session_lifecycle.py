@@ -134,18 +134,59 @@ class NativeLifecycleTests(Fixture,unittest.IsolatedAsyncioTestCase):
         self.manager._connections['conn']={"username":"admin","session_id":self.manual}
         self.manager.acquire_control(self.manual,"admin","conn")
         self.turns=NativeTurns(self.db)
-    async def test_deleted_viewport_gc_checks_identity_and_preserves_shared_engine(self):
+    async def test_deleted_viewport_reaped_even_when_pane_identity_drifted(self):
         from unittest.mock import AsyncMock,Mock
         self.duty.request_delete(self.manual,actor="admin")
         self.db.execute("UPDATE agent_runtime_bindings SET tmux_name='ayana-own',pane_id='%2',pane_pid=123,pane_started_at='start' WHERE session_id=?",(self.manual,))
         self.manager._pane=AsyncMock(return_value={"pane_id":"%2","pane_pid":999,"pane_started_at":"different"})
         self.manager._tmux=Mock(return_value=SimpleNamespace(returncode=0))
         await self.manager.reap_deleted_viewports()
-        self.manager._tmux.assert_not_called()
-        self.manager._pane.return_value={"pane_id":"%2","pane_pid":123,"pane_started_at":"start"}
+        self.manager._tmux.assert_any_call("kill-session","-t","ayana-own")
+        self.assertIsNone(self.db.query_one("SELECT tmux_name FROM agent_runtime_bindings WHERE session_id=?",(self.manual,))[0])
+    async def test_reap_clears_every_deleted_viewport_without_empty_name_conflict(self):
+        from unittest.mock import AsyncMock,Mock
+        self.manager._pane=AsyncMock(return_value=None)
+        self.manager._tmux=Mock(return_value=SimpleNamespace(returncode=0))
+        for i in range(3):
+            row=self.duty.create(origin="manual")["session_id"]
+            self.duty.set_runtime_state(row,"idle")
+            self.assertTrue(self.duty.request_delete(row,actor="admin")["deleted"])
+            self.db.execute("UPDATE agent_runtime_bindings SET tmux_name=? WHERE session_id=?",(f"ayana-own{i}",row))
         await self.manager.reap_deleted_viewports()
-        self.manager._tmux.assert_called_once_with("kill-session","-t","ayana-own")
-        self.assertEqual(self.db.query_one("SELECT tmux_name FROM agent_runtime_bindings WHERE session_id=?",(self.manual,))[0],"")
+        left=self.db.query("SELECT session_id FROM agent_runtime_bindings WHERE tmux_name IS NOT NULL AND tmux_name<>''")
+        self.assertEqual([r[0] for r in left],[])
+    async def test_ensure_refuses_deleted_session(self):
+        self.duty.request_delete(self.manual,actor="admin")
+        with self.assertRaises(Exception) as caught:
+            await self.manager.ensure(self.manual,self.rid)
+        self.assertEqual(getattr(caught.exception,"code",""),"session_deleted")
+    async def test_idle_viewport_release_keeps_remote_session_and_last_capture(self):
+        from unittest.mock import AsyncMock,Mock
+        self.manager.release_control(self.manual,"admin","conn")
+        self.manager._connections.clear();self.manager._activity.clear()
+        self.db.execute("UPDATE duty_sessions SET last_activity_at=? WHERE id=?",(time.time()-600,self.manual))
+        self.db.execute("UPDATE agent_runtime_bindings SET remote_session_id=?,tmux_name='ayana-idle',pane_id='%3',pane_pid=123,pane_started_at='start',updated_at=? WHERE session_id=?",(self.rid,time.time()-600,self.manual))
+        self.manager._pane=AsyncMock(return_value={"pane_id":"%3","pane_pid":123,"pane_started_at":"start"})
+        self.manager._tmux=Mock(return_value=SimpleNamespace(returncode=0,stdout="last frame"))
+        released=await self.manager.release_idle_viewports(idle_seconds=120)
+        self.assertIn(self.manual,released)
+        row=self.db.query_one("SELECT tmux_name,remote_session_id,last_capture,released_at FROM agent_runtime_bindings WHERE session_id=?",(self.manual,))
+        self.assertIsNone(row[0]);self.assertEqual(row[1],self.rid)
+        self.assertEqual(row[2],"last frame");self.assertGreater(row[3],0)
+    async def test_idle_release_holds_on_control_client_or_running_task(self):
+        from unittest.mock import AsyncMock,Mock
+        self.manager._pane=AsyncMock(return_value=None)
+        self.manager._tmux=Mock(return_value=SimpleNamespace(returncode=0))
+        self.db.execute("UPDATE duty_sessions SET last_activity_at=? WHERE id=?",(time.time()-600,self.manual))
+        self.db.execute("UPDATE agent_runtime_bindings SET tmux_name='ayana-hold',updated_at=? WHERE session_id=?",(time.time()-600,self.manual))
+        self.manager._activity.clear()
+        self.assertEqual(await self.manager.release_idle_viewports(idle_seconds=120),[])
+        self.manager.release_control(self.manual,"admin","conn")
+        self.assertEqual(await self.manager.release_idle_viewports(idle_seconds=120),[])
+        self.manager._connections.clear()
+        self.duty.set_runtime_state(self.manual,"running",receipt_id="r1",receipt_status="running")
+        self.assertEqual(await self.manager.release_idle_viewports(idle_seconds=120),[])
+        self.assertEqual(self.db.query_one("SELECT tmux_name FROM agent_runtime_bindings WHERE session_id=?",(self.manual,))[0],"ayana-hold")
     async def test_guidance_admitted_while_business_turn_held(self):
         self.native.busy=True
         with self.duty.turn(self.manual,require_idle=False):

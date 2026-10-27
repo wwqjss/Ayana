@@ -1096,10 +1096,14 @@ class App:
         while not self._stop.is_set():
             try:
                 self.duty.tick_archives()
-                if getattr(self,"agent_tui",None):
-                    await self.agent_tui.reap_deleted_viewports()
             except Exception as e:  # noqa: BLE001
                 log.warning("duty tick_archives failed: %s", e)
+            try:
+                if getattr(self,"agent_tui",None):
+                    await self.agent_tui.reap_deleted_viewports()
+                    await self.agent_tui.release_idle_viewports()
+            except Exception as e:  # noqa: BLE001
+                log.warning("viewport recycle failed: %s", e)
             try:
                 for sess in self.duty.list_sessions(status="open", origin="auto", limit=5):
                     sid = sess.get("id") or ""

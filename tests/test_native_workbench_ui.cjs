@@ -91,7 +91,7 @@ function environment(reply) {
   const defaultReply = call => {
     if (call.url.includes("/sessions?")) return { ok: true, sessions };
     if (call.url.endsWith("/terminal/control")) return { ok: true };
-    if (call.url.endsWith("/terminal")) return { ok: true, attached: true, binding: {} };
+    if (call.url.endsWith("/terminal")) return call.method === "POST" ? { ok: true, binding: {} } : { ok: true, attached: false, binding: null, released_at: 0, last_capture: "" };
     const sid = call.url.split("/").pop();
     return { ok: true, session: { ...sessions.find(s => s.id === sid), remote_session_id: "ses_" + sid }, effective_permissions:{session_id:sid,access_mode:"readwrite",approval_mode:"manual",revision:1}, incidents: [], can_control: true, can_prepare: true };
   };
@@ -118,10 +118,11 @@ function environment(reply) {
   vm.runInContext(clipboardSource, context);
   vm.runInContext(source, context);
   const select = id => nodes.get("aw-session-list").children.find(c => c.tagName === "BUTTON" && c.textContent.includes(id === "sess_a" ? "automatic-a" : "manual-b")).click();
+  const attach = async () => { const button = nodes.get("aw-term-reconnect"); if (button && button.onclick) await button.click(); await flush(); };
   const ready = (socket = sockets.at(-1)) => { socket.readyState = 1; socket.onmessage({ data: JSON.stringify({ type: "ready", connection_id: "connection-" + sockets.indexOf(socket), control: false }) }); };
   const output = (text, socket = sockets.at(-1)) => socket.onmessage({ data: new Uint8Array(Buffer.from(text)).buffer });
   const paint = (socket = sockets.at(-1)) => output("\x1b[HMiMo", socket);
-  return { nodes, calls, sockets, terminals, observers, timers, timeouts, events, modals, alerts, prompts, select, ready, output, paint, window, clipboardWrites, legacyCopies, setCopyAllowed: value => { copyAllowed=value; }, run: code => vm.runInContext(code, context), defaultReply };
+  return { nodes, calls, sockets, terminals, observers, timers, timeouts, events, modals, alerts, prompts, select, attach, ready, output, paint, window, clipboardWrites, legacyCopies, setCopyAllowed: value => { copyAllowed=value; }, run: code => vm.runInContext(code, context), defaultReply };
 }
 const tests = [];
 const test = (name, run) => tests.push([name, run]);
@@ -140,15 +141,29 @@ test("the center has one native viewport and no parallel chat, composer or think
   for (const removed of ["aw-chat-scroll", "aw-composer", "aw-input", "aw-send", "aw-live-strip", "返回对话", "原生终端"]) assert.equal(center.includes(removed), false, removed);
   for (const removed of ["function renderMessages(", "function sendPrompt(", "function renderLiveStrip(", '"/api/agent/events']) assert.equal(source.includes(removed), false, removed);
 });
-test("selecting the automatic session attaches native TUI without submitting a task", async () => {
+test("selecting a session never starts a viewport; connecting is an explicit action", async () => {
   const env = environment(); await env.window.renderAgentWorkbench();
+  assert.equal(env.sockets.length, 0);
+  assert.equal(env.calls.filter(c => c.url.endsWith("/terminal") && c.method === "POST").length, 0);
+  await env.attach();
   assert.equal(env.sockets.length, 1);
   assert.equal(new URL(env.sockets[0].url).searchParams.get("session_id"), "sess_a");
   assert.equal(env.calls.filter(c => c.url.endsWith("/terminal") && c.method === "POST").length, 1);
   assert.equal(env.calls.some(c => c.url.endsWith("/prompt") || c.url.includes("/events")), false);
 });
+test("released viewports show the last terminal text snapshot before connecting", async () => {
+  const env = environment((call, normal) => call.url.endsWith("/terminal") && call.method === "GET"
+    ? { ok: true, attached: false, binding: null, released_at: 12, last_capture: "line one\nline two" }
+    : normal(call));
+  await env.window.renderAgentWorkbench();
+  const snapshot = (env.nodes.get("aw-term-host").children || [])[0];
+  assert.equal(snapshot && snapshot.textContent, "line one\nline two");
+  assert.equal(env.nodes.get("aw-term-status").textContent, "已释放，可连接");
+  await env.attach();
+  assert.equal(env.sockets.length, 1);
+});
 test("transport-ready waits for real native bytes before claiming a rendered connection", async () => {
-  const env = environment(); await env.window.renderAgentWorkbench(); env.ready();
+  const env = environment(); await env.window.renderAgentWorkbench(); await env.attach(); env.ready();
   assert.equal(env.nodes.get("aw-term-status").textContent, "等待原生画面");
   assert.equal(env.nodes.get("aw-term-status").classList.contains("ready"), false);
   env.paint();
@@ -157,7 +172,7 @@ test("transport-ready waits for real native bytes before claiming a rendered con
   assert.equal(env.terminals[0].output.length, 1);
 });
 test("clear-screen and capability queries never count as a visible native screen", async () => {
-  const env = environment(); await env.window.renderAgentWorkbench(); env.ready();
+  const env = environment(); await env.window.renderAgentWorkbench(); await env.attach(); env.ready();
   env.output("\x1b[2J\x1b[H\x1b[?2026$p\x1b[14t");
   assert.equal(env.nodes.get("aw-term-status").textContent, "等待原生画面");
   assert.equal(env.nodes.get("aw-term-status").classList.contains("ready"), false);
@@ -166,7 +181,7 @@ test("clear-screen and capability queries never count as a visible native screen
   assert.ok(env.nodes.get("aw-term-notice").textContent.includes("尚未收到原生画面"));
 });
 test("native screen becomes ready only after the terminal parser commits visible text", async () => {
-  const env = environment(); await env.window.renderAgentWorkbench(); env.ready();
+  const env = environment(); await env.window.renderAgentWorkbench(); await env.attach(); env.ready();
   const terminal = env.terminals[0]; terminal.deferWrites = true;
   env.paint();
   assert.equal(env.nodes.get("aw-term-status").textContent, "等待原生画面");
@@ -177,9 +192,9 @@ test("native screen becomes ready only after the terminal parser commits visible
   assert.equal(env.timeouts.size, 0);
 });
 test("a pending parser callback from the old terminal cannot mark a new selection ready", async () => {
-  const env = environment(); await env.window.renderAgentWorkbench(); env.ready();
+  const env = environment(); await env.window.renderAgentWorkbench(); await env.attach(); env.ready();
   const old = env.terminals[0]; old.deferWrites = true; env.paint();
-  await env.select("sess_b"); env.ready();
+  await env.select("sess_b"); await env.attach(); env.ready();
   old.completeWrites();
   assert.equal(env.nodes.get("aw-term-status").textContent, "等待原生画面");
   assert.equal(env.nodes.get("aw-term-notice").classList.contains("hidden"), false);
@@ -187,7 +202,7 @@ test("a pending parser callback from the old terminal cannot mark a new selectio
   assert.equal(env.nodes.get("aw-term-status").textContent, "观察·读写");
 });
 test("fit, onResize and host observation send each distinct geometry once", async () => {
-  const env = environment(); await env.window.renderAgentWorkbench(); env.ready();
+  const env = environment(); await env.window.renderAgentWorkbench(); await env.attach(); env.ready();
   const socket = env.sockets[0], terminal = env.terminals[0]; socket.sent.length = 0;
   env.events.get("resize")[0](); env.observers[0].callback();
   assert.equal(socket.sent.length, 0);
@@ -201,13 +216,13 @@ test("fit, onResize and host observation send each distinct geometry once", asyn
   ]);
 });
 test("native geometry requests enable only terminal report options", async () => {
-  const env = environment(); await env.window.renderAgentWorkbench();
+  const env = environment(); await env.window.renderAgentWorkbench(); await env.attach();
   const options = env.terminals[0].options.windowOptions;
   assert.deepEqual(Object.keys(options).sort(), ["getCellSizePixels", "getWinSizeChars", "getWinSizePixels"]);
   assert.ok(Object.values(options).every(value => value === true));
 });
 test("typing in observation never acquires control or replays keystrokes later", async () => {
-  const env = environment(); await env.window.renderAgentWorkbench(); env.ready(); env.paint();
+  const env = environment(); await env.window.renderAgentWorkbench(); await env.attach(); env.ready(); env.paint();
   const socket = env.sockets[0], terminal = env.terminals[0]; socket.sent.length = 0;
   terminal.data("do-not-replay\r");
   assert.equal(socket.sent.length, 0);
@@ -223,7 +238,7 @@ test("typing in observation never acquires control or replays keystrokes later",
 });
 test("failed preparation remains an honest error and creates no empty terminal", async () => {
   const env = environment((call, normal) => call.url.endsWith("/terminal") ? { ok: false, message: "runtime unavailable" } : normal(call));
-  await env.window.renderAgentWorkbench();
+  await env.window.renderAgentWorkbench(); await env.attach();
   assert.equal(env.sockets.length, 0); assert.equal(env.terminals.length, 0);
   assert.ok(env.nodes.get("aw-term-notice").textContent.includes("runtime unavailable"));
   assert.equal(env.nodes.get("aw-term-status").classList.contains("ready"), false);
@@ -232,15 +247,15 @@ test("late preparation for an old selection cannot create a stale socket", async
   const pending = deferred();
   const env = environment((call, normal) => call.url === "/api/agent/sessions/sess_a/terminal" ? pending.promise : normal(call));
   const first = env.window.renderAgentWorkbench(); await flush();
-  await env.select("sess_b"); pending.resolve({ ok: true }); await first;
+  await env.select("sess_b"); await env.attach(); pending.resolve({ ok: true }); await first;
   assert.deepEqual(env.sockets.map(s => new URL(s.url).searchParams.get("session_id")), ["sess_b"]);
   assert.equal(env.nodes.get("aw-chat-title").textContent, "manual-b");
 });
 test("old socket output and keyboard callbacks cannot cross into another session", async () => {
-  const env = environment(); await env.window.renderAgentWorkbench(); env.ready(); env.paint();
+  const env = environment(); await env.window.renderAgentWorkbench(); await env.attach(); env.ready(); env.paint();
   const old = env.sockets[0], terminal = env.terminals[0];
   const handlers = { message: old.onmessage, close: old.onclose, error: old.onerror };
-  await env.select("sess_b"); env.ready(); env.paint();
+  await env.select("sess_b"); await env.attach(); env.ready(); env.paint();
   old.readyState = 1; terminal.data("old\r");
   handlers.message({ data: new Uint8Array([65]).buffer }); handlers.close({ code: 4403 }); handlers.error();
   assert.equal(terminal.disposed, true);
@@ -252,7 +267,7 @@ test("late session details never overwrite a more recent selection", async () =>
   const pending = deferred();
   const env = environment((call, normal) => call.url === "/api/agent/sessions/sess_a" ? pending.promise : normal(call));
   const first = env.window.renderAgentWorkbench(); await flush();
-  await env.select("sess_b");
+  await env.select("sess_b"); await env.attach();
   pending.resolve({ ok: true, session: sessions[0], incidents: [] }); await first;
   assert.equal(env.window.agentWorkbenchState.currentId, "sess_b");
   assert.equal(env.nodes.get("aw-chat-title").textContent, "manual-b");
@@ -267,17 +282,17 @@ test("suspending a pending attach prevents a late socket and task submission", a
   assert.equal(env.calls.some(c => c.url.endsWith("/abort") || c.url.endsWith("/prompt")), false);
 });
 test("leaving the view disposes only browser attachments and does not abort or archive", async () => {
-  const env = environment(); await env.window.renderAgentWorkbench(); env.ready(); env.paint();
+  const env = environment(); await env.window.renderAgentWorkbench(); await env.attach(); env.ready(); env.paint();
   env.window.suspendAgentWorkbench();
   assert.equal(env.sockets[0].readyState, 3); assert.equal(env.terminals[0].disposed, true);
   assert.equal(env.timers.size, 0); assert.equal(env.timeouts.size, 0);
   assert.equal(env.calls.some(c => c.url.endsWith("/abort") || c.url.endsWith("/archive")), false);
-  await env.window.renderAgentWorkbench();
+  await env.window.renderAgentWorkbench(); await env.attach();
   assert.equal(env.sockets.length, 2);
   assert.equal(new URL(env.sockets[1].url).searchParams.get("session_id"), "sess_a");
 });
 test("reconnect attaches the same session without any prompt replay", async () => {
-  const env = environment(); await env.window.renderAgentWorkbench(); env.ready(); env.paint();
+  const env = environment(); await env.window.renderAgentWorkbench(); await env.attach(); env.ready(); env.paint();
   env.sockets[0].onclose({ code: 1013 });
   await env.nodes.get("aw-term-reconnect").click();
   assert.equal(env.sockets.length, 2);
@@ -287,9 +302,9 @@ test("reconnect attaches the same session without any prompt replay", async () =
 test("late control grant after switching cannot enable keyboard in the new session", async () => {
   const pending = deferred();
   const env = environment((call, normal) => call.url.endsWith("/terminal/control") ? pending.promise : normal(call));
-  await env.window.renderAgentWorkbench(); env.ready(); env.paint();
+  await env.window.renderAgentWorkbench(); await env.attach(); env.ready(); env.paint();
   const grant = env.nodes.get("aw-term-acquire").click();
-  await env.select("sess_b"); env.ready(); env.paint();
+  await env.select("sess_b"); await env.attach(); env.ready(); env.paint();
   pending.resolve({ ok: true }); await grant;
   env.terminals[1].data("blocked-after-stale-grant\r");
   assert.equal(env.sockets[1].sent.map(JSON.parse).filter(item => item.type === "input").length, 0);
@@ -301,7 +316,7 @@ test("archived history attaches read-only without silently reopening a session",
     if (call.url === "/api/agent/sessions/sess_a") { result.session.status = "archived"; result.can_control = false; result.can_prepare = true; }
     return result;
   });
-  await env.window.renderAgentWorkbench(); env.ready(); env.paint();
+  await env.window.renderAgentWorkbench(); await env.attach(); env.ready(); env.paint();
   assert.equal(env.sockets.length, 1);
   assert.equal(env.nodes.get("aw-term-acquire").classList.contains("hidden"), true);
   assert.equal(env.nodes.get("aw-reopen").classList.contains("hidden"), false);
@@ -313,19 +328,19 @@ test("viewers inspect an existing binding without a mutation or control button",
     if (call.url === "/api/agent/sessions/sess_a") { result.can_prepare = false; result.can_control = false; }
     return result;
   });
-  await env.window.renderAgentWorkbench(); env.ready(); env.paint();
+  await env.window.renderAgentWorkbench(); await env.attach(); env.ready(); env.paint();
   assert.equal(env.calls.find(c => c.url.endsWith("/terminal")).method, "GET");
   assert.equal(env.nodes.get("aw-term-acquire").classList.contains("hidden"), true);
 });
 test("repeated renders bind one set of listeners and retain one native connection", async () => {
-  const env = environment(); await env.window.renderAgentWorkbench(); env.ready(); env.paint();
+  const env = environment(); await env.window.renderAgentWorkbench(); await env.attach(); env.ready(); env.paint();
   await env.window.renderAgentWorkbench(); await env.window.renderAgentWorkbench();
   assert.equal(env.sockets.length, 1); assert.equal(env.events.get("resize").length, 1);
   assert.equal(env.events.get("pagehide").length, 1);
   assert.equal([...env.timers.values()].length, 2);
 });
 test("native readiness with no bytes times out visibly without false success", async () => {
-  const env = environment(); await env.window.renderAgentWorkbench(); env.ready();
+  const env = environment(); await env.window.renderAgentWorkbench(); await env.attach(); env.ready();
   for (const callback of env.timeouts.values()) callback();
   assert.ok(env.nodes.get("aw-term-notice").textContent.includes("尚未收到原生画面"));
   assert.equal(env.nodes.get("aw-term-status").classList.contains("ready"), false);
@@ -340,6 +355,8 @@ test("new manual sessions collect only a title and start tasks inside the native
   const created = env.calls.find(c => c.url === "/api/agent/sessions" && c.method === "POST");
   assert.deepEqual(created.body, { title: "manual native" });
   assert.equal(env.calls.some(c => c.url.endsWith("/prompt")), false);
+  assert.equal(env.window.agentWorkbenchState.currentId, "sess_b");
+  await env.attach();
   assert.equal(new URL(env.sockets.at(-1).url).searchParams.get("session_id"), "sess_b");
 });
 test("approval retains the exact action and OTP while duplicate clicks submit once", async () => {
@@ -350,7 +367,7 @@ test("approval retains the exact action and OTP while duplicate clicks submit on
     if (call.url === "/api/agent/sessions/sess_a") result.pending_actions = [{ id: "action-a", capability: "service.restart", object_id: "mysql" }];
     return result;
   });
-  await env.window.renderAgentWorkbench();
+  await env.window.renderAgentWorkbench(); await env.attach();
   const approve = env.nodes.get("aw-pending").querySelectorAll("button").find(b => b.textContent === "批准并执行");
   env.prompts.push("123456");
   const first = approve.click(); await approve.click();
@@ -368,7 +385,7 @@ test("read-only viewers can inspect pending approvals without action buttons bec
     }
     return result;
   });
-  await env.window.renderAgentWorkbench();
+  await env.window.renderAgentWorkbench(); await env.attach();
   const buttons = env.nodes.get("aw-pending").querySelectorAll("button");
   assert.equal(buttons.length, 2);
   assert.ok(buttons.every(b => b.disabled));
@@ -376,7 +393,7 @@ test("read-only viewers can inspect pending approvals without action buttons bec
   assert.equal(env.calls.some(c => c.url.includes("/api/actions/")), false);
 });
 test("control revocation immediately disables the original native keyboard", async () => {
-  const env = environment(); await env.window.renderAgentWorkbench(); env.ready(); env.paint();
+  const env = environment(); await env.window.renderAgentWorkbench(); await env.attach(); env.ready(); env.paint();
   await env.nodes.get("aw-term-acquire").click();
   const socket = env.sockets[0]; socket.sent.length = 0;
   socket.onmessage({ data: JSON.stringify({ type: "control", control: false }) });
@@ -384,7 +401,7 @@ test("control revocation immediately disables the original native keyboard", asy
   assert.equal(socket.sent.length, 0);
 });
 test("observer device reports stay separate from encoded keys and clipboard commands", async () => {
-  const env = environment(); await env.window.renderAgentWorkbench(); env.ready(); env.paint();
+  const env = environment(); await env.window.renderAgentWorkbench(); await env.attach(); env.ready(); env.paint();
   const socket = env.sockets[0], terminal = env.terminals[0]; socket.sent.length = 0;
   terminal.data("\x1b[?1;2c");
   terminal.data("\x1b[97u");
@@ -394,7 +411,7 @@ test("observer device reports stay separate from encoded keys and clipboard comm
   assert.equal(env.calls.some(call => call.url.endsWith("/terminal/control")), false);
 });
 test("observers return only the native queried DECRPM modes and valid status values", async () => {
-  const env = environment(); await env.window.renderAgentWorkbench(); env.ready(); env.paint();
+  const env = environment(); await env.window.renderAgentWorkbench(); await env.attach(); env.ready(); env.paint();
   const socket = env.sockets[0], terminal = env.terminals[0]; socket.sent.length = 0;
   const reports = [];
   for (const mode of [1004, 1016, 2004, 2026, 2027, 2031]) {
@@ -407,7 +424,7 @@ test("observers return only the native queried DECRPM modes and valid status val
   assert.equal(env.calls.some(call => call.url.endsWith("/terminal/control")), false);
 });
 test("observer shows actual access with both permission controls disabled", async () => {
-  const env=environment();await env.window.renderAgentWorkbench();env.ready();env.paint();
+  const env=environment();await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();
   assert.equal(env.nodes.get("aw-term-status").textContent,"观察·读写");
   assert.equal(env.nodes.get("aw-access-mode").disabled,true);
   assert.equal(env.nodes.get("aw-approval-mode").disabled,true);
@@ -416,7 +433,7 @@ test("observer shows actual access with both permission controls disabled", asyn
 test("takeover inherits and permission toggle waits for confirmed response", async () => {
   const pending=deferred();let env;
   env=environment(call=>call.url.endsWith("/permissions") ? pending.promise : env.defaultReply(call));
-  await env.window.renderAgentWorkbench();env.ready();env.paint();await env.nodes.get("aw-term-acquire").click();
+  await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();await env.nodes.get("aw-term-acquire").click();
   assert.equal(env.nodes.get("aw-term-status").textContent,"控制中·读写");
   const operation=env.nodes.get("aw-access-mode").click();await flush();
   assert.equal(env.nodes.get("aw-access-mode").textContent,"读写");
@@ -428,27 +445,27 @@ test("takeover inherits and permission toggle waits for confirmed response", asy
 });
 test("permission failure keeps backend mode and exposes reason", async () => {
   let env;env=environment(call=>call.url.endsWith("/permissions") ? {ok:false,message:"控制权已过期",effective_permissions:{session_id:"sess_a",access_mode:"readwrite",approval_mode:"manual",revision:2}} : env.defaultReply(call));
-  await env.window.renderAgentWorkbench();env.ready();env.paint();await env.nodes.get("aw-term-acquire").click();await env.nodes.get("aw-access-mode").click();
+  await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();await env.nodes.get("aw-term-acquire").click();await env.nodes.get("aw-access-mode").click();
   assert.equal(env.nodes.get("aw-access-mode").textContent,"读写");
   assert.equal(env.nodes.get("aw-task-feedback").textContent,"控制权已过期");
   assert.equal(env.nodes.get("aw-term-notice").classList.contains("hidden"),true);
 });
 test("late permission response cannot change another session", async () => {
   const pending=deferred();let env;env=environment(call=>call.url.endsWith("/permissions") ? pending.promise : env.defaultReply(call));
-  await env.window.renderAgentWorkbench();env.ready();env.paint();await env.nodes.get("aw-term-acquire").click();
-  const operation=env.nodes.get("aw-access-mode").click();await flush();await env.select("sess_b");env.ready();env.paint();
+  await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();await env.nodes.get("aw-term-acquire").click();
+  const operation=env.nodes.get("aw-access-mode").click();await flush();await env.select("sess_b"); await env.attach();env.ready();env.paint();
   pending.resolve({ok:true,effective_permissions:{session_id:"sess_a",access_mode:"readonly",approval_mode:"automatic",revision:99}});await operation;
   assert.equal(env.nodes.get("aw-term-status").textContent,"观察·读写");assert.equal(env.nodes.get("aw-access-mode").disabled,true);
 });
 test("release and heartbeat adopt restored backend permissions", async () => {
   let env;env=environment(call=>call.url.endsWith("/terminal/control") && call.body.action==="release" ? {ok:true,effective_permissions:{session_id:"sess_a",access_mode:"readonly",approval_mode:"manual",revision:3}} : env.defaultReply(call));
-  await env.window.renderAgentWorkbench();env.ready();env.paint();await env.nodes.get("aw-term-acquire").click();await env.nodes.get("aw-term-release").click();
+  await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();await env.nodes.get("aw-term-acquire").click();await env.nodes.get("aw-term-release").click();
   assert.equal(env.nodes.get("aw-term-status").textContent,"观察·只读");assert.equal(env.nodes.get("aw-access-mode").disabled,true);
   env.sockets[0].onmessage({data:JSON.stringify({type:"control",control:false,effective_permissions:{session_id:"sess_a",access_mode:"readwrite",approval_mode:"automatic",revision:4}})});
   assert.equal(env.nodes.get("aw-term-status").textContent,"观察·读写");assert.equal(env.nodes.get("aw-approval-mode").value,"automatic");
 });
 test("backend task state is separate from open session and heartbeat does not erase a queue acknowledgment", async () => {
-  const env=environment();await env.window.renderAgentWorkbench();env.ready();env.paint();
+  const env=environment();await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();
   assert.ok(env.nodes.get("aw-chat-meta").textContent.includes("会话开放"));
   assert.equal(env.nodes.get("aw-task-state").textContent,"空闲");
   const socket=env.sockets[0];
@@ -461,7 +478,7 @@ test("backend task state is separate from open session and heartbeat does not er
 test("a detail response started before an acknowledgment cannot replace its newer task state", async () => {
   const pending=deferred();let hold=false,env;
   env=environment(call=>hold && call.url==="/api/agent/sessions/sess_a" ? pending.promise : env.defaultReply(call));
-  await env.window.renderAgentWorkbench();env.ready();env.paint();hold=true;
+  await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();hold=true;
   const operation=pollCallback(env)();await flush();
   env.sockets[0].onmessage({data:JSON.stringify({type:"action_ack",state:"queued",message:"新输入已确认排队"})});
   pending.resolve({...env.defaultReply({url:"/api/agent/sessions/sess_a"}),task_state:"idle",task_state_label:"空闲"});await operation;
@@ -469,7 +486,7 @@ test("a detail response started before an acknowledgment cannot replace its newe
   assert.ok(env.nodes.get("aw-task-state").textContent.includes("排队"));
 });
 test("a rejected new input displays its reason without marking the active task failed", async () => {
-  const env=environment();await env.window.renderAgentWorkbench();env.ready();env.paint();
+  const env=environment();await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();
   const socket=env.sockets[0];
   socket.onmessage({data:JSON.stringify({type:"action_ack",state:"running",message:"执行中"})});
   socket.onmessage({data:JSON.stringify({type:"action_ack",state:"error",ok:false,message:"控制权已过期，输入未接收"})});
@@ -485,7 +502,7 @@ test("pause and resume duty use distinct APIs without silently aborting the nati
     const reply=env.defaultReply(call);
     return call.url==="/api/agent/sessions/sess_a" ? {...reply,session:{...reply.session,paused_at:paused?1:0},task_state:paused?"paused":"running"} : reply;
   });
-  await env.window.renderAgentWorkbench();await env.nodes.get("aw-pause-duty").click();
+  await env.window.renderAgentWorkbench(); await env.attach();await env.nodes.get("aw-pause-duty").click();
   assert.equal(env.calls.filter(call=>call.url.endsWith("/pause")).length,1);
   assert.equal(env.nodes.get("aw-pause-duty").classList.contains("hidden"),true);
   assert.equal(env.nodes.get("aw-resume-duty").classList.contains("hidden"),false);
@@ -500,7 +517,7 @@ test("recover requires current control and resumes via recovery API without subm
     const reply=env.defaultReply(call);
     return call.url==="/api/agent/sessions/sess_a" ? {...reply,can_recover:!resumed,task_state:resumed?"running":"interrupted"} : reply;
   });
-  await env.window.renderAgentWorkbench();env.ready();env.paint();
+  await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();
   assert.equal(env.nodes.get("aw-recover-task").disabled,true);
   await env.nodes.get("aw-term-acquire").click();await env.nodes.get("aw-recover-task").click();
   const recovery=env.calls.find(call=>call.url.endsWith("/recover"));
@@ -519,7 +536,7 @@ test("stop and delete remains visible until backend confirms completion and then
     }
     return env.defaultReply(call);
   });
-  await env.window.renderAgentWorkbench();env.ready();env.paint();
+  await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();
   await env.nodes.get("aw-delete-stop").click();
   assert.equal(env.calls.filter(call=>call.method==="DELETE").length,1);
   assert.deepEqual(env.calls.find(call=>call.method==="DELETE").body,{stop:true});
@@ -536,13 +553,13 @@ test("safe delete sends stop false and removes only the confirmed session", asyn
     if(call.url.includes("/sessions?"))return {ok:true,sessions:gone?sessions.filter(s=>s.id!=="sess_a"):sessions};
     return env.defaultReply(call);
   });
-  await env.window.renderAgentWorkbench();await env.nodes.get("aw-delete-session").click();
+  await env.window.renderAgentWorkbench(); await env.attach();await env.nodes.get("aw-delete-session").click();
   assert.deepEqual(env.calls.find(call=>call.method==="DELETE").body,{stop:false});
   assert.equal(env.window.agentWorkbenchState.currentId,"sess_b");assert.equal(env.calls.some(call=>call.url.endsWith("/abort")),false);
 });
 test("lifecycle rejection keeps the selected session and makes the backend reason visible", async () => {
   let env;env=environment(call=>call.url.endsWith("/pause")?{ok:false,error:"unknown_requires_review",message:"结果待核对，未暂停任务"}:env.defaultReply(call));
-  await env.window.renderAgentWorkbench();await env.nodes.get("aw-pause-duty").click();
+  await env.window.renderAgentWorkbench(); await env.attach();await env.nodes.get("aw-pause-duty").click();
   assert.equal(env.window.agentWorkbenchState.currentId,"sess_a");
   assert.equal(env.nodes.get("aw-task-feedback").textContent,"结果待核对，未暂停任务");
   assert.equal(env.nodes.get("aw-pause-duty").disabled,false);
@@ -555,7 +572,7 @@ test("Agent settings separates permission and approval and shows actual role fal
     }
     return env.defaultReply(call);
   });
-  await env.window.renderAgentWorkbench();await env.nodes.get("aw-settings-btn").click();
+  await env.window.renderAgentWorkbench(); await env.attach();await env.nodes.get("aw-settings-btn").click();
   const wrap=env.modals.at(-1).children[0],access=modalNode(env,"agent-auto-access"),approval=modalNode(env,"agent-auto-approval");
   assert.equal(access.value,"readonly");assert.equal(approval.value,"automatic");
   assert.ok(wrap.textContent.includes("root@host.example · 回退至 write"));
@@ -571,7 +588,7 @@ test("Agent settings separates permission and approval and shows actual role fal
 });
 test("settings cancellation does not save and invalid custom delay stays inline", async () => {
   let env;env=environment(call=>call.url==="/api/agent/settings"?{ok:true,settings:{archive_delay_sec:300},ssh_roles:[{name:"read"},{name:"write"}]}:env.defaultReply(call));
-  await env.window.renderAgentWorkbench();await env.nodes.get("aw-settings-btn").click();
+  await env.window.renderAgentWorkbench(); await env.attach();await env.nodes.get("aw-settings-btn").click();
   const preset=modalNode(env,"agent-archive-preset");preset.value="custom";preset.onchange();modalNode(env,"agent-archive-custom").value="0";
   await modalButton(env,"保存设置").click();assert.ok(env.modals.at(-1).children[0].textContent.includes("30–3600"));
   await modalButton(env,"取消").click();
@@ -579,7 +596,7 @@ test("settings cancellation does not save and invalid custom delay stays inline"
 });
 test("settings prevents edits and duplicate saves while awaiting the backend and retains failed values", async () => {
   const pending=deferred();let env;env=environment(call=>call.url==="/api/agent/settings"?(call.method==="POST"?pending.promise:{ok:true,settings:{archive_delay_sec:300},ssh_roles:[{name:"read"},{name:"write"}]}):env.defaultReply(call));
-  await env.window.renderAgentWorkbench();await env.nodes.get("aw-settings-btn").click();
+  await env.window.renderAgentWorkbench(); await env.attach();await env.nodes.get("aw-settings-btn").click();
   const save=modalButton(env,"保存设置"),operation=save.click();await flush();
   assert.equal(modalNode(env,"agent-ssh-investigate").disabled,true);assert.equal(modalNode(env,"agent-auto-access").children[0].disabled,true);
   await save.click();assert.equal(env.calls.filter(call=>call.url==="/api/agent/settings"&&call.method==="POST").length,1);
@@ -588,33 +605,33 @@ test("settings prevents edits and duplicate saves while awaiting the backend and
 });
 test("observer copy result fetch offers text but waits for a fresh local copy click on HTTP", async () => {
   let env;env=environment(call=>call.url.endsWith("/copy-text")?{ok:true,text:"真实回答正文",source:"latest_assistant"}:env.defaultReply(call));
-  await env.window.renderAgentWorkbench();env.ready();env.paint();await env.nodes.get("aw-copy-result").click();
+  await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();await env.nodes.get("aw-copy-result").click();
   assert.equal(env.nodes.get("aw-copy-text").value,"真实回答正文");assert.equal(env.legacyCopies.length,0);assert.equal(env.clipboardWrites.length,0);
   await env.nodes.get("aw-copy-local").click();assert.deepEqual(env.legacyCopies,["真实回答正文"]);
   assert.ok(env.nodes.get("aw-task-feedback").textContent.includes("已复制到本机"));
   assert.equal(env.calls.some(call=>call.url.endsWith("/terminal/control")),false);
 });
 test("selected native text copies locally without a backend call or takeover", async () => {
-  const env=environment();await env.window.renderAgentWorkbench();env.ready();env.paint();
+  const env=environment();await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();
   env.terminals[0].selectionText="所选输出";env.terminals[0].selectionHandler();
   assert.equal(env.nodes.get("aw-copy-result").textContent,"复制选中文本");
   await env.nodes.get("aw-copy-result").click();assert.deepEqual(env.legacyCopies,["所选输出"]);
   assert.equal(env.calls.some(call=>call.url.endsWith("/copy-text")||call.url.endsWith("/terminal/control")),false);
 });
 test("failed local clipboard write keeps selectable text and does not claim success", async () => {
-  const env=environment();await env.window.renderAgentWorkbench();env.ready();env.paint();env.setCopyAllowed(false);
+  const env=environment();await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();env.setCopyAllowed(false);
   env.terminals[0].selectionText="保留文本";await env.nodes.get("aw-copy-result").click();
   assert.equal(env.nodes.get("aw-copy-text").value,"保留文本");assert.equal(env.nodes.get("aw-copy-text").selected,true);
   assert.ok(env.nodes.get("aw-task-feedback").textContent.includes("未允许复制"));assert.equal(env.nodes.get("aw-copy-panel").classList.contains("hidden"),false);
 });
 test("a late copy response cannot populate a different session", async () => {
   const pending=deferred();let env;env=environment(call=>call.url.endsWith("/copy-text")?pending.promise:env.defaultReply(call));
-  await env.window.renderAgentWorkbench();env.ready();env.paint();const operation=env.nodes.get("aw-copy-result").click();await flush();await env.select("sess_b");
+  await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();const operation=env.nodes.get("aw-copy-result").click();await flush();await env.select("sess_b"); await env.attach();
   pending.resolve({ok:true,text:"old session text"});await operation;
   assert.equal(env.nodes.get("aw-copy-text").value,"");assert.equal(env.nodes.get("aw-copy-panel").classList.contains("hidden"),true);assert.equal(env.legacyCopies.length,0);
 });
 test("OSC52 is registered, rejects queries and ignores replay after reattachment", async () => {
-  const env=environment();await env.window.renderAgentWorkbench();env.ready();env.paint();
+  const env=environment();await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();
   const terminal=env.terminals[0],handler=terminal.oscHandlers.get(52),payload="c;"+Buffer.from("copied native result").toString("base64");
   assert.equal(typeof handler,"function");handler(payload);assert.equal(env.nodes.get("aw-copy-text").value,"");
   await env.nodes.get("aw-term-acquire").click();terminal.data("x");handler("c;?");assert.equal(env.nodes.get("aw-copy-text").value,"");

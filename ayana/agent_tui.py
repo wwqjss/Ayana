@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS agent_runtime_bindings (
  receipt_id TEXT NOT NULL DEFAULT '', receipt_status TEXT NOT NULL DEFAULT '',
  controller TEXT NOT NULL DEFAULT '', controller_connection_id TEXT NOT NULL DEFAULT '',
  control_token_hash TEXT NOT NULL DEFAULT '', control_expires_at REAL NOT NULL DEFAULT 0,
+ last_capture TEXT NOT NULL DEFAULT '', released_at REAL NOT NULL DEFAULT 0,
  created_at REAL NOT NULL, updated_at REAL NOT NULL
 );
 """
@@ -146,6 +147,7 @@ class AgentTuiManager:
         self._tokens: dict[str, str] = {}
         self._ensure_lock = asyncio.Lock()
         self._connections: dict[str, dict] = {}
+        self._activity: dict[str, float] = {}
 
     @property
     def proxy_url(self) -> str:
@@ -333,10 +335,14 @@ class AgentTuiManager:
     async def ensure(self, session_id: str, remote_id: str) -> dict:
         session_id = _local_id(session_id)
         remote_id = _remote_id(remote_id)
+        if self._session(session_id).get("deleted_at"):
+            raise AgentTuiError("session_deleted")
         if os.name != "posix":
             raise AgentTuiError("posix_required")
         async with self._ensure_lock:
             sess = self._session(session_id)
+            if sess.get("deleted_at"):
+                raise AgentTuiError("session_deleted")
             if sess.get("remote_session_id") != remote_id:
                 raise AgentTuiError("runtime_binding_changed")
             server = await asyncio.to_thread(self._tmux, "list-sessions")
@@ -399,6 +405,7 @@ class AgentTuiManager:
                     "runtime_id=excluded.runtime_id,tmux_name=excluded.tmux_name,pane_id=excluded.pane_id,pane_pid=excluded.pane_pid,"
                     "pane_started_at=excluded.pane_started_at,updated_at=excluded.updated_at",
                     (session_id, remote_id, runtime_id, engine_pid, engine_start, name, pane["pane_id"], pane["pane_pid"], pane["pane_started_at"], t, t))
+            self._activity[session_id] = time.time()
             return self._public_binding(self._binding(session_id) or {})
 
     @staticmethod
@@ -417,28 +424,101 @@ class AgentTuiManager:
     async def status(self, session_id: str) -> dict:
         binding = self._binding(session_id)
         if not binding:
-            return {"ok": True, "attached": False, "binding": None}
+            return {"ok": True, "attached": False, "binding": None, "released_at": 0, "last_capture": ""}
         pane = await self._pane(binding.get("tmux_name") or "__absent__")
         alive = bool(pane and not pane["pane_dead"] and pane["pane_pid"] == int(binding.get("pane_pid") or 0)
                      and pane["pane_started_at"] == str(binding.get("pane_started_at") or ""))
-        return {"ok": True, "attached": alive, "binding": self._public_binding(binding)}
+        return {"ok": True, "attached": alive, "binding": self._public_binding(binding),
+                "released_at": float(binding.get("released_at") or 0), "last_capture": str(binding.get("last_capture") or "")}
+
+    def _touch(self, session_id: str) -> None:
+        self._activity[session_id] = time.time()
+
+    async def release_viewport(self, session_id: str, reason: str, *, idle_seconds: float = 0.0) -> bool:
+        """Free one viewport (tmux pane and its attach client), keeping the remote session.
+
+        The shared MiMo engine is never touched; the binding keeps
+        remote_session_id so ensure() can reattach on demand. idle_seconds>0
+        re-validates quietness inside the ensure lock so a fresh connect wins.
+        """
+        async with self._ensure_lock:
+            binding = self._binding(session_id)
+            name = (binding or {}).get("tmux_name") or ""
+            if not name:
+                return False
+            if idle_seconds > 0:
+                if any(c.get("session_id") == session_id for c in self._connections.values()):
+                    return False
+                last = max(float(binding.get("updated_at") or 0),
+                           float(self._session(session_id).get("last_activity_at") or 0),
+                           self._activity.get(session_id, 0.0))
+                if time.time() - last < idle_seconds:
+                    return False
+            capture = ""
+            pane = await self._pane(name)
+            if pane:
+                try:
+                    cap = await asyncio.to_thread(self._tmux, "capture-pane", "-p", "-t", name)
+                    capture = (getattr(cap, "stdout", "") or "")[-20000:]
+                except Exception:  # noqa: BLE001 - a snapshot must not block release
+                    capture = ""
+                result = await asyncio.to_thread(self._tmux, "kill-session", "-t", name)
+                if result.returncode and await self._pane(name):
+                    return False
+            t = time.time()
+            self.db.execute(
+                "UPDATE agent_runtime_bindings SET tmux_name=NULL,pane_id='',pane_pid=0,pane_started_at='',"
+                "last_capture=?,released_at=?,updated_at=? WHERE session_id=? AND tmux_name=?",
+                (capture, t, t, session_id, name))
+            self._activity.pop(session_id, None)
+            self.db.audit("system", "native_viewport_gc", "agent_viewport_released",
+                          detail={"session_id": session_id, "reason": reason, "shared_engine_preserved": True},
+                          channel="agent")
+            return True
 
     async def reap_deleted_viewports(self):
-        """Remove only the attested idle viewport, never the shared MiMo engine."""
+        """A deleted session's viewport dies with it; the shared MiMo engine stays."""
         from .duty_session import DutySessionManager
-        duty=DutySessionManager(self.db)
-        rows=self.db.query("SELECT b.* FROM agent_runtime_bindings b JOIN duty_sessions d ON d.id=b.session_id WHERE d.deleted_at>0 AND b.tmux_name<>'' LIMIT 20")
+        duty = DutySessionManager(self.db)
+        rows = self.db.query(
+            "SELECT b.session_id,b.tmux_name FROM agent_runtime_bindings b JOIN duty_sessions d ON d.id=b.session_id"
+            " WHERE d.deleted_at>0 AND b.tmux_name IS NOT NULL AND b.tmux_name<>'' LIMIT 20")
         for raw in rows:
-            binding=dict(raw);sid=binding["session_id"]
-            if duty.deletion_blockers(sid):continue
-            pane=await self._pane(binding["tmux_name"])
-            if pane and (pane["pane_id"]!=binding["pane_id"] or pane["pane_pid"]!=binding["pane_pid"] or pane["pane_started_at"]!=binding["pane_started_at"]):
-                continue
-            if pane:
-                result=await asyncio.to_thread(self._tmux,"kill-session","-t",binding["tmux_name"])
-                if result.returncode:continue
-            self.db.execute("UPDATE agent_runtime_bindings SET tmux_name='',pane_id='',pane_pid=0,pane_started_at='',updated_at=? WHERE session_id=? AND tmux_name=?",(time.time(),sid,binding["tmux_name"]))
-            self.db.audit("system","native_viewport_gc","agent_deleted_viewport_reaped",detail={"session_id":sid,"shared_engine_preserved":True},channel="agent")
+            sid = raw["session_id"]
+            try:
+                if duty.deletion_blockers(sid):
+                    continue
+                await self.release_viewport(sid, "session_deleted")
+            except Exception as e:  # noqa: BLE001 - one bad row must not stall the rest
+                log.warning("reap deleted viewport failed sid=%s: %s", sid, e)
+
+    async def release_idle_viewports(self, idle_seconds: float = 120.0) -> list[str]:
+        """Attach memory is leased: quiet viewports release after idle_seconds."""
+        from .duty_session import DutySessionManager
+        duty = DutySessionManager(self.db)
+        released: list[str] = []
+        now = time.time()
+        rows = self.db.query(
+            "SELECT b.session_id,b.updated_at,b.control_expires_at,d.deleted_at,d.last_activity_at"
+            " FROM agent_runtime_bindings b JOIN duty_sessions d ON d.id=b.session_id"
+            " WHERE b.tmux_name IS NOT NULL AND b.tmux_name<>'' AND d.deleted_at=0 LIMIT 40")
+        for raw in rows:
+            sid = raw["session_id"]
+            try:
+                if duty.deletion_blockers(sid):
+                    continue
+                if float(raw["control_expires_at"] or 0) > now:
+                    continue
+                if any(c.get("session_id") == sid for c in self._connections.values()):
+                    continue
+                last = max(float(raw["updated_at"] or 0), float(raw["last_activity_at"] or 0), self._activity.get(sid, 0.0))
+                if now - last < idle_seconds:
+                    continue
+                if await self.release_viewport(sid, "idle_timeout", idle_seconds=idle_seconds):
+                    released.append(sid)
+            except Exception as e:  # noqa: BLE001
+                log.warning("idle viewport release failed sid=%s: %s", sid, e)
+        return released
 
     def acquire_control(self, session_id: str, username: str, connection_id: str) -> dict:
         session_id = _local_id(session_id)
@@ -459,6 +539,7 @@ class AgentTuiManager:
             if cursor.rowcount != 1:
                 raise AgentTuiError("control_in_use")
             conn.execute("UPDATE duty_sessions SET authority_revision=authority_revision+1 WHERE id=?", (session_id,))
+        self._touch(session_id)
         self.db.audit("web_user", username, "agent_tui_control_acquired",
                       detail={"session_id": session_id, "connection_id": connection_id}, channel="web")
         return {"ok": True, "connection_id": connection_id, "expires_at": t + CONTROL_SECONDS,
@@ -934,6 +1015,7 @@ class AgentTuiManager:
                     except (BlockingIOError, OSError):
                         await ws.close(code=1013)
                         break
+                    self._touch(session_id)
         finally:
             loop.remove_reader(master)
             if pump:

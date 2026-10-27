@@ -1805,6 +1805,11 @@ class WebApp:
             return _json({"ok":False,"error":"invalid_delete_request"},400)
         result=self._duty().request_delete(sid,actor=user["username"],stop=body.get("stop",False))
         if not result.get("ok"):return _json(result,409)
+        if result.get("deleted") and getattr(self,"agent_tui",None):
+            try:
+                await self.agent_tui.release_viewport(sid,"session_deleted")
+            except Exception:
+                log.warning("viewport release on delete failed sid=%s",sid)
         if result.get("pending") and session.get("remote_session_id") and getattr(self,"mimo_serve",None):
             try:
                 await self.mimo_serve.client().abort(session["remote_session_id"])
