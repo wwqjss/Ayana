@@ -508,10 +508,16 @@ class SessionBridge:
         params: dict[str, Any] | None = None,
         claimed_by: str = "",
         retry_safe: bool = False,
+        authority_session_id: str = "",
     ) -> dict[str, Any]:
         if not incident_id or not action_key:
             raise ValueError("incident_id and action_key required")
-        sid = self._session_id_for(incident_id)
+        sid = authority_session_id or self._session_id_for(incident_id)
+        if authority_session_id:
+            from .agent_authority import resolve_authority
+            authority = resolve_authority(self.db, authority_session_id)
+            if authority["access_mode"] != "readwrite":
+                return {"ok": False, "claimed": False, "error": "readonly_mode_rejects_write"}
         t = now()
         lease = t + self._lease_seconds()
         params_hash = ""
@@ -702,6 +708,7 @@ class SessionBridge:
         target: str = "",
         params: dict[str, Any] | None = None,
         claimed_by: str = "",
+        authority_session_id: str = "",
     ) -> dict[str, Any]:
         """登记待人工批准的写操作。已存在 pending/done 则不重复。"""
         if not incident_id or not action_key:
@@ -715,7 +722,13 @@ class SessionBridge:
             if st == "awaiting_approval":
                 return {"ok": True, "action": "already_pending", "action_key": action_key}
             return {"ok": False, "error": "already_exists", "status": st, "action_key": action_key}
-        sid = self._session_id_for(incident_id)
+        sid = authority_session_id or self._session_id_for(incident_id)
+        if authority_session_id:
+            from .agent_authority import resolve_authority
+            authority = resolve_authority(self.db, authority_session_id)
+            if authority["access_mode"] != "readwrite":
+                return {"ok": False, "error": "readonly_mode_rejects_write"}
+            params = {**(params or {}), "_ayana_session_id": authority_session_id}
         t = now()
         with self.db.tx() as conn:
             conn.execute(
@@ -729,7 +742,7 @@ class SessionBridge:
                     sid,
                     action_key,
                     "awaiting_approval",
-                    json.dumps(params or {}, ensure_ascii=False)[:2000],
+                    json.dumps(params or {}, ensure_ascii=False),
                     t,
                     t,
                     0,
@@ -766,6 +779,18 @@ class SessionBridge:
             if state!="awaiting_approval":
                 error="already_done" if state=="done" else "in_flight" if state=="claimed" else "not_pending"
                 return {"ok":False,"error":error,"status":state,"action_key":action_key}
+            params = self._params_of(row)
+            authority_sid = str(params.get("_ayana_session_id") or "")
+            if authority_sid:
+                from .agent_authority import AuthorityError, resolve_authority
+                if authority_sid != str(row["session_id"] or ""):
+                    return {"ok": False, "error": "pending_session_mismatch"}
+                try:
+                    authority = resolve_authority(self.db, authority_sid, conn=conn)
+                except AuthorityError as exc:
+                    return {"ok": False, "error": exc.code}
+                if authority["access_mode"] != "readwrite":
+                    return {"ok": False, "error": "readonly_mode_rejects_write"}
             t=now()
             cur=conn.execute("UPDATE session_write_ops SET status='claimed',updated_at=?,lease_expires_at=?,claimed_by=? WHERE incident_id=? AND action_key=? AND status='awaiting_approval'",(t,t+self._lease_seconds(),(approved_by or "human")[:64],incident_id,action_key))
             if cur.rowcount!=1:return {"ok":False,"error":"in_flight","action_key":action_key}

@@ -66,20 +66,38 @@ class DutySessionManager:
         return str(row["value"] or "1") not in ("0", "false", "False", "")
 
     def set_setting(self, key: str, value: str, *, actor: str = "web") -> dict[str, Any]:
+        self.set_settings({key: value}, actor=actor)
+        return {"ok": True, "key": key, "value": str(value)}
+
+    def set_settings(self, changes: dict, *, actor: str = "web") -> dict[str, Any]:
+        changes = {k: str(v) for k, v in changes.items()}
+        if "auto_access_mode" in changes and changes["auto_access_mode"] not in ("readonly", "readwrite"):
+            raise ValueError("invalid_access_mode")
+        if "auto_approval_mode" in changes:
+            if changes["auto_approval_mode"] not in ("manual", "automatic"):
+                raise ValueError("invalid_approval_mode")
+            changes["require_human_approval"] = "1" if changes["auto_approval_mode"] == "manual" else "0"
+        elif "require_human_approval" in changes:
+            changes["auto_approval_mode"] = "automatic" if changes["require_human_approval"] in ("0", "false", "False", "") else "manual"
         t = now()
         with self.db.tx() as conn:
-            conn.execute(
+            if not conn.in_transaction: conn.execute("BEGIN IMMEDIATE")
+            for key, value in changes.items():
+                conn.execute(
                 "INSERT INTO agent_settings(key, value, updated_at, updated_by) VALUES(?,?,?,?)"
                 " ON CONFLICT(key) DO UPDATE SET value=excluded.value,"
                 " updated_at=excluded.updated_at, updated_by=excluded.updated_by",
-                (key, str(value), t, actor),
+                    (key, str(value), t, actor),
             )
-        return {"ok": True, "key": key, "value": str(value)}
+            conn.execute("UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='agent_authority_revision'")
+        return {"ok": True, "changed": changes}
 
     def settings(self) -> dict[str, Any]:
         rows = self.db.query("SELECT key, value, updated_at, updated_by FROM agent_settings")
         out = {str(r["key"]): str(r["value"] or "") for r in rows}
         return {
+            "auto_access_mode": out.get("auto_access_mode", "readwrite"),
+            "auto_approval_mode": out.get("auto_approval_mode", "manual"),
             "require_human_approval": str(out.get("require_human_approval", "1")) not in ("0", "false", "False", ""),
             "archive_delay_sec": int(float(out.get("archive_delay_sec") or DEFAULT_ARCHIVE_DELAY_SEC)),
             "ssh_investigate_role": out.get("ssh_investigate_role", "read"),
@@ -168,6 +186,9 @@ class DutySessionManager:
                 " VALUES(?,?,?,?,?,?,?,?,?,?,0)",
                 (sid, title[:120], origin, "open", prompt or "", created_by, t, t, t, 0),
             )
+            manual_default = conn.execute("SELECT value FROM agent_settings WHERE key='manual_approval_default'").fetchone()
+            conn.execute("UPDATE duty_sessions SET access_mode='readwrite',approval_mode=? WHERE id=?",
+                         (manual_default[0] if manual_default else "manual", sid))
         self.record_event(sid, type="session_created", title=title)
         return {"ok": True, "action": "created", "session_id": sid, "origin": origin, "title": title}
 
@@ -303,6 +324,8 @@ class DutySessionManager:
             return {"ok":True,"action":"countdown","archive_due_at":due,"delay_sec":delay}
 
     def tick_archives(self) -> dict[str, Any]:
+        from .agent_authority import reset_controls
+        reset_controls(self.db, reason="lease_expired", expired_only=True)
         archived = []
         for row in self.db.query("SELECT id FROM duty_sessions WHERE origin='auto' AND status='open' AND archive_due_at>0 AND archive_due_at<=?",(now(),)):
             sid=row["id"]
@@ -470,6 +493,8 @@ class DutySessionManager:
 
     def recover(self) -> dict[str, Any]:
         """重启恢复：校验倒计时与状态一致性。"""
+        from .agent_authority import reset_controls
+        reset_controls(self.db)
         t = now()
         self.db.execute(
             "UPDATE duty_sessions SET archive_due_at=0 WHERE status='archived' AND archive_due_at>0"

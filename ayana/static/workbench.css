@@ -112,3 +112,7 @@ main:has(#tab-agent.tab-panel:not(.hidden)) { max-width: none !important; paddin
   .aw-session-list { padding: 4px; }
   .aw-chat-title { font-size: 13px; }
 }
+/* Session controls stay adjacent to takeover; the native terminal stays central. */
+.aw-access-switch[aria-checked="true"] { color:var(--accent,#ff8547); border-color:currentColor; }
+.aw-term-actions select { background:var(--bg,#151515); color:inherit; border:1px solid var(--border,#444); border-radius:6px; padding:5px; font-size:12px; }
+.aw-term-actions :disabled { opacity:.55; cursor:default; }

@@ -26,12 +26,12 @@ def verified_runtime(cfg: dict[str, Any], db: Any, admin: Any) -> dict[str, Any]
         **(overlay.get("mcp") or {}),
         "ayana": {"type": "local", "enabled": True,
                   "command": [sys.executable, "-m", "ayana.mcp_server", base],
-                  "environment": {**environment, "AYANA_MCP_READONLY": "1"}},
+                  "environment": {**environment, "AYANA_MCP_READONLY": "0", "AYANA_MCP_MANAGED_CONTEXT": "1"}},
     }
     port = int(cfg.get("mimo_serve_port") or 6290)
     password = str(cfg.get("mimo_serve_password") or cfg.get("webhook_token") or "")
     if not password:
         raise ValueError("runtime_auth_required")
-    return {**runtime, "cwd": paths["workdir"], "runtime_attestation_path": paths["attestation"], "config": overlay,
+    return {**runtime, "managed_context": True, "cwd": paths["workdir"], "runtime_attestation_path": paths["attestation"], "config": overlay,
             "environment": environment, "serve_url": f"http://127.0.0.1:{port}",
             "serve_username": "mimocode", "serve_password": password}

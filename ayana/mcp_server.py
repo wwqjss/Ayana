@@ -1,7 +1,7 @@
 """Ayana 薄 MCP 服务（stdio · JSON-RPC 2.0）。
 
-供常驻 MiMo Code ops agent 调用。只暴露 HANDOFF §4 的最小工具集；
-不启 Web/机器人，不引入 Policy/Council/审批。
+供 MiMo Code 调用，共用 Ayana 的执行、审批和审计服务。
+不启动 Web、机器人或自治调度；受管调用按原生会话上下文授权。
 
 启动：
     python -m ayana.mcp_server [config_dir]
@@ -34,6 +34,7 @@ log = logging.getLogger("ayana.mcp")
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "ayana-mcp", "version": "0.1.0"}
+TURN_LIFECYCLE_CAPABILITY = "com.xiaomi.mimo/turn-lifecycle"
 
 
 def build_ops_context(cfg: dict[str, Any]) -> OpsContext:
@@ -62,6 +63,7 @@ def build_ops_context(cfg: dict[str, Any]) -> OpsContext:
             model=os.environ.get("AYANA_MIMO_MODEL") or "",
         )
     readonly = str(os.environ.get("AYANA_MCP_READONLY") or "").strip() in ("1", "true", "yes", "on")
+    managed_context = str(os.environ.get("AYANA_MCP_MANAGED_CONTEXT") or "").strip() in ("1", "true", "yes", "on")
     bridge = SessionBridge(db, knowledge=knowledge, mimo=mimo)
     incidents.session_bridge = bridge
     from .actions import ActionService
@@ -119,6 +121,7 @@ def build_ops_context(cfg: dict[str, Any]) -> OpsContext:
         db=db,
         session_bridge=bridge,
         readonly=readonly,
+        managed_context=managed_context,
         actions=actions,
         promconfig=promconfig,
         ops_loop=ops_loop,
@@ -145,7 +148,10 @@ class McpStdioServer:
                 mid,
                 {
                     "protocolVersion": params.get("protocolVersion") or PROTOCOL_VERSION,
-                    "capabilities": {"tools": {"listChanged": False}},
+                    "capabilities": {
+                        "tools": {"listChanged": False},
+                        "experimental": {TURN_LIFECYCLE_CAPABILITY: {"version": 1}},
+                    },
                     "serverInfo": SERVER_INFO,
                 },
             )
@@ -161,7 +167,9 @@ class McpStdioServer:
             if not isinstance(args, dict):
                 return _error(mid, -32602, "arguments must be object")
             try:
-                out = await self.tools.call(name, args)
+                meta = params.get("_meta")
+                invocation = meta.get(TURN_LIFECYCLE_CAPABILITY) if isinstance(meta, dict) else None
+                out = await self.tools.call(name, args, invocation_context=invocation)
             except McpToolError as e:
                 return _result(
                     mid,

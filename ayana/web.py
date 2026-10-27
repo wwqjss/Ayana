@@ -22,6 +22,7 @@ from .incidents import IncidentService
 from .investigation import InvestigationService
 from .policy import Policy, PolicyDeny
 from .prom import PromClient, summarize_probe
+from .agent_authority import resolve_authority
 
 log = logging.getLogger("ayana.web")
 
@@ -242,6 +243,7 @@ class WebApp:
         app.router.add_get("/api/agent/sessions", self.api_agent_sessions)
         app.router.add_post("/api/agent/sessions", self.api_agent_session_create)
         app.router.add_get("/api/agent/sessions/{sid}", self.api_agent_session_detail)
+        app.router.add_post("/api/agent/sessions/{sid}/permissions", self.api_agent_session_permissions)
         app.router.add_post("/api/agent/sessions/{sid}/prompt", self.api_agent_session_prompt)
         app.router.add_post("/api/agent/sessions/{sid}/abort", self.api_agent_session_abort)
         app.router.add_get("/api/agent/events", self.api_agent_events)
@@ -1663,10 +1665,11 @@ class WebApp:
         if not self.mimo_serve:
             raise ValueError("runtime_unavailable")
         await self.mimo_serve.ensure_running()
+        native_agent = self.agent_tui._agent_name() if getattr(self,"agent_tui",None) else READONLY_AGENT
         # Observing an existing task must never wait for its execution lease.
         current = duty.get(sid)
         if current and current.get("remote_session_id"):
-            return {"session": current, "remote_session_id": current["remote_session_id"], "agent": READONLY_AGENT}
+            return {"session": current, "remote_session_id": current["remote_session_id"], "agent": native_agent}
         async with duty.async_turn(sid):
             session = duty.get(sid)
             if not session:
@@ -1676,7 +1679,7 @@ class WebApp:
                 remote = await asyncio.to_thread(bridge.mimo.allocate, title=session.get("title") or "Ayana")
                 rid = remote.remote_session_id
                 bridge._set_remote(sid, remote_session_id=rid, status="active", model=remote.model)
-            return {"session": duty.get(sid), "remote_session_id": rid, "agent": READONLY_AGENT}
+            return {"session": duty.get(sid), "remote_session_id": rid, "agent": native_agent}
 
     @staticmethod
     def _agent_runtime_failure() -> web.Response:
@@ -1740,6 +1743,38 @@ class WebApp:
         self._agent_session_require(user, sid, control=True)
         result = self._duty().reopen_session(sid, actor=user["username"], as_manual=True)
         return _json(result, 200 if result.get("ok") else 409)
+
+    async def api_agent_session_permissions(self, request: web.Request) -> web.Response:
+        user = self._require_admin(request)
+        self._check_csrf(request, user)
+        sid = request.match_info.get("sid") or ""
+        session = self._agent_session_require(user, sid, control=True)
+        if session.get("status") != "open":
+            return _json({"ok": False, "error": "session_archived"}, 409)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            body = None
+        if (not isinstance(body, dict) or not isinstance(body.get("connection_id"), str)
+                or type(body.get("revision")) is not int
+                or not any(key in body for key in ("access_mode", "approval_mode"))
+                or any(key not in ("connection_id", "revision", "access_mode", "approval_mode") for key in body)
+                or ("access_mode" in body and body["access_mode"] not in ("readonly", "readwrite"))
+                or ("approval_mode" in body and body["approval_mode"] not in ("manual", "automatic"))):
+            return _json({"ok": False, "error": "invalid_permissions"}, 400)
+        manager = getattr(self, "agent_tui", None)
+        if manager is None:
+            return self._agent_runtime_failure()
+        try:
+            result = manager.change_permissions(sid, user["username"], body["connection_id"],
+                access_mode=body.get("access_mode"), approval_mode=body.get("approval_mode"),
+                expected_revision=body["revision"])
+            return _json(result)
+        except Exception as error:
+            from .agent_authority import resolve_authority
+            return _json({"ok": False, "error": getattr(error, "code", "permissions_unavailable"),
+                "message": "权限切换未生效，请确认当前窗口仍持有控制权后重试。",
+                "effective_permissions": resolve_authority(self.db, sid)}, 409)
 
     async def ws_agent_terminal(self, request: web.Request) -> web.StreamResponse:
         # Upgrade only after authentication, Origin and complete session ACL.
@@ -1847,6 +1882,7 @@ class WebApp:
             "pending_actions": pending_actions,
             "can_prepare": bool(sess.get("is_admin")),
             "can_control": bool(sess.get("is_admin") and s.get("status") == "open"),
+            "effective_permissions": resolve_authority(self.db, sid),
             "runtime": (await self.agent_tui.status(sid)).get("binding") if getattr(self, "agent_tui", None) else None,
         })
 
@@ -1882,7 +1918,7 @@ class WebApp:
                     raise NativeTurnBusyError(["native_turn_pending"])
                 duty.add_message(sid, role="user", kind="prompt", title="", body=prompt)
                 try:
-                    receipt = await client.prompt_async(rid, prompt, agent=READONLY_AGENT, message_id="msg_" + uuid.uuid4().hex)
+                    receipt = await client.prompt_async(rid, prompt, agent=ready["agent"], message_id="msg_" + uuid.uuid4().hex)
                     if not receipt.get("accepted"):
                         return _json({"ok": False, "error": "turn_not_admitted", "message": "当前任务尚未接受新输入，请等待任务状态更新。"}, 409)
                     receipt_id = str(receipt.get("receipt_id") or "")
@@ -2027,6 +2063,8 @@ class WebApp:
             return _json({"ok": False, "error": "bad_json"}, 400)
         allowed = {
             "require_human_approval",
+            "auto_access_mode",
+            "auto_approval_mode",
             "archive_delay_sec",
             "ssh_investigate_role",
             "ssh_execute_role",
@@ -2040,6 +2078,11 @@ class WebApp:
                 if type(value) is not bool:
                     return _json({"ok": False, "error": "boolean_required", "field": key}, 400)
                 val = "1" if value else "0"
+            elif key in ("auto_access_mode", "auto_approval_mode"):
+                options = ("readonly", "readwrite") if key == "auto_access_mode" else ("manual", "automatic")
+                if value not in options:
+                    return _json({"ok": False, "error": "invalid_permission_mode", "field": key}, 400)
+                val = value
             elif key == "archive_delay_sec":
                 if type(value) is not int or not 30 <= value <= 3600:
                     return _json({"ok": False, "error": "invalid_archive_delay", "field": key}, 400)
@@ -2049,8 +2092,10 @@ class WebApp:
                     return _json({"ok": False, "error": "invalid_credential_role", "field": key}, 400)
                 val = str(value)
             changed[key] = val
-        for key, val in changed.items():
-            duty.set_setting(key, val, actor=actor)
+        if ("require_human_approval" in changed and "auto_approval_mode" in changed
+                and (changed["require_human_approval"] == "1") != (changed["auto_approval_mode"] == "manual")):
+            return _json({"ok": False, "error": "conflicting_approval_modes"}, 400)
+        duty.set_settings(changed, actor=actor)
         self.db.audit("web_user", actor, "agent_settings_saved",
                       detail={"changed": changed}, channel="web")
         return _json({"ok": True, "changed": changed, "settings": duty.settings()})
@@ -2061,7 +2106,8 @@ class WebApp:
         if not bridge:
             return _json({"ok": False, "error": "bridge_unavailable"}, 503)
         visible = self._visible_asset_ids(user)
-        pending = [row for row in bridge.list_pending_writes(limit=50) if row.get("target") in visible]
+        pending = [row for row in bridge.list_pending_writes(limit=50)
+                   if row.get("target") in visible or (row.get("session_id") and self._agent_session_visible(user, self._duty().get(row["session_id"])))]
         return _json({"ok": True, "pending": pending})
 
     async def api_agent_pending_approve(self, request: web.Request) -> web.Response:
@@ -2095,10 +2141,32 @@ class WebApp:
             (inc_id, action_key),
         )
         asset_id = (row["target"] if row else "") or ""
-        if command and asset_id and self.transport is not None:
+        authority_sid = str(params.get("_ayana_session_id") or "")
+        if params.get("_ayana_tool"):
+            try:
+                from .mcp_tools import OpsContext, OpsTools
+                from .transport import session_dispatch_guard
+                context = OpsContext(db=self.db, transport=self.transport, prom=self.prom,
+                    incidents=self.incidents, knowledge=bridge.knowledge, session_bridge=bridge,
+                    actions=self.actions, promconfig=getattr(self,"promconfig",None),
+                    ops_loop=getattr(self,"ops_loop",None), constraints=getattr(self,"ops_constraints",None))
+                with session_dispatch_guard(self.db, authority_sid):
+                    out = await OpsTools(context).call_approved(str(params["_ayana_tool"]),
+                        params.get("_ayana_arguments") or {}, authority_session_id=authority_sid)
+                bridge.complete_write(inc_id,action_key,ok=out.get("ok",True),result=json.dumps(out,default=str))
+                result.update({"exec_state":"success" if out.get("ok",True) else "failed","tool_result":out})
+            except Exception as error:
+                if getattr(error,"dispatch_not_started",False):
+                    bridge.release_write(inc_id,action_key,confirmed_safe=True,reason=error.code)
+                else:
+                    bridge.mark_unknown(inc_id,action_key,reason=type(error).__name__)
+                result.update({"exec_state":"rejected" if getattr(error,"dispatch_not_started",False) else "unknown", "exec_error":getattr(error,"code","tool_failed")})
+        elif command and asset_id and self.transport is not None:
             try:
                 from .actions import classify_exec_result
-                res = await self.transport.exec_shell(asset_id, command, timeout_f, channel=channel)
+                from .transport import session_dispatch_guard
+                with session_dispatch_guard(self.db, authority_sid):
+                    res = await self.transport.exec_shell(asset_id, command, timeout_f, channel=channel)
                 state, detail = classify_exec_result(res)
                 if state == "unknown":
                     bridge.mark_unknown(inc_id, action_key, reason=detail or "unknown")
@@ -2106,7 +2174,10 @@ class WebApp:
                     bridge.complete_write(inc_id, action_key, ok=(state == "success"), result=(detail or "")[:500])
                 result.update({"exec_state": state, "detail": (detail or "")[:300]})
             except Exception as e:  # noqa: BLE001
-                bridge.mark_unknown(inc_id, action_key, reason=str(e)[:120])
+                if getattr(e,"dispatch_not_started",False):
+                    bridge.release_write(inc_id,action_key,confirmed_safe=True,reason=e.code)
+                else:
+                    bridge.mark_unknown(inc_id, action_key, reason=str(e)[:120])
                 result["exec_error"] = str(e)[:200]
         else:
             # 无命令参数：仅批准状态，调用方稍后执行

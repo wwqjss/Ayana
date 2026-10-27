@@ -5,7 +5,7 @@
   const appShowModal = typeof window.showModal === "function" ? window.showModal : null;
   const appCloseModal = typeof window.closeModal === "function" ? window.closeModal : null;
   const state = {
-    sessions: [], currentId: "", detail: null, settings: null,
+    sessions: [], currentId: "", detail: null, settings: null, permissions: null, permissionBusy: false,
     active: false, generation: 0, mount: 0, pollTimer: null, polling: false,
     collapsedLeft: false, collapsedRight: false,
   };
@@ -219,6 +219,7 @@
       return false;
     }
     state.detail = result;
+    adoptPermissions(result.effective_permissions);
     renderHeader(); renderRight(); renderSessionList();
     return true;
   }
@@ -226,6 +227,7 @@
     const generation = ++state.generation;
     disconnectTerminal();
     state.currentId = sid;
+    state.permissions = null; state.permissionBusy = false;
     state.detail = null;
     renderHeader(); renderRight(); renderSessionList();
     notice("正在读取会话…");
@@ -287,11 +289,14 @@
     const r = await api("/api/agent/settings");
     const settings = (r && r.settings) || {};
     const wrap = el("div", { class: "form-col" });
+    const access = el("select", { id: "agent-auto-access" }, [el("option", { value:"readonly", text:"只读" }), el("option", { value:"readwrite", text:"读写" })]);
+    access.value = settings.auto_access_mode || "readwrite";
+    wrap.appendChild(el("label", { class:"form-row" }, [el("span", {text:"自动值班执行权限"}),access]));
     const approval = el("input", { type: "checkbox", id: "agent-require-approval" });
     approval.checked = settings.require_human_approval !== false;
     wrap.appendChild(el("label", { class: "form-row" }, [
       approval,
-      el("span", { text: "需要人工审批（写操作等待批准后执行）" }),
+      el("span", { text: "自动值班人工审批（关闭后按现有授权规则自动审批）" }),
     ]));
     const delay = el("input", { type: "number", min: "30", max: "3600", value: String(settings.archive_delay_sec || 300) });
     wrap.appendChild(el("label", { class: "form-row" }, [
@@ -316,14 +321,15 @@
       text: "保存设置",
       onclick: async () => {
         const body = {
-          require_human_approval: approval.checked,
+          auto_access_mode: access.value,
+          auto_approval_mode: approval.checked ? "manual" : "automatic",
           archive_delay_sec: Number(delay.value) || 300,
           ssh_investigate_role: invRole.value || "read",
           ssh_execute_role: exeRole.value || "write",
         };
         const res = await api("/api/agent/settings", { method: "POST", body: JSON.stringify(body) });
         if (!res.ok) alert(res.message || res.error || "保存失败");
-        else if (appCloseModal) appCloseModal();
+        else if (appCloseModal) { appCloseModal(); await loadDetail(state.currentId); }
         else if (appShowModal) appShowModal("已保存", [el("p", { text: "Agent 设置已更新" })]);
       },
     });
@@ -336,15 +342,39 @@
   }
 
 
+  function adoptPermissions(value) {
+    if (!value || value.session_id !== state.currentId || !["readonly","readwrite"].includes(value.access_mode) || !["manual","automatic"].includes(value.approval_mode)) return;
+    if (state.permissions && value.revision < state.permissions.revision) return;
+    state.permissions = value;
+    if (value.controller_active === false) term.control = false;
+  }
+  async function changePermissions(changes) {
+    const sid=state.currentId, generation=state.generation, attempt=term.attempt, connectionId=term.connectionId;
+    if (!term.control || !state.permissions || state.permissionBusy) { updateTermUi(); return; }
+    const revision=state.permissions.revision;
+    state.permissionBusy=true; updateTermUi();
+    try {
+      const result=await api(sessionPath(sid)+"/permissions", {method:"POST",body:JSON.stringify({connection_id:connectionId,revision,...changes})});
+      if (!current(sid,generation) || term.attempt!==attempt || term.connectionId!==connectionId) return;
+      adoptPermissions(result && result.effective_permissions);
+      if (!result || !result.ok) notice(result && (result.message || result.error) || "权限切换未生效。",true);
+      else notice("");
+    } catch (_) { if(current(sid,generation) && term.attempt===attempt) notice("权限切换尚未确认，请核对后端状态。",true); }
+    finally { if(current(sid,generation)) {state.permissionBusy=false;updateTermUi();} }
+  }
   function updateTermUi() {
     const status = $("aw-term-status");
     if (status) {
-      status.textContent = term.connecting ? "接入中" : term.ready && term.rendered ? term.control ? "控制中" : "观察" : term.ready ? "等待原生画面" : "未接入";
+      const mode = state.permissions ? (state.permissions.access_mode === "readwrite" ? "读写" : "只读") : "权限待确认";
+      status.textContent = term.connecting ? "接入中" : term.ready && term.rendered ? (term.control ? "控制中" : "观察")+"·"+mode : term.ready ? "等待原生画面" : "未接入";
       status.classList.toggle("ready", term.ready && term.rendered);
       status.classList.toggle("control", term.control);
     }
     const toggle = (id, visible) => { const node = $(id); if (node) node.classList.toggle("hidden", !visible); };
     const admin = manageable(), open = openSession();
+    const access=$("aw-access-mode"), approval=$("aw-approval-mode"), permissions=state.permissions;
+    if(access) {access.disabled=!(term.control && permissions && term.ready && open && !state.permissionBusy);access.textContent=permissions ? permissions.access_mode==="readwrite" ? "读写" : "只读" : "权限待确认";access.setAttribute("aria-checked",String(!!permissions && permissions.access_mode==="readwrite"));}
+    if(approval) {approval.disabled=!(term.control && permissions && term.ready && open && !state.permissionBusy);if(permissions)approval.value=permissions.approval_mode;}
     toggle("aw-term-acquire", term.ready && term.rendered && !term.control && admin && open);
     toggle("aw-term-release", term.ready && term.control);
     toggle("aw-term-reconnect", !!state.currentId && !term.connecting && !term.ready);
@@ -453,6 +483,7 @@
         let message;
         try { message = JSON.parse(event.data); } catch (_) { return; }
         if (message.type === "ready") {
+          adoptPermissions(message.effective_permissions || message.binding && message.binding.effective_permissions);
           term.connectionId = message.connection_id || "";
           term.control = !!message.control;
           term.ready = true; term.connecting = false;
@@ -462,6 +493,7 @@
             if (frame() && !term.rendered) notice("尚未收到原生画面，请重新接入。后台任务未停止。", true);
           }, 12000);
         } else if (message.type === "control") {
+          adoptPermissions(message.effective_permissions);
           term.control = !!message.control; updateTermUi();
         } else if (message.type === "error") {
           notice(message.message || message.error || "原生连接异常，请核对任务状态。", true);
@@ -524,6 +556,7 @@
       const result = await api(sessionPath(sid) + "/terminal/control", { method: "POST", body: JSON.stringify({ action: "acquire", connection_id: connectionId }) });
       if (!current(sid, generation) || term.attempt !== attempt || term.connectionId !== connectionId) return;
       if (!result || !result.ok) { notice(result && (result.message || result.error) || "无法取得控制权，可能已由其他窗口持有。", true); return; }
+      adoptPermissions(result.effective_permissions);
       term.control = true; updateTermUi(); notice("");
       if (term.xterm) term.xterm.focus();
       fitTerminal();
@@ -537,6 +570,7 @@
     if (!sid || !connectionId) return;
     try {
       const result = await api(sessionPath(sid) + "/terminal/control", { method: "POST", body: JSON.stringify({ action: "release", connection_id: connectionId }) });
+      if(current(sid,generation) && term.attempt===attempt) {adoptPermissions(result && result.effective_permissions);updateTermUi();}
       if (current(sid, generation) && term.attempt === attempt && (!result || !result.ok)) notice("释放请求未确认，键盘已在当前页面停用。", true);
     } catch (_) { if (current(sid, generation) && term.attempt === attempt) notice("释放请求未确认，键盘已在当前页面停用。", true); }
   }
@@ -579,6 +613,9 @@
       "aw-toggle-left": () => toggleColumn("left"), "aw-toggle-right": () => toggleColumn("right"),
     };
     Object.entries(handlers).forEach(([id, callback]) => { const node = $(id); if (node) node.onclick = callback; });
+    const access=$("aw-access-mode"),approval=$("aw-approval-mode");
+    if(access)access.onclick=()=>changePermissions({access_mode:state.permissions && state.permissions.access_mode==="readwrite" ? "readonly" : "readwrite"});
+    if(approval)approval.onchange=()=>{const mode=approval.value;updateTermUi();return changePermissions({approval_mode:mode});};
     window.addEventListener("resize", fitTerminal);
     window.addEventListener("pagehide", suspendAgentWorkbench);
   }

@@ -86,6 +86,7 @@ async def run(config_path: str, headless_module: str, *, use_runtime_proxy: bool
         data = json.loads(response.text)
         if data.get("session_id"):
             owned.add(data["session_id"])
+            db.execute("UPDATE duty_sessions SET access_mode='readonly',approval_mode='manual' WHERE id=?", (data["session_id"],))
         return response
 
     async def sessions(request):

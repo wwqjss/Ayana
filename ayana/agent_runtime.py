@@ -53,6 +53,8 @@ async def run(config_path: str) -> None:
     dbpath = Path(cfg["db_path"])
     if not dbpath.is_absolute(): dbpath = Path(cfg["base_dir"]) / dbpath
     db = Database(dbpath)
+    from .agent_authority import reset_controls
+    reset_controls(db, reason="native_runtime_restart")
     binary = str(cfg.get("mimo_bin") or (cfg.get("auto_investigate") or {}).get("mimo_bin") or Path(paths["home"])/".mimocode/bin/mimo")
     admin = MimoAdmin(mimo_bin=binary, workdir=paths["workdir"])
     resolver = lambda: verified_runtime(cfg, db, admin)

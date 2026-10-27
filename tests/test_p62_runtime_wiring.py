@@ -170,7 +170,8 @@ class AppWiringTests(unittest.IsolatedAsyncioTestCase):
                 server = json.loads(env["MIMOCODE_CONFIG_CONTENT"])["mcp"]["ayana"]
                 self.assertEqual(server["command"], [sys.executable, "-m", "ayana.mcp_server", self.tmp.name])
                 self.assertEqual(server["environment"]["AYANA_MCP_DB_PATH"], str(Path(app.db.path).resolve()))
-                self.assertEqual(server["environment"]["AYANA_MCP_READONLY"], "1")
+                self.assertEqual(server["environment"]["AYANA_MCP_READONLY"], "0")
+                self.assertEqual(server["environment"]["AYANA_MCP_MANAGED_CONTEXT"], "1")
                 self.assertIn(str(Path(__file__).resolve().parents[1]), server["environment"]["PYTHONPATH"])
                 self.assertEqual(client._argv(["test"], bound)[0], "web-configured-bin")
                 self.assertEqual(client._argv(["test"], bound)[client._argv(["test"], bound).index("-m") + 1], "xiaomi/saved-model")

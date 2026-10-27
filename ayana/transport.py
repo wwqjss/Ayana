@@ -14,9 +14,11 @@ import re
 import shlex
 import subprocess
 import tempfile
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Iterator, Protocol
 
 from .db import Database, new_id, now
 from .ntsafe import NTError, NTResult
@@ -108,6 +110,48 @@ class TransportError(Exception):
         self.code = code
         self.detail = detail
         super().__init__(f"{code}: {detail}" if detail else code)
+
+
+_dispatch_guards: ContextVar[tuple[Callable[[], None], ...]] = ContextVar(
+    "ayana_dispatch_guards", default=()
+)
+
+
+def check_dispatch_authority() -> None:
+    """Recheck trusted caller authority immediately before starting SSH."""
+    for guard in _dispatch_guards.get():
+        guard()
+
+
+@contextmanager
+def session_dispatch_guard(
+    db: Any, session_id: str, *, require_automatic: bool = False
+) -> Iterator[None]:
+    """An invocation-local guard; an empty scope preserves legacy callers."""
+    if not session_id:
+        yield
+        return
+
+    def check() -> None:
+        from .agent_authority import AuthorityError, resolve_authority
+
+        try:
+            authority = resolve_authority(db, session_id)
+            if authority["access_mode"] != "readwrite":
+                raise TransportError("readonly_mode_rejects_write", session_id)
+            if require_automatic and authority["approval_mode"] != "automatic":
+                raise TransportError("approval_required", session_id)
+        except (AuthorityError, TransportError) as exc:
+            error = TransportError(exc.code, str(exc))
+            error.dispatch_not_started = True
+            raise error from exc
+
+    token = _dispatch_guards.set((*_dispatch_guards.get(), check))
+    try:
+        check()
+        yield
+    finally:
+        _dispatch_guards.reset(token)
 
 
 def compute_host_key_fingerprint(key_line: str) -> tuple[str, str]:
@@ -616,6 +660,7 @@ class SSHTransport:
             validate_ssh_identity(ep.username, ep.host)
             argv += ["-l", ep.username, "--", ep.host, remote]
 
+            check_dispatch_authority()
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdout=asyncio.subprocess.PIPE,
@@ -708,6 +753,7 @@ class SSHTransport:
             argv += ["-l", ep.username, "--", ep.host, remote_cmd]
 
             async def _run_cat(cmd_line: str, data: bytes) -> NTResult:
+                check_dispatch_authority()
                 proc = await asyncio.create_subprocess_exec(
                     *argv[:-1],
                     cmd_line,

@@ -153,11 +153,8 @@ class ClosedLoopE2E(unittest.IsolatedAsyncioTestCase):
         ensure_ops_loop_schema(self.db)
         _seed(self.db)
         # 闭环 E2E：关闭人工审批以验证 P6 自动路径
-        self.db.execute(
-            "INSERT OR REPLACE INTO agent_settings(key, value, updated_at, updated_by)"
-            " VALUES('require_human_approval','0',?, 'test')",
-            (now(),),
-        )
+        from ayana.duty_session import DutySessionManager
+        DutySessionManager(self.db).set_setting("require_human_approval", "0", actor="test")
         self.incidents = IncidentService(self.db)
         self.transport = FakeTransport(ok=True)
         self.prom = FakeProm(healthy=True)
@@ -362,11 +359,8 @@ class ClosedLoopE2E(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(states.count("dispatched"), 1)
 
     async def test_human_approval_gate_blocks_auto_execute(self):
-        self.db.execute(
-            "INSERT OR REPLACE INTO agent_settings(key, value, updated_at, updated_by)"
-            " VALUES('require_human_approval','1',?, 'test')",
-            (now(),),
-        )
+        from ayana.duty_session import DutySessionManager
+        DutySessionManager(self.db).set_setting("require_human_approval", "1", actor="test")
         conclusion = {
             "status": "completed",
             "root_cause": "service down",

@@ -320,7 +320,7 @@ class MimoServeManager:
             raise MimoServeError("provider_not_verified", "Current model configuration is not verified") from None
 
     def _env(self, runtime: dict[str, Any] | None = None) -> dict[str, str]:
-        from .mimo_session import READONLY_AGENT, DECISION_AGENT, READONLY_TOOLS, DECISION_TOOLS
+        from .mimo_session import READONLY_AGENT, DECISION_AGENT, MANAGED_AGENT, READONLY_TOOLS, DECISION_TOOLS
         runtime = self._runtime() if runtime is None else runtime
         try:
             config = json.loads(json.dumps(runtime.get("config") or {}))
@@ -328,12 +328,20 @@ class MimoServeManager:
             agents = config.setdefault("agent", {})
             if not isinstance(agents, dict): raise ValueError()
             tools = tuple(dict.fromkeys(DECISION_TOOLS + READONLY_TOOLS))
+            managed = runtime.get("managed_context") is True
+            if managed:
+                from .mcp_tools import TOOL_SPECS
+                tools = tuple("ayana_" + spec["name"].replace(".", "_") for spec in TOOL_SPECS)
             policy = {"*": "deny", **dict.fromkeys(tools, "allow"), "mcp_tool_search": "allow"}
             for name, allowed in ((READONLY_AGENT, READONLY_TOOLS), (DECISION_AGENT, DECISION_TOOLS)):
                 if name in agents and not isinstance(agents[name], dict): raise ValueError()
                 agents.setdefault(name, {}).update({"mode": "primary", "disable": False,
                     "tool_allowlist": list(allowed), "permission": {"*": "deny", **dict.fromkeys(allowed, "allow"), "mcp_tool_search": "allow"}})
-            config["default_agent"] = READONLY_AGENT
+            if managed:
+                # Schemas stay stable throughout a turn. Each actual MCP call
+                # is authorized from native metadata and live session state.
+                agents[MANAGED_AGENT] = {"mode":"primary", "disable":False, "tool_allowlist":list(tools), "permission":policy}
+            config["default_agent"] = MANAGED_AGENT if managed else READONLY_AGENT
             config["permission"] = policy
             mcp = config.setdefault("mcp", {})
             if not isinstance(mcp, dict): raise ValueError()
@@ -341,7 +349,8 @@ class MimoServeManager:
                 if not isinstance(mcp["ayana"], dict): raise ValueError()
                 environment = mcp["ayana"].setdefault("environment", {})
                 if not isinstance(environment, dict): raise ValueError()
-                environment["AYANA_MCP_READONLY"] = "1"
+                environment["AYANA_MCP_READONLY"] = "0" if managed else "1"
+                if managed: environment["AYANA_MCP_MANAGED_CONTEXT"] = "1"
             env = {**os.environ, **{str(k): str(v) for k, v in (runtime.get("environment") or {}).items()}}
             env.update({"HOME": self.home, "XDG_CONFIG_HOME": str(Path(self.home) / ".config"),
                         "XDG_DATA_HOME": str(Path(self.home) / ".local" / "share"),
@@ -349,7 +358,8 @@ class MimoServeManager:
                         "XDG_STATE_HOME": str(Path(self.home) / ".local" / "state"),
                         "MIMOCODE_SERVER_PASSWORD": self.password, "MIMOCODE_SERVER_USERNAME": self.username,
                         "MIMOCODE_CONFIG_CONTENT": json.dumps(config, ensure_ascii=False),
-                        "MIMOCODE_PERMISSION": json.dumps(policy), "AYANA_MCP_READONLY": "1"})
+                        "MIMOCODE_PERMISSION": json.dumps(policy), "AYANA_MCP_READONLY": "0" if managed else "1"})
+            if managed: env["AYANA_MCP_MANAGED_CONTEXT"] = "1"
             env.pop("MIMOCODE_HOME", None)
             if runtime.get("config_path"): env["MIMOCODE_CONFIG"] = str(runtime["config_path"])
             binary = str(runtime.get("mimo_bin") or self.mimo_bin)

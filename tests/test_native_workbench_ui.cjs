@@ -83,7 +83,7 @@ function environment(reply) {
     if (call.url.endsWith("/terminal/control")) return { ok: true };
     if (call.url.endsWith("/terminal")) return { ok: true, attached: true, binding: {} };
     const sid = call.url.split("/").pop();
-    return { ok: true, session: { ...sessions.find(s => s.id === sid), remote_session_id: "ses_" + sid }, incidents: [], can_control: true, can_prepare: true };
+    return { ok: true, session: { ...sessions.find(s => s.id === sid), remote_session_id: "ses_" + sid }, effective_permissions:{session_id:sid,access_mode:"readwrite",approval_mode:"manual",revision:1}, incidents: [], can_control: true, can_prepare: true };
   };
   const window = {
     Terminal, FitAddon: { FitAddon: class {
@@ -131,7 +131,7 @@ test("transport-ready waits for real native bytes before claiming a rendered con
   assert.equal(env.nodes.get("aw-term-status").textContent, "等待原生画面");
   assert.equal(env.nodes.get("aw-term-status").classList.contains("ready"), false);
   env.paint();
-  assert.equal(env.nodes.get("aw-term-status").textContent, "观察");
+  assert.equal(env.nodes.get("aw-term-status").textContent, "观察·读写");
   assert.equal(env.nodes.get("aw-term-notice").classList.contains("hidden"), true);
   assert.equal(env.terminals[0].output.length, 1);
 });
@@ -151,7 +151,7 @@ test("native screen becomes ready only after the terminal parser commits visible
   assert.equal(env.nodes.get("aw-term-status").textContent, "等待原生画面");
   assert.equal(env.nodes.get("aw-term-notice").classList.contains("hidden"), false);
   terminal.completeWrites();
-  assert.equal(env.nodes.get("aw-term-status").textContent, "观察");
+  assert.equal(env.nodes.get("aw-term-status").textContent, "观察·读写");
   assert.equal(env.nodes.get("aw-term-notice").classList.contains("hidden"), true);
   assert.equal(env.timeouts.size, 0);
 });
@@ -163,7 +163,7 @@ test("a pending parser callback from the old terminal cannot mark a new selectio
   assert.equal(env.nodes.get("aw-term-status").textContent, "等待原生画面");
   assert.equal(env.nodes.get("aw-term-notice").classList.contains("hidden"), false);
   env.paint();
-  assert.equal(env.nodes.get("aw-term-status").textContent, "观察");
+  assert.equal(env.nodes.get("aw-term-status").textContent, "观察·读写");
 });
 test("fit, onResize and host observation send each distinct geometry once", async () => {
   const env = environment(); await env.window.renderAgentWorkbench(); env.ready();
@@ -224,7 +224,7 @@ test("old socket output and keyboard callbacks cannot cross into another session
   handlers.message({ data: new Uint8Array([65]).buffer }); handlers.close({ code: 4403 }); handlers.error();
   assert.equal(terminal.disposed, true);
   assert.equal(env.terminals[1].output.length, 1);
-  assert.equal(env.nodes.get("aw-term-status").textContent, "观察");
+  assert.equal(env.nodes.get("aw-term-status").textContent, "观察·读写");
   assert.equal(old.sent.map(JSON.parse).filter(v => v.type === "input").length, 0);
 });
 test("late session details never overwrite a more recent selection", async () => {
@@ -272,7 +272,7 @@ test("late control grant after switching cannot enable keyboard in the new sessi
   pending.resolve({ ok: true }); await grant;
   env.terminals[1].data("blocked-after-stale-grant\r");
   assert.equal(env.sockets[1].sent.map(JSON.parse).filter(item => item.type === "input").length, 0);
-  assert.equal(env.nodes.get("aw-term-status").textContent, "观察");
+  assert.equal(env.nodes.get("aw-term-status").textContent, "观察·读写");
 });
 test("archived history attaches read-only without silently reopening a session", async () => {
   const env = environment((call, normal) => {
@@ -384,6 +384,46 @@ test("observers return only the native queried DECRPM modes and valid status val
   for (const data of ["\x1b[?2025;1$y", "\x1b[?2026;5$y", "\x1b[2026;1$y", "\x1b[?2026;1$yinspect\r", "\x1b[97u"]) terminal.data(data);
   assert.deepEqual(socket.sent.map(JSON.parse), reports);
   assert.equal(env.calls.some(call => call.url.endsWith("/terminal/control")), false);
+});
+test("observer shows actual access with both permission controls disabled", async () => {
+  const env=environment();await env.window.renderAgentWorkbench();env.ready();env.paint();
+  assert.equal(env.nodes.get("aw-term-status").textContent,"观察·读写");
+  assert.equal(env.nodes.get("aw-access-mode").disabled,true);
+  assert.equal(env.nodes.get("aw-approval-mode").disabled,true);
+  const before=env.calls.length;await env.nodes.get("aw-access-mode").click();assert.equal(env.calls.length,before);
+});
+test("takeover inherits and permission toggle waits for confirmed response", async () => {
+  const pending=deferred();let env;
+  env=environment(call=>call.url.endsWith("/permissions") ? pending.promise : env.defaultReply(call));
+  await env.window.renderAgentWorkbench();env.ready();env.paint();await env.nodes.get("aw-term-acquire").click();
+  assert.equal(env.nodes.get("aw-term-status").textContent,"控制中·读写");
+  const operation=env.nodes.get("aw-access-mode").click();await flush();
+  assert.equal(env.nodes.get("aw-access-mode").textContent,"读写");
+  assert.equal(env.nodes.get("aw-access-mode").disabled,true);
+  const call=env.calls.find(c=>c.url.endsWith("/permissions"));
+  assert.equal(call.body.access_mode,"readonly");
+  pending.resolve({ok:true,effective_permissions:{session_id:"sess_a",access_mode:"readonly",approval_mode:"manual",revision:2}});await operation;
+  assert.equal(env.nodes.get("aw-term-status").textContent,"控制中·只读");
+});
+test("permission failure keeps backend mode and exposes reason", async () => {
+  let env;env=environment(call=>call.url.endsWith("/permissions") ? {ok:false,message:"控制权已过期",effective_permissions:{session_id:"sess_a",access_mode:"readwrite",approval_mode:"manual",revision:2}} : env.defaultReply(call));
+  await env.window.renderAgentWorkbench();env.ready();env.paint();await env.nodes.get("aw-term-acquire").click();await env.nodes.get("aw-access-mode").click();
+  assert.equal(env.nodes.get("aw-access-mode").textContent,"读写");
+  assert.equal(env.nodes.get("aw-term-notice").textContent,"控制权已过期");
+});
+test("late permission response cannot change another session", async () => {
+  const pending=deferred();let env;env=environment(call=>call.url.endsWith("/permissions") ? pending.promise : env.defaultReply(call));
+  await env.window.renderAgentWorkbench();env.ready();env.paint();await env.nodes.get("aw-term-acquire").click();
+  const operation=env.nodes.get("aw-access-mode").click();await flush();await env.select("sess_b");env.ready();env.paint();
+  pending.resolve({ok:true,effective_permissions:{session_id:"sess_a",access_mode:"readonly",approval_mode:"automatic",revision:99}});await operation;
+  assert.equal(env.nodes.get("aw-term-status").textContent,"观察·读写");assert.equal(env.nodes.get("aw-access-mode").disabled,true);
+});
+test("release and heartbeat adopt restored backend permissions", async () => {
+  let env;env=environment(call=>call.url.endsWith("/terminal/control") && call.body.action==="release" ? {ok:true,effective_permissions:{session_id:"sess_a",access_mode:"readonly",approval_mode:"manual",revision:3}} : env.defaultReply(call));
+  await env.window.renderAgentWorkbench();env.ready();env.paint();await env.nodes.get("aw-term-acquire").click();await env.nodes.get("aw-term-release").click();
+  assert.equal(env.nodes.get("aw-term-status").textContent,"观察·只读");assert.equal(env.nodes.get("aw-access-mode").disabled,true);
+  env.sockets[0].onmessage({data:JSON.stringify({type:"control",control:false,effective_permissions:{session_id:"sess_a",access_mode:"readwrite",approval_mode:"automatic",revision:4}})});
+  assert.equal(env.nodes.get("aw-term-status").textContent,"观察·读写");assert.equal(env.nodes.get("aw-approval-mode").value,"automatic");
 });
 test("logout and navigation both invoke the workbench suspension hook", () => {
   const login = app.slice(app.indexOf("function showLogin()"), app.indexOf("function showLogin()") + 220);

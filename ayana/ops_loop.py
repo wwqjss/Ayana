@@ -156,6 +156,7 @@ class OpsLoop:
         params: dict | None = None,
         reason: str = "",
         plan_sig: str = "",
+        authority_session_id: str = "",
     ) -> dict[str, Any]:
         """自主写 + 验证。失败/unknown 记软约束。执行前有硬轮次上限。"""
         if not self.actions:
@@ -197,9 +198,12 @@ class OpsLoop:
                 params=params,
                 reason=reason or "ops_loop_autonomous",
                 incident_id=incident_id,
+                **({"authority_session_id": authority_session_id} if authority_session_id else {}),
             )
         except Exception as e:  # noqa: BLE001
             code = getattr(e, "code", "exec_failed")
+            if code == "readonly_mode_rejects_write":
+                return {"ok": False, "error": code, "permission_blocked": True, "message": str(e)[:300]}
             if not self._same_generation(incident_id,generation):return {"ok":False,"skipped":"stale_generation","error":code}
             self.note_round(
                 incident_id, progressed=False, plan_sig=plan_sig or capability,

@@ -174,11 +174,35 @@ class ActionService:
         # P4.2：可选幂等台账（SessionBridge）；未注入则退化为仅 FSM 防重放
         self.write_ops = None
 
-    async def _write_channel(self, asset_id: str, tokens: list[str], timeout: float | None = None):
-        """写通道：仅原生 SSH。NT 已移除。"""
-        if self.transport is not None:
-            return await self.transport.exec(asset_id, tokens, timeout=timeout)
-        raise ActionError("ssh_required", "native SSH transport not configured")
+    async def _write_channel(
+        self, asset_id: str, tokens: list[str], timeout: float | None = None,
+        *, authority_session_id: str = "", require_automatic: bool = False,
+    ):
+        """Keep the trusted session scope through the final SSH dispatch boundary."""
+        if self.transport is None:
+            raise ActionError("ssh_required", "native SSH transport not configured")
+        if authority_session_id:
+            from .transport import session_dispatch_guard
+
+            with session_dispatch_guard(self.db, authority_session_id, require_automatic=require_automatic):
+                return await self.transport.exec(asset_id, tokens, timeout=timeout)
+        return await self.transport.exec(asset_id, tokens, timeout=timeout)
+
+    def _session_authority(self, session_id: str, *, conn=None) -> dict[str, Any] | None:
+        if not session_id:
+            return None
+        from .agent_authority import AuthorityError, resolve_authority
+
+        try:
+            return resolve_authority(self.db, session_id, conn=conn)
+        except AuthorityError as exc:
+            raise ActionError(exc.code, str(exc)) from exc
+
+    @staticmethod
+    def _action_session_id(action: Any) -> str:
+        # This is server-owned metadata, deliberately outside model-supplied params.
+        payload = json.loads(dict(action).get("params_json") or "{}")
+        return str(payload.get("_ayana_session_id") or "")
 
     def _require_human_approval(self) -> bool:
         """Agent 设置总开关：需要人工审批（默认开）。"""
@@ -213,6 +237,7 @@ class ActionService:
         template_id: str = "",
         council_grant_id: str = "",
         council_step: int = -1,
+        authority_session_id: str = "",
     ) -> dict[str, Any]:
         blocked = legacy_action_block({"mode": mode, "council_grant_id": council_grant_id,
                                        "council_step": council_step})
@@ -261,7 +286,16 @@ class ActionService:
         # 自动语义与人工语义分开（P1-01：服务端三态）
         # 工作台：require_human_approval 开启时，autonomous 仍走人工审批门；
         # 关闭时保留 P6 自动闭环（硬保护：能力目录/对象绑定/host key/幂等不变）。
-        require_human = self._require_human_approval()
+        authority = self._session_authority(authority_session_id)
+        if authority and authority["access_mode"] == "readonly":
+            self.db.audit(
+                proposer_type, proposer_id, "action_propose_denied",
+                asset_id=asset_id, object_id=obj["id"], incident_id=incident_id,
+                channel="agent", detail={"reason": "readonly_mode_rejects_write",
+                                         "session_id": authority_session_id, "authority": authority},
+            )
+            raise ActionError("readonly_mode_rejects_write", "Current session is read-only")
+        require_human = (authority["approval_mode"] == "manual") if authority else self._require_human_approval()
         if mode == "autonomous" and not require_human:
             decision = {
                 "decision": "automatic",
@@ -353,6 +387,9 @@ class ActionService:
             "runbook_rev": runbook_rev,
             "template_id": template_id,
         }
+        if authority_session_id:
+            payload["_ayana_session_id"] = authority_session_id
+            payload["_ayana_authority"] = authority
         approval_deadline = now() + float(self.action_ttl)
         with self.db.tx() as conn:
             conn.execute(
@@ -414,6 +451,8 @@ class ActionService:
                             "template_id": template_id,
                             "params_digest": params_digest,
                             "tokens": tokens,
+                            "session_id": authority_session_id,
+                            "authority": authority,
                         },
                         ensure_ascii=False,
                     ),
@@ -482,6 +521,16 @@ class ActionService:
                 ),
             )
 
+    def _return_to_human_approval(self, conn: Any, action_id: str) -> None:
+        conn.execute(
+            "UPDATE actions SET state='proposed',approver_type='',approver_id='',approved_at=NULL,"
+            " decision_channel='',decision_reason='',decided_at=NULL,decision_id='',decision_snapshot_json='{}',"
+            " result_detail='',finished_at=NULL WHERE id=? AND state='approved'", (action_id,),
+        )
+        row = conn.execute("SELECT incident_id FROM actions WHERE id=?", (action_id,)).fetchone()
+        self.db.event("action_approval_required", "当前会话需要人工审批", incident_id=row["incident_id"] or "",
+                      payload={"action_id": action_id, "reason": "approval_mode_changed"})
+
     async def autonomous_execute(
         self,
         *,
@@ -492,6 +541,7 @@ class ActionService:
         reason: str = "",
         incident_id: str = "",
         actor_id: str = "mimo_agent",
+        authority_session_id: str = "",
     ) -> dict[str, Any]:
         """MiMoCode 闭环：提案 →（可选人工审批）→ 执行。硬保护仍在 execute。"""
         proposed = self.propose(
@@ -504,6 +554,7 @@ class ActionService:
             proposer_type="agent",
             proposer_id=actor_id,
             mode="autonomous",
+            authority_session_id=authority_session_id,
         )
         if proposed.get("state") == "proposed" and proposed.get("require_approval"):
             return {
@@ -514,12 +565,16 @@ class ActionService:
                 "tokens": proposed.get("tokens") or [],
                 "message": "等待人工批准后执行",
             }
-        return await self.execute(
-            proposed["id"],
-            actor_type="agent",
-            actor_id=actor_id,
-            is_admin=False,
-        )
+        try:
+            return await self.execute(
+                proposed["id"], actor_type="agent", actor_id=actor_id, is_admin=False,
+            )
+        except ActionError as exc:
+            if exc.code == "approval_required" and self._get(proposed["id"])["state"] == "proposed":
+                return {"id": proposed["id"], "state": "proposed", "approval_required": True,
+                        "require_approval": True, "tokens": proposed.get("tokens") or [],
+                        "message": "等待人工批准后执行"}
+            raise
 
     def _assert_incident_matches(self, incident_id: str, asset_id: str, obj: dict) -> None:
         inc = self.db.query_one("SELECT * FROM incidents WHERE id=?", (incident_id,))
@@ -1204,6 +1259,8 @@ class ActionService:
         reject: tuple[str, str] | None = None
         tokens: list[str] = []
         with self.db.tx() as conn:
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
             fresh = conn.execute(
                 "SELECT * FROM actions WHERE id=?", (action_id,)
             ).fetchone()
@@ -1256,7 +1313,20 @@ class ActionService:
                 blocked = IncidentService(self.db).source_block_reason(fresh["incident_id"])
                 if blocked:
                     reject = (_source_block_code(blocked), blocked)
-            require_human_now = self._require_human_approval()
+            authority_session_id = self._action_session_id(fresh)
+            authority_now = None
+            if reject is None and authority_session_id:
+                try:
+                    authority_now = self._session_authority(authority_session_id, conn=conn)
+                except ActionError as exc:
+                    reject = (exc.code, exc.detail)
+                if authority_now and authority_now["access_mode"] == "readonly":
+                    reject = ("readonly_mode_rejects_write", "Current session is read-only")
+            require_human_now = ((authority_now["approval_mode"] == "manual")
+                                 if authority_now else self._require_human_approval())
+            human_approved = fresh["approver_type"] in ("web_user", "qq_user", "wecom_user") and bool(fresh["approver_id"])
+            if reject is None and action_mode == "autonomous" and require_human_now and not human_approved:
+                reject = ("approval_required", "Current session requires human approval")
             # 人工审批关闭时，autonomous 不查 Policy（权限=SSH 账号 + 能力目录硬保护）；
             # 开启时走人工审批，Policy 在 ApprovalService.decide 强制。
             if reject is None and not (action_mode == "autonomous" and not require_human_now):
@@ -1394,6 +1464,8 @@ class ActionService:
                             "detail": detail,
                             "capability": fresh_d.get("capability") or "",
                             "tokens": tokens,
+                            "session_id": authority_session_id,
+                            "authority": authority_now,
                         },
                         ensure_ascii=False,
                     ),
@@ -1402,13 +1474,15 @@ class ActionService:
                     "system",
                 )
                 # 客观原因终止提案；调用者无权仅拒绝本次请求
-                if code in ("dispatcher_denied",):
+                if code in ("dispatcher_denied", "readonly_mode_rejects_write", "approval_required"):
                     conn.execute(
                         "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, object_id,"
                         " action_id, detail_json, decision_id, incident_id, channel)"
                         " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                         _aud,
                     )
+                    if code == "approval_required":
+                        self._return_to_human_approval(conn, action_id)
                 else:
                     conn.execute(
                         "UPDATE actions SET state='cancelled', result_detail=?, finished_at=?"
@@ -1494,9 +1568,38 @@ class ActionService:
             except Exception:
                 wo_key = ""
         try:
-            res = await self._write_channel(row["asset_id"], tokens, timeout=15.0)
+            write_kwargs = {}
+            if authority_session_id:
+                write_kwargs = {"authority_session_id": authority_session_id,
+                                "require_automatic": not human_approved}
+            res = await self._write_channel(row["asset_id"], tokens, timeout=15.0, **write_kwargs)
             state, detail = classify_exec_result(res)
         except Exception as e:
+            if getattr(e, "dispatch_not_started", False):
+                # The final SSH guard guarantees no command was sent. This is
+                # neither an unknown execution nor permission to replay one.
+                code = str(getattr(e, "code", "authority_unavailable"))
+                with self.db.tx() as conn:
+                    conn.execute(
+                        "UPDATE actions SET state='approved',dispatched_at=NULL,exec_account='',budget_claimed_at=NULL"
+                        " WHERE id=? AND state='dispatched'", (action_id,),
+                    )
+                    if code == "approval_required":
+                        self._return_to_human_approval(conn, action_id)
+                    conn.execute(
+                        "UPDATE jobs SET state='cancelled',updated_at=? WHERE kind='exec_intent'"
+                        " AND json_valid(payload_json) AND json_extract(payload_json,'$.action_id')=? AND state='queued'",
+                        (now(), action_id),
+                    )
+                    self.db.audit(
+                        actor_type, actor_id, "action_dispatch_denied", action_id=action_id,
+                        asset_id=row["asset_id"], object_id=row["object_id"],
+                        incident_id=row.get("incident_id") or "", channel="agent",
+                        detail={"code": code, "session_id": authority_session_id, "dispatch_not_started": True},
+                    )
+                if self.write_ops is not None and wo_key:
+                    self.write_ops.release_write(wo_incident, wo_key, confirmed_safe=True, reason=code)
+                raise ActionError(code, str(e)) from e
             # 不能证明是否执行：收敛为 unknown + 需人工，保留对象锁防止重放。
             log.exception("action write_channel failed")
             state, detail = "unknown", f"exec_exception:{str(e)[:120]}"

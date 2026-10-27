@@ -48,6 +48,7 @@ _SES_LIST_RE = re.compile(r"\b(ses_[A-Za-z0-9]+)\b")
 
 READONLY_AGENT = "ayana-readonly"
 DECISION_AGENT = "ayana-decision"
+MANAGED_AGENT = "ayana"
 READONLY_TOOLS = (
     "ayana_knowledge_query", "ayana_knowledge_get", "ayana_metrics_query",
     "ayana_incident_list", "ayana_incident_get", "ayana_asset_list", "ayana_host_exec",
@@ -109,7 +110,9 @@ class MimoSessionClient:
         cwd = str(runtime.get("cwd") or self.cwd or "")
         if cwd:
             argv += ["--dir", cwd]
-        if self.readonly_env or self.decision_only:
+        if runtime.get("managed_context"):
+            argv += ["--agent", MANAGED_AGENT]
+        elif self.readonly_env or self.decision_only:
             argv += ["--agent", DECISION_AGENT if self.decision_only else READONLY_AGENT]
         argv += extra
         return argv
@@ -125,7 +128,7 @@ class MimoSessionClient:
     def _environment(self, runtime: dict[str, Any] | None = None) -> dict[str, str]:
         env = {**os.environ}
         runtime = runtime or {}
-        constrained = self.readonly_env or self.decision_only
+        constrained = (self.readonly_env or self.decision_only) and not runtime.get("managed_context")
         serve_url = runtime.get("serve_url") or self.serve_url
         if serve_url:
             from .mimo_serve import local_serve_url
@@ -451,7 +454,7 @@ class MimoServeSessionClient(MimoSessionClient):
             announced = True
             submitted = True
             acknowledgement = await client.prompt_async(remote_id, prompt,
-                agent=DECISION_AGENT if self.decision_only else READONLY_AGENT,
+                agent=MANAGED_AGENT if runtime.get("managed_context") else DECISION_AGENT if self.decision_only else READONLY_AGENT,
                 message_id=message_id, model=str(runtime.get("model") or self.model or ""))
             if not acknowledgement.get("accepted"):
                 raise MimoSessionError("turn_not_admitted", "MiMo did not admit a new turn")

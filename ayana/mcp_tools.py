@@ -1,18 +1,19 @@
 """Ayana MCP 工具集（薄层）。
 
 工具命名对齐 HANDOFF：host.exec / metrics.query / incident.* / knowledge.*。
-只做参数校验与结果整形，能力边界 = SSH 账户 + 现有服务；不引入 Policy/审批。
+复用现有服务、SSH 凭据、审批与审计；受管调用逐次核对会话实际权限。
 """
 
 from __future__ import annotations
 
 import json
 import shlex
+from copy import copy
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from .ntsafe import NTResult
-from .transport import TransportError
+from .transport import TransportError, session_dispatch_guard
 
 
 class McpToolError(Exception):
@@ -56,6 +57,7 @@ class OpsContext:
     promconfig: Any = None
     ops_loop: Any = None
     constraints: Any = None
+    managed_context: bool = False
 
 
 TOOL_SPECS: list[dict[str, Any]] = [
@@ -316,6 +318,12 @@ TOOL_SPECS: list[dict[str, Any]] = [
 ]
 
 
+_MANAGED_MUTATIONS = frozenset({
+    "incident.note", "incident.close", "knowledge.upsert", "session.remote",
+    "config.prom_target_add", "config.prom_target_update", "config.prom_target_delete",
+})
+
+
 class OpsTools:
     """把 HANDOFF §4 工具映射到 Ayana 服务。"""
 
@@ -325,7 +333,63 @@ class OpsTools:
     def specs(self) -> list[dict[str, Any]]:
         return [dict(s) for s in TOOL_SPECS]
 
-    async def call(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _with_authority(self, session_id: str, *, approved: bool = False) -> "OpsTools":
+        from .agent_authority import AuthorityError, resolve_authority
+
+        try:
+            authority = resolve_authority(self.ctx.db, session_id)
+        except AuthorityError as exc:
+            raise McpToolError(exc.code, str(exc)) from exc
+        scoped = copy(self.ctx)
+        scoped.readonly = self.ctx.readonly or authority["access_mode"] == "readonly"
+        scoped.authority_session_id = session_id
+        scoped.authority_approval_mode = authority["approval_mode"]
+        scoped.authority_revision = authority.get("revision")
+        scoped.approved_write = approved
+        scoped.mcp_incident_scope = f"_session:{session_id}"
+        return OpsTools(scoped)
+
+    async def call(
+        self, name: str, arguments: dict[str, Any] | None = None, *,
+        invocation_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if self.ctx.managed_context:
+            from .agent_authority import AuthorityError, resolve_remote_authority
+
+            if not isinstance(invocation_context, dict) or not all(
+                isinstance(invocation_context.get(key), str) and invocation_context[key].strip()
+                for key in ("sessionId", "turnId", "actorId")
+            ):
+                raise McpToolError("trusted_session_context_required")
+            try:
+                authority = resolve_remote_authority(self.ctx.db, invocation_context["sessionId"])
+            except AuthorityError as exc:
+                raise McpToolError(exc.code, str(exc)) from exc
+            scoped = self._with_authority(authority["session_id"])
+            return await scoped._call(name, arguments)
+        return await self._call(name, arguments)
+
+    async def call_approved(
+        self, name: str, arguments: dict[str, Any], *, authority_session_id: str,
+    ) -> dict[str, Any]:
+        """Internal Web approval dispatch; never derived from model arguments."""
+        if name not in _MANAGED_MUTATIONS:
+            raise McpToolError("invalid_pending_tool", name)
+        scoped = self._with_authority(authority_session_id, approved=True)
+        return await scoped._call(name, arguments)
+
+    def _validate_incident_scope(self, args: dict[str, Any]) -> None:
+        sid = getattr(self.ctx, "authority_session_id", "")
+        incident_id = args.get("incident_id") or args.get("source_incident")
+        if sid and incident_id:
+            row = self.ctx.db.query_one(
+                "SELECT 1 FROM session_incidents WHERE session_id=? AND incident_id=?",
+                (sid, str(incident_id)),
+            )
+            if not row:
+                raise McpToolError("incident_session_mismatch", str(incident_id))
+
+    async def _call(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         args = arguments or {}
         handlers: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = {
             "host.exec": self.host_exec,
@@ -352,6 +416,11 @@ class OpsTools:
         if not fn:
             raise McpToolError("unknown_tool", name)
         try:
+            if name in _MANAGED_MUTATIONS and getattr(self.ctx, "authority_session_id", ""):
+                self._validate_incident_scope(args)
+                return await self._managed_mutation(name, args, fn)
+            if name == "action.execute":
+                self._validate_incident_scope(args)
             return await fn(args)
         except McpToolError:
             raise
@@ -359,6 +428,41 @@ class OpsTools:
             raise McpToolError(e.code, str(e)) from e
         except Exception as e:  # noqa: BLE001 — 工具边界统一成结构化错误
             raise McpToolError("internal", f"{type(e).__name__}: {e}") from e
+
+    async def _managed_mutation(self, name: str, args: dict[str, Any], fn: Any) -> dict[str, Any]:
+        self._require_write_mode(name)
+        sid = self.ctx.authority_session_id
+        approved = bool(getattr(self.ctx, "approved_write", False))
+        br = self._bridge()
+        incident_id = self.ctx.mcp_incident_scope
+        action_key = br.make_action_key(sid, name, args, context="mcp-tool-write")
+        payload = {"_ayana_session_id": sid, "_ayana_tool": name, "_ayana_arguments": args}
+        if not approved:
+            if self.ctx.authority_approval_mode == "manual":
+                pending = br.pending_write(incident_id, action_key, target=str(args.get("asset_id") or ""),
+                                           params=payload, claimed_by="mcp_agent", authority_session_id=sid)
+                if not pending.get("ok"):
+                    return {"ok": False, "error": "idempotent_block", "detail": pending, "action_key": action_key}
+                self._audit_write("", name, "awaiting_approval", sid)
+                return {"ok": False, "error": "approval_required", "pending": True,
+                        "action_key": action_key, "incident_id": incident_id}
+            claim = br.claim_write(incident_id, action_key, params=payload, claimed_by="mcp_agent", authority_session_id=sid)
+            if not claim.get("claimed"):
+                return {"ok": False, "error": "idempotent_block", "detail": claim, "action_key": action_key}
+        try:
+            with session_dispatch_guard(self.ctx.db, sid, require_automatic=not approved):
+                out = await fn(args)
+        except Exception as exc:
+            if not approved:
+                if getattr(exc, "dispatch_not_started", False):
+                    br.release_write(incident_id, action_key, confirmed_safe=True, reason=exc.code)
+                else:
+                    br.mark_unknown(incident_id, action_key, reason=type(exc).__name__)
+            raise
+        if not approved:
+            br.complete_write(incident_id, action_key, ok=out.get("ok", True), result=json.dumps(out, default=str))
+        self._audit_write("", name, "success" if out.get("ok", True) else "failed", sid)
+        return out
 
     # ---- host ----
 
@@ -451,6 +555,10 @@ class OpsTools:
                     require_human = str(row["value"] or "1") not in ("0", "false", "False", "")
             except Exception:
                 require_human = True
+        authority_sid = getattr(self.ctx, "authority_session_id", "")
+        if authority_sid:
+            # The mode is trusted per-call state, separate from global defaults.
+            require_human = self.ctx.authority_approval_mode == "manual"
         incident_id = str(getattr(self.ctx, "mcp_incident_scope", "") or "_mcp_")
         action_key = ""
         if br is not None:
@@ -466,8 +574,10 @@ class OpsTools:
                         incident_id,
                         action_key,
                         target=asset_id,
-                        params={"command": command[:500], "channel": channel, "timeout": timeout},
+                        params={"command": command, "channel": channel, "timeout": timeout,
+                                **({"_ayana_session_id": authority_sid} if authority_sid else {})},
                         claimed_by="mcp_agent",
+                        **({"authority_session_id": authority_sid} if authority_sid else {}),
                     )
                     if not pending.get("ok") and pending.get("error") != "already_pending":
                         return {
@@ -489,8 +599,10 @@ class OpsTools:
                     incident_id,
                     action_key,
                     target=asset_id,
-                    params={"command": command[:200], "channel": channel},
+                    params={"command": command, "channel": channel,
+                            **({"_ayana_session_id": authority_sid} if authority_sid else {})},
                     claimed_by="mcp_agent",
+                    **({"authority_session_id": authority_sid} if authority_sid else {}),
                 )
             except Exception as e:  # noqa: BLE001
                 return {"ok": False, "error": "claim_failed", "message": str(e)}
@@ -502,10 +614,16 @@ class OpsTools:
                     "action_key": action_key,
                 }
         try:
-            res = await self.ctx.transport.exec_shell(
-                asset_id, command, timeout, channel=channel
-            )
+            with session_dispatch_guard(self.ctx.db, authority_sid, require_automatic=bool(authority_sid)):
+                res = await self.ctx.transport.exec_shell(
+                    asset_id, command, timeout, channel=channel
+                )
         except Exception as e:  # noqa: BLE001
+            if getattr(e, "dispatch_not_started", False):
+                if br is not None and action_key:
+                    br.release_write(incident_id, action_key, confirmed_safe=True, reason=e.code)
+                self._audit_write(asset_id, command, "rejected_before_dispatch", e.code)
+                return {"ok": False, "error": e.code, "action_key": action_key}
             if br is not None and action_key:
                 br.mark_unknown(incident_id, action_key, reason=f"exception:{type(e).__name__}")
             self._audit_write(asset_id, command, "unknown", str(e)[:200])
@@ -545,6 +663,10 @@ class OpsTools:
                     "command": command[:300],
                     "state": state,
                     "result": result[:200],
+                    "authority_session_id": getattr(self.ctx, "authority_session_id", ""),
+                    "authority_approval_mode": getattr(self.ctx, "authority_approval_mode", ""),
+                    "authority_revision": getattr(self.ctx, "authority_revision", None),
+                    "approved_write": bool(getattr(self.ctx, "approved_write", False)),
                 },
                 channel="mcp",
             )
@@ -870,6 +992,8 @@ class OpsTools:
             capability=capability, params=params,
             reason=str(args.get("reason") or "mcp_action_execute"),
             plan_sig=str(args.get("plan_sig") or f"{capability}:{object_id}"),
+            **({"authority_session_id": self.ctx.authority_session_id}
+               if getattr(self.ctx, "authority_session_id", "") else {}),
         )
         self._audit_write(asset_id, capability, str(res.get("state") or res.get("error") or ""),
                           str(res.get("detail") or "")[:200])

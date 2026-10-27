@@ -183,6 +183,10 @@ class AgentTuiManager:
         except Exception:
             raise AgentTuiError("provider_not_verified") from None
 
+    def _agent_name(self) -> str:
+        from .mimo_session import MANAGED_AGENT, READONLY_AGENT
+        return MANAGED_AGENT if self._runtime().get("managed_context") else READONLY_AGENT
+
     def _token(self, session_id: str, remote_id: str, *, start_home: bool = False) -> str:
         _private_directory(self.state_dir)
         _private_directory(self.state_dir / "secrets")
@@ -364,13 +368,20 @@ class AgentTuiManager:
                     "runtime_id=excluded.runtime_id,tmux_name=excluded.tmux_name,pane_id=excluded.pane_id,pane_pid=excluded.pane_pid,"
                     "pane_started_at=excluded.pane_started_at,updated_at=excluded.updated_at",
                     (session_id, remote_id, runtime_id, engine_pid, engine_start, name, pane["pane_id"], pane["pane_pid"], pane["pane_started_at"], t, t))
-            return self.public_binding(self._binding(session_id) or {})
+            return self._public_binding(self._binding(session_id) or {})
 
     @staticmethod
     def public_binding(binding: dict) -> dict:
         allowed = ("session_id", "remote_session_id", "runtime_id", "engine_pid", "engine_started_at", "tmux_name", "pane_id",
                    "pane_pid", "pane_started_at", "state", "receipt_id", "receipt_status", "controller", "control_expires_at")
         return {key: binding.get(key) for key in allowed}
+
+    def _public_binding(self, binding: dict) -> dict:
+        result = self.public_binding(binding)
+        if binding.get("session_id"):
+            from .agent_authority import resolve_authority
+            result["effective_permissions"] = resolve_authority(self.db, binding["session_id"])
+        return result
 
     async def status(self, session_id: str) -> dict:
         binding = self._binding(session_id)
@@ -379,7 +390,7 @@ class AgentTuiManager:
         pane = await self._pane(binding.get("tmux_name") or "__absent__")
         alive = bool(pane and not pane["pane_dead"] and pane["pane_pid"] == int(binding.get("pane_pid") or 0)
                      and pane["pane_started_at"] == str(binding.get("pane_started_at") or ""))
-        return {"ok": True, "attached": alive, "binding": self.public_binding(binding)}
+        return {"ok": True, "attached": alive, "binding": self._public_binding(binding)}
 
     def acquire_control(self, session_id: str, username: str, connection_id: str) -> dict:
         session_id = _local_id(session_id)
@@ -388,29 +399,61 @@ class AgentTuiManager:
             raise AgentTuiError("connection_not_found")
         t = time.time()
         with self.db.tx() as conn:
+            if not conn.in_transaction: conn.execute("BEGIN IMMEDIATE")
             if not conn.execute("SELECT 1 FROM agent_runtime_bindings WHERE session_id=?", (session_id,)).fetchone():
                 raise AgentTuiError("binding_missing")
+            from .agent_authority import resolve_authority
+            authority = resolve_authority(self.db, session_id, conn=conn)
             cursor = conn.execute(
-                "UPDATE agent_runtime_bindings SET controller=?,controller_connection_id=?,control_expires_at=?,updated_at=?"
+                "UPDATE agent_runtime_bindings SET controller=?,controller_connection_id=?,control_expires_at=?,updated_at=?,override_access_mode=?,override_approval_mode=?"
                 " WHERE session_id=? AND (control_expires_at<=? OR controller_connection_id=?)",
-                (username, connection_id, t + CONTROL_SECONDS, t, session_id, t, connection_id))
+                (username, connection_id, t + CONTROL_SECONDS, t, authority["access_mode"], authority["approval_mode"], session_id, t, connection_id))
             if cursor.rowcount != 1:
                 raise AgentTuiError("control_in_use")
+            conn.execute("UPDATE duty_sessions SET authority_revision=authority_revision+1 WHERE id=?", (session_id,))
         self.db.audit("web_user", username, "agent_tui_control_acquired",
                       detail={"session_id": session_id, "connection_id": connection_id}, channel="web")
-        return {"ok": True, "connection_id": connection_id, "expires_at": t + CONTROL_SECONDS}
+        return {"ok": True, "connection_id": connection_id, "expires_at": t + CONTROL_SECONDS,
+                "effective_permissions": resolve_authority(self.db, session_id)}
+
+    def change_permissions(self, session_id: str, username: str, connection_id: str, *,
+                           access_mode=None, approval_mode=None, expected_revision=None) -> dict:
+        from .agent_authority import resolve_authority
+        session_id = _local_id(session_id)
+        if (access_mode is not None and access_mode not in ("readonly", "readwrite")) or (approval_mode is not None and approval_mode not in ("manual", "automatic")):
+            raise AgentTuiError("invalid_permissions")
+        with self.db.tx() as conn:
+            if not conn.in_transaction: conn.execute("BEGIN IMMEDIATE")
+            old = resolve_authority(self.db, session_id, conn=conn)
+            row = conn.execute("SELECT * FROM agent_runtime_bindings WHERE session_id=?", (session_id,)).fetchone()
+            if not old["controller_active"] or row["controller"] != username or row["controller_connection_id"] != connection_id:
+                raise AgentTuiError("control_required")
+            if type(expected_revision) is not int or old["revision"] != expected_revision:
+                raise AgentTuiError("permissions_changed")
+            conn.execute("UPDATE agent_runtime_bindings SET override_access_mode=?,override_approval_mode=?,updated_at=? WHERE session_id=?",
+                         (access_mode or old["access_mode"], approval_mode or old["approval_mode"], time.time(), session_id))
+            conn.execute("UPDATE duty_sessions SET authority_revision=authority_revision+1 WHERE id=?", (session_id,))
+            new = resolve_authority(self.db, session_id, conn=conn)
+            self.db.audit("web_user", username, "agent_permissions_changed", detail={"session_id":session_id,"connection_id":connection_id,"before":old,"after":new}, channel="web")
+        return {"ok":True,"effective_permissions":new}
 
     def release_control(self, session_id: str, username: str, connection_id: str = "") -> dict:
         session_id = _local_id(session_id)
         with self.db.tx() as conn:
             cursor = conn.execute(
-                "UPDATE agent_runtime_bindings SET controller='',controller_connection_id='',control_expires_at=0,updated_at=?"
+                "UPDATE agent_runtime_bindings SET controller='',controller_connection_id='',control_expires_at=0,override_access_mode='',override_approval_mode='',updated_at=?"
                 " WHERE session_id=? AND controller=? AND controller_connection_id=?",
                 (time.time(), session_id, username, connection_id))
-        return {"ok": True, "released": cursor.rowcount == 1}
+            if cursor.rowcount:
+                conn.execute("UPDATE duty_sessions SET authority_revision=authority_revision+1 WHERE id=?", (session_id,))
+                self.db.audit("web_user", username, "agent_permissions_restored", detail={"session_id":session_id,"connection_id":connection_id,"reason":"release_or_disconnect"}, channel="web")
+        from .agent_authority import resolve_authority
+        return {"ok": True, "released": cursor.rowcount == 1,"effective_permissions":resolve_authority(self.db, session_id)}
 
     def _has_control(self, session_id: str, username: str, connection_id: str, *, renew: bool = False) -> bool:
         t = time.time()
+        from .agent_authority import reset_controls
+        reset_controls(self.db, reason="lease_expired", session_id=session_id, expired_only=True)
         binding = self._binding(session_id)
         allowed = bool(binding and binding.get("controller") == username and binding.get("controller_connection_id") == connection_id
                        and float(binding.get("control_expires_at") or 0) > t)
@@ -485,10 +528,10 @@ class AgentTuiManager:
                     return web.json_response({"home": self.home, "directory": self.workdir, "worktree": self.workdir})
                 if path == "/config":
                     return web.json_response({"permission": {"*": "deny"}, "agent": {},
-                                              "default_agent": "ayana-readonly"})
+                                              "default_agent": self._agent_name()})
                 if path == "/agent":
                     agents = await self._upstream("GET", path)
-                    return web.json_response(self._sanitize([a for a in agents if a.get("name") == "ayana-readonly"]))
+                    return web.json_response(self._sanitize([a for a in agents if a.get("name") == self._agent_name()]))
                 if path in ("/provider/auth", "/experimental/resource"):
                     return web.json_response({})
                 if path in ("/experimental/workspace", "/experimental/workspace/status", "/skill"):
@@ -562,7 +605,7 @@ class AgentTuiManager:
                             native_id(part["id"])
                             item["id"] = part["id"]
                         cleaned.append(item)
-                    body = {"parts": cleaned, "agent": "ayana-readonly"}
+                    body = {"parts": cleaned, "agent": self._agent_name()}
                     if message_id:
                         body["messageID"] = message_id
                     model = str(runtime.get("model") or "")
@@ -774,7 +817,9 @@ class AgentTuiManager:
         pump = None
         try:
             await ws.prepare(request)
-            await ws.send_json({"type": "ready", "connection_id": connection_id, "binding": binding, "control": False})
+            from .agent_authority import resolve_authority
+            await ws.send_json({"type": "ready", "connection_id": connection_id, "binding": binding, "control": False,
+                                "effective_permissions":resolve_authority(self.db, session_id)})
             pump = asyncio.create_task(output_pump())
             self.db.audit("web_user", username, "agent_tui_attached", detail={"session_id": session_id, "connection_id": connection_id}, channel="web")
             async for message in ws:
@@ -794,7 +839,8 @@ class AgentTuiManager:
                     kind = payload.get("type")
                     if kind in ("ping", "heartbeat"):
                         control = self._has_control(session_id, username, connection_id, renew=True)
-                        await ws.send_json({"type": "control", "control": control})
+                        await ws.send_json({"type": "control", "control": control,
+                                            "effective_permissions":resolve_authority(self.db, session_id)})
                         continue
                     if kind == "resize":
                         # Viewport size is not an Agent instruction; observers
@@ -886,7 +932,7 @@ def launch_native_attach(state_dir: str, session_id: str) -> None:
                PATH=os.pathsep.join([str(Path(binary).parent), "/usr/local/bin", "/usr/bin", "/bin"]), TERM="xterm-256color",
                MIMOCODE_SERVER_USERNAME=session_id, MIMOCODE_SERVER_PASSWORD=token,
                MIMOCODE_DISABLE_MODELS_FETCH="1",
-               EDITOR="/bin/false", VISUAL="/bin/false", BROWSER="/bin/false", AYANA_MCP_READONLY="1")
+               EDITOR="/bin/false", VISUAL="/bin/false", BROWSER="/bin/false")
     os.chdir(workdir)
     args = [binary, "attach", url, "--dir", workdir]
     if not config.get("start_home"):

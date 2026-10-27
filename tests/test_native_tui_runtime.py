@@ -379,7 +379,7 @@ class RuntimePathsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             verified_runtime({"base_dir": "/tmp"}, db, admin)
 
-    def test_verified_runtime_forces_readonly_mcp(self):
+    def test_verified_runtime_requires_trusted_dynamic_mcp_context(self):
         admin = Mock()
         admin.runtime_configuration.return_value = {"config": {"mcp": {"other": {"type": "local"}}}}
         db = Mock()
@@ -387,7 +387,9 @@ class RuntimePathsTests(unittest.TestCase):
         out = verified_runtime({"base_dir": "/tmp", "mimo_serve_password": "pw", "agent_runtime_home": "/tmp/h"}, db, admin)
         mcp = out["config"]["mcp"]
         self.assertIn("other", mcp)
-        self.assertEqual(mcp["ayana"]["environment"]["AYANA_MCP_READONLY"], "1")
+        self.assertEqual(mcp["ayana"]["environment"]["AYANA_MCP_READONLY"], "0")
+        self.assertEqual(mcp["ayana"]["environment"]["AYANA_MCP_MANAGED_CONTEXT"], "1")
+        self.assertTrue(out["managed_context"])
         self.assertEqual(out["serve_password"], "pw")
         self.assertTrue(out["serve_url"].startswith("http://127.0.0.1:"))
 

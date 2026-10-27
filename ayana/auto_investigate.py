@@ -671,6 +671,21 @@ class AutoInvestigator:
             return {**out, "skipped": "incident_changed"}
         if not self._runtime_ready():
             return {**out, "skipped": "provider_not_verified"}
+        # The local Incident mapping, never model output, selects the authority scope.
+        mapping = self.bridge.get_mapping(incident_id) if self.bridge is not None else None
+        authority_session_id = str((mapping or {}).get("session_id") or "")
+        if authority_session_id:
+            from .agent_authority import AuthorityError, resolve_authority
+
+            try:
+                authority = resolve_authority(self.db, authority_session_id)
+            except AuthorityError as exc:
+                return {**out, "skipped": exc.code, "result": "authority_unavailable"}
+            if authority["access_mode"] == "readonly":
+                self.db.audit("agent", "auto_investigator", "agent_remediation_readonly",
+                              incident_id=incident_id, channel="agent",
+                              detail={"session_id": authority_session_id, "authority": authority})
+                return {**out, "skipped": "readonly_mode_rejects_write", "result": "readonly"}
         decision = await self._decide_remediation(incident_id, conclusion, generation=generation)
         out["decision"] = decision
         if not self._incident_is_current(incident_id, generation):
@@ -708,8 +723,11 @@ class AutoInvestigator:
             params=decision.get("params") or {},
             reason=str(decision.get("reason") or "closed_loop_remediate")[:200],
             plan_sig=str(decision.get("plan_sig") or ""),
+            **({"authority_session_id": authority_session_id} if authority_session_id else {}),
         )
         out["action"] = res
+        if res.get("permission_blocked"):
+            return {**out, "result": "readonly"}
         if res.get("approval_required"):
             out["result"] = "awaiting_approval"
             out["action_id"] = res.get("action_id") or ""

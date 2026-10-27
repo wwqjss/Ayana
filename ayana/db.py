@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 
 class MigrationError(RuntimeError):
@@ -1182,6 +1182,27 @@ CREATE INDEX IF NOT EXISTS idx_runtime_receipts_session_status ON agent_runtime_
         conn.execute("ALTER TABLE investigation_jobs ADD COLUMN phase TEXT NOT NULL DEFAULT 'queued'")
 
 
+def _migrate_v24_agent_authority(conn: sqlite3.Connection) -> None:
+    """Preserve historical effective modes; new manual defaults are independent."""
+    added_approval = False
+    for table, columns in {
+        "duty_sessions": (("access_mode", "TEXT NOT NULL DEFAULT 'readonly'"), ("approval_mode", "TEXT NOT NULL DEFAULT 'manual'"), ("authority_revision", "INTEGER NOT NULL DEFAULT 0")),
+        "agent_runtime_bindings": (("override_access_mode", "TEXT NOT NULL DEFAULT ''"), ("override_approval_mode", "TEXT NOT NULL DEFAULT ''")),
+    }.items():
+        existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for column, definition in columns:
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+                added_approval |= table == "duty_sessions" and column == "approval_mode"
+    old = conn.execute("SELECT value FROM agent_settings WHERE key='require_human_approval'").fetchone()
+    approval = "automatic" if old and str(old[0]) in ("0", "false", "False", "") else "manual"
+    if added_approval:
+        conn.execute("UPDATE duty_sessions SET approval_mode=?", (approval,))
+    for key, value in (("auto_access_mode", "readwrite"), ("auto_approval_mode", approval), ("manual_approval_default", approval)):
+        conn.execute("INSERT OR IGNORE INTO agent_settings(key,value,updated_at,updated_by) VALUES(?,?,?,'migration24')", (key,value,now()))
+    conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('agent_authority_revision','0')")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_v1_baseline,
     2: _migrate_v2_p0_p1_columns,
@@ -1206,6 +1227,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     21: _migrate_v21_ops_loop,
     22: _migrate_v22_duty_sessions,
     23: _migrate_v23_native_runtime,
+    24: _migrate_v24_agent_authority,
 }
 
 _MIGRATION_NAMES = {
@@ -1232,6 +1254,7 @@ _MIGRATION_NAMES = {
     21: "ops_loop_state",
     22: "duty_sessions",
     23: "native_runtime_bindings",
+    24: "live_session_authority",
 }
 
 
