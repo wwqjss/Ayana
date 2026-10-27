@@ -12,7 +12,7 @@
 
 <link rel="stylesheet" href="/static/app.css?v=17">
 
-<link rel="stylesheet" href="/static/workbench.css?v=20261027-native1">
+<link rel="stylesheet" href="/static/workbench.css?v=20261027-authority1">
 
 <link rel="stylesheet" href="/static/xterm/xterm.css">
 
@@ -476,7 +476,7 @@
                   <button type="button" class="btn ghost small hidden" id="aw-term-reconnect">重新接入</button>
                   <button type="button" class="btn primary small hidden" id="aw-term-acquire">接管控制</button>
                   <button type="button" class="btn ghost small hidden" id="aw-term-release">释放控制</button>
-                  <button type="button" class="btn ghost small aw-access-switch" id="aw-access-mode" role="switch" aria-label="会话读写权限" aria-checked="false" disabled>只读</button>
+                  <button type="button" class="btn ghost small aw-access-switch" id="aw-access-mode" role="switch" aria-label="会话读写权限" title="接管后可临时切换权限，释放后恢复" aria-checked="false" disabled>只读</button>
                   <select id="aw-approval-mode" aria-label="当前会话审批模式" title="接管期间的临时审批模式" disabled><option value="manual">人工审批</option><option value="automatic">自动审批</option></select>
                   <details class="aw-session-menu">
                     <summary class="btn ghost small" aria-label="会话操作">···</summary>

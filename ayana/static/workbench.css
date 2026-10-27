@@ -114,5 +114,10 @@ main:has(#tab-agent.tab-panel:not(.hidden)) { max-width: none !important; paddin
 }
 /* Session controls stay adjacent to takeover; the native terminal stays central. */
 .aw-access-switch[aria-checked="true"] { color:var(--accent,#ff8547); border-color:currentColor; }
+.aw-access-switch { position:relative; padding-left:43px!important; min-height:28px; }
+.aw-access-switch::before { content:""; position:absolute; left:7px; top:calc(50% - 7px); width:28px; height:14px; border-radius:8px; background:#555; }
+.aw-access-switch::after { content:""; position:absolute; left:9px; top:calc(50% - 5px); width:10px; height:10px; border-radius:50%; background:#eee; transition:transform .15s; }
+.aw-access-switch[aria-checked="true"]::before { background:var(--accent,#ff8547); }
+.aw-access-switch[aria-checked="true"]::after { transform:translateX(14px); }
 .aw-term-actions select { background:var(--bg,#151515); color:inherit; border:1px solid var(--border,#444); border-radius:6px; padding:5px; font-size:12px; }
 .aw-term-actions :disabled { opacity:.55; cursor:default; }
