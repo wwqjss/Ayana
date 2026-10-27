@@ -26,7 +26,7 @@ from .auto_investigate import AutoInvestigator, InvestConfig
 from .session_bridge import SessionBridge
 from .investigation import InvestigationService
 from .instance import acquire_single_instance_lock
-from .knowledge import KnowledgeBase
+from .knowledge import KnowledgeBase, knowledge_root
 from .llm import make_llm
 from .ntsafe import AssetBinding, IdentityGate, NTClient
 from .notify import Notifier
@@ -266,7 +266,7 @@ class App:
         self.policy = Policy(self.db)
         self.nt = NTClient(privilege_mode="restricted_dispatcher")
         self.gate = IdentityGate(self.nt, load_bindings(self.db))
-        self.knowledge = KnowledgeBase(self.db)
+        self.knowledge = KnowledgeBase(self.db, root=knowledge_root(cfg))
         self.prom = PromClient(cfg.get("prometheus_url", "http://127.0.0.1:9090"))
         # 首登/设置页写入的运行时覆盖（DB meta），优先于 config.json
         try:

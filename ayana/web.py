@@ -3569,7 +3569,7 @@ class WebApp:
         """运维知识库只读：Markdown 主题（front matter + 正文）。"""
         self._require_auth(request)
         # 与 Agent/Investigation 共用同一 KnowledgeBase，保证 revision 一致
-        kb = getattr(self.investigation, "knowledge", None)
+        kb = getattr(self.investigation, "knowledge", None) or getattr(self.session_bridge, "knowledge", None)
         if kb is None:
             from .knowledge import KnowledgeBase
 

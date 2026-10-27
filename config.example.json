@@ -8,6 +8,7 @@
   "log_file": "ayana.log",
   "self_id": 0,
   "db_path": "ayana.db",
+  "knowledge_dir": "",
   "prometheus_url": "http://127.0.0.1:9090",
   "alertmanager_url": "http://127.0.0.1:9093",
   "alertmanager_webhook_path": "/hooks/alertmanager",

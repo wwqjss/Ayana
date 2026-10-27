@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -228,6 +230,17 @@ def _match_object(doc_objects: list[str], asset_id: str, object_name: str) -> bo
     return False
 
 
+def knowledge_root(cfg: dict[str, Any]) -> Path:
+    """Resolve the shared content directory independently of each process' cwd."""
+    configured = str(cfg.get("knowledge_dir") or "").strip()
+    if not configured:
+        return Path(__file__).resolve().parents[1] / "knowledge"
+    root = Path(configured).expanduser()
+    if not root.is_absolute():
+        root = Path(cfg.get("base_dir") or Path(__file__).resolve().parents[1]) / root
+    return root.resolve()
+
+
 class KnowledgeBase:
     """扫描 knowledge/*.md，建立对象/标签索引。"""
 
@@ -235,6 +248,7 @@ class KnowledgeBase:
         self.db = db  # 保留兼容；正文不入库
         self.root = Path(root) if root else self._default_root()
         self._docs: list[KnowledgeDoc] = []
+        self._disk_signature: tuple = ()
         self.reload()
 
     @staticmethod
@@ -243,25 +257,47 @@ class KnowledgeBase:
         return Path(__file__).resolve().parents[1] / "knowledge"
 
     def reload(self) -> int:
-        self._docs = []
+        signature = self._signature()
+        docs = []
         if not self.root.is_dir():
+            self._docs = docs
+            self._disk_signature = signature
             return 0
         for p in sorted(self.root.glob("*.md")):
             try:
-                self._docs.append(parse_doc(p))
+                docs.append(parse_doc(p))
             except Exception:
                 continue
-        return len(self._docs)
+        self._docs = docs
+        self._disk_signature = signature
+        return len(docs)
+
+    def _signature(self) -> tuple:
+        entries = []
+        for path in sorted(self.root.glob("*.md")):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            entries.append((path.name, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino))
+        return tuple(entries)
+
+    def _refresh(self) -> None:
+        if self._signature() != self._disk_signature:
+            self.reload()
 
     @property
     def revision(self) -> str:
         """当前知识集 revision（原子 reload 后可复算）。"""
+        self._refresh()
         blob = "|".join(f"{d.id}:{d.hash}:{d.status}" for d in sorted(self._docs, key=lambda x: x.id))
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
 
     # ---- 查询 ----
 
     def list_docs(self, *, status: str = "", typ: str = "", q: str = "") -> list[KnowledgeDoc]:
+        # MCP and Web are independent processes sharing Markdown, not memory.
+        self._refresh()
         out = []
         ql = (q or "").lower()
         for d in self._docs:
@@ -279,6 +315,7 @@ class KnowledgeBase:
         return out
 
     def get(self, doc_id: str) -> KnowledgeDoc | None:
+        self._refresh()
         for d in self._docs:
             if d.id == doc_id:
                 return d
@@ -287,6 +324,7 @@ class KnowledgeBase:
     def docs_for_object(
         self, asset_id: str, object_name: str, *, include_inactive: bool = False
     ) -> list[KnowledgeDoc]:
+        self._refresh()
         hits = [
             d
             for d in self._docs
@@ -478,6 +516,7 @@ class KnowledgeBase:
         verified=result 且 status=active 才是「已验证事实」；
         verified=speculation 允许入库但不进自动上下文。
         """
+        self.reload()
         if not title or not title.strip():
             raise ValueError("title required")
         if verified not in VALID_VERIFIED:
@@ -587,9 +626,21 @@ class KnowledgeBase:
         return {"ok": True, "action": "deprecated", "doc_id": doc.id, "revision": doc.revision}
 
     def _write_doc(self, doc: KnowledgeDoc, *, actor: str = "") -> None:
+        if not doc.id or any(c in doc.id for c in ("/", "\\")) or any(ord(c) < 32 for c in doc.id):
+            raise ValueError("invalid knowledge doc_id")
         self.root.mkdir(parents=True, exist_ok=True)
         path = self.root / f"{doc.id}.md"
-        path.write_text(format_doc(doc), encoding="utf-8")
+        # Readers in other processes must see either complete version.
+        staged = ""
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.root,
+                                             prefix=".knowledge-", suffix=".tmp", delete=False) as out:
+                staged = out.name
+                out.write(format_doc(doc))
+            os.replace(staged, path)
+        finally:
+            if staged and os.path.exists(staged):
+                os.unlink(staged)
         doc.path = str(path)
 
 

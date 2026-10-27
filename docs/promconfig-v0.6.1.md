@@ -54,6 +54,39 @@ Prometheus 配置目录（本地或经 SSH 资产）
 
 ## 配置
 
+### Agent 添加 HTTP 健康监控
+
+MCP 工具 `ayana_config_prom_target_add` 支持可选的 `probe` 对象。普通
+`address=host:port` 仍使用原有 file_sd 流程；HTTP 探测示例：
+
+```json
+{
+  "address": "http://172.16.0.14/",
+  "labels": {"asset": "ROMI", "service": "nginx"},
+  "probe": {
+    "exporter": "blackbox:9115",
+    "module": "http_2xx",
+    "job_name": "romi-nginx-blackbox"
+  }
+}
+```
+
+`exporter` 必填，使用 Prometheus 能访问的 Blackbox Exporter 地址。
+`module` 默认 `http_2xx`，`job_name` 省略时按探测参数生成稳定名称。
+工具仅登记已有 Exporter 的探测配置，不安装 Exporter 或创建告警规则。
+Agent 应继续核对 `probe_success` 和告警规则是否符合需求。
+
+配置固定生成 `/probe`、`params.module`、静态目标和三条标准 relabel；
+不接受自定义 relabel、任意 YAML 或文件路径。URL 仅允许 HTTP(S)，
+拒绝内联凭据、片段和控制字符；内部标签、`job`、`instance` 保留。
+配置在同一事务内完成备份、promtool 检查、热重载，失败恢复原配置。
+读写模式和人工审批继续使用原工具的门禁。
+
+已有等价探测（包括手写任务和额外标签）会返回 `changed=false` 和实际任务名，
+保留配置原文，避免重复抓取。同名任务参数不兼容时返回 `probe_job_conflict`。
+复杂且无法安全追加的 YAML 返回 `yaml_unsupported`，不会重写原文件。
+`prom_target_update/delete` 仍只处理原有托管 file_sd 目标；此扩展仅提供安全新增和复用。
+
 ```json
 "prometheus_config": {
   "local_dir": "prometheus",

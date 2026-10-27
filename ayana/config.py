@@ -32,6 +32,8 @@ DEFAULTS: dict[str, Any] = {
     # 企业微信长期授权仅接受显式列出的管理员；普通审批仍检查主体权限。
     "admin_wecom_users": [],
     "db_path": "ayana.db",
+    # Empty keeps repository knowledge/ for development; services select a data directory.
+    "knowledge_dir": "",
     "web_session_ttl_sec": 12 * 3600,
     "web_max_failed_logins": 8,
     "web_lockout_sec": 900,

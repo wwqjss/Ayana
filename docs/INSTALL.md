@@ -147,6 +147,7 @@ sudo chmod 640 /etc/ayana/config.json
   "http_host": "127.0.0.1",
   "http_port": 6200,
   "db_path": "/var/lib/ayana/ayana.db",
+  "knowledge_dir": "/var/lib/ayana/knowledge",
   "log_file": "/var/log/ayana/ayana.log",
   "prometheus_url": "http://127.0.0.1:9090",
   "alertmanager_url": "http://127.0.0.1:9093",
@@ -155,6 +156,33 @@ sudo chmod 640 /etc/ayana/config.json
 ```
 
 **不要**把 `http_host` 设成 `0.0.0.0`，除非前面有反向代理与 TLS。
+
+知识正文是可写的运行数据。生产配置的 `knowledge_dir` 应指向
+`/var/lib/ayana/knowledge`（或 `--data` 下的 `knowledge`），保持
+`ProtectSystem=strict` 和代码目录只读。新安装会把发行版 Markdown 复制到该目录，
+遇到同名文件则保留原内容；开发配置留空时继续使用仓库的 `knowledge/`。
+相对路径按配置文件所在目录解析，Web 与 MCP 使用同一个目录。
+
+已有安装升级时先备份原知识目录和配置，再把 `/opt/ayana/knowledge` 中的现有正文
+复制到数据目录，保留已存在的同名正文，并设置目录属主为 `ayana:ayana`。
+随后在 `/etc/ayana/config.json` 设置上述 `knowledge_dir`，在空闲时重启
+`ayana-agent-runtime.service` 与 `ayana.service`。安装脚本不会覆盖已有配置，
+因此已有安装须显式完成这一步；不需要放开 `/opt/ayana` 的写权限。
+
+若使用本地 Prometheus 配置管理，`prometheus_config.local_dir` 也必须在
+**Web 服务和 Agent runtime 服务两者**的 `ReadWritePaths` 内。原生 MCP 由
+`ayana-agent-runtime.service` 启动，仅给 `ayana.service` 授权不会让 MCP 可写。
+例如配置目录为 `/data/prometheus/config` 时，分别执行
+`sudo systemctl edit ayana.service` 和
+`sudo systemctl edit ayana-agent-runtime.service`，各加入：
+
+```ini
+[Service]
+ReadWritePaths=/data/prometheus/config
+```
+
+保留原有的数据目录授权和 `ProtectSystem=strict`，仅加入实际使用的配置目录。
+执行 `sudo systemctl daemon-reload`，在任务空闲时重启这两个服务后再验证配置写入。
 
 ### 秘密（secrets.json）
 

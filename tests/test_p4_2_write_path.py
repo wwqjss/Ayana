@@ -35,6 +35,42 @@ class FakeTransport:
 
 
 class TestClassifyShell(unittest.TestCase):
+    def test_nginx_diagnostics_and_harmless_output_redirection(self):
+        for cmd in (
+            "nginx -v",
+            "nginx -V 2>&1",
+            "systemctl is-active nginx 2>&1",
+            "ss -lntp 2>/dev/null | head -30",
+            "ss -lntp 2>/dev/null | head -n 30",
+            "which nginx; nginx -v 2>&1; systemctl is-active nginx 2>&1; ss -lntp 2>/dev/null | head -30",
+        ):
+            with self.subTest(command=cmd):
+                self.assertEqual(classify_shell_command(cmd), "read")
+
+    def test_diagnostic_chain_validates_every_command_and_redirection(self):
+        for cmd in (
+            "which nginx; touch /tmp/x",
+            "which nginx; some_custom_tool --do",
+            "which nginx; nginx -s reload 2>&1",
+            "which nginx; systemctl restart nginx 2>&1",
+            "which nginx; ss -K 2>/dev/null",
+            "ss -lntp 2>/dev/null | tee /tmp/x",
+            "ss -lntp 2>/dev/null | head -30 /etc/passwd",
+            "systemctl is-active nginx 2>/tmp/output",
+            "systemctl is-active nginx 2>>/tmp/output",
+            "systemctl is-active nginx 2>&3",
+            "systemctl is-active nginx 3>&1",
+            "systemctl is-active nginx </etc/passwd",
+            "nginx -v $(touch /tmp/x) 2>&1",
+            "nginx -v `touch /tmp/x` 2>&1",
+            "which nginx & touch /tmp/x",
+            "which nginx\ntouch /tmp/x",
+            "ss -lntp 2>/dev/null | head -30;",
+            "ss -lntp 2>/dev/null | head -30; date -s 2026-01-01",
+        ):
+            with self.subTest(command=cmd):
+                self.assertNotEqual(classify_shell_command(cmd), "read")
+
     def test_reads(self):
         for cmd in (
             "uptime",
@@ -121,6 +157,21 @@ class TestMcpControlledWrite(unittest.TestCase):
         )
         self.assertTrue(out["ok"])
         self.assertEqual(out.get("classified"), "read")
+
+    def test_read_channel_accepts_nginx_diagnostic_chain(self):
+        command = "which nginx; nginx -v 2>&1; systemctl is-active nginx 2>&1; ss -lntp 2>/dev/null | head -30"
+        out = asyncio.run(self.tools.call("host.exec", {"asset_id": "romi", "command": command, "channel": "read"}))
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["classified"], "read")
+        self.assertEqual(self.transport.calls, [("romi", command, "read")])
+
+    def test_automatic_readonly_still_rejects_compound_diagnostics(self):
+        self.tools.ctx.readonly = True
+        command = "which nginx; nginx -v 2>&1; systemctl is-active nginx 2>&1; ss -lntp 2>/dev/null | head -30"
+        with self.assertRaises(Exception) as cm:
+            asyncio.run(self.tools.call("host.exec", {"asset_id": "romi", "command": command, "channel": "read"}))
+        self.assertEqual(getattr(cm.exception, "code", ""), "readonly_mode_rejects_write")
+        self.assertEqual(self.transport.calls, [])
 
     def test_write_goes_through_claim_and_audit(self):
         out = asyncio.run(

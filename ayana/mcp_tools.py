@@ -289,12 +289,26 @@ TOOL_SPECS: list[dict[str, Any]] = [
     },
     {
         "name": "config.prom_target_add",
-        "description": "自然语言配置：向 Prometheus file_sd 增加采集目标（校验+备份+回滚）。",
+        "description": (
+            "向 Prometheus 增加监控（校验+备份+回滚）。普通采集使用 address=host:port；"
+            "HTTP 健康探测使用 address=http(s)://... 并指定 probe.exporter=blackbox:9115，"
+            "可选 probe.module（默认 http_2xx）和 probe.job_name。无需手写 relabel 配置。"
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "address": {"type": "string"},
                 "labels": {"type": "object"},
+                "probe": {
+                    "type": "object",
+                    "properties": {
+                        "exporter": {"type": "string", "description": "Blackbox Exporter host:port"},
+                        "module": {"type": "string", "default": "http_2xx"},
+                        "job_name": {"type": "string", "description": "独立任务名；省略时按探测参数生成"},
+                    },
+                    "required": ["exporter"],
+                    "additionalProperties": False,
+                },
             },
             "required": ["address"],
         },
@@ -1090,10 +1104,12 @@ class OpsTools:
         if pc is None:
             raise McpToolError("unavailable", "promconfig not wired")
         try:
+            options = {"probe": args["probe"]} if "probe" in args else {}
             return await pc.add_target(
                 address=str(args.get("address") or ""),
                 labels=args.get("labels") or {},
                 actor="mcp_agent",
+                **options,
             )
         except Exception as e:  # noqa: BLE001
             raise McpToolError(getattr(e, "code", "promconfig_failed"), str(e)[:300]) from e

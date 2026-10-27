@@ -346,20 +346,98 @@ _SHELL_WRITE_HINTS = re.compile(
 )
 
 
+def _readonly_diagnostic_shell(command: str) -> bool:
+    """Recognize bounded diagnostic chains, including harmless output redirects.
+
+    This is only the read/write shell classifier. Automatic read-only sessions
+    still require the separate single-command ``readonly_command`` grammar.
+    Every command in a chain must pass validation; trusting the first executable
+    would allow a later command to inherit its read permission.
+    """
+    if len(command) > 8192 or any(c in command for c in "$`\n\r\0<(){}#\\"):
+        return False
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    if not tokens or len(tokens) > 256:
+        return False
+
+    def valid_simple(argv: list[str], *, piped_input: bool) -> bool:
+        if readonly_command(argv):
+            return True
+        if not safe_tokens(argv):
+            return False
+        prog, args = argv[0], argv[1:]
+        if prog == "which":
+            if args[:1] == ["-a"]:
+                args = args[1:]
+            return bool(args) and all(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.+-]*", a) for a in args)
+        if prog == "nginx":
+            return args in (["-v"], ["-V"])
+        if prog == "head" and piped_input:
+            # Only bound an existing pipeline's output; do not add file reads.
+            count = (args[0][1:] if len(args) == 1 and re.fullmatch(r"-[1-9][0-9]{0,4}", args[0])
+                     else args[1] if len(args) == 2 and args[0] == "-n" else "")
+            return bool(re.fullmatch(r"[1-9][0-9]{0,4}", count)) and int(count) <= 10000
+        return False
+
+    argv: list[str] = []
+    piped_input = False
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in {";", "&&", "||", "|"}:
+            if not valid_simple(argv, piped_input=piped_input):
+                return False
+            argv = []
+            piped_input = token == "|"
+        elif token in {">", ">&"}:
+            if i + 1 >= len(tokens):
+                return False
+            # Only stdout/stderr can be merged or discarded. File output,
+            # append, input, arbitrary descriptors and process substitution
+            # remain outside this grammar.
+            if argv and argv[-1].isdigit():
+                if argv[-1] not in {"1", "2"}:
+                    return False
+                argv.pop()
+            target = tokens[i + 1]
+            if (token == ">" and target != "/dev/null") or (token == ">&" and target not in {"1", "2"}):
+                return False
+            i += 1
+        elif any(c in token for c in ";&|<>"):
+            return False
+        else:
+            argv.append(token)
+        i += 1
+    return valid_simple(argv, piped_input=piped_input)
+
+
 def classify_shell_command(command: str) -> str:
     """对任意 shell 命令行做 read|write|unknown 三态分类。
 
-    - 含重定向/管道副作用/写动词 → write
-    - 明确只读常见命令 → read
+    - 已验证的诊断命令链（含标准输出/错误合并或丢弃）→ read
+    - 含文件写重定向/管道副作用/写动词 → write
+    - 明确只读常见命令 → read；未知复合语法不继承首命令权限
     - 其余 → unknown（默认按写处理，禁止经 read 通道偷跑）
     """
     if not isinstance(command, str) or not command.strip():
         return "unknown"
+    if _readonly_diagnostic_shell(command):
+        return "read"
     # 结构性写特征：重定向到文件、追加、in-place 编辑
     if re.search(r"(?:^|[^>])>>?|sed\s+-i|tee\s+|crontab\s+-", command):
         return "write"
     if _SHELL_WRITE_HINTS.search(command):
         return "write"
+    # A failed compound/substitution parse must not fall back to trusting only
+    # the first executable. Single-command compatibility continues below.
+    if any(c in command for c in ";|&<>$`\n\r\0(){}\\"):
+        return "unknown"
     first = re.split(r"\s+", command.strip(), maxsplit=1)[0]
     # 去掉可能的 sudo/env 前缀
     parts = re.split(r"\s+", command.strip())

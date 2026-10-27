@@ -25,6 +25,8 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/ayana
+# Local Prometheus config management: add the configured local_dir to
+# ReadWritePaths in BOTH this unit and ayana-agent-runtime.service via drop-ins.
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true

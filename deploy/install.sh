@@ -273,10 +273,10 @@ if [[ "$MODE" == "system" ]]; then
     ok "system user ayana exists"
   fi
   install -d -o root -g ayana -m 750 "$PREFIX"
-  install -d -o ayana -g ayana -m 750 "$DATA_DIR" "$DATA_DIR/log" "$DATA_DIR/prometheus"
+  install -d -o ayana -g ayana -m 750 "$DATA_DIR" "$DATA_DIR/log" "$DATA_DIR/prometheus" "$DATA_DIR/knowledge"
   install -d -o root -g ayana -m 750 "$CONF_DIR"
 else
-  install -d -m 700 "$PREFIX" "$DATA_DIR" "$DATA_DIR/log" "$DATA_DIR/prometheus" "$CONF_DIR"
+  install -d -m 700 "$PREFIX" "$DATA_DIR" "$DATA_DIR/log" "$DATA_DIR/prometheus" "$DATA_DIR/knowledge" "$CONF_DIR"
 fi
 
 # --- 代码（缺失才装；--force 才 --delete 同步）---
@@ -315,6 +315,21 @@ if [[ "$HAS_CODE" -eq 0 || "$FORCE" -eq 1 ]]; then
   fi
 else
   ok "code already present, skip copy"
+fi
+
+# Keep editable knowledge in the writable data tree; never overwrite user content.
+if [[ -d "$PREFIX/knowledge" ]]; then
+  for doc in "$PREFIX/knowledge/"*.md; do
+    [[ -f "$doc" ]] || continue
+    target="$DATA_DIR/knowledge/$(basename "$doc")"
+    if [[ ! -e "$target" ]]; then
+      if [[ "$MODE" == "system" ]]; then
+        install -o ayana -g ayana -m 640 "$doc" "$target"
+      else
+        install -m 600 "$doc" "$target"
+      fi
+    fi
+  done
 fi
 
 # --- venv ---
@@ -367,6 +382,7 @@ else
   "log_file": "$LOG_PATH",
   "self_id": 0,
   "db_path": "$DB_PATH",
+  "knowledge_dir": "$DATA_DIR/knowledge",
   "prometheus_url": "http://127.0.0.1:9090",
   "alertmanager_url": "http://127.0.0.1:9093",
   "admin_qq": "",

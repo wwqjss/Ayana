@@ -23,7 +23,7 @@ from .config import load_config
 from .credentials import CredentialStore
 from .db import Database
 from .incidents import IncidentService
-from .knowledge import KnowledgeBase
+from .knowledge import KnowledgeBase, knowledge_root
 from .mcp_tools import McpToolError, OpsContext, OpsTools
 from .mimo_session import MimoSessionClient
 from .prom import PromClient
@@ -42,8 +42,9 @@ def build_ops_context(cfg: dict[str, Any]) -> OpsContext:
     # Only the launching Ayana process sets this explicit same-instance binding.
     cfg = dict(cfg)
     cfg["db_path"] = os.environ.get("AYANA_MCP_DB_PATH") or cfg["db_path"]
+    cfg["knowledge_dir"] = os.environ.get("AYANA_MCP_KNOWLEDGE_DIR") or cfg.get("knowledge_dir", "")
     db = Database(cfg["db_path"])
-    knowledge = KnowledgeBase(db)
+    knowledge = KnowledgeBase(db, root=knowledge_root(cfg))
     try:
         row = db.query_one("SELECT value FROM meta WHERE key='prometheus_url'")
         if row and str(row["value"] or "").strip():

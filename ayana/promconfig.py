@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from .db import Database, new_id, now
 
@@ -196,6 +197,24 @@ def _scalar(tok: str) -> Any:
     return t
 
 
+def _yaml_line_without_comment(raw: str) -> str:
+    quote = ""
+    escaped = False
+    for index, char in enumerate(raw):
+        if quote:
+            if escaped:
+                escaped = False
+            elif quote == '"' and char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+        elif char in ("'", '"'):
+            quote = char
+        elif char == "#" and (index == 0 or raw[index - 1].isspace()):
+            return raw[:index].rstrip()
+    return raw
+
+
 def parse_simple_yaml(text: str) -> Any:
     """解析 Prometheus 常用 YAML 子集（映射/列表/标量）。
 
@@ -206,6 +225,7 @@ def parse_simple_yaml(text: str) -> Any:
     # 去掉纯注释/空行后建立缩进栈
     cleaned: list[tuple[int, str]] = []
     for raw in lines:
+        raw = _yaml_line_without_comment(raw)
         if not raw.strip() or raw.lstrip().startswith("#"):
             continue
         indent = len(raw) - len(raw.lstrip(" "))
@@ -230,6 +250,7 @@ def parse_simple_yaml(text: str) -> Any:
                     ":" in body
                     and not body.startswith("{")
                     and not body.startswith("[")
+                    and not body.startswith(("'", '"'))
                     and not re.match(r"^[A-Za-z0-9._\[\]]+:\d+", body)
                     and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", body)
                 ):
@@ -303,7 +324,9 @@ def parse_simple_yaml(text: str) -> Any:
                 continue
             # 嵌套
             idx += 1
-            if idx < len(cleaned) and cleaned[idx][0] > indent:
+            if idx < len(cleaned) and (cleaned[idx][0] > indent or (
+                cleaned[idx][0] == indent and cleaned[idx][1].startswith("- ")
+            )):
                 val, idx = parse_block(idx, cleaned[idx][0])
                 obj[key] = val
             else:
@@ -522,6 +545,86 @@ def ensure_file_sd_job(
     lines.append("scrape_configs:\n")
     lines.append(job_block)
     return "".join(lines), True
+
+
+def ensure_http_probe_job(raw: str, job: dict[str, Any]) -> tuple[str, bool, str]:
+    """Append a fixed blackbox job without rewriting any existing YAML.
+
+    Matching hand-written jobs are reusable; differing jobs with the same name
+    fail closed. Unsupported scrape_configs layouts remain read-only.
+    """
+    lines = raw.splitlines(keepends=True)
+    headers = [i for i, line in enumerate(lines) if re.match(r"^scrape_configs\s*:", line)]
+    if len(headers) > 1:
+        raise PromConfigError("yaml_unsupported", "duplicate scrape_configs")
+    data = parse_simple_yaml(raw)
+    if not isinstance(data, dict):
+        raise PromConfigError("yaml_unsupported", "top-level mapping required")
+    jobs = data.get("scrape_configs", [])
+    if jobs is None:
+        jobs = []
+    if not isinstance(jobs, list) or any(not isinstance(j, dict) for j in jobs):
+        raise PromConfigError("yaml_unsupported", "scrape_configs must be a list of mappings")
+    def matches(current: dict[str, Any]) -> bool:
+        target = job["static_configs"][0]
+        same = all(current.get(k) == job[k] for k in ("metrics_path", "params", "relabel_configs"))
+        same = same and current.get("scheme", "http") == "http"
+        groups = current.get("static_configs")
+        if not isinstance(groups, list) or current.get("metric_relabel_configs"):
+            return False
+        same = same and any(
+            isinstance(group, dict)
+            and target["targets"][0] in (group.get("targets") or [])
+            and isinstance(group.get("labels", {}), dict)
+            and all((group.get("labels") or {}).get(k) == v for k, v in target.get("labels", {}).items())
+            for group in groups
+        )
+        return same
+
+    existing = [j for j in jobs if j.get("job_name") == job["job_name"]]
+    if existing:
+        if len(existing) == 1 and matches(existing[0]):
+            return raw, False, job["job_name"]
+        raise PromConfigError("probe_job_conflict", job["job_name"])
+    # The same endpoint/module/exporter may already have an operator-chosen
+    # name. Reuse it, including extra labels, instead of scraping it twice.
+    for current in jobs:
+        name = current.get("job_name")
+        if isinstance(name, str) and name and matches(current):
+            return raw, False, name
+
+    if not headers:
+        if "scrape_configs" in data:
+            raise PromConfigError("yaml_unsupported", "quoted scrape_configs key")
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        return "".join(lines) + "scrape_configs:\n" + dump_simple_yaml([job], 1), True, job["job_name"]
+
+    start = headers[0]
+    # Only a block list (or an empty list) can be extended without rewriting.
+    match = re.fullmatch(r"scrape_configs\s*:\s*(\[\])?\s*(?:#[^\r\n]*)?\r?\n?", lines[start])
+    if match is None:
+        raise PromConfigError("yaml_unsupported", "scrape_configs must use a block list")
+    end = start + 1
+    while end < len(lines):
+        line = lines[end]
+        if line.strip() and not line.lstrip().startswith("#") and not line.startswith((" ", "\t", "-")):
+            break
+        end += 1
+    indent = 2
+    for line in lines[start + 1:end]:
+        if line.strip() and not line.lstrip().startswith("#"):
+            item = re.match(r"^( *)-\s+", line)
+            if not item or len(item.group(1)) % 2:
+                raise PromConfigError("yaml_unsupported", "unsupported scrape_configs indentation")
+            indent = len(item.group(1))
+            break
+    if match.group(1):
+        lines[start] = re.sub(r"\[\]", "", lines[start], count=1)
+    if end and not lines[end - 1].endswith("\n"):
+        lines[end - 1] += "\n"
+    lines.insert(end, dump_simple_yaml([job], indent // 2))
+    return "".join(lines), True, job["job_name"]
 
 
 # ---------------------------------------------------------------------------
@@ -1131,7 +1234,10 @@ class PromConfigService:
         actor: str = "web",
         job: str = MANAGED_JOB,
         interval: str = "30s",
+        probe: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if probe is not None:
+            return await self._add_http_probe(address=address, labels=labels, probe=probe, actor=actor)
         address = _validate_target_address(address)
         labels = _clean_labels(labels or {})
         if job != MANAGED_JOB:
@@ -1144,6 +1250,53 @@ class PromConfigService:
         await self._write_file_sd(items, actor, action="target_add", detail={"address": address, "labels": labels})
         await self._ensure_job_and_rules_entry(actor)
         return {"ok": True, "address": address, "labels": labels}
+
+    async def _add_http_probe(
+        self, *, address: str, labels: dict[str, str] | None, probe: dict[str, Any], actor: str,
+    ) -> dict[str, Any]:
+        if not isinstance(probe, dict) or set(probe) - {"exporter", "module", "job_name"}:
+            raise PromConfigError("bad_probe", "expected exporter, module and job_name only")
+        address = _validate_http_probe_url(address)
+        exporter = _validate_probe_exporter(probe.get("exporter"))
+        module = probe.get("module", "http_2xx")
+        if not isinstance(module, str) or not _SAFE_NAME_RE.fullmatch(module):
+            raise PromConfigError("bad_probe_module", "invalid module name")
+        job_name = probe.get("job_name")
+        if job_name is None:
+            fingerprint = json.dumps([address, exporter, module], separators=(",", ":")).encode()
+            job_name = "ayana-probe-" + hashlib.sha256(fingerprint).hexdigest()[:16]
+        if not isinstance(job_name, str) or not _SAFE_NAME_RE.fullmatch(job_name):
+            raise PromConfigError("bad_probe_job", "invalid job name")
+        if labels is not None and not isinstance(labels, dict):
+            raise PromConfigError("bad_probe_labels", "labels must be an object")
+        labels = _clean_labels(labels or {})
+        if any(k.startswith("__") or k in ("job", "instance") for k in labels):
+            raise PromConfigError("bad_probe_labels", "internal, job and instance labels are reserved")
+        static_config = {"targets": [address]}
+        if labels:
+            static_config["labels"] = labels
+        job = {
+            "job_name": job_name,
+            "metrics_path": "/probe",
+            "params": {"module": [module]},
+            "static_configs": [static_config],
+            "relabel_configs": [
+                {"source_labels": ["__address__"], "target_label": "__param_target"},
+                {"source_labels": ["__param_target"], "target_label": "instance"},
+                {"target_label": "__address__", "replacement": exporter},
+            ],
+        }
+        # Hold the same lock for the read/modify/write to avoid lost updates.
+        async with self._write_lock:
+            raw = await self.fs.read_text(CONFIG_FILE)
+            new_raw, changed, job_name = ensure_http_probe_job(raw, job)
+            if changed:
+                await self._apply_write_unlocked(
+                    actor, "probe_add", writes={CONFIG_FILE: new_raw},
+                    detail={"address": address, "job": job_name, "exporter": exporter, "module": module},
+                )
+        return {"ok": True, "address": address, "labels": labels, "job": job_name,
+                "probe": {"exporter": exporter, "module": module}, "changed": changed}
 
     async def update_target(
         self,
@@ -1228,78 +1381,84 @@ class PromConfigService:
     ) -> dict[str, Any]:
         """事务写入：备份 → 提交 → promtool → reload；失败恢复并拒绝报告成功。"""
         async with self._write_lock:
-            originals: dict[str, str | None] = {}
-            for rel in writes:
-                try:
-                    originals[rel] = await self.fs.read_text(rel)
-                except PromConfigError:
-                    originals[rel] = None
+            return await self._apply_write_unlocked(actor, action, writes=writes, detail=detail)
+
+    async def _apply_write_unlocked(
+        self, actor: str, action: str, *, writes: dict[str, str | None], detail: dict | None = None,
+    ) -> dict[str, Any]:
+        """Commit with _write_lock held, including callers that prepare under it."""
+        originals: dict[str, str | None] = {}
+        for rel in writes:
+            try:
+                originals[rel] = await self.fs.read_text(rel)
+            except PromConfigError:
+                originals[rel] = None
+        for rel, orig in originals.items():
+            if orig is not None:
+                await self._backup_if_exists(rel, actor, action)
+        check: dict[str, Any] = {}
+        relr: dict[str, Any] = {}
+        try:
+            for rel, content in writes.items():
+                if content is None:
+                    continue
+                await self.fs.write_text(rel, content)
+            if self.require_promtool:
+                check = await self._run_promtool_check()
+                if not check.get("ok"):
+                    err = str(check.get("error") or "")
+                    detail = str(check)[:400]
+                    if "promtool_not_found" in err or "not_found" in (check.get("detail") or ""):
+                        raise PromConfigError(
+                            "promtool_not_found",
+                            "未安装 promtool，或配置了 require_promtool=true。"
+                            "请安装 Prometheus/promtool，或在 config.prometheus_config.require_promtool 设为 false。",
+                        )
+                    if "config_missing" in err:
+                        raise PromConfigError(
+                            "prom_config_missing",
+                            "未找到 prometheus.yml。请先准备 Prometheus 配置目录，"
+                            "或把 prometheus_config.local_dir / ssh_asset_id 指向真实 Prometheus。",
+                        )
+                    raise PromConfigError("promtool_failed", detail)
+            relr = await self._try_reload()
+            if not relr.get("ok"):
+                raise PromConfigError("reload_failed", str(relr)[:400])
+            for rel, content in writes.items():
+                if content is not None:
+                    self._last_good[rel] = content
+            self._txn_seq += 1
+            self._audit(
+                "web_user",
+                actor,
+                f"promconfig_{action}",
+                {
+                    **(detail or {}),
+                    "paths": list(writes.keys()),
+                    "txn": self._txn_seq,
+                    "promtool_ok": bool(check.get("ok")) if check else None,
+                    "reload_ok": True,
+                },
+            )
+            return {"ok": True, "promtool": check, "reload": relr, "txn": self._txn_seq}
+        except Exception as e:
             for rel, orig in originals.items():
                 if orig is not None:
-                    await self._backup_if_exists(rel, actor, action)
-            check: dict[str, Any] = {}
-            relr: dict[str, Any] = {}
+                    try:
+                        await self.fs.write_text(rel, orig)
+                    except Exception:
+                        pass
             try:
-                for rel, content in writes.items():
-                    if content is None:
-                        continue
-                    await self.fs.write_text(rel, content)
-                if self.require_promtool:
-                    check = await self._run_promtool_check()
-                    if not check.get("ok"):
-                        err = str(check.get("error") or "")
-                        detail = str(check)[:400]
-                        if "promtool_not_found" in err or "not_found" in (check.get("detail") or ""):
-                            raise PromConfigError(
-                                "promtool_not_found",
-                                "未安装 promtool，或配置了 require_promtool=true。"
-                                "请安装 Prometheus/promtool，或在 config.prometheus_config.require_promtool 设为 false。",
-                            )
-                        if "config_missing" in err:
-                            raise PromConfigError(
-                                "prom_config_missing",
-                                "未找到 prometheus.yml。请先准备 Prometheus 配置目录，"
-                                "或把 prometheus_config.local_dir / ssh_asset_id 指向真实 Prometheus。",
-                            )
-                        raise PromConfigError("promtool_failed", detail)
-                relr = await self._try_reload()
-                if not relr.get("ok"):
-                    raise PromConfigError("reload_failed", str(relr)[:400])
-                for rel, content in writes.items():
-                    if content is not None:
-                        self._last_good[rel] = content
-                self._txn_seq += 1
-                self._audit(
-                    "web_user",
-                    actor,
-                    f"promconfig_{action}",
-                    {
-                        **(detail or {}),
-                        "paths": list(writes.keys()),
-                        "txn": self._txn_seq,
-                        "promtool_ok": bool(check.get("ok")) if check else None,
-                        "reload_ok": True,
-                    },
-                )
-                return {"ok": True, "promtool": check, "reload": relr, "txn": self._txn_seq}
-            except Exception as e:
-                for rel, orig in originals.items():
-                    if orig is not None:
-                        try:
-                            await self.fs.write_text(rel, orig)
-                        except Exception:
-                            pass
-                try:
-                    await self._try_reload()
-                except Exception:
-                    pass
-                self._audit(
-                    "web_user",
-                    actor,
-                    f"promconfig_{action}_failed",
-                    {"detail": str(e)[:300], "paths": list(writes.keys())},
-                )
-                raise
+                await self._try_reload()
+            except Exception:
+                pass
+            self._audit(
+                "web_user",
+                actor,
+                f"promconfig_{action}_failed",
+                {"detail": str(e)[:300], "paths": list(writes.keys())},
+            )
+            raise
 
     async def _ensure_job_and_rules_entry(self, actor: str) -> None:
         """确保 prometheus.yml 含 ayana-nodes job 与规则文件引用；外科插入。"""
@@ -2437,6 +2596,51 @@ def _validate_target_address(address: str) -> str:
     if not (1 <= port <= 65535):
         raise PromConfigError("bad_target_port", port_s)
     return address
+
+
+def _validate_http_probe_url(value: Any) -> str:
+    if not isinstance(value, str) or not value or len(value) > 2048:
+        raise PromConfigError("bad_probe_url", "expected an HTTP(S) URL")
+    if any(ord(c) <= 32 or ord(c) == 127 for c in value) or "\\" in value:
+        raise PromConfigError("bad_probe_url", "control characters or whitespace")
+    try:
+        parsed = urlsplit(value)
+        if parsed.port is not None and not 1 <= parsed.port <= 65535:
+            raise ValueError("port must be between 1 and 65535")
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("HTTP(S) host required")
+        if parsed.username is not None or parsed.password is not None or parsed.fragment:
+            raise ValueError("credentials and fragments are unsupported")
+        _validate_probe_host(parsed.hostname)
+    except ValueError as exc:
+        raise PromConfigError("bad_probe_url", "invalid HTTP(S) URL") from exc
+    return value
+
+
+def _validate_probe_host(host: str) -> None:
+    import ipaddress
+
+    if ":" in host:
+        ipaddress.IPv6Address(host)
+    elif not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9.])?", host):
+        raise ValueError("invalid host")
+
+
+def _validate_probe_exporter(value: Any) -> str:
+    if not isinstance(value, str) or not value or len(value) > 260:
+        raise PromConfigError("bad_probe_exporter", "expected host:port")
+    if any(ord(c) <= 32 or ord(c) == 127 for c in value) or "\\" in value:
+        raise PromConfigError("bad_probe_exporter", "expected host:port")
+    try:
+        parsed = urlsplit("//" + value)
+        if not parsed.hostname or parsed.port is None or not 1 <= parsed.port <= 65535:
+            raise ValueError("host and port required")
+        if parsed.username is not None or parsed.password is not None or parsed.path or parsed.query or parsed.fragment:
+            raise ValueError("host:port only")
+        _validate_probe_host(parsed.hostname)
+    except ValueError as exc:
+        raise PromConfigError("bad_probe_exporter", "invalid host:port") from exc
+    return value
 
 
 def _clean_labels(labels: dict) -> dict[str, str]:

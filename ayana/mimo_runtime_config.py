@@ -4,6 +4,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Any
+from .knowledge import knowledge_root
 
 
 def runtime_paths(cfg: dict[str, Any]) -> dict[str, str]:
@@ -20,7 +21,8 @@ def verified_runtime(cfg: dict[str, Any], db: Any, admin: Any) -> dict[str, Any]
     paths = runtime_paths(cfg)
     # Web and the independent runtime must attest the same configuration even
     # when systemd starts them with different inherited Python search paths.
-    environment = {"AYANA_MCP_DB_PATH": str(Path(db.path).resolve()), "PYTHONPATH": root}
+    environment = {"AYANA_MCP_DB_PATH": str(Path(db.path).resolve()),
+                   "AYANA_MCP_KNOWLEDGE_DIR": str(knowledge_root(cfg)), "PYTHONPATH": root}
     overlay = dict(runtime.get("config") or {})
     overlay["mcp"] = {
         **(overlay.get("mcp") or {}),
