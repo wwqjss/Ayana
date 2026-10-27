@@ -10,7 +10,7 @@
 
 <title>Ayana</title>
 
-<link rel="stylesheet" href="/static/app.css?v=17">
+<link rel="stylesheet" href="/static/app.css?v=20261028-auth1">
 
 <link rel="stylesheet" href="/static/workbench.css?v=20261027-lifecycle2">
 
@@ -23,85 +23,87 @@
 <div id="app">
 
   <div id="login-view" class="login-wrap hidden">
-
-    <form id="login-form" class="card login-card">
-
-      <h1>Ayana</h1>
-
-      <p class="muted">运维控制台</p>
-
-      <div id="login-step1">
-        <label>用户名 <input name="username" id="login-username" autocomplete="username" required></label>
-        <label>密码 <input name="password" id="login-password" type="password" autocomplete="current-password" required></label>
-        <button type="submit" class="btn primary" id="login-next-btn">下一步</button>
+    <form id="login-form" class="login-card auth-panel" aria-labelledby="login-title">
+      <header class="auth-header">
+        <div class="auth-brand"><span class="auth-brand-mark" aria-hidden="true">A</span><span>Ayana</span></div>
+        <span class="auth-caption">运维控制台</span>
+      </header>
+      <div class="auth-body">
+        <div class="auth-intro">
+          <h1 id="login-title">欢迎回来</h1>
+          <p>登录你的账户，继续使用控制台。</p>
+        </div>
+        <div id="login-step1" class="auth-fields">
+          <label for="login-username">用户名<input name="username" id="login-username" autocomplete="username" placeholder="输入用户名" required></label>
+          <label for="login-password">密码<input name="password" id="login-password" type="password" autocomplete="current-password" placeholder="输入密码" required></label>
+          <div class="auth-actions"><button type="submit" class="btn primary" id="login-next-btn">下一步</button></div>
+        </div>
+        <div id="login-step2" class="auth-fields hidden">
+          <p class="auth-notice" id="login-step2-hint">账号已验证，请输入动态验证码</p>
+          <label id="totp-field" for="login-totp">动态码<input id="login-totp" inputmode="numeric" maxlength="6" placeholder="6 位动态码" autocomplete="one-time-code"></label>
+          <label id="recovery-field" for="login-recovery" class="hidden">恢复码<input id="login-recovery" placeholder="XXXX-XXXX-XXXX" autocomplete="one-time-code"></label>
+          <div class="auth-actions auth-actions-pair">
+            <button type="button" class="btn primary" id="login-totp-btn">验证并登录</button>
+            <button type="button" class="btn ghost" id="login-back-btn">返回</button>
+          </div>
+          <p class="auth-help"><a href="#" id="use-recovery">使用恢复码</a></p>
+        </div>
+        <p class="error" id="login-error" role="alert" aria-live="polite"></p>
       </div>
-
-      <div id="login-step2" class="hidden">
-        <p class="muted small" id="login-step2-hint">账号已验证，请输入动态验证码</p>
-        <label id="totp-field">动态码 <input id="login-totp" inputmode="numeric" maxlength="6" placeholder="6 位动态码" autocomplete="one-time-code"></label>
-        <label id="recovery-field" class="hidden">恢复码 <input id="login-recovery" placeholder="XXXX-XXXX-XXXX" autocomplete="one-time-code"></label>
-        <button type="button" class="btn primary" id="login-totp-btn">验证并登录</button>
-        <button type="button" class="btn ghost" id="login-back-btn">返回</button>
-        <p class="muted small" style="margin-top:10px"><a href="#" id="use-recovery">使用恢复码</a></p>
-      </div>
-
-      <p class="error" id="login-error"></p>
-
     </form>
-
   </div>
 
   <div id="setup-view" class="login-wrap hidden">
-    <form id="setup-form" class="card login-card">
-      <div class="brand-tag" style="text-align:center;margin-bottom:14px;font-size:12px;letter-spacing:.12em;color:var(--dim)">
-        <b style="color:var(--acc);font-size:14px;letter-spacing:.04em">Ayana</b> · 初始化
-      </div>
-      <h1>注册管理员</h1>
-      <p class="muted small">
-        首次安装请使用服务器上的一次性 Token 创建管理员账号。Token 用完即失效。
-      </p>
-      <label>初始化 Token
-        <input id="setup-token" type="text" autocomplete="one-time-code" placeholder="粘贴 setup-admin.token 内容" required>
-      </label>
-      <p class="muted small" id="setup-token-hint" style="margin-top:6px">
-        Token 文件：与数据库同目录的 <code>setup-admin.token</code>（权限 600）。
-        系统安装时通常为 <code>/var/lib/ayana/setup-admin.token</code>，用户安装为数据目录下同名文件。
-      </p>
-      <label>用户名
-        <input id="setup-username" type="text" autocomplete="username" placeholder="2–32 位字母/数字/._-" required>
-      </label>
-      <label>密码
-        <input id="setup-password" type="password" autocomplete="new-password" minlength="10" required>
-      </label>
-      <label>确认密码
-        <input id="setup-confirm" type="password" autocomplete="new-password" minlength="10" required>
-      </label>
-      <p class="muted small">密码至少 10 位。注册成功后直接进入控制台。</p>
-      <p class="error" id="setup-error"></p>
-      <div class="form-row" style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
-        <button type="submit" class="btn primary" id="setup-submit">创建管理员并进入</button>
+    <form id="setup-form" class="login-card auth-panel auth-panel-wide" aria-labelledby="setup-title">
+      <header class="auth-header">
+        <div class="auth-brand"><span class="auth-brand-mark" aria-hidden="true">A</span><span>Ayana</span></div>
+        <span class="auth-caption">初始化</span>
+      </header>
+      <div class="auth-body">
+        <div class="auth-intro">
+          <h1 id="setup-title">注册管理员</h1>
+          <p>使用一次性 Token 创建管理员账号，完成控制台初始化。</p>
+        </div>
+        <div class="auth-fields">
+          <label for="setup-token">初始化 Token<input id="setup-token" type="text" autocomplete="one-time-code" placeholder="粘贴 setup-admin.token 内容" required></label>
+          <p class="auth-hint" id="setup-token-hint">Token 文件：与数据库同目录的 <code>setup-admin.token</code>（权限 600）。系统安装时通常为 <code>/var/lib/ayana/setup-admin.token</code>，用户安装为数据目录下同名文件。</p>
+          <label for="setup-username">用户名<input id="setup-username" type="text" autocomplete="username" placeholder="2–32 位字母/数字/._-" required></label>
+          <label for="setup-password">密码<input id="setup-password" type="password" autocomplete="new-password" minlength="10" required></label>
+          <label for="setup-confirm">确认密码<input id="setup-confirm" type="password" autocomplete="new-password" minlength="10" required></label>
+          <p class="auth-hint">密码至少 10 位。注册成功后直接进入控制台。</p>
+          <p class="error" id="setup-error" role="alert" aria-live="polite"></p>
+          <div class="auth-actions"><button type="submit" class="btn primary" id="setup-submit">创建管理员并进入</button></div>
+        </div>
       </div>
     </form>
   </div>
 
   <div id="pw-change-view" class="login-wrap hidden">
-    <form id="pw-change-form" class="card login-card">
-      <h1>修改密码</h1>
-      <p class="muted" id="pw-change-desc">首次登录或口令已重置，请设置新密码后继续。</p>
-      <label id="pw-old-wrap" class="hidden">当前密码 <input id="pw-old" type="password" autocomplete="current-password"></label>
-      <label>新密码 <input id="pw-new" type="password" autocomplete="new-password" minlength="10" required></label>
-      <label>确认新密码 <input id="pw-confirm" type="password" autocomplete="new-password" minlength="10" required></label>
-      <p class="muted small">新密码至少 10 位；建议混合大小写、数字与符号。</p>
-      <p class="error" id="pw-change-error"></p>
-      <div class="form-row" style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
-        <button type="submit" class="btn primary" id="pw-change-submit">确认修改</button>
-        <button type="button" class="btn ghost hidden" id="pw-change-cancel">取消</button>
-        <button type="button" class="btn ghost" id="pw-change-logout">退出登录</button>
+    <form id="pw-change-form" class="login-card auth-panel" aria-labelledby="pw-change-title">
+      <header class="auth-header">
+        <div class="auth-brand"><span class="auth-brand-mark" aria-hidden="true">A</span><span>Ayana</span></div>
+        <span class="auth-caption">账户设置</span>
+      </header>
+      <div class="auth-body">
+        <div class="auth-intro">
+          <h1 id="pw-change-title">修改密码</h1>
+          <p id="pw-change-desc">首次登录或口令已重置，请设置新密码后继续。</p>
+        </div>
+        <div class="auth-fields">
+          <label id="pw-old-wrap" class="hidden" for="pw-old">当前密码<input id="pw-old" type="password" autocomplete="current-password"></label>
+          <label for="pw-new">新密码<input id="pw-new" type="password" autocomplete="new-password" minlength="10" required></label>
+          <label for="pw-confirm">确认新密码<input id="pw-confirm" type="password" autocomplete="new-password" minlength="10" required></label>
+          <p class="auth-hint">新密码至少 10 位；建议混合大小写、数字与符号。</p>
+          <p class="error" id="pw-change-error" role="alert" aria-live="polite"></p>
+          <div class="auth-actions auth-actions-wrap">
+            <button type="submit" class="btn primary" id="pw-change-submit">确认修改</button>
+            <button type="button" class="btn ghost hidden" id="pw-change-cancel">取消</button>
+            <button type="button" class="btn ghost" id="pw-change-logout">退出登录</button>
+          </div>
+        </div>
       </div>
     </form>
   </div>
-
-
 
   <div id="main-view" class="hidden">
 
