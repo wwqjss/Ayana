@@ -39,7 +39,7 @@ async def verify(config_path: str, proxy_port: int) -> dict:
         directory=paths["workdir"], base_url="http://127.0.0.1:" + str(cfg.get("mimo_serve_port") or 6290))
     manager = AgentTuiManager(db, lambda: native, mimo_bin=binary, workdir=paths["workdir"], home=paths["home"],
         state_dir=paths["state_dir"] + "/tui", proxy_port=proxy_port,
-        runtime_resolver=lambda: verified_runtime(cfg, db, admin), redactor=admin._redact)
+        runtime_resolver=lambda: verified_runtime(cfg, db, admin), redactor_factory=admin.redactor)
     await manager.start()
     sid = duty.create(origin="manual", title="原生 TUI 实时连接验收", created_by="native-smoke")["session_id"]
     rid = (await native.create_session(title="原生 TUI 实时连接验收"))["session_id"]

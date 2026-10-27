@@ -182,6 +182,27 @@ class NativeProxyTests(unittest.IsolatedAsyncioTestCase):
         async with self.http.get(self.url + "/session/" + self.rid, headers=header) as response:
             self.assertEqual(response.status, 401)
 
+    async def test_separate_web_manager_issues_credentials_and_control_after_proxy_start(self):
+        web_db = Database(Path(self.tmp.name) / "db.sqlite")
+        try:
+            web_manager = AgentTuiManager(web_db, self.manager.serve_client_factory,
+                workdir=self.manager.workdir, home=self.manager.home, state_dir=str(self.manager.state_dir),
+                proxy_port=self.manager.proxy_port, runtime_resolver=lambda: {"model": "verified/model"})
+            token = web_manager._token(self.sid, self.rid)
+            self.manager._tokens.clear()
+            web_manager._connections["web_socket"] = {"session_id": self.sid, "username": "admin"}
+            web_manager.acquire_control(self.sid, "admin", "web_socket")
+            self.assertEqual(self.manager._connections, {})
+            header = {"Authorization": "Basic " + base64.b64encode((self.sid + ":" + token).encode()).decode()}
+            async with self.http.post(self.url + "/session/" + self.rid + "/prompt_async", headers=header,
+                    json={"messageID": "msg_cross_process", "parts": [{"type": "text", "text": "inspect"}]}) as response:
+                self.assertEqual(response.status, 202)
+            receipt = web_db.query_one("SELECT session_id,status FROM agent_runtime_receipts WHERE receipt_id='receipt_native'")
+            self.assertEqual(receipt["session_id"], self.sid)
+            self.assertEqual(receipt["status"], "accepted")
+        finally:
+            web_db.close()
+
     async def test_welcome_cannot_replace_session_with_existing_history(self):
         self.control(); self.history = [{"info": {"id": "msg_existing"}}]
         async with self.http.post(self.url + "/session", json={}) as response:
@@ -212,9 +233,9 @@ class NativeProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.manager._event_matches({"type": "message.part.updated", "properties": {"sessionID": self.rid, "part": {"sessionID": "ses_other"}}}, self.rid))
 
     def test_observer_terminal_reports_cannot_encode_user_instructions(self):
-        for report in ("\x1b[1;1R", "\x1b[?1;2c", "\x1b[>0;276;0c", "\x1b[8;24;80t", "\x1b]11;rgb:0000/0000/0000\x07"):
+        for report in ("\x1b[1;1R", "\x1b[?1;2c", "\x1b[>0;276;0c", "\x1b[8;24;80t", "\x1b]11;rgb:0000/0000/0000\x07", "\x1b[?2026;2$y", "\x1b[?1004;0$y"):
             self.assertIsNotNone(TERMINAL_REPLY.fullmatch(report))
-        for instruction in ("inspect", "\r", "\x1b[13u", "\x1b[97u", "\x1b[1;1Rinspect\r", "\x1b]52;c;c2VjcmV0\x07"):
+        for instruction in ("inspect", "\r", "\x1b[13u", "\x1b[97u", "\x1b[1;1Rinspect\r", "\x1b]52;c;c2VjcmV0\x07", "\x1b[?2026;9$y", "\x1b[?9999;1$y", "\x1b[?2026;2$yinspect\r"):
             self.assertIsNone(TERMINAL_REPLY.fullmatch(instruction))
 
 

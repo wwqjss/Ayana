@@ -13,6 +13,7 @@
     ws: null, xterm: null, fit: null, observer: null, connectionId: "",
     control: false, ready: false, rendered: false, connecting: false,
     sessionId: "", attempt: 0, pingTimer: null, paintTimer: null,
+    resizeCols: 0, resizeRows: 0,
   };
   const $ = (id) => document.getElementById(id);
   function el(tag, attrs = {}, children = []) {
@@ -344,7 +345,7 @@
     }
     const toggle = (id, visible) => { const node = $(id); if (node) node.classList.toggle("hidden", !visible); };
     const admin = manageable(), open = openSession();
-    toggle("aw-term-acquire", term.ready && !term.control && admin && open);
+    toggle("aw-term-acquire", term.ready && term.rendered && !term.control && admin && open);
     toggle("aw-term-release", term.ready && term.control);
     toggle("aw-term-reconnect", !!state.currentId && !term.connecting && !term.ready);
     toggle("aw-term-disconnect", term.ready || term.connecting);
@@ -352,12 +353,21 @@
     toggle("aw-archive", !!state.currentId && admin && open);
     toggle("aw-reopen", !!state.detail && admin && !open);
   }
+  function sendTerminalSize(socket, cols, rows) {
+    if (!state.active || !term.ready || term.ws !== socket || !socket || socket.readyState !== 1) return;
+    if (!Number.isFinite(cols) || !Number.isFinite(rows)) return;
+    cols = Math.max(20, Math.min(400, Math.floor(cols)));
+    rows = Math.max(5, Math.min(200, Math.floor(rows)));
+    if (term.resizeCols === cols && term.resizeRows === rows) return;
+    term.resizeCols = cols; term.resizeRows = rows;
+    socket.send(JSON.stringify({ type: "resize", cols, rows }));
+  }
   function fitTerminal() {
     if (!term.xterm || !state.active) return;
     try { if (term.fit) term.fit.fit(); } catch (_) {}
     const socket = term.ws;
     if (socket && socket.readyState === 1 && term.ready) {
-      socket.send(JSON.stringify({ type: "resize", cols: Math.max(40, term.xterm.cols || 80), rows: Math.max(12, term.xterm.rows || 24) }));
+      sendTerminalSize(socket, term.xterm.cols, term.xterm.rows);
     }
   }
   function disconnectTerminal() {
@@ -378,6 +388,7 @@
     if (host) host.innerHTML = "";
     term.connectionId = "";
     term.sessionId = "";
+    term.resizeCols = term.resizeRows = 0;
     term.control = term.ready = term.rendered = term.connecting = false;
     updateTermUi();
   }
@@ -412,6 +423,7 @@
       // Keep device replies active; user instructions are gated below and
       // independently by the server's exclusive controller lease.
       scrollback: 2000, disableStdin: false, convertEol: false,
+      windowOptions: { getWinSizePixels: true, getCellSizePixels: true, getWinSizeChars: true },
     });
     term.xterm = terminal;
     if (Fit) { term.fit = new Fit(); terminal.loadAddon(term.fit); }
@@ -423,7 +435,7 @@
     }
     terminal.onData((data) => {
       if (!valid() || term.ws !== socket || !term.ready || socket.readyState !== 1) return;
-      const reply = /^(?:\x1b\[(?:[?>]?[0-9;]*c|[0-9]+;[0-9]+R|[0-9;]+t|\?[0-9]+u)|\x1b\](?:10|11);rgb:[0-9a-f/]+(?:\x07|\x1b\\))$/i;
+      const reply = /^(?:\x1b\[(?:[?>]?[0-9;]*c|[0-9]+;[0-9]+R|[0-9;]+t|\?[0-9]+u|\?(?:1004|1016|2004|2026|2027|2031);[0-4]\$y)|\x1b\](?:10|11);rgb:[0-9a-f/]+(?:\x07|\x1b\\))$/i;
       if (data.length <= 256 && reply.test(data)) {
         socket.send(JSON.stringify({ type: "terminal_response", data }));
         return;
@@ -432,7 +444,7 @@
       socket.send(JSON.stringify({ type: "input", data }));
     });
     terminal.onResize(({ cols, rows }) => {
-      if (valid() && term.ws === socket && term.ready && socket.readyState === 1) socket.send(JSON.stringify({ type: "resize", cols, rows }));
+      if (valid()) sendTerminalSize(socket, cols, rows);
     });
     const frame = () => valid() && term.ws === socket;
     socket.onmessage = (event) => {
@@ -457,10 +469,27 @@
         return;
       }
       if (event.data instanceof ArrayBuffer && event.data.byteLength) {
-        term.rendered = true;
-        terminal.write(new Uint8Array(event.data));
-        if (term.ready) notice("");
-        updateTermUi();
+        terminal.write(new Uint8Array(event.data), () => {
+          if (!frame() || term.xterm !== terminal) return;
+          const buffer = terminal.buffer && terminal.buffer.active;
+          if (buffer && typeof buffer.getLine === "function") {
+            const start = Math.max(0, buffer.viewportY || 0);
+            const end = Math.min(buffer.length, start + terminal.rows);
+            for (let index = start; index < end; index++) {
+              const line = buffer.getLine(index);
+              if (line && /\S/.test(line.translateToString(true))) {
+                term.rendered = true;
+                break;
+              }
+            }
+          }
+          if (term.ready && term.rendered) {
+            if (term.paintTimer) clearTimeout(term.paintTimer);
+            term.paintTimer = null;
+            notice("");
+          }
+          updateTermUi();
+        });
       }
     };
     socket.onclose = (event) => {
@@ -487,7 +516,7 @@
   async function acquireControl() {
     const sid = state.currentId, generation = state.generation;
     const connectionId = term.connectionId, attempt = term.attempt;
-    if (!term.ready || !connectionId || !manageable() || !openSession()) return;
+    if (!term.ready || !term.rendered || !connectionId || !manageable() || !openSession()) return;
     const button = $("aw-term-acquire");
     if (button && button.disabled) return;
     if (button) button.disabled = true;

@@ -33,15 +33,37 @@ const sessions = [
   { id: "sess_b", title: "manual-b", origin: "manual", status: "open", created_at: 2 },
 ];
 function environment(reply) {
-  const nodes = new Map(), calls = [], sockets = [], terminals = [], timers = new Map(), timeouts = new Map(), events = new Map(), modals = [], alerts = [], prompts = [];
+  const nodes = new Map(), calls = [], sockets = [], terminals = [], observers = [], timers = new Map(), timeouts = new Map(), events = new Map(), modals = [], alerts = [], prompts = [];
   for (const match of html.matchAll(/\bid="(aw-[^"]+|agent-workbench)"/g)) nodes.set(match[1], new Element());
   class Terminal {
-    constructor(options) { this.options = options; this.cols = 100; this.rows = 36; this.output = []; terminals.push(this); }
+    constructor(options) {
+      this.options = options; this.cols = 100; this.rows = 36; this.output = [];
+      this.screenText = ""; this.pendingWrites = [];
+      const terminal = this;
+      this.buffer = { active: { viewportY: 0, get length() { return terminal.rows; },
+        getLine(index) { return { translateToString: () => terminal.screenText.split("\n")[index] || "" }; } } };
+      terminals.push(this);
+    }
     open(host) { this.host = host; }
-    loadAddon(addon) { this.addon = addon; }
+    loadAddon(addon) { this.addon = addon; if (addon.activate) addon.activate(this); }
     onData(callback) { this.data = callback; }
-    onResize(callback) { this.resize = callback; }
-    write(data) { this.output.push(data); }
+    onResize(callback) { this.resizeHandler = callback; }
+    write(data, done) {
+      this.output.push(data);
+      const commit = () => {
+        const text = Buffer.from(data).toString("utf8");
+        if (text.includes("\x1b[2J")) this.screenText = "";
+        this.screenText += text.replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, "").replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+        if (done) done();
+      };
+      if (this.deferWrites) this.pendingWrites.push(commit); else commit();
+    }
+    completeWrites() { for (const done of this.pendingWrites.splice(0)) done(); }
+    resize(cols, rows) {
+      if (this.cols === cols && this.rows === rows) return;
+      this.cols = cols; this.rows = rows;
+      if (this.resizeHandler) this.resizeHandler({ cols, rows });
+    }
     dispose() { this.disposed = true; }
     focus() { this.focused = true; }
   }
@@ -50,7 +72,11 @@ function environment(reply) {
     send(data) { this.sent.push(data); }
     close() { this.readyState = 3; if (this.onclose) this.onclose({ code: 1000 }); }
   }
-  class Observer { observe() {} disconnect() { this.disconnected = true; } }
+  class Observer {
+    constructor(callback) { this.callback = callback; observers.push(this); }
+    observe(host) { this.host = host; }
+    disconnect() { this.disconnected = true; }
+  }
   let nextTimer = 0;
   const defaultReply = call => {
     if (call.url.includes("/sessions?")) return { ok: true, sessions };
@@ -60,7 +86,10 @@ function environment(reply) {
     return { ok: true, session: { ...sessions.find(s => s.id === sid), remote_session_id: "ses_" + sid }, incidents: [], can_control: true, can_prepare: true };
   };
   const window = {
-    Terminal, FitAddon: { FitAddon: class { fit() {} } },
+    Terminal, FitAddon: { FitAddon: class {
+      activate(terminal) { this.terminal = terminal; }
+      fit() { if (this.dimensions) this.terminal.resize(this.dimensions.cols, this.dimensions.rows); }
+    } },
     api: async (url, options = {}) => { const call = { url, method: options.method || "GET", body: options.body ? JSON.parse(options.body) : null }; calls.push(call); return reply ? await reply(call, defaultReply) : defaultReply(call); },
     showModal: (title, children) => modals.push({ title, children }), closeModal: () => {},
     addEventListener: (name, callback) => { (events.get(name) || events.set(name, []).get(name)).push(callback); },
@@ -77,8 +106,9 @@ function environment(reply) {
   vm.runInContext(source, context);
   const select = id => nodes.get("aw-session-list").children.find(c => c.tagName === "BUTTON" && c.textContent.includes(id === "sess_a" ? "automatic-a" : "manual-b")).click();
   const ready = (socket = sockets.at(-1)) => { socket.readyState = 1; socket.onmessage({ data: JSON.stringify({ type: "ready", connection_id: "connection-" + sockets.indexOf(socket), control: false }) }); };
-  const paint = (socket = sockets.at(-1)) => socket.onmessage({ data: new Uint8Array([27, 91, 72, 77, 105, 77, 111]).buffer });
-  return { nodes, calls, sockets, terminals, timers, timeouts, events, modals, alerts, prompts, select, ready, paint, window, run: code => vm.runInContext(code, context), defaultReply };
+  const output = (text, socket = sockets.at(-1)) => socket.onmessage({ data: new Uint8Array(Buffer.from(text)).buffer });
+  const paint = (socket = sockets.at(-1)) => output("\x1b[HMiMo", socket);
+  return { nodes, calls, sockets, terminals, observers, timers, timeouts, events, modals, alerts, prompts, select, ready, output, paint, window, run: code => vm.runInContext(code, context), defaultReply };
 }
 const tests = [];
 const test = (name, run) => tests.push([name, run]);
@@ -104,6 +134,56 @@ test("transport-ready waits for real native bytes before claiming a rendered con
   assert.equal(env.nodes.get("aw-term-status").textContent, "观察");
   assert.equal(env.nodes.get("aw-term-notice").classList.contains("hidden"), true);
   assert.equal(env.terminals[0].output.length, 1);
+});
+test("clear-screen and capability queries never count as a visible native screen", async () => {
+  const env = environment(); await env.window.renderAgentWorkbench(); env.ready();
+  env.output("\x1b[2J\x1b[H\x1b[?2026$p\x1b[14t");
+  assert.equal(env.nodes.get("aw-term-status").textContent, "等待原生画面");
+  assert.equal(env.nodes.get("aw-term-status").classList.contains("ready"), false);
+  assert.equal(env.nodes.get("aw-term-notice").classList.contains("hidden"), false);
+  for (const callback of [...env.timeouts.values()]) callback();
+  assert.ok(env.nodes.get("aw-term-notice").textContent.includes("尚未收到原生画面"));
+});
+test("native screen becomes ready only after the terminal parser commits visible text", async () => {
+  const env = environment(); await env.window.renderAgentWorkbench(); env.ready();
+  const terminal = env.terminals[0]; terminal.deferWrites = true;
+  env.paint();
+  assert.equal(env.nodes.get("aw-term-status").textContent, "等待原生画面");
+  assert.equal(env.nodes.get("aw-term-notice").classList.contains("hidden"), false);
+  terminal.completeWrites();
+  assert.equal(env.nodes.get("aw-term-status").textContent, "观察");
+  assert.equal(env.nodes.get("aw-term-notice").classList.contains("hidden"), true);
+  assert.equal(env.timeouts.size, 0);
+});
+test("a pending parser callback from the old terminal cannot mark a new selection ready", async () => {
+  const env = environment(); await env.window.renderAgentWorkbench(); env.ready();
+  const old = env.terminals[0]; old.deferWrites = true; env.paint();
+  await env.select("sess_b"); env.ready();
+  old.completeWrites();
+  assert.equal(env.nodes.get("aw-term-status").textContent, "等待原生画面");
+  assert.equal(env.nodes.get("aw-term-notice").classList.contains("hidden"), false);
+  env.paint();
+  assert.equal(env.nodes.get("aw-term-status").textContent, "观察");
+});
+test("fit, onResize and host observation send each distinct geometry once", async () => {
+  const env = environment(); await env.window.renderAgentWorkbench(); env.ready();
+  const socket = env.sockets[0], terminal = env.terminals[0]; socket.sent.length = 0;
+  env.events.get("resize")[0](); env.observers[0].callback();
+  assert.equal(socket.sent.length, 0);
+  terminal.addon.dimensions = { cols: 156, rows: 58 };
+  env.events.get("resize")[0](); env.observers[0].callback();
+  assert.deepEqual(socket.sent.map(JSON.parse), [{ type: "resize", cols: 156, rows: 58 }]);
+  terminal.addon.dimensions = { cols: 120, rows: 36 };
+  env.observers[0].callback();
+  assert.deepEqual(socket.sent.map(JSON.parse), [
+    { type: "resize", cols: 156, rows: 58 }, { type: "resize", cols: 120, rows: 36 },
+  ]);
+});
+test("native geometry requests enable only terminal report options", async () => {
+  const env = environment(); await env.window.renderAgentWorkbench();
+  const options = env.terminals[0].options.windowOptions;
+  assert.deepEqual(Object.keys(options).sort(), ["getCellSizePixels", "getWinSizeChars", "getWinSizePixels"]);
+  assert.ok(Object.values(options).every(value => value === true));
 });
 test("typing in observation never acquires control or replays keystrokes later", async () => {
   const env = environment(); await env.window.renderAgentWorkbench(); env.ready(); env.paint();
@@ -290,6 +370,19 @@ test("observer device reports stay separate from encoded keys and clipboard comm
   terminal.data("\x1b]52;c;c2VjcmV0\x07");
   terminal.data("\x1b[1;1Rinspect\r");
   assert.deepEqual(socket.sent.map(JSON.parse), [{ type: "terminal_response", data: "\x1b[?1;2c" }]);
+  assert.equal(env.calls.some(call => call.url.endsWith("/terminal/control")), false);
+});
+test("observers return only the native queried DECRPM modes and valid status values", async () => {
+  const env = environment(); await env.window.renderAgentWorkbench(); env.ready(); env.paint();
+  const socket = env.sockets[0], terminal = env.terminals[0]; socket.sent.length = 0;
+  const reports = [];
+  for (const mode of [1004, 1016, 2004, 2026, 2027, 2031]) {
+    for (let status = 0; status <= 4; status++) {
+      const data = `\x1b[?${mode};${status}$y`; reports.push({ type: "terminal_response", data }); terminal.data(data);
+    }
+  }
+  for (const data of ["\x1b[?2025;1$y", "\x1b[?2026;5$y", "\x1b[2026;1$y", "\x1b[?2026;1$yinspect\r", "\x1b[97u"]) terminal.data(data);
+  assert.deepEqual(socket.sent.map(JSON.parse), reports);
   assert.equal(env.calls.some(call => call.url.endsWith("/terminal/control")), false);
 });
 test("logout and navigation both invoke the workbench suspension hook", () => {

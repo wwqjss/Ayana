@@ -391,7 +391,7 @@ class App:
             mimo_bin=self.mimo_admin.mimo_bin, workdir=_native_paths["workdir"],
             home=_native_paths["home"], state_dir=str(Path(_native_paths["state_dir"]) / "tui"),
             proxy_port=int(cfg.get("agent_tui_proxy_port") or 6291), runtime_resolver=_mimo_runtime,
-            redactor=self.mimo_admin._redact,
+            redactor_factory=self.mimo_admin.redactor,
         )
         # Manual chat shares the verified read-only client rather than a no_mimo bridge.
         self.session_bridge.mimo = self.mimo_read_client

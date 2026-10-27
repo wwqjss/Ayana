@@ -31,7 +31,7 @@ MAX_BODY = 131072
 MAX_UPSTREAM_BYTES = 8 * 1024 * 1024
 CONTROL_SECONDS = 60.0
 TERMINAL_REPLY = re.compile(
-    r"(?:\x1b\[(?:[?>]?[0-9;]*c|[0-9]+;[0-9]+R|[0-9;]+t|\?[0-9]+u)"
+    r"(?:\x1b\[(?:[?>]?[0-9;]*c|[0-9]+;[0-9]+R|[0-9;]+t|\?[0-9]+u|\?(?:1004|1016|2004|2026|2027|2031);[0-4]\$y)"
     r"|\x1b\](?:10|11);rgb:[0-9a-f/]+(?:\x07|\x1b\\))\Z", re.IGNORECASE)
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS agent_runtime_bindings (
@@ -124,7 +124,8 @@ class AgentTuiManager:
                  state_dir: str = "/var/lib/ayana/tui", tmux_bin: str = "tmux",
                  proxy_host: str = "127.0.0.1", proxy_port: int = 6291,
                  runtime_resolver: Callable[[], dict] | None = None,
-                 redactor: Callable[[str], str] | None = None):
+                 redactor: Callable[[str], str] | None = None,
+                 redactor_factory: Callable[[], Callable[[str], str]] | None = None):
         if proxy_host not in ("127.0.0.1", "::1"):
             raise AgentTuiError("proxy_must_be_loopback")
         self.db = db
@@ -139,6 +140,7 @@ class AgentTuiManager:
         self.proxy_port = int(proxy_port)
         self.runtime_resolver = runtime_resolver
         self.redactor = redactor
+        self.redactor_factory = redactor_factory
         self._runner = None
         self._http = None
         self._tokens: dict[str, str] = {}
@@ -319,6 +321,14 @@ class AgentTuiManager:
             client = self.serve_client_factory()
             client._admit()
             start_home = sess.get("origin") == "manual" and not await client.messages(remote_id, limit=1)
+            # Native bootstrap may reach the independent proxy immediately.
+            # Publish the immutable RID scope before the pane can make requests.
+            t = time.time()
+            self.db.execute(
+                "INSERT INTO agent_runtime_bindings(session_id,remote_session_id,engine_pid,engine_started_at,created_at,updated_at)"
+                " VALUES(?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET remote_session_id=excluded.remote_session_id,"
+                "engine_pid=excluded.engine_pid,engine_started_at=excluded.engine_started_at,updated_at=excluded.updated_at",
+                (session_id, remote_id, engine_pid, engine_start, t, t))
             self._token(session_id, remote_id, start_home=start_home)
             pane = await self._pane(name)
             if pane and pane["pane_dead"]:
@@ -436,19 +446,27 @@ class AgentTuiManager:
         return sid, binding
 
     def _sanitize(self, value):
-        if isinstance(value, str):
-            if self.redactor:
-                try:
-                    return self.redactor(value)
-                except Exception:
-                    return "[unavailable]"
-            return re.sub(r"(?i)(Bearer\s+)\S+", r"\1[redacted]", value)
-        if isinstance(value, list):
-            return [self._sanitize(item) for item in value]
-        if isinstance(value, dict):
-            return {key: ("[redacted]" if re.search(r"(?i)(api[_-]?key|password|authorization|secret|token|private[_-]?key)$|^(key|auth)$", str(key))
-                          else self._sanitize(item)) for key, item in value.items()}
-        return value
+        try:
+            redact = self.redactor_factory() if self.redactor_factory else self.redactor
+            if self.redactor_factory and not callable(redact):
+                raise ValueError("invalid_redactor")
+        except Exception:
+            raise AgentTuiError("redaction_unavailable") from None
+        def clean(item):
+            if isinstance(item, str):
+                if redact:
+                    try:
+                        return redact(item)
+                    except Exception:
+                        raise AgentTuiError("redaction_unavailable") from None
+                return re.sub(r"(?i)(Bearer\s+)\S+", r"\1[redacted]", item)
+            if isinstance(item, list):
+                return [clean(child) for child in item]
+            if isinstance(item, dict):
+                return {key: ("[redacted]" if re.search(r"(?i)(api[_-]?key|password|authorization|secret|token|private[_-]?key)$|^(key|auth)$", str(key))
+                              else clean(child)) for key, child in item.items()}
+            return item
+        return clean(value)
 
     async def proxy_request(self, request):
         from aiohttp import web
@@ -562,7 +580,7 @@ class AgentTuiManager:
                 return web.Response(status=204) if status == 204 else web.json_response(self._sanitize(payload), status=status)
             raise AgentTuiError("tui_route_forbidden")
         except AgentTuiError as error:
-            log.warning("native TUI request rejected code=%s method=%s route=%s", error.code, request.method, self._sanitize(request.path[:200]))
+            log.warning("native TUI request rejected code=%s method=%s", error.code, request.method)
             status = 401 if error.code == "unauthorized" else 409 if error.code in ("control_required", "runtime_binding_changed", "session_turn_busy", "native_turn_pending", "native_turn_unknown", "business_task_running") else 403
             return web.json_response({"name": "AyanaTuiRestricted", "data": {"message": error.code}}, status=status)
         except Exception as error:

@@ -16,7 +16,7 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 log = __import__("logging").getLogger("ayana.mimo_admin")
 
@@ -130,14 +130,36 @@ class MimoAdmin:
         except OSError:
             return {"ok": False, "error": "process_error", "stdout": "", "stderr": ""}
 
+    def redactor(self) -> Callable[[str], str]:
+        """Snapshot current provider secrets once for one response traversal.
+
+        Catalogs contain thousands of strings. Reopening and parsing the same
+        configuration for each leaf blocks the native proxy event loop. This
+        closure performs no I/O; the next response obtains a fresh snapshot so
+        key rotation never depends on a process-wide redaction cache.
+        """
+        with _CONFIG_LOCK:
+            keys = tuple(sorted({
+                key
+                for conf in self._providers(self._read_config()).values()
+                if isinstance(key := (conf.get('options') or {}).get('apiKey'), str) and key
+            }, key=len, reverse=True))
+        bearer = re.compile(r'(?i)(Bearer\s+)[^\s"\']+')
+
+        def redact(text: str) -> str:
+            for key in keys:
+                text = text.replace(key, '[redacted]')
+            return bearer.sub(r'\1[redacted]', text)
+
+        return redact
+
     def _redact(self, text: str) -> str:
+        # Compatibility for individual diagnostic strings. Recursive callers
+        # should obtain redactor() once rather than reread for every leaf.
         try:
-            for conf in self._providers(self._read_config()).values():
-                key=(conf.get('options') or {}).get('apiKey')
-                if isinstance(key,str) and key: text=text.replace(key,'[redacted]')
-        except ValueError: pass
-        text=re.sub(r'(?i)(Bearer\s+)[^\s"\']+',r'\1[redacted]',text)
-        return text
+            return self.redactor()(text)
+        except ValueError:
+            return '[unavailable]'
 
     async def status(self) -> dict[str, Any]:
         """健康与版本：mimo 是否存在、systemd（若配置）、serve URL。"""

@@ -62,7 +62,7 @@ async def run(config_path: str) -> None:
                               runtime_resolver=resolver, runtime_attestation_path=paths["attestation"])
     tui = AgentTuiManager(db, manager.client, mimo_bin=binary, workdir=paths["workdir"], home=paths["home"],
                           state_dir=str(Path(paths["state_dir"])/"tui"), runtime_resolver=manager.validate_runtime,
-                          proxy_port=int(cfg.get("agent_tui_proxy_port") or 6291), redactor=admin._redact)
+                          proxy_port=int(cfg.get("agent_tui_proxy_port") or 6291), redactor_factory=admin.redactor)
     # A persistent server must originate in this independent unit. A socket
     # left by the Web process requires an explicit drained deployment cutover.
     await _check_tmux_owner(tui)
