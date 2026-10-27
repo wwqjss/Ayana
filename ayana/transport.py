@@ -115,6 +115,17 @@ class TransportError(Exception):
 _dispatch_guards: ContextVar[tuple[Callable[[], None], ...]] = ContextVar(
     "ayana_dispatch_guards", default=()
 )
+_session_ssh_scope: ContextVar[tuple[Any, str] | None] = ContextVar("ayana_session_ssh_scope", default=None)
+
+
+@contextmanager
+def session_ssh_scope(db: Any, session_id: str) -> Iterator[None]:
+    """Use configured investigation/execution roles only for managed sessions."""
+    token = _session_ssh_scope.set((db, session_id) if session_id else None)
+    try:
+        yield
+    finally:
+        _session_ssh_scope.reset(token)
 
 
 def check_dispatch_authority() -> None:
@@ -125,7 +136,8 @@ def check_dispatch_authority() -> None:
 
 @contextmanager
 def session_dispatch_guard(
-    db: Any, session_id: str, *, require_automatic: bool = False
+    db: Any, session_id: str, *, require_automatic: bool = False,
+    asset_id: str = "", object_id: str = "", incident_id: str = "",
 ) -> Iterator[None]:
     """An invocation-local guard; an empty scope preserves legacy callers."""
     if not session_id:
@@ -137,21 +149,34 @@ def session_dispatch_guard(
 
         try:
             authority = resolve_authority(db, session_id)
+            if authority.get("lifecycle_block"):
+                raise TransportError(authority["lifecycle_block"], session_id)
             if authority["access_mode"] != "readwrite":
                 raise TransportError("readonly_mode_rejects_write", session_id)
             if require_automatic and authority["approval_mode"] != "automatic":
                 raise TransportError("approval_required", session_id)
+            if asset_id:
+                from .agent_work_scope import WorkScopeError, claim_target
+                try:
+                    claim_target(db,session_id,asset_id=asset_id,object_id=object_id,incident_id=incident_id)
+                except WorkScopeError as exc:
+                    error = TransportError(exc.code,str(exc))
+                    error.detail = exc.detail
+                    raise error from exc
         except (AuthorityError, TransportError) as exc:
             error = TransportError(exc.code, str(exc))
+            error.detail = getattr(exc,"detail",{})
             error.dispatch_not_started = True
             raise error from exc
 
     token = _dispatch_guards.set((*_dispatch_guards.get(), check))
+    role_token = _session_ssh_scope.set((db,session_id))
     try:
         check()
         yield
     finally:
         _dispatch_guards.reset(token)
+        _session_ssh_scope.reset(role_token)
 
 
 def compute_host_key_fingerprint(key_line: str) -> tuple[str, str]:
@@ -503,6 +528,19 @@ class SSHTransport:
 
         只读探测在缺少 read 端点时，回落到同资产 write 端点（只读命令仍走 probe）。
         """
+        scope = _session_ssh_scope.get()
+        if scope:
+            database, session_id = scope
+            setting = "ssh_execute_role" if kind == "write" else "ssh_investigate_role"
+            selected = database.query_one("SELECT value FROM agent_settings WHERE key=?",(setting,))
+            role = str(selected["value"] or kind) if selected else kind
+            row = self.store.get_endpoint(asset_id,role)
+            if row and row.get("enabled"):
+                return self._endpoint(asset_id,role)
+            # Keep the legacy default read/write fallback, but an explicitly
+            # selected alternate account must never silently become root.
+            if role != kind or role not in ("read","write"):
+                raise TransportError("configured_ssh_endpoint_missing",f"{asset_id}/{role}; setting={setting}; session_id={session_id}")
         if kind == "write":
             row = self.store.get_endpoint(asset_id, "write")
             if row and row.get("enabled"):

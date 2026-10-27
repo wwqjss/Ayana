@@ -136,6 +136,7 @@ class AppWiringTests(unittest.IsolatedAsyncioTestCase):
         self.cfg = {"db_path": str(Path(self.tmp.name) / "actual.db"), "base_dir": self.tmp.name,
                     "onewbot_token": "test", "webhook_token": "test", "ssh_credential_key": "test",
                     "web_auth_pepper": "test", "mimo_bin": "web-configured-bin",
+                    "mimo_config_dir": str(Path(self.tmp.name) / "production-model"),
                     "auto_investigate": {"enabled": True, "closed_loop": True, "mimo_bin": "old-bin", "mimo_model": "old/model"},
                     "prometheus_config": {"local_dir": str(Path(self.tmp.name) / "prom")}}
         self.app = App(self.cfg)
@@ -156,6 +157,7 @@ class AppWiringTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_read_decision_and_manual_chat_share_current_config_and_same_db(self):
         app = self.app
+        self.assertEqual(app.mimo_admin.config_path().parent, Path(self.cfg["mimo_config_dir"]))
         runtime = {"mimo_bin": "web-configured-bin", "model": "xiaomi/saved-model", "cwd": self.tmp.name,
                    "config_path": str(Path(self.tmp.name) / "mimocode.jsonc"),
                    "config": {"provider": {"xiaomi": {"options": {"apiKey": "dummy-test-key"}}}, "model": "xiaomi/saved-model",

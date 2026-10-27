@@ -13,13 +13,14 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from .ntsafe import NTResult
-from .transport import TransportError, session_dispatch_guard
+from .transport import TransportError, session_dispatch_guard, session_ssh_scope
 
 
 class McpToolError(Exception):
-    def __init__(self, code: str, message: str = ""):
+    def __init__(self, code: str, message: str = "", detail: dict | None = None):
         self.code = code
         self.message = message or code
+        self.detail = detail if isinstance(detail,dict) else {}
         super().__init__(self.message)
 
 
@@ -234,10 +235,15 @@ TOOL_SPECS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "session.claim",
+        "description": "在当前真实原生会话中申请参与工单。若同一工单或目标已有任务，停止重复处置并返回已有会话；不会替换自动值班主会话。",
+        "inputSchema": {"type":"object","properties":{"incident_id":{"type":"string"}},"required":["incident_id"]},
+    },
+    {
         "name": "session.remote",
         "description": (
-            "把本地 Session 关联到 MiMo 远端会话并发起首轮调查 prompt。"
-            "已有存活远端则复用；失效则保留历史后新建（不伪装 resume）。"
+            "受管原生模式将工单关联到当前真实会话，返回已有RID，不另起任务；新任务输入使用当前CLI。"
+            "兼容独立旧客户端的远端会话创建接口。"
         ),
         "inputSchema": {
             "type": "object",
@@ -345,6 +351,7 @@ class OpsTools:
         scoped.authority_session_id = session_id
         scoped.authority_approval_mode = authority["approval_mode"]
         scoped.authority_revision = authority.get("revision")
+        scoped.effective_permissions = authority
         scoped.approved_write = approved
         scoped.mcp_incident_scope = f"_session:{session_id}"
         return OpsTools(scoped)
@@ -366,7 +373,8 @@ class OpsTools:
             except AuthorityError as exc:
                 raise McpToolError(exc.code, str(exc)) from exc
             scoped = self._with_authority(authority["session_id"])
-            return await scoped._call(name, arguments)
+            with session_ssh_scope(self.ctx.db,authority["session_id"]):
+                return await scoped._call(name, arguments)
         return await self._call(name, arguments)
 
     async def call_approved(
@@ -376,18 +384,27 @@ class OpsTools:
         if name not in _MANAGED_MUTATIONS:
             raise McpToolError("invalid_pending_tool", name)
         scoped = self._with_authority(authority_session_id, approved=True)
-        return await scoped._call(name, arguments)
+        with session_ssh_scope(self.ctx.db,authority_session_id):
+            return await scoped._call(name, arguments)
 
     def _validate_incident_scope(self, args: dict[str, Any]) -> None:
         sid = getattr(self.ctx, "authority_session_id", "")
         incident_id = args.get("incident_id") or args.get("source_incident")
         if sid and incident_id:
+            from .agent_work_scope import find_work_conflict
+            conflict = find_work_conflict(self.ctx.db,sid,incident_id=str(incident_id))
+            if conflict:
+                raise McpToolError("work_already_running",conflict["message"],conflict)
             row = self.ctx.db.query_one(
                 "SELECT 1 FROM session_incidents WHERE session_id=? AND incident_id=?",
                 (sid, str(incident_id)),
             )
             if not row:
-                raise McpToolError("incident_session_mismatch", str(incident_id))
+                owner = self._bridge().get_mapping(str(incident_id)) or {}
+                raise McpToolError("incident_session_mismatch",
+                    "当前会话尚未关联该工单；先调用 ayana_session_claim 申请参与，已有任务时进入原会话。",
+                    {"current_session_id":sid,"owner_session_id":owner.get("session_id") or "",
+                     "incident_id":str(incident_id),"next_tool":"ayana_session_claim","stop_processing":True})
 
     async def _call(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         args = arguments or {}
@@ -405,6 +422,7 @@ class OpsTools:
             "session.get": self.session_get,
             "session.write_ops": self.session_write_ops,
             "session.remote": self.session_remote,
+            "session.claim": self.session_claim,
             "action.execute": self.action_execute,
             "ops.constraints": self.ops_constraints,
             "ops.loop_status": self.ops_loop_status,
@@ -416,16 +434,20 @@ class OpsTools:
         if not fn:
             raise McpToolError("unknown_tool", name)
         try:
+            if name == "session.remote" and getattr(self.ctx,"authority_session_id",""):
+                return await fn(args)
             if name in _MANAGED_MUTATIONS and getattr(self.ctx, "authority_session_id", ""):
+                self._require_write_mode(name)
                 self._validate_incident_scope(args)
                 return await self._managed_mutation(name, args, fn)
             if name == "action.execute":
+                self._require_write_mode(name)
                 self._validate_incident_scope(args)
             return await fn(args)
         except McpToolError:
             raise
         except TransportError as e:
-            raise McpToolError(e.code, str(e)) from e
+            raise McpToolError(e.code, str(e),getattr(e,"detail",{})) from e
         except Exception as e:  # noqa: BLE001 — 工具边界统一成结构化错误
             raise McpToolError("internal", f"{type(e).__name__}: {e}") from e
 
@@ -450,7 +472,9 @@ class OpsTools:
             if not claim.get("claimed"):
                 return {"ok": False, "error": "idempotent_block", "detail": claim, "action_key": action_key}
         try:
-            with session_dispatch_guard(self.ctx.db, sid, require_automatic=not approved):
+            with session_dispatch_guard(self.ctx.db, sid, require_automatic=not approved,
+                    asset_id=str(args.get("asset_id") or ""),object_id=str(args.get("object_id") or ""),
+                    incident_id=str(args.get("incident_id") or args.get("source_incident") or "")):
                 out = await fn(args)
         except Exception as exc:
             if not approved:
@@ -497,7 +521,8 @@ class OpsTools:
                 self._audit_write(asset_id, command, "rejected_readonly", cls)
                 raise McpToolError(
                     "readonly_mode_rejects_write",
-                    f"auto-investigation requires an allowed read-only command; classified={cls}",
+                    f"当前会话为只读，命令未通过既有只读语法校验；classified={cls}",
+                    {"effective_permissions":getattr(self.ctx,"effective_permissions",{}),"classified":cls},
                 )
             # 重新引用参数，避免让原始 shell 字符串引入额外解释。
             command = shlex.join(tokens)
@@ -538,6 +563,15 @@ class OpsTools:
     ) -> dict[str, Any]:
         """统一受控写：审批门 → claim → 执行 → 确定结果/unknown → 审计。"""
         from .actions import classify_exec_result
+
+        self._require_write_mode("host.exec")
+        authority_sid = getattr(self.ctx,"authority_session_id","")
+        if authority_sid:
+            from .agent_work_scope import WorkScopeError,claim_target
+            try:
+                claim_target(self.ctx.db,authority_sid,asset_id=asset_id)
+            except WorkScopeError as exc:
+                raise McpToolError(exc.code,str(exc),exc.detail) from exc
 
         br = getattr(self.ctx, "session_bridge", None)
         duty = getattr(self.ctx, "duty", None)
@@ -614,7 +648,7 @@ class OpsTools:
                     "action_key": action_key,
                 }
         try:
-            with session_dispatch_guard(self.ctx.db, authority_sid, require_automatic=bool(authority_sid)):
+            with session_dispatch_guard(self.ctx.db, authority_sid, require_automatic=bool(authority_sid),asset_id=asset_id):
                 res = await self.ctx.transport.exec_shell(
                     asset_id, command, timeout, channel=channel
                 )
@@ -623,7 +657,7 @@ class OpsTools:
                 if br is not None and action_key:
                     br.release_write(incident_id, action_key, confirmed_safe=True, reason=e.code)
                 self._audit_write(asset_id, command, "rejected_before_dispatch", e.code)
-                return {"ok": False, "error": e.code, "action_key": action_key}
+                return {"ok": False, "error": e.code, "action_key": action_key,**(getattr(e,"detail",{}) if isinstance(getattr(e,"detail",{}),dict) else {})}
             if br is not None and action_key:
                 br.mark_unknown(incident_id, action_key, reason=f"exception:{type(e).__name__}")
             self._audit_write(asset_id, command, "unknown", str(e)[:200])
@@ -913,7 +947,30 @@ class OpsTools:
         inc_id = str(args.get("incident_id") or "").strip()
         if not inc_id:
             raise McpToolError("bad_request", "incident_id required")
+        sid = getattr(self.ctx,"authority_session_id","")
+        if sid:
+            from .agent_work_scope import find_work_conflict
+            mapping = self._bridge().get_mapping(inc_id)
+            linked = self.ctx.db.query_one("SELECT 1 FROM session_incidents WHERE session_id=? AND incident_id=?",(sid,inc_id))
+            return {"ok":True,**(mapping or {"incident_id":inc_id,"session_id":""}),
+                    "current_session_id":sid,"current_session_linked":bool(linked),
+                    "active_owner":find_work_conflict(self.ctx.db,sid,incident_id=inc_id),
+                    "next_tool":"" if linked else "ayana_session_claim"}
         return self._bridge().ensure_session(inc_id)
+
+    async def session_claim(self, args: dict[str, Any]) -> dict[str, Any]:
+        sid = getattr(self.ctx,"authority_session_id","")
+        if not sid:
+            raise McpToolError("trusted_session_context_required")
+        self._require_write_mode("session.claim")
+        inc_id = str(args.get("incident_id") or "").strip()
+        if not inc_id:
+            raise McpToolError("bad_request","incident_id required")
+        from .agent_work_scope import WorkScopeError,claim_incident
+        try:
+            return claim_incident(self.ctx.db,sid,inc_id)
+        except WorkScopeError as exc:
+            raise McpToolError(exc.code,str(exc),exc.detail) from exc
 
     async def session_write_ops(self, args: dict[str, Any]) -> dict[str, Any]:
         inc_id = str(args.get("incident_id") or "").strip()
@@ -922,6 +979,16 @@ class OpsTools:
         return {"ok": True, "write_ops": self._bridge().write_ops(inc_id)}
 
     async def session_remote(self, args: dict[str, Any]) -> dict[str, Any]:
+        sid = getattr(self.ctx,"authority_session_id","")
+        if sid:
+            self._require_write_mode("session.remote")
+            if args.get("force_new") or str(args.get("prompt") or "").strip():
+                raise McpToolError("use_current_session_input",
+                    "当前任务已绑定原生会话；请在当前CLI输入新指导，工单关联使用 ayana_session_claim，不重建RID或嵌套启动任务。",
+                    {"current_session_id":sid,"next_tool":"ayana_session_claim"})
+            result = await self.session_claim(args)
+            current = self.ctx.db.query_one("SELECT remote_session_id FROM duty_sessions WHERE id=?",(sid,))
+            return {**result,"remote_session_id":current["remote_session_id"] if current else "","action":"associated_current_native"}
         if getattr(self.ctx, "readonly", False):
             self._audit_write("", str(args.get("incident_id") or ""), "rejected_readonly", "session.remote")
             raise McpToolError("readonly_mode_rejects_write", "session.remote disabled in readonly mode")
@@ -968,9 +1035,12 @@ class OpsTools:
     # ---- final architecture: autonomous action / ops / config ----
 
     def _require_write_mode(self, tool: str) -> None:
+        authority = getattr(self.ctx,"effective_permissions",{})
+        if authority.get("lifecycle_block"):
+            raise McpToolError(authority["lifecycle_block"],"当前会话已暂停或正在删除；请在原会话明确恢复后继续。",{"effective_permissions":authority})
         if getattr(self.ctx, "readonly", False):
             self._audit_write("", "", "rejected_readonly", tool)
-            raise McpToolError("readonly_mode_rejects_write", f"{tool} disabled in readonly mode")
+            raise McpToolError("readonly_mode_rejects_write", f"当前会话为只读，拒绝 {tool}；请核对当前会话权限。",{"effective_permissions":authority})
 
     async def action_execute(self, args: dict[str, Any]) -> dict[str, Any]:
         self._require_write_mode("action.execute")

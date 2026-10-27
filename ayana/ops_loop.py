@@ -204,6 +204,9 @@ class OpsLoop:
             code = getattr(e, "code", "exec_failed")
             if code == "readonly_mode_rejects_write":
                 return {"ok": False, "error": code, "permission_blocked": True, "message": str(e)[:300]}
+            if code in ("session_paused","session_deleting","session_deleted","work_already_running"):
+                return {"ok":False,"error":code,"permission_blocked":True,"stop_processing":True,
+                        "message":str(e)[:300],**getattr(e,"context",{})}
             if not self._same_generation(incident_id,generation):return {"ok":False,"skipped":"stale_generation","error":code}
             self.note_round(
                 incident_id, progressed=False, plan_sig=plan_sig or capability,

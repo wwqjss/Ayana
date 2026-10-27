@@ -143,11 +143,15 @@ class NativeProxyTests(unittest.IsolatedAsyncioTestCase):
             response.release()
         self.assertEqual(sum(item[0] == "POST" for item in self.calls), 1)
 
-    async def test_foreign_native_busy_blocks_input_without_receipt(self):
+    async def test_same_native_busy_admits_human_guidance_to_durable_queue(self):
         self.control(); self.busy = True
         async with await self.prompt() as response:
-            self.assertEqual(response.status, 409)
-        self.assertFalse(any(item[0] == "POST" for item in self.calls))
+            self.assertEqual(response.status, 202)
+        self.assertEqual(sum(item[0] == "POST" for item in self.calls),1)
+        row=self.db.query_one("SELECT * FROM agent_runtime_receipts WHERE session_id=?",(self.sid,))
+        self.assertEqual(row["remote_session_id"],self.rid)
+        self.assertEqual(row["status"],"queued")
+        self.assertFalse(any(item[1].endswith('/abort') for item in self.calls))
 
     async def test_unacknowledged_submission_becomes_unknown_and_never_replays(self):
         self.control(); self.receipt_response = False

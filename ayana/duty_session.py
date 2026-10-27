@@ -116,10 +116,13 @@ class DutySessionManager:
         status: str = "",
         origin: str = "",
         limit: int = 50,
+        include_deleted: bool = False,
     ) -> list[dict[str, Any]]:
         sql = "SELECT * FROM duty_sessions"
         clauses: list[str] = []
         params: list[Any] = []
+        if not include_deleted:
+            clauses.append("deleted_at=0")
         if status:
             clauses.append("status=?")
             params.append(status)
@@ -134,7 +137,7 @@ class DutySessionManager:
 
     def open_auto_session(self) -> dict[str, Any] | None:
         row = self.db.query_one(
-            "SELECT * FROM duty_sessions WHERE origin='auto' AND status='open'"
+            "SELECT * FROM duty_sessions WHERE origin='auto' AND status='open' AND deleted_at=0"
             " ORDER BY created_at DESC LIMIT 1"
         )
         return dict(row) if row else None
@@ -159,7 +162,10 @@ class DutySessionManager:
     def session_for_incident(self, incident_id: str) -> dict[str, Any] | None:
         row = self.db.query_one(
             "SELECT d.* FROM session_incidents si JOIN duty_sessions d ON d.id=si.session_id"
-            " WHERE si.incident_id=? ORDER BY d.updated_at DESC LIMIT 1",
+            " WHERE si.incident_id=? ORDER BY"
+            " CASE WHEN d.origin='auto' AND d.deleted_at=0 AND d.status='open' THEN 0"
+            " WHEN d.origin IN ('auto','legacy_auto') AND d.deleted_at=0 THEN 1"
+            " WHEN d.origin IN ('auto','legacy_auto') THEN 2 ELSE 3 END, d.updated_at DESC LIMIT 1",
             (incident_id,),
         )
         return dict(row) if row else None
@@ -196,7 +202,7 @@ class DutySessionManager:
         """Reserve the one automatic slot in a SQLite write transaction."""
         with self.db.tx() as conn:
             if not conn.in_transaction: conn.execute("BEGIN IMMEDIATE")
-            existing = conn.execute("SELECT * FROM duty_sessions WHERE origin='auto' AND status='open' ORDER BY created_at DESC LIMIT 1").fetchone()
+            existing = conn.execute("SELECT * FROM duty_sessions WHERE origin='auto' AND status='open' AND deleted_at=0 ORDER BY created_at DESC LIMIT 1").fetchone()
             if existing:
                 sid = existing["id"]
                 conn.execute("UPDATE duty_sessions SET archive_due_at=0,updated_at=? WHERE id=?", (now(),sid))
@@ -215,8 +221,8 @@ class DutySessionManager:
         t = now()
         with self.db.tx() as conn:
             if not conn.in_transaction: conn.execute("BEGIN IMMEDIATE")
-            sess = conn.execute("SELECT status FROM duty_sessions WHERE id=?", (session_id,)).fetchone()
-            if not sess or sess["status"] != "open":
+            sess = conn.execute("SELECT status,deleted_at,delete_requested_at FROM duty_sessions WHERE id=?", (session_id,)).fetchone()
+            if not sess or sess["status"] != "open" or sess["deleted_at"] or sess["delete_requested_at"]:
                 return {"ok":False,"error":"session_not_open"}
             conn.execute(
                 "INSERT INTO session_incidents(session_id,incident_id,generation,joined_at) VALUES(?,?,?,?)"
@@ -272,9 +278,142 @@ class DutySessionManager:
             )
         self.record_event(session_id, type="archive_cancelled", title="新告警取消归档倒计时")
 
+    def pause_session(self, session_id: str, *, actor: str, reason: str = "user_pause") -> dict[str, Any]:
+        with self.db.tx() as conn:
+            if not conn.in_transaction: conn.execute("BEGIN IMMEDIATE")
+            session = self.get(session_id)
+            if not session or session.get("deleted_at"):
+                return {"ok": False, "error": "session_unavailable"}
+            if session["status"] != "open" or session.get("delete_requested_at"):
+                return {"ok": False, "error": "session_not_open"}
+            conn.execute("UPDATE duty_sessions SET paused_at=CASE WHEN paused_at>0 THEN paused_at ELSE ? END,pause_reason=?,archive_due_at=0,updated_at=? WHERE id=?", (now(),reason,now(),session_id))
+            self.record_event(session_id,type="session_paused",title="自动调度已暂停" if session["origin"] == "auto" else "任务已暂停",payload={"actor":actor,"reason":reason})
+            self.db.audit("web_user",actor,"agent_session_paused",detail={"session_id":session_id,"reason":reason},channel="web")
+        return {"ok": True,"session_id":session_id,"paused":True,**self.task_info(session_id)}
+
+    def resume_session(self, session_id: str, *, actor: str) -> dict[str, Any]:
+        with self.db.tx() as conn:
+            if not conn.in_transaction: conn.execute("BEGIN IMMEDIATE")
+            session=self.get(session_id)
+            if not session or session.get("deleted_at") or session.get("delete_requested_at") or session["status"] != "open":
+                return {"ok":False,"error":"session_unavailable"}
+            conn.execute("UPDATE duty_sessions SET paused_at=0,pause_reason='',human_message_revision=human_message_revision+1,updated_at=? WHERE id=?",(now(),session_id))
+            self.record_event(session_id,type="session_resumed",title="自动调度已恢复" if session["origin"] == "auto" else "已解除暂停",payload={"actor":actor})
+            self.db.audit("web_user",actor,"agent_session_resumed",detail={"session_id":session_id},channel="web")
+        return {"ok":True,"session_id":session_id,"paused":False,**self.task_info(session_id)}
+
+    def interrupt_business_work(self, session_id: str, *, actor: str):
+        """An explicit stop ends the old worker; recovery belongs to the operator."""
+        ids=self._owned_job_ids(session_id)
+        if ids:
+            marks=",".join("?" for _ in ids)
+            self.db.execute("UPDATE investigation_jobs SET status='cancelled',phase='user_interrupted',last_error='operator_stopped',lease_expires_at=0,updated_at=? WHERE incident_id IN ("+marks+") AND status='running'",(now(),*ids))
+        self.db.audit("web_user",actor,"agent_business_interrupted",detail={"session_id":session_id},channel="web")
+
+    def _owned_job_ids(self, session_id: str) -> list[str]:
+        session=self.get(session_id)
+        if not session or session["origin"] != "auto":return []
+        return [iid for iid in self.incident_ids(session_id)
+                if (self.session_for_incident(iid) or {}).get("id") == session_id]
+
+    def deletion_blockers(self, session_id: str) -> list[str]:
+        """Only this session's active execution blocks deletion, not its Incidents."""
+        session=self.get(session_id)
+        if not session or session.get("deleted_at"):return []
+        blockers=[b for b in self.native_admission_blockers(session_id) if b != "session_not_open"]
+        runtime=self.db.query_one("SELECT state FROM agent_runtime_bindings WHERE session_id=?",(session_id,))
+        if runtime and runtime["state"] not in ("idle","ready","stopped","archived"):
+            blockers.append("native_runtime_busy")
+        if self.db.query_one("SELECT 1 FROM agent_native_submissions WHERE session_id=? AND state IN ('submitting','recovering','unknown')",(session_id,)):
+            blockers.append("submission_unknown")
+        if self.db.query_one("SELECT 1 FROM agent_session_turns WHERE session_id=? AND expires_at>?",(session_id,now())):
+            blockers.append("turn_active")
+        if self.db.query_one("SELECT 1 FROM session_write_ops WHERE session_id=? AND status IN ('claimed','unknown')",(session_id,)):
+            blockers.append("write_result_pending")
+        if self.db.query_one("SELECT 1 FROM actions WHERE json_valid(params_json) AND json_extract(params_json,'$._ayana_session_id')=? AND state IN ('dispatched','unknown')",(session_id,)):
+            blockers.append("action_result_pending")
+        ids=self._owned_job_ids(session_id)
+        if ids:
+            marks=",".join("?" for _ in ids)
+            if self.db.query_one("SELECT 1 FROM investigation_jobs WHERE incident_id IN ("+marks+") AND status IN ('queued','running')",tuple(ids)):
+                blockers.append("business_task_running")
+        return list(dict.fromkeys(blockers))
+
+    def request_delete(self, session_id: str, *, actor: str, stop: bool = False) -> dict[str, Any]:
+        with self.db.tx() as conn:
+            if not conn.in_transaction:conn.execute("BEGIN IMMEDIATE")
+            session=self.get(session_id)
+            if not session:return {"ok":False,"error":"session_unavailable"}
+            if session.get("deleted_at"):return {"ok":True,"deleted":True,"session_id":session_id}
+            blockers=self.deletion_blockers(session_id)
+            if blockers and not stop:
+                return {"ok":False,"error":"session_has_tasks","blockers":blockers,"message":"会话仍有任务或结果待确认，可选择停止并删除。"}
+            t=now()
+            conn.execute("UPDATE duty_sessions SET delete_requested_at=CASE WHEN delete_requested_at>0 THEN delete_requested_at ELSE ? END,deleted_by=?,paused_at=CASE WHEN paused_at>0 THEN paused_at ELSE ? END,pause_reason='delete_requested',archive_due_at=0,delete_error='',updated_at=? WHERE id=?",(t,actor,t,t,session_id))
+            # Cancel only not-yet-dispatched work owned by this session.
+            conn.execute("UPDATE session_write_ops SET status='failed',result='cancelled:session_deleted',lease_expires_at=0,updated_at=? WHERE session_id=? AND status='awaiting_approval'",(t,session_id))
+            conn.execute("UPDATE actions SET state='cancelled',result_detail='session_deleted',finished_at=? WHERE json_valid(params_json) AND json_extract(params_json,'$._ayana_session_id')=? AND state IN ('proposed','approved')",(t,session_id))
+            ids=self._owned_job_ids(session_id)
+            if ids:
+                marks=",".join("?" for _ in ids)
+                conn.execute("UPDATE investigation_jobs SET status='cancelled',phase='user_deleted',last_error='session_deleted',lease_expires_at=0,updated_at=? WHERE incident_id IN ("+marks+") AND status='queued'",(t,*ids))
+            self.record_event(session_id,type="session_delete_requested",title="已请求停止并删除" if blockers else "已请求删除",payload={"actor":actor,"stop":stop})
+            self.db.audit("web_user",actor,"agent_session_delete_requested",detail={"session_id":session_id,"stop":stop,"blockers":blockers},channel="web")
+        self.tick_deletions(session_id=session_id)
+        session=self.get(session_id)
+        return {"ok":True,"session_id":session_id,"deleted":bool(session.get("deleted_at")),"pending":not bool(session.get("deleted_at")),"blockers":self.deletion_blockers(session_id),**self.task_info(session_id)}
+
+    def tick_deletions(self, *, session_id: str = "") -> list[str]:
+        sql="SELECT id FROM duty_sessions WHERE delete_requested_at>0 AND deleted_at=0"
+        rows=self.db.query(sql+(" AND id=?" if session_id else ""),(session_id,) if session_id else ())
+        deleted=[]
+        for row in rows:
+            sid=row["id"]
+            with self.db.tx() as conn:
+                if not conn.in_transaction:conn.execute("BEGIN IMMEDIATE")
+                blockers=self.deletion_blockers(sid)
+                if blockers:
+                    conn.execute("UPDATE duty_sessions SET delete_error=? WHERE id=?",(",".join(blockers),sid));continue
+                session=self.get(sid);t=now()
+                conn.execute("UPDATE duty_sessions SET deleted_at=?,status='archived',archived_at=CASE WHEN archived_at>0 THEN archived_at ELSE ? END,archive_due_at=0,delete_error='',updated_at=? WHERE id=? AND deleted_at=0",(t,t,t,sid))
+                conn.execute("UPDATE agent_runtime_bindings SET state='archived',updated_at=? WHERE session_id=?",(t,sid))
+                from .agent_authority import reset_controls
+                reset_controls(self.db,reason="session_deleted",session_id=sid)
+                self.record_event(sid,type="session_deleted",title="会话已从列表删除，业务记录保留",payload={"actor":session.get("deleted_by")})
+                self.db.audit("web_user",session.get("deleted_by") or "web","agent_session_deleted",detail={"session_id":sid,"history_preserved":True},channel="web")
+                deleted.append(sid)
+        return deleted
+
+    def task_info(self, session_id: str) -> dict[str, Any]:
+        session=self.get(session_id) or {}
+        runtime=self.db.query_one("SELECT state,receipt_status FROM agent_runtime_bindings WHERE session_id=?",(session_id,))
+        runtime=dict(runtime) if runtime else {}
+        blockers=self.native_admission_blockers(session_id) if session.get("status") == "open" else []
+        unknown=any("unknown" in b for b in blockers) or bool(self.db.query_one("SELECT 1 FROM agent_native_submissions WHERE session_id=? AND state='unknown'",(session_id,)))
+        recovering=bool(self.db.query_one("SELECT 1 FROM agent_native_submissions WHERE session_id=? AND state IN ('submitting','recovering')",(session_id,)))
+        busy=bool(blockers) or recovering
+        if session.get("deleted_at"):state="deleted"
+        elif session.get("delete_requested_at"):state="deleting"
+        elif unknown:state="unknown"
+        elif session.get("paused_at"):state="stopping" if busy else "paused"
+        elif session.get("status") == "archived":state="archived"
+        elif runtime.get("receipt_status") in ("cancelled","canceled","aborted","interrupted","failed","error") and not busy:state="interrupted"
+        elif busy:state="queued" if runtime.get("receipt_status") in ("queued","pending") else "running"
+        else:state="idle"
+        labels={"deleted":"会话已删除","deleting":"正在停止并删除" if busy else "正在删除","unknown":"执行结果待核对","stopping":"正在暂停，等待任务停止","paused":"已暂停","archived":"已归档","interrupted":"任务已中断，等待恢复","queued":"消息已排队","running":"任务执行中","idle":"空闲"}
+        recoverable=runtime.get("receipt_status") in ("cancelled","canceled","aborted","interrupted","failed","error") and not busy and not unknown and not session.get("delete_requested_at") and session.get("status") == "open"
+        return {"task_state":state,"task_state_label":labels[state],"can_recover":bool(recoverable),"deletion_blockers":self.deletion_blockers(session_id)}
+
     def archive_blockers(self, session_id: str) -> list[str]:
         """Business and runtime facts, never a UI-only busy flag."""
         blockers = []
+        session=self.get(session_id) or {}
+        if session.get("paused_at"):blockers.append("session_paused")
+        if session.get("delete_requested_at"):blockers.append("deletion_pending")
+        if self.db.query_one("SELECT 1 FROM agent_native_submissions WHERE session_id=? AND state IN ('submitting','recovering','unknown')",(session_id,)):
+            blockers.append("submission_pending")
+        if self.db.query_one("SELECT 1 FROM agent_runtime_bindings WHERE session_id=? AND controller_connection_id<>'' AND control_expires_at>?",(session_id,now())):
+            blockers.append("human_control")
         incs = self.incidents(session_id)
         ids = [row["incident_id"] for row in incs]
         if any((row.get("status") or "open") == "open" for row in incs): blockers.append("open_incidents")
@@ -326,6 +465,7 @@ class DutySessionManager:
     def tick_archives(self) -> dict[str, Any]:
         from .agent_authority import reset_controls
         reset_controls(self.db, reason="lease_expired", expired_only=True)
+        self.tick_deletions()
         archived = []
         for row in self.db.query("SELECT id FROM duty_sessions WHERE origin='auto' AND status='open' AND archive_due_at>0 AND archive_due_at<=?",(now(),)):
             sid=row["id"]
@@ -356,6 +496,8 @@ class DutySessionManager:
             if not conn.in_transaction: conn.execute("BEGIN IMMEDIATE")
             row=self.get(session_id)
             if not row:return {"ok":False,"error":"not_found"}
+            if row.get("deleted_at") or row.get("delete_requested_at"):
+                return {"ok":False,"error":"session_deleted"}
             if row["status"]=="open" and row["origin"]!="legacy_auto":return {"ok":True,"changed":False,"session_id":session_id}
             if not as_manual:return {"ok":False,"error":"history_requires_manual_reopen"}
             conn.execute("UPDATE duty_sessions SET status='open',origin='manual',archive_due_at=0,archived_at=0,updated_at=? WHERE id=?",(now(),session_id))
@@ -394,6 +536,10 @@ class DutySessionManager:
         terminals = tuple(sorted(_RECEIPT_TERMINAL))
         marks = ",".join("?" for _ in terminals)
         blockers = []
+        if self.db.query_one("SELECT 1 FROM agent_native_submissions WHERE session_id=? AND state='unknown'",(session_id,)):
+            blockers.append("native_turn_unknown")
+        elif self.db.query_one("SELECT 1 FROM agent_native_submissions WHERE session_id=? AND state IN ('submitting','recovering')",(session_id,)):
+            blockers.append("native_submission_pending")
         if self.db.query_one(
             "SELECT 1 FROM agent_runtime_receipts WHERE session_id=? AND status NOT IN (" + marks + ") LIMIT 1",
             (session_id, *terminals),

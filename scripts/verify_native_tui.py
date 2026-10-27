@@ -34,7 +34,7 @@ async def verify(config_path: str, proxy_port: int) -> dict:
     db = Database(cfg["db_path"])
     duty = DutySessionManager(db)
     binary = str(cfg.get("mimo_bin") or "/var/lib/ayana/.mimocode/bin/mimo")
-    admin = MimoAdmin(mimo_bin=binary, workdir=paths["workdir"])
+    admin = MimoAdmin(mimo_bin=binary, workdir=paths["workdir"], config_dir=str(cfg.get("mimo_config_dir") or ""))
     native = MimoServeClient(password=str(cfg.get("mimo_serve_password") or cfg.get("webhook_token") or ""),
         directory=paths["workdir"], base_url="http://127.0.0.1:" + str(cfg.get("mimo_serve_port") or 6290))
     manager = AgentTuiManager(db, lambda: native, mimo_bin=binary, workdir=paths["workdir"], home=paths["home"],

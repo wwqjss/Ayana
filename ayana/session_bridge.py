@@ -516,6 +516,8 @@ class SessionBridge:
         if authority_session_id:
             from .agent_authority import resolve_authority
             authority = resolve_authority(self.db, authority_session_id)
+            if authority.get("lifecycle_block"):
+                return {"ok":False,"claimed":False,"error":authority["lifecycle_block"]}
             if authority["access_mode"] != "readwrite":
                 return {"ok": False, "claimed": False, "error": "readonly_mode_rejects_write"}
         t = now()
@@ -726,6 +728,8 @@ class SessionBridge:
         if authority_session_id:
             from .agent_authority import resolve_authority
             authority = resolve_authority(self.db, authority_session_id)
+            if authority.get("lifecycle_block"):
+                return {"ok":False,"error":authority["lifecycle_block"]}
             if authority["access_mode"] != "readwrite":
                 return {"ok": False, "error": "readonly_mode_rejects_write"}
             params = {**(params or {}), "_ayana_session_id": authority_session_id}
@@ -791,6 +795,8 @@ class SessionBridge:
                     return {"ok": False, "error": exc.code}
                 if authority["access_mode"] != "readwrite":
                     return {"ok": False, "error": "readonly_mode_rejects_write"}
+                if authority.get("lifecycle_block"):
+                    return {"ok":False,"error":authority["lifecycle_block"]}
             t=now()
             cur=conn.execute("UPDATE session_write_ops SET status='claimed',updated_at=?,lease_expires_at=?,claimed_by=? WHERE incident_id=? AND action_key=? AND status='awaiting_approval'",(t,t+self._lease_seconds(),(approved_by or "human")[:64],incident_id,action_key))
             if cur.rowcount!=1:return {"ok":False,"error":"in_flight","action_key":action_key}

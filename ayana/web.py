@@ -243,6 +243,11 @@ class WebApp:
         app.router.add_get("/api/agent/sessions", self.api_agent_sessions)
         app.router.add_post("/api/agent/sessions", self.api_agent_session_create)
         app.router.add_get("/api/agent/sessions/{sid}", self.api_agent_session_detail)
+        app.router.add_delete("/api/agent/sessions/{sid}", self.api_agent_session_delete)
+        app.router.add_get("/api/agent/sessions/{sid}/copy-text", self.api_agent_session_copy_text)
+        app.router.add_post("/api/agent/sessions/{sid}/pause", self.api_agent_session_pause)
+        app.router.add_post("/api/agent/sessions/{sid}/resume-duty", self.api_agent_session_resume_duty)
+        app.router.add_post("/api/agent/sessions/{sid}/recover", self.api_agent_session_recover)
         app.router.add_post("/api/agent/sessions/{sid}/permissions", self.api_agent_session_permissions)
         app.router.add_post("/api/agent/sessions/{sid}/prompt", self.api_agent_session_prompt)
         app.router.add_post("/api/agent/sessions/{sid}/abort", self.api_agent_session_abort)
@@ -1649,9 +1654,9 @@ class WebApp:
     def _agent_session_require(self, user: dict, sid: str, *, control: bool = False) -> dict:
         duty = self._duty()
         session = duty.get(sid) if duty else None
-        if not session or not self._agent_session_visible(user, session):
+        if not session or session.get("deleted_at") or not self._agent_session_visible(user, session):
             raise web.HTTPNotFound(text=json.dumps({"ok": False, "error": "session_unavailable"}), content_type="application/json")
-        if control and not user.get("is_admin"):
+        if control and (not user.get("is_admin") or session.get("delete_requested_at")):
             raise web.HTTPForbidden(text=json.dumps({"ok": False, "error": "permission_denied"}), content_type="application/json")
         return session
 
@@ -1744,6 +1749,94 @@ class WebApp:
         result = self._duty().reopen_session(sid, actor=user["username"], as_manual=True)
         return _json(result, 200 if result.get("ok") else 409)
 
+    async def api_agent_session_pause(self, request: web.Request) -> web.Response:
+        user=self._require_admin(request);self._check_csrf(request,user)
+        sid=request.match_info.get("sid") or ""
+        session=self._agent_session_require(user,sid,control=True)
+        result=self._duty().pause_session(sid,actor=user["username"])
+        if not result.get("ok"):return _json(result,409)
+        self._duty().interrupt_business_work(sid,actor=user["username"])
+        rid=session.get("remote_session_id")
+        if rid and getattr(self,"mimo_serve",None):
+            try:
+                await self.mimo_serve.client().abort(rid)
+                result["stop_requested"]=True
+            except Exception:
+                result.update(stop_requested=False,message="调度已暂停，但本轮停止尚未确认；请核对任务状态。")
+        result.update(self._duty().task_info(sid))
+        return _json(result)
+
+    async def api_agent_session_resume_duty(self, request: web.Request) -> web.Response:
+        user=self._require_admin(request);self._check_csrf(request,user)
+        sid=request.match_info.get("sid") or ""
+        self._agent_session_require(user,sid,control=True)
+        result=self._duty().resume_session(sid,actor=user["username"])
+        # This lifts the scheduling pause. Interrupted/unknown native execution
+        # is reconciled/recovered separately, never by replaying the old prompt.
+        return _json(result,200 if result.get("ok") else 409)
+
+    async def api_agent_session_recover(self, request: web.Request) -> web.Response:
+        user=self._require_admin(request);self._check_csrf(request,user)
+        sid=request.match_info.get("sid") or ""
+        self._agent_session_require(user,sid,control=True)
+        try:body=await request.json()
+        except (ValueError,TypeError):body=None
+        if not isinstance(body,dict) or not isinstance(body.get("connection_id"),str):
+            return _json({"ok":False,"error":"connection_required"},400)
+        manager=getattr(self,"agent_tui",None)
+        if not manager:return self._agent_runtime_failure()
+        if not manager._has_control(sid,user["username"],body["connection_id"],renew=True):
+            return _json({"ok":False,"error":"control_required","message":"请先在当前会话取得控制权，再恢复任务。"},409)
+        payload={key:value for key,value in body.items() if key!="connection_id"}
+        try:
+            result=await manager.recover_session(sid,payload)
+            return _json(result,202 if result.get("ok") else 409)
+        except Exception as error:
+            code=getattr(error,"code","recovery_unavailable")
+            return _json({"ok":False,"error":code,"message":"恢复尚未确认，原会话及执行记录已保留。","task":self._duty().task_info(sid)},409)
+
+    async def api_agent_session_delete(self, request: web.Request) -> web.Response:
+        user=self._require_admin(request);self._check_csrf(request,user)
+        sid=request.match_info.get("sid") or ""
+        session=self._agent_session_require(user,sid)
+        try:body=await request.json() if request.can_read_body else {}
+        except (ValueError,TypeError):body=None
+        if not isinstance(body,dict) or any(key!="stop" for key in body) or type(body.get("stop",False)) is not bool:
+            return _json({"ok":False,"error":"invalid_delete_request"},400)
+        result=self._duty().request_delete(sid,actor=user["username"],stop=body.get("stop",False))
+        if not result.get("ok"):return _json(result,409)
+        if result.get("pending") and session.get("remote_session_id") and getattr(self,"mimo_serve",None):
+            try:
+                await self.mimo_serve.client().abort(session["remote_session_id"])
+                result["stop_requested"]=True
+            except Exception:
+                result.update(stop_requested=False,message="删除请求已保存，停止尚未确认；会话将在结果核对后移除。")
+        return _json(result,202 if result.get("pending") else 200)
+
+    async def api_agent_session_copy_text(self, request: web.Request) -> web.Response:
+        user=self._require_auth(request)
+        sid=request.match_info.get("sid") or ""
+        session=self._agent_session_require(user,sid)
+        rid=session.get("remote_session_id")
+        if not rid or not getattr(self,"mimo_serve",None):
+            return _json({"ok":False,"error":"no_assistant_result","message":"会话还没有可复制的原生回复。"},409)
+        try:
+            messages=await self.mimo_serve.client().messages(rid,limit=100)
+            assistants=[m for m in messages if isinstance(m,dict) and (m.get("info") or {}).get("role")=="assistant"]
+            assistants.sort(key=lambda m:((m.get("info") or {}).get("time") or {}).get("created",0))
+            text=""
+            for message in reversed(assistants):
+                text="\n".join(p.get("text","") for p in message.get("parts",[]) if isinstance(p,dict) and p.get("type")=="text" and isinstance(p.get("text"),str)).strip()
+                if text:break
+            if not text:return _json({"ok":False,"error":"no_assistant_result","message":"尚无可复制的回复正文。"},409)
+            if len(text.encode("utf-8"))>256*1024:
+                return _json({"ok":False,"error":"copy_text_too_large","message":"回复过长，请选择需要的部分复制。"},413)
+            admin=getattr(self,"mimo_admin",None)
+            if admin is not None:text=admin.redactor()(text)
+            return _json({"ok":True,"text":text,"source":"latest_assistant"})
+        except Exception:
+            return _json({"ok":False,"error":"copy_unavailable","message":"暂时无法读取回复，可选择终端文字复制。"},502)
+
     async def api_agent_session_permissions(self, request: web.Request) -> web.Response:
         user = self._require_admin(request)
         self._check_csrf(request, user)
@@ -1819,6 +1912,9 @@ class WebApp:
                 "remote_status": r.get("remote_status") or "none",
                 "incident_count": len(incs),
                 "open_incident_count": open_n,
+                "paused_at":r.get("paused_at") or 0,
+                "delete_requested_at":r.get("delete_requested_at") or 0,
+                **duty.task_info(r["id"]),
             })
         return _json({"ok": True, "sessions": out, "settings": duty.settings()})
 
@@ -1872,6 +1968,7 @@ class WebApp:
             pending_actions = []
         linked = {row["incident_id"] for row in incs}
         pending_actions = [row for row in pending_actions if row.get("incident_id") in linked]
+        task=duty.task_info(sid)
         return _json({
             "ok": True,
             "session": s,
@@ -1881,62 +1978,36 @@ class WebApp:
             "pending_writes": pending_writes,
             "pending_actions": pending_actions,
             "can_prepare": bool(sess.get("is_admin")),
-            "can_control": bool(sess.get("is_admin") and s.get("status") == "open"),
+            "can_control": bool(sess.get("is_admin") and s.get("status") == "open" and not s.get("delete_requested_at")),
+            **task,
+            "can_recover":bool(sess.get("is_admin") and task["can_recover"]),
+            "can_delete":bool(sess.get("is_admin") and not task["deletion_blockers"] and not s.get("delete_requested_at")),
+            "can_request_delete":bool(sess.get("is_admin") and not s.get("deleted_at")),
             "effective_permissions": resolve_authority(self.db, sid),
             "runtime": (await self.agent_tui.status(sid)).get("binding") if getattr(self, "agent_tui", None) else None,
         })
 
     async def api_agent_session_prompt(self, request: web.Request) -> web.Response:
-        from .mimo_session import READONLY_AGENT
-        from .duty_session import NativeTurnBusyError
         import uuid
-        user = self._require_admin(request); self._check_csrf(request, user)
-        sid = request.match_info.get("sid") or ""
-        session = self._agent_session_require(user, sid, control=True)
-        if session.get("status") != "open":
-            return _json({"ok": False, "error": "session_archived", "message": "请先续接历史会话。"}, 409)
-        try: body = await request.json()
-        except (ValueError, TypeError): body = None
-        if not isinstance(body, dict) or not isinstance(body.get("prompt"), str) or not 0 < len(body["prompt"].strip()) <= 20000:
-            return _json({"ok": False, "error": "prompt_required"}, 400)
-        prompt = body["prompt"].strip()
-        duty = self._duty()
-        receipt_id = ""
+        user=self._require_admin(request);self._check_csrf(request,user)
+        sid=request.match_info.get("sid") or ""
+        self._agent_session_require(user,sid,control=True)
+        try:body=await request.json()
+        except (ValueError,TypeError):body=None
+        if not isinstance(body,dict) or not isinstance(body.get("prompt"),str) or not 0<len(body["prompt"].strip())<=20000:
+            return _json({"ok":False,"error":"prompt_required"},400)
+        manager=getattr(self,"agent_tui",None)
+        if manager is None:return self._agent_runtime_failure()
+        connection=body.get("connection_id")
+        if not isinstance(connection,str) or not manager._has_control(sid,user["username"],connection,renew=True):
+            return _json({"ok":False,"error":"control_required","message":"请在当前会话取得控制权后发送。"},409)
         try:
-            async with duty.async_turn(sid, timeout=0):
-                blockers = duty.native_admission_blockers(sid, include_business=True)
-                if blockers:
-                    raise NativeTurnBusyError(blockers)
-                ready = await self._agent_remote_ready(sid)
-                rid = ready["remote_session_id"]
-                client = self.mimo_serve.client()
-                statuses = await client.session_status()
-                if not isinstance(statuses, dict):
-                    raise ValueError("native_status_unavailable")
-                native = statuses.get(rid)
-                if native is not None and (not isinstance(native, dict) or native.get("type") != "idle"):
-                    raise NativeTurnBusyError(["native_turn_pending"])
-                duty.add_message(sid, role="user", kind="prompt", title="", body=prompt)
-                try:
-                    receipt = await client.prompt_async(rid, prompt, agent=ready["agent"], message_id="msg_" + uuid.uuid4().hex)
-                    if not receipt.get("accepted"):
-                        return _json({"ok": False, "error": "turn_not_admitted", "message": "当前任务尚未接受新输入，请等待任务状态更新。"}, 409)
-                    receipt_id = str(receipt.get("receipt_id") or "")
-                    duty.record_receipt(sid, rid, receipt_id, origin="manual_api")
-                    duty.set_runtime_state(sid, "running", receipt_id=receipt_id, receipt_status="accepted")
-                except BaseException as error:
-                    if getattr(error, "code", "") not in ("invalid_prompt", "http_400", "http_401", "http_403", "http_404", "provider_not_verified", "runtime_changed"):
-                        # Persist uncertainty before releasing the submission lease,
-                        # including cancellation caused by an HTTP disconnect.
-                        duty.set_runtime_state(sid, "unknown", receipt_id=receipt_id, receipt_status="unknown")
-                    raise
-        except (NativeTurnBusyError, TimeoutError):
-            return _json({"ok": False, "error": "session_busy", "message": "该会话仍有任务执行中或结果待确认，请等待当前任务结束。"}, 409)
-        except Exception:
-            duty.add_message(sid, role="system", kind="error", title="发送失败", body="原生运行服务或已验证模型配置暂不可用。")
-            return self._agent_runtime_failure()
-        self.db.audit("web_user", user["username"], "agent_session_prompt", detail={"session_id": sid,"remote_session_id": rid,"len": len(prompt)}, channel="web")
-        return _json({"ok": True, "accepted": True, "session_id": sid, "remote_session_id": rid, "receipt": receipt}, 202)
+            ready=await self._agent_remote_ready(sid);rid=ready["remote_session_id"]
+            _,receipt=await manager._submit_prompt(sid,rid,"/session/"+rid+"/prompt_async",{"parts":[{"type":"text","text":body["prompt"].strip()}],"agent":ready["agent"],"messageID":"msg_"+uuid.uuid4().hex},origin="manual_api")
+            return _json({"ok":True,"accepted":True,"session_id":sid,"remote_session_id":rid,"receipt":receipt},202)
+        except Exception as error:
+            code=getattr(error,"code","submission_unconfirmed")
+            return _json({"ok":False,"error":code,"message":str(error)},503 if code=="native_backend_unavailable" else 409)
 
     async def api_agent_session_abort(self, request: web.Request) -> web.Response:
         sess = self._require_admin(request)
@@ -1951,6 +2022,8 @@ class WebApp:
         if not serve or not remote_id:
             return _json({"ok": False, "error": "no_remote_session"}, 400)
         try:
+            duty.pause_session(sid,actor=sess["username"],reason="user_stop")
+            duty.interrupt_business_work(sid,actor=sess["username"])
             await serve.client().abort(remote_id)
         except Exception as e:  # noqa: BLE001
             return _json({"ok": False, "error": "abort_failed", "message": str(e)[:200]}, 502)
@@ -2034,8 +2107,10 @@ class WebApp:
             return _json({"ok": False, "error": "duty_unavailable"}, 503)
         settings = duty.settings()
         ssh_accounts = []
+        ssh_roles=[]
         try:
             if self.ssh_store:
+                ssh_roles=self.ssh_store.list_roles()
                 for ep in self.ssh_store.list_endpoints():
                     ssh_accounts.append({
                         "asset_id": ep.get("asset_id"),
@@ -2047,7 +2122,7 @@ class WebApp:
                     })
         except Exception:
             ssh_accounts = []
-        return _json({"ok": True, "settings": settings, "ssh_endpoints": ssh_accounts})
+        return _json({"ok": True, "settings": settings, "ssh_endpoints": ssh_accounts,"ssh_roles":ssh_roles})
 
     async def api_agent_settings_post(self, request: web.Request) -> web.Response:
         sess = self._require_admin(request)
@@ -2090,6 +2165,9 @@ class WebApp:
             else:
                 if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value):
                     return _json({"ok": False, "error": "invalid_credential_role", "field": key}, 400)
+                store=getattr(self,"ssh_store",None)
+                if store is not None and value not in {role["name"] for role in store.list_roles()}:
+                    return _json({"ok":False,"error":"ssh_role_not_found","field":key,"message":"请选择已配置的 SSH 角色。"},400)
                 val = str(value)
             changed[key] = val
         if ("require_human_approval" in changed and "auto_approval_mode" in changed
@@ -2165,7 +2243,7 @@ class WebApp:
             try:
                 from .actions import classify_exec_result
                 from .transport import session_dispatch_guard
-                with session_dispatch_guard(self.db, authority_sid):
+                with session_dispatch_guard(self.db, authority_sid,asset_id=asset_id):
                     res = await self.transport.exec_shell(asset_id, command, timeout_f, channel=channel)
                 state, detail = classify_exec_result(res)
                 if state == "unknown":

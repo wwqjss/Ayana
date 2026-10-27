@@ -56,7 +56,7 @@ async def run(config_path: str) -> None:
     from .agent_authority import reset_controls
     reset_controls(db, reason="native_runtime_restart")
     binary = str(cfg.get("mimo_bin") or (cfg.get("auto_investigate") or {}).get("mimo_bin") or Path(paths["home"])/".mimocode/bin/mimo")
-    admin = MimoAdmin(mimo_bin=binary, workdir=paths["workdir"])
+    admin = MimoAdmin(mimo_bin=binary, workdir=paths["workdir"], config_dir=str(cfg.get("mimo_config_dir") or ""))
     resolver = lambda: verified_runtime(cfg, db, admin)
     password = str(cfg.get("mimo_serve_password") or cfg.get("webhook_token") or "")
     manager = MimoServeManager(mimo_bin=binary, workdir=paths["workdir"], home=paths["home"],

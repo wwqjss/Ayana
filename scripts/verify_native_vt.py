@@ -35,7 +35,7 @@ async def run(config_path: str, headless_module: str, *, use_runtime_proxy: bool
     paths = runtime_paths(cfg)
     db = Database(cfg["db_path"])
     duty = DutySessionManager(db)
-    admin = MimoAdmin(mimo_bin=str(cfg.get("mimo_bin") or (cfg.get("auto_investigate") or {}).get("mimo_bin") or "mimo"), workdir=paths["workdir"])
+    admin = MimoAdmin(mimo_bin=str(cfg.get("mimo_bin") or (cfg.get("auto_investigate") or {}).get("mimo_bin") or "mimo"), workdir=paths["workdir"], config_dir=str(cfg.get("mimo_config_dir") or ""))
     runtime = lambda: verified_runtime(cfg, db, admin)
     client = MimoServeClient(base_url="http://127.0.0.1:" + str(cfg.get("mimo_serve_port") or 6290),
         password=str(cfg.get("mimo_serve_password") or cfg.get("webhook_token") or ""), directory=paths["workdir"],

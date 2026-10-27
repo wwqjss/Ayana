@@ -340,7 +340,8 @@ class RuntimeAndMigrationTests(unittest.TestCase):
                 old.execute("UPDATE agent_settings SET value='0' WHERE key='require_human_approval'")
                 old.close()
             db=Database(path)
-            self.assertEqual(db.schema_version(),24)
+            from ayana.db import SCHEMA_VERSION
+            self.assertEqual(db.schema_version(),SCHEMA_VERSION)
             before=resolve_authority(db,"sess_old")
             self.assertEqual((before["access_mode"],before["approval_mode"]),("readonly","automatic"))
             duty=DutySessionManager(db)

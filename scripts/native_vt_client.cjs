@@ -32,7 +32,7 @@ let phase = "initialize", activeModal = null, context, window;
 class Element {
   constructor(tag = "div") {
     this.tagName = tag.toUpperCase(); this.children = []; this.listeners = {};
-    this.className = ""; this._text = ""; this.value = ""; this.checked = false; this.disabled = false; this.style = {};
+    this.className = ""; this._text = ""; this.value = ""; this.checked = false; this.disabled = false; this.style = {};this.dataset={};
     this.classList = {
       contains: name => this.className.split(/\s+/).includes(name),
       add: (...names) => { this.className = [...new Set([...this.className.split(/\s+/), ...names])].join(" "); },
@@ -101,13 +101,14 @@ window = {
   showModal: (title, children) => { activeModal = { title, children }; modals.push(activeModal); },
   closeModal: () => { activeModal = null; },
   addEventListener: () => {}, matchMedia: () => ({ matches: false }),
+  atob: value => Buffer.from(value, "base64").toString("binary"),
 };
 const trackedTimeout = (callback, delay) => {
   const timer = setTimeout(() => { timeouts.delete(timer); callback(); }, delay);
   timeouts.add(timer); return timer;
 };
 context = vm.createContext({
-  window, console, WebSocket: Socket, ArrayBuffer, Uint8Array, URL, Date,
+  window, console, WebSocket: Socket, ArrayBuffer, Uint8Array, URL, Date, TextEncoder, TextDecoder,
   document: { getElementById: id => nodes.get(id), createElement: tag => new Element(tag), createTextNode: text => { const node = new Element("#text"); node.textContent = text; return node; } },
   location: { protocol: base.protocol, host: base.host },
   ResizeObserver: class { observe() {} disconnect() {} },
@@ -117,6 +118,7 @@ context = vm.createContext({
   setTimeout: trackedTimeout, clearTimeout: timer => { clearTimeout(timer); timeouts.delete(timer); },
   alert: () => {}, confirm: () => false, prompt: () => null,
 });
+vm.runInContext(fs.readFileSync(path.resolve(__dirname, "../ayana/static/terminal_clipboard.js"), "utf8"), context, { filename: "actual-terminal-clipboard.js" });
 vm.runInContext(source, context, { filename: "actual-workbench.js" });
 
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));

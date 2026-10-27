@@ -31,7 +31,7 @@ async def run(config_path: str) -> dict:
     from ayana.web import WebApp
     cfg=load_config(config_path);paths=runtime_paths(cfg);db=Database(cfg['db_path'])
     duty=DutySessionManager(db);actor='authority-probe-'+secrets.token_hex(5)
-    admin=MimoAdmin(mimo_bin=str(cfg.get('mimo_bin') or (cfg.get('auto_investigate') or {}).get('mimo_bin') or 'mimo'),workdir=paths['workdir'])
+    admin=MimoAdmin(mimo_bin=str(cfg.get('mimo_bin') or (cfg.get('auto_investigate') or {}).get('mimo_bin') or 'mimo'),workdir=paths['workdir'],config_dir=str(cfg.get('mimo_config_dir') or ''))
     runtime=lambda:verified_runtime(cfg,db,admin)
     native=MimoServeClient(base_url='http://127.0.0.1:'+str(cfg.get('mimo_serve_port') or 6290),password=str(cfg.get('mimo_serve_password') or cfg.get('webhook_token') or ''),directory=paths['workdir'])
     manager=AgentTuiManager(db,lambda:native,mimo_bin=admin._bin(),workdir=paths['workdir'],home=paths['home'],state_dir=paths['state_dir']+'/tui',runtime_resolver=runtime,redactor_factory=admin.redactor)

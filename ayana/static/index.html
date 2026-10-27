@@ -12,7 +12,7 @@
 
 <link rel="stylesheet" href="/static/app.css?v=17">
 
-<link rel="stylesheet" href="/static/workbench.css?v=20261027-authority1">
+<link rel="stylesheet" href="/static/workbench.css?v=20261027-lifecycle2">
 
 <link rel="stylesheet" href="/static/xterm/xterm.css">
 
@@ -473,6 +473,8 @@
                 </div>
                 <div class="aw-term-actions">
                   <span id="aw-term-status" class="aw-term-status" role="status">未接入</span>
+                  <span id="aw-task-state" class="aw-task-state" role="status"></span>
+                  <button type="button" class="btn ghost small" id="aw-copy-result" disabled>复制结果</button>
                   <button type="button" class="btn ghost small hidden" id="aw-term-reconnect">重新接入</button>
                   <button type="button" class="btn primary small hidden" id="aw-term-acquire">接管控制</button>
                   <button type="button" class="btn ghost small hidden" id="aw-term-release">释放控制</button>
@@ -482,17 +484,28 @@
                     <summary class="btn ghost small" aria-label="会话操作">···</summary>
                     <div class="aw-menu-items">
                       <button type="button" class="btn ghost small hidden" id="aw-term-disconnect">离开视图</button>
+                      <button type="button" class="btn ghost small hidden" id="aw-pause-duty">暂停值班</button>
+                      <button type="button" class="btn ghost small hidden" id="aw-resume-duty">恢复值班</button>
+                      <button type="button" class="btn ghost small hidden" id="aw-recover-task">恢复任务</button>
                       <button type="button" class="btn ghost small hidden" id="aw-archive">归档会话</button>
                       <button type="button" class="btn ghost small hidden" id="aw-reopen">续接为手动会话</button>
                       <button type="button" class="btn danger small hidden" id="aw-term-stop">停止任务</button>
+                      <button type="button" class="btn danger small hidden" id="aw-delete-session">删除会话</button>
+                      <button type="button" class="btn danger small hidden" id="aw-delete-stop">停止并删除</button>
                     </div>
                   </details>
                 </div>
               </div>
             </div>
+            <div id="aw-task-feedback" class="aw-task-feedback hidden" role="status" aria-live="polite"></div>
             <div id="aw-terminal" class="aw-terminal">
               <div id="aw-term-host" class="aw-term-host"></div>
               <div id="aw-term-notice" class="aw-term-notice" role="status" aria-live="polite">选择或新建会话，直接进入 MiMoCode。</div>
+            </div>
+            <div id="aw-copy-panel" class="aw-copy-panel hidden" role="region" aria-label="复制内容">
+              <div class="aw-copy-heading"><span id="aw-copy-status" role="status" aria-live="polite">复制内容</span><button type="button" class="btn ghost small" id="aw-copy-dismiss" aria-label="关闭复制内容">关闭</button></div>
+              <textarea id="aw-copy-text" rows="3" readonly aria-label="待复制文本"></textarea>
+              <div class="aw-copy-actions"><span class="aw-muted">此处仅用于复制，不会发送给 Agent。</span><button type="button" class="btn primary small" id="aw-copy-local">复制到本机</button></div>
             </div>
           </section>
           <aside class="aw-right" id="aw-right">
@@ -1283,10 +1296,11 @@
 <script src="/static/xterm/xterm.js"></script>
 
 <script src="/static/xterm/xterm-addon-fit.js"></script>
+<script src="/static/terminal_clipboard.js?v=20261027-lifecycle2"></script>
 
 <script src="/static/app.js?v=47-native1"></script>
 <script src="/static/settings.js?v=20261026"></script>
-<script src="/static/workbench.js?v=20261027-authority1"></script>
+<script src="/static/workbench.js?v=20261027-lifecycle2"></script>
 
 </body>
 

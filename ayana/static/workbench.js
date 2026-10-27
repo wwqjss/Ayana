@@ -7,13 +7,13 @@
   const state = {
     sessions: [], currentId: "", detail: null, settings: null, permissions: null, permissionBusy: false,
     active: false, generation: 0, mount: 0, pollTimer: null, polling: false,
-    collapsedLeft: false, collapsedRight: false,
+    collapsedLeft: false, collapsedRight: false, settingsGeneration: 0, lifecycleBusy: false, taskEventVersion: 0,
   };
   const term = {
     ws: null, xterm: null, fit: null, observer: null, connectionId: "",
     control: false, ready: false, rendered: false, connecting: false,
     sessionId: "", attempt: 0, pingTimer: null, paintTimer: null,
-    resizeCols: 0, resizeRows: 0,
+    resizeCols: 0, resizeRows: 0, clipboard: null, clipboardHandler: null,
   };
   const $ = (id) => document.getElementById(id);
   function el(tag, attrs = {}, children = []) {
@@ -50,6 +50,22 @@
     box.classList.toggle("hidden", !text);
     box.classList.toggle("error", failure);
   }
+  function taskFeedback(text = "", failure = false) {
+    const node = $("aw-task-feedback");
+    if (!node) return;
+    node.textContent = text; node.classList.toggle("hidden", !text); node.classList.toggle("error", failure);
+  }
+  function taskState() {
+    const detail = state.detail || {}, session = detail.session || {};
+    if (session.deleted_at) return "deleted";
+    if (session.delete_requested_at) return detail.task_state || "deleting";
+    if (session.status === "archived") return "archived";
+    return detail.task_state || (session.paused_at ? "paused" : detail.runtime && detail.runtime.state) || "idle";
+  }
+  function taskLabel() {
+    const names = {idle:"空闲",running:"任务执行中",busy:"任务执行中",queued:"输入已排队",interrupted:"任务已中断",paused:"值班已暂停",unknown:"执行结果待核对",stopping:"正在停止",deleting:"正在停止并删除",archived:"已归档",deleted:"已删除"};
+    return state.detail && state.detail.task_state_label || names[taskState()] || "状态待确认";
+  }
   function renderSessionList() {
     const root = $("aw-session-list");
     if (!root) return;
@@ -72,7 +88,9 @@
           el("div", { class: "aw-session-title", text: item.title || item.id }),
           el("div", { class: "aw-session-meta", text: `${fmtTime(item.updated_at || item.created_at)} · ${item.incident_count || 0} 个工单` }),
         ]);
-        if (item.archive_due_at > 0) button.appendChild(el("div", { class: "aw-session-badge warn", text: "归档缓冲中" }));
+        if (item.delete_requested_at) button.appendChild(el("div", { class: "aw-session-badge warn", text: item.task_state_label || "等待停止并删除" }));
+        else if (item.paused_at) button.appendChild(el("div", { class: "aw-session-badge warn", text: "值班已暂停" }));
+        else if (item.archive_due_at > 0) button.appendChild(el("div", { class: "aw-session-badge warn", text: "归档缓冲中" }));
         else if (item.status === "archived") button.appendChild(el("div", { class: "aw-session-badge", text: "已归档" }));
         root.appendChild(button);
       });
@@ -82,7 +100,7 @@
     const session = state.detail && state.detail.session;
     const title = $("aw-chat-title"), meta = $("aw-chat-meta");
     if (title) title.textContent = session ? session.title || session.id : "MiMoCode 工作台";
-    if (meta) meta.textContent = session ? [session.origin === "auto" ? "自动值班" : "手动会话", session.status === "open" ? "进行中" : "已归档", session.archive_due_at > 0 ? "归档缓冲中" : ""].filter(Boolean).join(" · ") : "";
+    if (meta) meta.textContent = session ? [session.origin === "auto" ? "自动值班" : "手动会话", session.status === "open" ? "会话开放" : "已归档", session.archive_due_at > 0 ? "归档缓冲中" : ""].filter(Boolean).join(" · ") : "";
     updateTermUi();
   }
   function renderRight() {
@@ -101,9 +119,7 @@
     }
     const incidents = d.incidents || [];
     const openN = incidents.filter((i) => i.status === "open").length;
-    prog.textContent = incidents.length
-      ? `关联 ${incidents.length} 个工单 · 进行中 ${openN}`
-      : "无关联工单";
+    prog.textContent = `${taskLabel()} · ` + (incidents.length ? `关联 ${incidents.length} 个工单 · 未关闭 ${openN}` : "无关联工单");
     if (incs) {
       incs.innerHTML = "";
       if (!incidents.length) incs.appendChild(el("div", { class: "aw-muted", text: "暂无" }));
@@ -205,20 +221,31 @@
     const result = await api("/api/agent/sessions?limit=100");
     if (!state.active || state.mount !== mount) return false;
     if (!result || !result.ok) return false;
-    state.sessions = result.sessions || [];
+    state.sessions = (result.sessions || []).filter((session) => !session.deleted_at);
     if (result.settings) state.settings = result.settings;
     renderSessionList();
     return true;
   }
   async function loadDetail(sid, generation = state.generation) {
     if (!sid) return false;
+    const taskEventVersion = state.taskEventVersion;
     const result = await api(sessionPath(sid));
     if (!current(sid, generation)) return false;
     if (!result || !result.ok) {
+      if (state.detail && state.detail.session && state.detail.session.delete_requested_at
+          && result && ["session_unavailable", "not_found", "session_deleted"].includes(result.error)) {
+        await chooseAfterDeletion(sid, generation); return false;
+      }
       notice(result && (result.message || result.error) || "无法读取会话。", true);
       return false;
     }
+    if (result.session && result.session.deleted_at) { await chooseAfterDeletion(sid, generation); return false; }
+    if (taskEventVersion !== state.taskEventVersion && state.detail) {
+      result.task_state = state.detail.task_state;
+      result.task_state_label = state.detail.task_state_label;
+    }
     state.detail = result;
+    if (result.can_control === false) term.control = false;
     adoptPermissions(result.effective_permissions);
     renderHeader(); renderRight(); renderSessionList();
     return true;
@@ -229,6 +256,8 @@
     state.currentId = sid;
     state.permissions = null; state.permissionBusy = false;
     state.detail = null;
+    state.taskEventVersion = 0; state.lifecycleBusy = false;
+    taskFeedback("");
     renderHeader(); renderRight(); renderSessionList();
     notice("正在读取会话…");
     try {
@@ -263,17 +292,17 @@
     try {
       const result = await api(sessionPath(sid) + "/abort", { method: "POST", body: "{}" });
       if (!current(sid, generation)) return;
-      if (!result || !result.ok) notice(result && (result.message || result.error) || "停止请求未确认。", true);
-      else notice("已发送停止请求，正在核对任务状态。");
+      if (!result || !result.ok) taskFeedback(result && (result.message || result.error) || "停止请求未确认。", true);
+      else taskFeedback("已发送停止请求，正在核对任务状态。");
       await loadDetail(sid, generation);
-    } catch (_) { if (current(sid, generation)) notice("停止请求未确认，请检查任务状态。", true); }
+    } catch (_) { if (current(sid, generation)) taskFeedback("停止请求未确认，请检查任务状态。", true); }
   }
   async function archiveCurrent() {
     const sid = state.currentId, generation = state.generation;
     if (!sid || !confirm("归档当前会话？仍有运行任务或待审批时将保留会话。")) return;
     const result = await api(sessionPath(sid) + "/archive", { method: "POST", body: "{}" });
     if (!current(sid, generation)) return;
-    if (!result || !result.ok) notice(result && (result.message || result.error) || "当前会话暂不能归档。", true);
+    if (!result || !result.ok) taskFeedback(result && (result.message || result.error) || "当前会话暂不能归档。", true);
     await loadSessions(); await loadDetail(sid, generation);
   }
   async function reopenCurrent() {
@@ -281,64 +310,174 @@
     if (!sid || !confirm("将此历史会话续接为手动会话？自动值班会话继续独立运行。")) return;
     const result = await api(sessionPath(sid) + "/reopen", { method: "POST", body: "{}" });
     if (!current(sid, generation)) return;
-    if (!result || !result.ok) { notice(result && (result.message || result.error) || "续接失败。", true); return; }
+    if (!result || !result.ok) { taskFeedback(result && (result.message || result.error) || "续接失败。", true); return; }
     await loadSessions();
     if (current(sid, generation)) await selectSession(sid);
   }
+  async function chooseAfterDeletion(sid, generation) {
+    if (!current(sid, generation)) return;
+    disconnectTerminal();
+    const nextGeneration = ++state.generation;
+    state.currentId = ""; state.detail = null; state.permissions = null; state.lifecycleBusy = false;
+    taskFeedback(""); renderHeader(); renderRight();
+    await loadSessions();
+    if (!state.active || state.generation !== nextGeneration || state.currentId) return;
+    state.sessions = state.sessions.filter((item) => item.id !== sid);
+    renderSessionList();
+    const next = state.sessions.find((item) => item.origin === "auto" && item.status === "open") || state.sessions[0];
+    if (next) await selectSession(next.id);
+    else notice("会话已从列表移除。可以新建会话开始任务。");
+  }
+  async function lifecycleAction(action) {
+    const sid = state.currentId, generation = state.generation;
+    if (!sid || state.lifecycleBusy || !manageable()) return;
+    const prompts = {
+      pause: "暂停此会话的自动值班接单？当前任务的执行状态会单独显示。",
+      "resume-duty": "恢复此会话的自动值班接单？这不会自动重放未知操作。",
+      recover: "继续当前中断任务？将沿用原生会话和权限，未知写操作不会自动重放。",
+      delete: "删除此会话并从列表移除？关联工单和审计历史会保留。",
+      "delete-stop": "停止当前任务并删除此会话？结果尚未确认时会保留会话，关联工单和审计历史不删除。",
+    };
+    if (!confirm(prompts[action])) return;
+    state.lifecycleBusy = true; updateTermUi();
+    try {
+      const deleting = action === "delete" || action === "delete-stop";
+      const response = await api(sessionPath(sid) + (deleting ? "" : "/" + action), {
+        method: deleting ? "DELETE" : "POST", body: JSON.stringify(deleting ? { stop: action === "delete-stop" } : action === "recover" ? { connection_id: term.connectionId } : {}),
+      });
+      if (!current(sid, generation)) return;
+      if (!response || !response.ok) {
+        const reason = response && (response.message || response.error);
+        taskFeedback(reason || "操作未完成，请核对当前任务状态。", true);
+        await loadDetail(sid, generation); return;
+      }
+      ++state.taskEventVersion;
+      if (deleting && !response.pending) { await chooseAfterDeletion(sid, generation); return; }
+      if (deleting && response.pending && state.detail && state.detail.session) state.detail.session.delete_requested_at = state.detail.session.delete_requested_at || Date.now() / 1000;
+      const messages = {pause:"暂停值班请求已确认。", "resume-duty":"已恢复值班接单。", recover:"恢复请求已接受，正在核对原生任务状态。", delete:"删除正在等待安全确认。", "delete-stop":"正在停止并删除；确认完成前会话仍会保留。"};
+      taskFeedback(response.message || messages[action]);
+      await loadSessions();
+      if (current(sid, generation)) await loadDetail(sid, generation);
+    } catch (_) { if (current(sid, generation)) taskFeedback("请求结果未确认，请核对状态，勿重复提交。", true); }
+    finally { if (current(sid, generation)) { state.lifecycleBusy = false; updateTermUi(); } }
+  }
   async function openAgentSettings() {
-    const r = await api("/api/agent/settings");
-    const settings = (r && r.settings) || {};
-    const wrap = el("div", { class: "form-col" });
-    const access = el("select", { id: "agent-auto-access" }, [el("option", { value:"readonly", text:"只读" }), el("option", { value:"readwrite", text:"读写" })]);
-    access.value = settings.auto_access_mode || "readwrite";
-    wrap.appendChild(el("label", { class:"form-row" }, [el("span", {text:"自动值班执行权限"}),access]));
-    const approval = el("input", { type: "checkbox", id: "agent-require-approval" });
-    approval.checked = settings.require_human_approval !== false;
-    wrap.appendChild(el("label", { class: "form-row" }, [
-      approval,
-      el("span", { text: "自动值班人工审批（关闭后按现有授权规则自动审批）" }),
-    ]));
-    const delay = el("input", { type: "number", min: "30", max: "3600", value: String(settings.archive_delay_sec || 300) });
-    wrap.appendChild(el("label", { class: "form-row" }, [
-      el("span", { text: "归档倒计时（秒）" }),
-      delay,
-    ]));
-    const invRole = el("input", { type: "text", value: settings.ssh_investigate_role || "read", placeholder: "read" });
-    const exeRole = el("input", { type: "text", value: settings.ssh_execute_role || "write", placeholder: "write" });
-    wrap.appendChild(el("label", { class: "form-row" }, [el("span", { text: "调查 SSH 角色" }), invRole]));
-    wrap.appendChild(el("label", { class: "form-row" }, [el("span", { text: "执行 SSH 角色" }), exeRole]));
-
-    const eps = (r && r.ssh_endpoints) || [];
-    const epBox = el("div", { class: "aw-muted" });
-    epBox.textContent = eps.length
-      ? "当前 SSH 端点：" + eps.map((e) => `${e.asset_id}/${e.role}=${e.username}`).join("，")
-      : "未配置 SSH 端点（请在「连接」页配置）";
-    wrap.appendChild(epBox);
-
-    const save = el("button", {
-      type: "button",
-      class: "btn primary",
-      text: "保存设置",
-      onclick: async () => {
-        const body = {
-          auto_access_mode: access.value,
-          auto_approval_mode: approval.checked ? "manual" : "automatic",
-          archive_delay_sec: Number(delay.value) || 300,
-          ssh_investigate_role: invRole.value || "read",
-          ssh_execute_role: exeRole.value || "write",
-        };
-        const res = await api("/api/agent/settings", { method: "POST", body: JSON.stringify(body) });
-        if (!res.ok) alert(res.message || res.error || "保存失败");
-        else if (appCloseModal) { appCloseModal(); await loadDetail(state.currentId); }
-        else if (appShowModal) appShowModal("已保存", [el("p", { text: "Agent 设置已更新" })]);
-      },
-    });
-    wrap.appendChild(save);
-    if (appShowModal) {
-      appShowModal("Agent 设置", [wrap]);
-    } else {
-      alert("设置面板不可用");
+    const generation = ++state.settingsGeneration, mount = state.mount;
+    let reply;
+    try { reply = await api("/api/agent/settings"); }
+    catch (_) { taskFeedback("无法读取 Agent 设置，请重试。", true); return; }
+    if (!state.active || mount !== state.mount || generation !== state.settingsGeneration) return;
+    if (!reply || !reply.ok) { taskFeedback(reply && (reply.message || reply.error) || "无法读取 Agent 设置。", true); return; }
+    if (!appShowModal) { taskFeedback("设置面板暂不可用。", true); return; }
+    const settings = reply.settings || {}, endpoints = reply.ssh_endpoints || [];
+    const wrap = el("div", { class: "aw-agent-settings" });
+    const feedback = el("p", { class: "settings-footer-note", role: "status", "aria-live": "polite", text: "修改尚未保存" });
+    const dirty = () => { feedback.textContent = "修改尚未保存"; feedback.classList.remove("error"); };
+    function section(title, description) {
+      const card = el("section", { class: "settings-card" }, [el("h3", { text: title }), el("p", { class: "settings-description", text: description })]);
+      wrap.appendChild(card); return card;
     }
+    function field(label, control, help = "") {
+      return el("label", { class: "settings-field" }, [el("span", { text: label }), control, ...(help ? [el("small", { text: help })] : [])]);
+    }
+    function segmented(id, label, choices, value) {
+      const group = el("div", { id, class: "aw-segmented", role: "group", "aria-label": label });
+      const buttons = [];
+      group.value = value;
+      group.setValue = (selected) => {
+        group.value = selected;
+        buttons.forEach(([key, button]) => { button.classList.toggle("selected", key === selected); button.setAttribute("aria-pressed", String(key === selected)); });
+      };
+      choices.forEach(([key, text]) => {
+        const button = el("button", { type: "button", class: "btn", text, onclick: () => { group.setValue(key); dirty(); } });
+        buttons.push([key, button]); group.appendChild(button);
+      });
+      group.setValue(value); return group;
+    }
+    const dutyCard = section("自动值班", "无人接管时按以下配置执行。接管期间的临时权限不会改动这里。");
+    const access = segmented("agent-auto-access", "自动值班执行权限", [["readonly", "只读"], ["readwrite", "读写"]], settings.auto_access_mode || "readwrite");
+    const approval = segmented("agent-auto-approval", "自动值班审批模式", [["manual", "人工审批"], ["automatic", "自动审批"]], settings.auto_approval_mode || (settings.require_human_approval === false ? "automatic" : "manual"));
+    dutyCard.appendChild(field("执行权限", access, "只读拒绝写操作；读写时再按审批模式执行。"));
+    dutyCard.appendChild(field("审批模式", approval, "自动审批继续遵守当前工具授权、凭据与审计规则。"));
+    const sshCard = section("SSH 账户", "选择实际连接角色。调查与执行可以使用不同账户。");
+    const roles = (reply.ssh_roles || []).map((role) => typeof role === "string" ? { name: role } : role).filter((role) => role && role.name);
+    endpoints.forEach((endpoint) => { if (endpoint.role && !roles.some((role) => role.name === endpoint.role)) roles.push({ name: endpoint.role }); });
+    function rolePicker(id, label, selected) {
+      const select = el("select", { id, "aria-label": label });
+      const choices = roles.slice();
+      if (!choices.some((role) => role.name === selected)) choices.push({ name: selected, missing: true });
+      choices.forEach((role) => select.appendChild(el("option", { value: role.name, disabled: role.enabled === false ? "disabled" : null, text: (role.display_name || role.name) + (role.missing ? "（待配置）" : role.enabled === false ? "（已停用）" : role.kind ? " · " + (role.kind === "write" ? "写角色" : "读角色") : "") })));
+      select.value = selected;
+      const accounts = el("div", { class: "aw-role-accounts", "aria-live": "polite" });
+      function renderAccounts() {
+        accounts.innerHTML = "";
+        const assets = [...new Set(endpoints.map((endpoint) => endpoint.asset_id))];
+        if (!assets.length) accounts.appendChild(el("span", { class: "aw-muted", text: "暂无 SSH 端点，请在「连接」中配置。" }));
+        assets.forEach((asset) => {
+          const enabled = endpoints.filter((endpoint) => endpoint.enabled && endpoint.asset_id === asset);
+          let endpoint = enabled.find((candidate) => candidate.role === select.value);
+          if (!endpoint && ["read", "write"].includes(select.value)) {
+            const compatibleRoles = roles.filter((role) => role.kind === select.value && role.enabled !== false).map((role) => role.name);
+            endpoint = compatibleRoles.map((role) => enabled.find((candidate) => candidate.role === role)).find(Boolean);
+            if (!endpoint && select.value === "read") endpoint = enabled.find((candidate) => candidate.role === "write");
+          }
+          const text = endpoint ? `${endpoint.username || "未设置账户"}@${endpoint.host || "未设置地址"}` + (endpoint.role !== select.value ? ` · 回退至 ${endpoint.role}` : "") : "未配置该角色的可用端点";
+          accounts.appendChild(el("div", { class: "aw-role-account" }, [el("span", { text: asset || "资产" }), el("code", { text })]));
+        });
+      }
+      select.onchange = () => { renderAccounts(); dirty(); };
+      renderAccounts();
+      sshCard.appendChild(field(label, select)); sshCard.appendChild(accounts);
+      return select;
+    }
+    const investigateRole = rolePicker("agent-ssh-investigate", "调查账户角色", settings.ssh_investigate_role || "read");
+    const executeRole = rolePicker("agent-ssh-execute", "执行账户角色", settings.ssh_execute_role || "write");
+    const archiveCard = section("会话归档", "自动值班关联工单全部关闭后开始缓冲；新告警会取消倒计时。手动会话独立管理。");
+    const presets = [["60", "1 分钟"], ["300", "5 分钟"], ["900", "15 分钟"], ["1800", "30 分钟"], ["custom", "自定义"]];
+    const delayValue = String(settings.archive_delay_sec || 300);
+    const delayPreset = el("select", { id: "agent-archive-preset", "aria-label": "归档缓冲" }, presets.map(([value, text]) => el("option", { value, text })));
+    delayPreset.value = presets.some(([value]) => value === delayValue) ? delayValue : "custom";
+    const customDelay = el("input", { id: "agent-archive-custom", type: "number", min: "30", max: "3600", step: "1", value: delayValue, "aria-label": "自定义归档秒数" });
+    const customField = field("自定义秒数", customDelay, "支持 30–3600 秒。");
+    function showCustom() { customField.classList.toggle("hidden", delayPreset.value !== "custom"); }
+    delayPreset.onchange = () => { showCustom(); dirty(); }; customDelay.oninput = dirty;
+    archiveCard.appendChild(field("归档缓冲", delayPreset)); archiveCard.appendChild(customField); showCustom();
+    let busy = false;
+    const cancel = el("button", { type: "button", class: "btn", text: "取消", onclick: () => {
+      if (busy) return; ++state.settingsGeneration; if (appCloseModal) appCloseModal();
+    } });
+    const save = el("button", { type: "button", class: "btn primary", text: "保存设置", onclick: async () => {
+      if (busy) return;
+      const seconds = Number(delayPreset.value === "custom" ? customDelay.value : delayPreset.value);
+      if (!Number.isInteger(seconds) || seconds < 30 || seconds > 3600) {
+        feedback.textContent = "归档缓冲需要是 30–3600 秒的整数。"; feedback.classList.add("error"); return;
+      }
+      busy = true;
+      for (const tag of ["button", "input", "select"]) wrap.querySelectorAll(tag).forEach((node) => { node.disabled = true; });
+      wrap.setAttribute("aria-busy", "true"); save.textContent = "保存中…";
+      feedback.textContent = "正在保存…"; feedback.classList.remove("error");
+      const stillCurrent = () => state.active && state.settingsGeneration === generation && wrap.isConnected !== false;
+      try {
+        const result = await api("/api/agent/settings", { method: "POST", body: JSON.stringify({
+          auto_access_mode: access.value, auto_approval_mode: approval.value, archive_delay_sec: seconds,
+          ssh_investigate_role: investigateRole.value, ssh_execute_role: executeRole.value,
+        }) });
+        if (!stillCurrent()) return;
+        if (!result || !result.ok) { feedback.textContent = result && (result.message || result.error) || "保存失败，请重试。"; feedback.classList.add("error"); return; }
+        state.settings = result.settings || state.settings;
+        feedback.textContent = "已保存并生效"; cancel.textContent = "关闭";
+        if (state.currentId) await loadDetail(state.currentId);
+      } catch (_) { if (stillCurrent()) { feedback.textContent = "保存结果未确认，请重新读取设置后核对。"; feedback.classList.add("error"); } }
+      finally {
+        busy = false;
+        if (stillCurrent()) {
+          for (const tag of ["button", "input", "select"]) wrap.querySelectorAll(tag).forEach((node) => { node.disabled = false; });
+          wrap.setAttribute("aria-busy", "false"); save.textContent = "保存设置";
+        }
+      }
+    } });
+    wrap.appendChild(el("div", { class: "settings-actions aw-settings-actions" }, [feedback, cancel, save]));
+    appShowModal("Agent 设置", [wrap]);
   }
 
 
@@ -347,6 +486,60 @@
     if (state.permissions && value.revision < state.permissions.revision) return;
     state.permissions = value;
     if (value.controller_active === false) term.control = false;
+  }
+  function clipboardBridge() {
+    if (term.clipboard) return term.clipboard;
+    if (!window.AyanaTerminalClipboard) { taskFeedback("复制组件未加载，请刷新页面。", true); return null; }
+    const sid = state.currentId, generation = state.generation, attempt = term.attempt;
+    term.clipboard = window.AyanaTerminalClipboard.create({
+      document, navigator: window.navigator,
+      isCurrent: () => current(sid, generation) && term.attempt === attempt,
+      preview: () => $("aw-copy-text"),
+      onOffer: (text, visible) => {
+        const panel = $("aw-copy-panel"), preview = $("aw-copy-text");
+        if (preview) preview.value = text;
+        if (panel) panel.classList.toggle("hidden", !visible);
+      },
+      onStatus: (text, failure) => {
+        const status = $("aw-copy-status");
+        if (status) { status.textContent = text; status.classList.toggle("error", failure); }
+        taskFeedback(text, failure);
+      },
+    });
+    return term.clipboard;
+  }
+  async function copyResult() {
+    const sid = state.currentId, generation = state.generation, attempt = term.attempt;
+    if (!sid || !state.detail) return;
+    const bridge = clipboardBridge();
+    if (!bridge) return;
+    const selected = term.xterm && typeof term.xterm.getSelection === "function" ? term.xterm.getSelection() : "";
+    if (selected) {
+      if (bridge.offer(selected)) await bridge.copyPending();
+      return;
+    }
+    const button = $("aw-copy-result");
+    if (button && button.disabled) return;
+    if (button) button.disabled = true;
+    try {
+      const reply = await api(sessionPath(sid) + "/copy-text");
+      if (!current(sid, generation) || term.attempt !== attempt) return;
+      if (!reply || !reply.ok || typeof reply.text !== "string" || !reply.text) {
+        taskFeedback(reply && (reply.message || reply.error) || "当前没有可复制的回答，可先在终端选中文本。", true); return;
+      }
+      // HTTP fetch has crossed the gesture boundary. Offer text and require a
+      // fresh click instead of pretending a remote copy updated this device.
+      bridge.offer(reply.text);
+    } catch (_) { if (current(sid, generation) && term.attempt === attempt) taskFeedback("无法读取复制内容，请重试或选择终端文本。", true); }
+    finally { if (current(sid, generation) && term.attempt === attempt) updateTermUi(); }
+  }
+  async function copyLocal() {
+    const bridge = term.clipboard, sid = state.currentId, generation = state.generation;
+    const button = $("aw-copy-local");
+    if (!bridge || button && button.disabled) return;
+    if (button) button.disabled = true;
+    try { await bridge.copyPending(); }
+    finally { if (button && current(sid, generation) && term.clipboard === bridge) button.disabled = false; }
   }
   async function changePermissions(changes) {
     const sid=state.currentId, generation=state.generation, attempt=term.attempt, connectionId=term.connectionId;
@@ -357,9 +550,9 @@
       const result=await api(sessionPath(sid)+"/permissions", {method:"POST",body:JSON.stringify({connection_id:connectionId,revision,...changes})});
       if (!current(sid,generation) || term.attempt!==attempt || term.connectionId!==connectionId) return;
       adoptPermissions(result && result.effective_permissions);
-      if (!result || !result.ok) notice(result && (result.message || result.error) || "权限切换未生效。",true);
-      else notice("");
-    } catch (_) { if(current(sid,generation) && term.attempt===attempt) notice("权限切换尚未确认，请核对后端状态。",true); }
+      if (!result || !result.ok) taskFeedback(result && (result.message || result.error) || "权限切换未生效。",true);
+      else taskFeedback("权限已更新。");
+    } catch (_) { if(current(sid,generation) && term.attempt===attempt) taskFeedback("权限切换尚未确认，请核对后端状态。",true); }
     finally { if(current(sid,generation)) {state.permissionBusy=false;updateTermUi();} }
   }
   function updateTermUi() {
@@ -372,16 +565,30 @@
     }
     const toggle = (id, visible) => { const node = $(id); if (node) node.classList.toggle("hidden", !visible); };
     const admin = manageable(), open = openSession();
+    const detail = state.detail || {}, session = detail.session || {}, task = taskState();
+    const taskBadge = $("aw-task-state");
+    if (taskBadge) { taskBadge.textContent = state.detail ? taskLabel() : ""; taskBadge.dataset.state = task; }
+    const copy = $("aw-copy-result");
+    if (copy) { copy.disabled = !state.currentId || !state.detail; copy.textContent = term.xterm && typeof term.xterm.hasSelection === "function" && term.xterm.hasSelection() ? "复制选中文本" : "复制结果"; }
     const access=$("aw-access-mode"), approval=$("aw-approval-mode"), permissions=state.permissions;
-    if(access) {access.disabled=!(term.control && permissions && term.ready && open && !state.permissionBusy);access.textContent=permissions ? permissions.access_mode==="readwrite" ? "读写" : "只读" : "权限待确认";access.setAttribute("aria-checked",String(!!permissions && permissions.access_mode==="readwrite"));}
-    if(approval) {approval.disabled=!(term.control && permissions && term.ready && open && !state.permissionBusy);if(permissions)approval.value=permissions.approval_mode;}
-    toggle("aw-term-acquire", term.ready && term.rendered && !term.control && admin && open);
+    const canControl = admin && detail.can_control !== false && !session.delete_requested_at;
+    if(access) {access.disabled=!(term.control && canControl && permissions && term.ready && open && !state.permissionBusy);access.textContent=permissions ? permissions.access_mode==="readwrite" ? "读写" : "只读" : "权限待确认";access.setAttribute("aria-checked",String(!!permissions && permissions.access_mode==="readwrite"));}
+    if(approval) {approval.disabled=!(term.control && canControl && permissions && term.ready && open && !state.permissionBusy);if(permissions)approval.value=permissions.approval_mode;}
+    toggle("aw-term-acquire", term.ready && term.rendered && !term.control && canControl && open);
     toggle("aw-term-release", term.ready && term.control);
     toggle("aw-term-reconnect", !!state.currentId && !term.connecting && !term.ready);
     toggle("aw-term-disconnect", term.ready || term.connecting);
     toggle("aw-term-stop", !!state.currentId && admin && open);
     toggle("aw-archive", !!state.currentId && admin && open);
     toggle("aw-reopen", !!state.detail && admin && !open);
+    toggle("aw-pause-duty", !!state.detail && admin && open && session.origin === "auto" && !session.paused_at && !session.delete_requested_at);
+    toggle("aw-resume-duty", !!state.detail && admin && open && session.origin === "auto" && !!session.paused_at && !session.delete_requested_at);
+    toggle("aw-recover-task", !!state.detail && admin && open && detail.can_recover === true && !session.delete_requested_at);
+    toggle("aw-delete-session", !!state.detail && admin && detail.can_delete !== false && !session.delete_requested_at);
+    toggle("aw-delete-stop", !!state.detail && admin && detail.can_request_delete !== false && detail.can_delete === false && !session.delete_requested_at);
+    for (const id of ["aw-pause-duty", "aw-resume-duty", "aw-delete-session", "aw-delete-stop", "aw-recover-task"]) {
+      const button = $(id); if (button) button.disabled = state.lifecycleBusy || id === "aw-recover-task" && !term.control;
+    }
   }
   function sendTerminalSize(socket, cols, rows) {
     if (!state.active || !term.ready || term.ws !== socket || !socket || socket.readyState !== 1) return;
@@ -407,6 +614,13 @@
     term.pingTimer = term.paintTimer = null;
     if (term.observer) term.observer.disconnect();
     term.observer = null;
+    if (term.clipboardHandler) term.clipboardHandler.dispose();
+    term.clipboardHandler = null;
+    if (term.clipboard) term.clipboard.dispose();
+    term.clipboard = null;
+    const copyPanel = $("aw-copy-panel"), copyText = $("aw-copy-text");
+    if (copyPanel) copyPanel.classList.add("hidden");
+    if (copyText) copyText.value = "";
     if (term.ws) {
       term.ws.onopen = term.ws.onmessage = term.ws.onclose = term.ws.onerror = null;
       term.ws.close();
@@ -458,6 +672,11 @@
     term.xterm = terminal;
     if (Fit) { term.fit = new Fit(); terminal.loadAddon(term.fit); }
     terminal.open($("aw-term-host"));
+    const clipboard = clipboardBridge();
+    if (clipboard && terminal.parser && typeof terminal.parser.registerOscHandler === "function") {
+      term.clipboardHandler = terminal.parser.registerOscHandler(52, (data) => clipboard.receiveOsc52(data));
+    }
+    if (typeof terminal.onSelectionChange === "function") terminal.onSelectionChange(() => { if (valid()) updateTermUi(); });
     socket = new WebSocket(`${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws/agent-terminal?session_id=${encodeURIComponent(sid)}`);
     term.ws = socket; socket.binaryType = "arraybuffer";
     } catch (_) {
@@ -470,7 +689,8 @@
         socket.send(JSON.stringify({ type: "terminal_response", data }));
         return;
       }
-      if (!term.control) return;
+      if (!term.control || state.detail && (state.detail.can_control === false || state.detail.session && state.detail.session.delete_requested_at)) return;
+      if (term.clipboard) term.clipboard.arm();
       socket.send(JSON.stringify({ type: "input", data }));
     });
     terminal.onResize(({ cols, rows }) => {
@@ -496,7 +716,16 @@
           adoptPermissions(message.effective_permissions);
           term.control = !!message.control; updateTermUi();
         } else if (message.type === "error") {
-          notice(message.message || message.error || "原生连接异常，请核对任务状态。", true);
+          taskFeedback(message.message || message.error || "原生连接异常，请核对任务状态。", true);
+        } else if (message.type === "action_ack" || message.type === "task_state") {
+          ++state.taskEventVersion;
+          if (state.detail && message.state !== "error" && (message.state || message.task_state)) {
+            state.detail.task_state = message.state || message.task_state;
+            if (message.task_state_label) state.detail.task_state_label = message.task_state_label;
+            else delete state.detail.task_state_label;
+          }
+          if (message.type === "action_ack" || message.message) taskFeedback(message.message || (message.queued ? "输入已排队，将在当前任务之后处理。" : "任务状态已更新。"), !!message.error || message.state === "error" || message.ok === false);
+          renderHeader();
         }
         return;
       }
@@ -555,12 +784,12 @@
     try {
       const result = await api(sessionPath(sid) + "/terminal/control", { method: "POST", body: JSON.stringify({ action: "acquire", connection_id: connectionId }) });
       if (!current(sid, generation) || term.attempt !== attempt || term.connectionId !== connectionId) return;
-      if (!result || !result.ok) { notice(result && (result.message || result.error) || "无法取得控制权，可能已由其他窗口持有。", true); return; }
+      if (!result || !result.ok) { taskFeedback(result && (result.message || result.error) || "无法取得控制权，可能已由其他窗口持有。", true); return; }
       adoptPermissions(result.effective_permissions);
       term.control = true; updateTermUi(); notice("");
       if (term.xterm) term.xterm.focus();
       fitTerminal();
-    } catch (_) { if (current(sid, generation) && term.attempt === attempt) notice("控制权请求未完成，请重新核对。", true); }
+    } catch (_) { if (current(sid, generation) && term.attempt === attempt) taskFeedback("控制权请求未完成，请重新核对。", true); }
     finally { if (button) button.disabled = false; }
   }
   async function releaseControl() {
@@ -571,8 +800,8 @@
     try {
       const result = await api(sessionPath(sid) + "/terminal/control", { method: "POST", body: JSON.stringify({ action: "release", connection_id: connectionId }) });
       if(current(sid,generation) && term.attempt===attempt) {adoptPermissions(result && result.effective_permissions);updateTermUi();}
-      if (current(sid, generation) && term.attempt === attempt && (!result || !result.ok)) notice("释放请求未确认，键盘已在当前页面停用。", true);
-    } catch (_) { if (current(sid, generation) && term.attempt === attempt) notice("释放请求未确认，键盘已在当前页面停用。", true); }
+      if (current(sid, generation) && term.attempt === attempt && (!result || !result.ok)) taskFeedback("释放请求未确认，键盘已在当前页面停用。", true);
+    } catch (_) { if (current(sid, generation) && term.attempt === attempt) taskFeedback("释放请求未确认，键盘已在当前页面停用。", true); }
   }
   function stopPoll() {
     if (state.pollTimer) clearInterval(state.pollTimer);
@@ -610,6 +839,10 @@
       "aw-term-release": releaseControl, "aw-term-stop": abortCurrent,
       "aw-term-disconnect": () => { disconnectTerminal(); notice("已离开当前视图，后台任务继续执行。"); },
       "aw-archive": archiveCurrent, "aw-reopen": reopenCurrent,
+      "aw-pause-duty": () => lifecycleAction("pause"), "aw-resume-duty": () => lifecycleAction("resume-duty"),
+      "aw-recover-task": () => lifecycleAction("recover"), "aw-delete-session": () => lifecycleAction("delete"),
+      "aw-delete-stop": () => lifecycleAction("delete-stop"), "aw-copy-result": copyResult, "aw-copy-local": copyLocal,
+      "aw-copy-dismiss": () => { if (term.clipboard) term.clipboard.clear(); },
       "aw-toggle-left": () => toggleColumn("left"), "aw-toggle-right": () => toggleColumn("right"),
     };
     Object.entries(handlers).forEach(([id, callback]) => { const node = $(id); if (node) node.onclick = callback; });

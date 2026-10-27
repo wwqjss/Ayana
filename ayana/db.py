@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 
 class MigrationError(RuntimeError):
@@ -1203,6 +1203,26 @@ def _migrate_v24_agent_authority(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('agent_authority_revision','0')")
 
 
+def _migrate_v25_session_lifecycle(conn: sqlite3.Connection) -> None:
+    """Durable pause/deletion requests and native admission; retain all history."""
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(duty_sessions)")}
+    for column, definition in (
+        ("paused_at", "REAL NOT NULL DEFAULT 0"), ("pause_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("delete_requested_at", "REAL NOT NULL DEFAULT 0"), ("deleted_at", "REAL NOT NULL DEFAULT 0"),
+        ("deleted_by", "TEXT NOT NULL DEFAULT ''"), ("delete_error", "TEXT NOT NULL DEFAULT ''"),
+        ("human_message_revision", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE duty_sessions ADD COLUMN {column} {definition}")
+    conn.execute("CREATE TABLE IF NOT EXISTS agent_native_submissions (session_id TEXT NOT NULL, submission_id TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL, created_at REAL NOT NULL, updated_at REAL NOT NULL, remote_session_id TEXT NOT NULL DEFAULT '',payload_json TEXT NOT NULL DEFAULT '{}',receipt_id TEXT NOT NULL DEFAULT '',PRIMARY KEY(session_id,submission_id))")
+    submission_columns={r[1] for r in conn.execute("PRAGMA table_info(agent_native_submissions)")}
+    for column,definition in (("remote_session_id","TEXT NOT NULL DEFAULT ''"),("payload_json","TEXT NOT NULL DEFAULT '{}'"),("receipt_id","TEXT NOT NULL DEFAULT ''")):
+        if column not in submission_columns:conn.execute(f"ALTER TABLE agent_native_submissions ADD COLUMN {column} {definition}")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_native_submitting ON agent_native_submissions(session_id) WHERE state='submitting'")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_native_recovering ON agent_native_submissions(session_id) WHERE kind='recovery' AND state IN ('submitting','recovering','unknown')")
+    conn.execute("CREATE TABLE IF NOT EXISTS agent_work_targets (asset_id TEXT NOT NULL, object_id TEXT NOT NULL, session_id TEXT NOT NULL, updated_at REAL NOT NULL, PRIMARY KEY(asset_id,object_id))")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_v1_baseline,
     2: _migrate_v2_p0_p1_columns,
@@ -1228,6 +1248,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     22: _migrate_v22_duty_sessions,
     23: _migrate_v23_native_runtime,
     24: _migrate_v24_agent_authority,
+    25: _migrate_v25_session_lifecycle,
 }
 
 _MIGRATION_NAMES = {
@@ -1255,6 +1276,7 @@ _MIGRATION_NAMES = {
     22: "duty_sessions",
     23: "native_runtime_bindings",
     24: "live_session_authority",
+    25: "native_guidance_and_session_lifecycle",
 }
 
 

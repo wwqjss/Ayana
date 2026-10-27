@@ -45,8 +45,11 @@ def resolve_authority(db: Any, session_id: str, *, conn=None) -> dict:
         raise AuthorityError("authority_state_invalid")
     global_rev = _one(db, conn, "SELECT value FROM meta WHERE key='agent_authority_revision'")
     revision = int(global_rev["value"] if global_rev else 0) * 1000000000 + int(session["authority_revision"]) * 2 + (0 if active else 1)
+    lifecycle_block = ("session_deleted" if session.get("deleted_at") else "session_deleting" if session.get("delete_requested_at")
+                       else "session_paused" if session.get("paused_at") else "")
     return {"session_id": session_id, "access_mode": access, "approval_mode": approval,
         "source": source, "revision": revision, "controller_active": active,
+        "lifecycle_block": lifecycle_block, "write_allowed": not lifecycle_block and access == "readwrite",
         "lease_expires_at": float(binding.get("control_expires_at") or 0) if active else 0}
 
 

@@ -187,6 +187,34 @@ class AgentTuiManager:
         from .mimo_session import MANAGED_AGENT, READONLY_AGENT
         return MANAGED_AGENT if self._runtime().get("managed_context") else READONLY_AGENT
 
+    def engine_signature(self) -> dict:
+        runtime=self._runtime()
+        path=runtime.get("runtime_attestation_path")
+        if not path:
+            # Isolated protocol fixtures have no POSIX process attestation.
+            return {"fixture_endpoint":self.serve_client_factory().base_url}
+        data=_read_private(Path(path))
+        if (not data.get("owner_start") or _identity(data.get("owner_pid",0))!=data["owner_start"]
+                or data.get("home")!=self.home or data.get("workdir")!=self.workdir):
+            raise AgentTuiError("runtime_binding_changed")
+        return {key:data.get(key) for key in ("owner_pid","owner_start","config_digest")}
+
+    def require_live_controller(self,sid,expected=None):
+        binding=self._binding(sid) or {}
+        if not binding.get("controller") or not binding.get("controller_connection_id") or float(binding.get("control_expires_at") or 0)<=time.time():
+            raise AgentTuiError("control_required")
+        identity=(binding["controller"],binding["controller_connection_id"])
+        if expected is not None and identity!=expected:
+            raise AgentTuiError("control_changed")
+        return identity
+
+    async def recover_session(self,sid,payload=None):
+        from .native_turns import NativeTurns
+        self.require_live_controller(sid)
+        try:return await NativeTurns(self.db).recover(self,sid,payload)
+        except Exception as error:
+            raise AgentTuiError(getattr(error,"code","recovery_unconfirmed")) from error
+
     def _token(self, session_id: str, remote_id: str, *, start_home: bool = False) -> str:
         _private_directory(self.state_dir)
         _private_directory(self.state_dir / "secrets")
@@ -275,6 +303,9 @@ class AgentTuiManager:
             ("set-option", "-g", "destroy-unattached", "off"), ("set-option", "-g", "exit-empty", "off"),
             ("set-option", "-g", "remain-on-exit", "on"), ("set-option", "-g", "allow-rename", "off"),
             ("set-option", "-g", "update-environment", ""),
+            # OSC52 copy is handled by the browser as an explicit local offer.
+            # No general DCS passthrough or local clipboard reads are enabled.
+            ("set-option", "-g", "set-clipboard", "on"),
             # tmux 3.3a segfaults on new-session after `window-size manual`;
             # attach-time TIOCSWINSZ still resizes the pane.
         ):
@@ -391,6 +422,23 @@ class AgentTuiManager:
         alive = bool(pane and not pane["pane_dead"] and pane["pane_pid"] == int(binding.get("pane_pid") or 0)
                      and pane["pane_started_at"] == str(binding.get("pane_started_at") or ""))
         return {"ok": True, "attached": alive, "binding": self._public_binding(binding)}
+
+    async def reap_deleted_viewports(self):
+        """Remove only the attested idle viewport, never the shared MiMo engine."""
+        from .duty_session import DutySessionManager
+        duty=DutySessionManager(self.db)
+        rows=self.db.query("SELECT b.* FROM agent_runtime_bindings b JOIN duty_sessions d ON d.id=b.session_id WHERE d.deleted_at>0 AND b.tmux_name<>'' LIMIT 20")
+        for raw in rows:
+            binding=dict(raw);sid=binding["session_id"]
+            if duty.deletion_blockers(sid):continue
+            pane=await self._pane(binding["tmux_name"])
+            if pane and (pane["pane_id"]!=binding["pane_id"] or pane["pane_pid"]!=binding["pane_pid"] or pane["pane_started_at"]!=binding["pane_started_at"]):
+                continue
+            if pane:
+                result=await asyncio.to_thread(self._tmux,"kill-session","-t",binding["tmux_name"])
+                if result.returncode:continue
+            self.db.execute("UPDATE agent_runtime_bindings SET tmux_name='',pane_id='',pane_pid=0,pane_started_at='',updated_at=? WHERE session_id=? AND tmux_name=?",(time.time(),sid,binding["tmux_name"]))
+            self.db.audit("system","native_viewport_gc","agent_deleted_viewport_reaped",detail={"session_id":sid,"shared_engine_preserved":True},channel="agent")
 
     def acquire_control(self, session_id: str, username: str, connection_id: str) -> dict:
         session_id = _local_id(session_id)
@@ -560,6 +608,18 @@ class AgentTuiManager:
                 # Native automatic input suggestions are optional. Do not spend
                 # model quota or create an untracked turn for a viewer.
                 return web.Response(status=204)
+            if method == "POST" and relative is not None and (relative=="/resume" or re.fullmatch(r"/turn/[A-Za-z0-9_-]+/resume",relative)):
+                self.require_live_controller(sid)
+                raw=await request.read()
+                body=json.loads(raw) if raw else {}
+                if not isinstance(body,dict):raise AgentTuiError("invalid_recovery")
+                if relative.startswith("/turn/"):
+                    selected=relative.split("/")[2]
+                    if body.get("assistantMessageID",selected)!=selected:raise AgentTuiError("recovery_candidate_mismatch")
+                    body={**body,"assistantMessageID":selected}
+                result=await self.recover_session(sid,body)
+                # MiMo's native TUI expects exactly the native 202 empty body.
+                return web.Response(status=202) if result.get("ok") else web.json_response(result,status=409)
             if method == "POST" and path == "/session":
                 # Native welcome page creates its first session on Enter. Bind
                 # that navigation to the RID already reserved by Ayana.
@@ -615,6 +675,10 @@ class AgentTuiManager:
                             raise AgentTuiError("provider_not_verified")
                         body["model"] = {"providerID": provider, "modelID": model_id}
                 if relative == "/abort":
+                    from .duty_session import DutySessionManager
+                    duty=DutySessionManager(self.db)
+                    duty.pause_session(sid,actor=binding.get("controller") or "operator",reason="user_stop")
+                    duty.interrupt_business_work(sid,actor=binding.get("controller") or "operator")
                     status, payload = await self._upstream(method, path, body=body, with_status=True)
                 else:
                     status, payload = await self._submit_prompt(sid, remote, path, body)
@@ -624,7 +688,7 @@ class AgentTuiManager:
             raise AgentTuiError("tui_route_forbidden")
         except AgentTuiError as error:
             log.warning("native TUI request rejected code=%s method=%s", error.code, request.method)
-            status = 401 if error.code == "unauthorized" else 409 if error.code in ("control_required", "runtime_binding_changed", "session_turn_busy", "native_turn_pending", "native_turn_unknown", "business_task_running") else 403
+            status = 401 if error.code == "unauthorized" else 409 if error.code in ("control_required", "runtime_binding_changed", "session_turn_busy", "native_turn_pending", "native_turn_unknown", "business_task_running","session_paused","submission_unconfirmed","native_submission_pending","recovery_running","no_recovery_candidate") else 403
             return web.json_response({"name": "AyanaTuiRestricted", "data": {"message": error.code}}, status=status)
         except Exception as error:
             log.warning("native TUI protocol failure error=%s method=%s", type(error).__name__, request.method)
@@ -653,43 +717,16 @@ class AgentTuiManager:
             payload = json.loads(raw) if raw else {}
             return (response.status, payload) if with_status else payload
 
-    async def _submit_prompt(self, sid: str, remote: str, path: str, body: dict) -> tuple[int, dict]:
-        from .duty_session import DutySessionManager, NativeTurnBusyError
-        duty = DutySessionManager(self.db)
+    async def _submit_prompt(self, sid: str, remote: str, path: str, body: dict, *, origin: str = "tui") -> tuple[int, dict]:
+        from .native_turns import NativeTurns
+        turns=NativeTurns(self.db)
         try:
-            async with duty.async_turn(sid, timeout=0):
-                blockers = duty.native_admission_blockers(sid, include_business=True)
-                if blockers:
-                    raise AgentTuiError(blockers[0])
-                client = self.serve_client_factory()
-                client._admit()
-                from .mimo_serve import MimoServeError
-                try:
-                    await client.require_session_idle(remote)
-                except MimoServeError:
-                    raise AgentTuiError("native_turn_pending") from None
-                # Persist uncertainty before transport: a lost response never
-                # makes this session eligible for an automatic prompt replay.
-                duty.set_runtime_state(sid, "unknown", receipt_status="unknown")
-                try:
-                    status, payload = await self._upstream("POST", path, body=body, with_status=True)
-                except AgentTuiError as error:
-                    if error.code in ("native_http_400", "native_http_401", "native_http_403", "native_http_404", "native_http_422"):
-                        duty.set_runtime_state(sid, "idle", receipt_status="failed")
-                    raise
-                if status == 204:
-                    duty.set_runtime_state(sid, "idle", receipt_status="failed")
-                    raise AgentTuiError("native_turn_pending")
-                receipt_id = payload.get("receiptId") if isinstance(payload, dict) else None
-                if status != 202 or not isinstance(receipt_id, str) or not receipt_id:
-                    raise AgentTuiError("native_turn_unknown")
-                duty.record_receipt(sid, remote, receipt_id, origin="tui")
-                duty.set_runtime_state(sid, "running", receipt_id=receipt_id, receipt_status="accepted")
-                return status, payload
-        except NativeTurnBusyError as error:
-            raise AgentTuiError(error.blockers[0]) from None
-        except TimeoutError:
-            raise AgentTuiError("session_turn_busy") from None
+            self.require_live_controller(sid)
+            return await turns.prompt(self,sid,remote,path,body,origin=origin)
+        except Exception as error:
+            code=getattr(error,"code","native_backend_unavailable")
+            turns.ack(sid,state=turns.duty.task_info(sid)["task_state"],message=str(error),error=code)
+            raise AgentTuiError(code) from error
 
     @staticmethod
     def _event_matches(value: dict, remote: str) -> bool:
@@ -795,8 +832,10 @@ class AgentTuiManager:
                 overflow.set()
         loop.add_reader(master, readable)
         bytes_in = bytes_out = 0
+        notice_after=self.db.query_one("SELECT COALESCE(MAX(id),0) n FROM session_events WHERE session_id=?",(session_id,))["n"]
+        notice_check=0.0
         async def output_pump():
-            nonlocal bytes_out
+            nonlocal bytes_out,notice_after,notice_check
             while not ws.closed:
                 if not await permitted():
                     await ws.close(code=4403, message=b"permission revoked")
@@ -804,6 +843,14 @@ class AgentTuiManager:
                 if overflow.is_set() or process.poll() is not None:
                     await ws.close(code=1013, message=b"reattach required")
                     break
+                if time.monotonic()>=notice_check:
+                    notice_check=time.monotonic()+1
+                    for row in self.db.query("SELECT id,payload_json FROM session_events WHERE session_id=? AND type='input_ack' AND id>? ORDER BY id LIMIT 20",(session_id,notice_after)):
+                        notice_after=row["id"]
+                        try:await ws.send_json({"type":"action_ack",**json.loads(row["payload_json"])})
+                        except (ValueError,TypeError):pass
+                    from .duty_session import DutySessionManager
+                    await ws.send_json({"type":"task_state",**DutySessionManager(self.db).task_info(session_id)})
                 try:
                     data = await asyncio.wait_for(queue.get(), timeout=1)
                 except asyncio.TimeoutError:

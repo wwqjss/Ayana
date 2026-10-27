@@ -34,9 +34,10 @@ log = logging.getLogger("ayana.actions")
 
 
 class ActionError(Exception):
-    def __init__(self, code: str, message: str = ""):
+    def __init__(self, code: str, message: str = "", *, context: dict | None = None):
         self.code = code
         self.detail = message
+        self.context = context or {}
         super().__init__(f"{code}: {message}" if message else code)
 
 
@@ -62,6 +63,7 @@ WRITE_NO_REPLAY_STATES = frozenset(
 AUTO_RETRYABLE_BLOCKS = frozenset({
     "cooldown", "budget_exhausted", "global_pause", "object_locked", "source_unavailable",
 })
+TEMPORARY_SESSION_BLOCKS = frozenset({"session_paused", "work_already_running"})
 
 
 def _source_block_code(reason: str) -> str:
@@ -176,7 +178,7 @@ class ActionService:
 
     async def _write_channel(
         self, asset_id: str, tokens: list[str], timeout: float | None = None,
-        *, authority_session_id: str = "", require_automatic: bool = False,
+        *, authority_session_id: str = "", require_automatic: bool = False, object_id: str = "", incident_id: str = "",
     ):
         """Keep the trusted session scope through the final SSH dispatch boundary."""
         if self.transport is None:
@@ -184,7 +186,8 @@ class ActionService:
         if authority_session_id:
             from .transport import session_dispatch_guard
 
-            with session_dispatch_guard(self.db, authority_session_id, require_automatic=require_automatic):
+            with session_dispatch_guard(self.db, authority_session_id, require_automatic=require_automatic,
+                                        asset_id=asset_id,object_id=object_id,incident_id=incident_id):
                 return await self.transport.exec(asset_id, tokens, timeout=timeout)
         return await self.transport.exec(asset_id, tokens, timeout=timeout)
 
@@ -287,6 +290,8 @@ class ActionService:
         # 工作台：require_human_approval 开启时，autonomous 仍走人工审批门；
         # 关闭时保留 P6 自动闭环（硬保护：能力目录/对象绑定/host key/幂等不变）。
         authority = self._session_authority(authority_session_id)
+        if authority and authority.get("lifecycle_block"):
+            raise ActionError(authority["lifecycle_block"],"当前会话已暂停或正在删除")
         if authority and authority["access_mode"] == "readonly":
             self.db.audit(
                 proposer_type, proposer_id, "action_propose_denied",
@@ -295,6 +300,12 @@ class ActionService:
                                          "session_id": authority_session_id, "authority": authority},
             )
             raise ActionError("readonly_mode_rejects_write", "Current session is read-only")
+        if authority_session_id:
+            from .agent_work_scope import WorkScopeError,claim_target
+            try:
+                claim_target(self.db,authority_session_id,asset_id=asset_id,object_id=obj["id"],incident_id=incident_id)
+            except WorkScopeError as exc:
+                raise ActionError(exc.code,str(exc),context=exc.detail) from exc
         require_human = (authority["approval_mode"] == "manual") if authority else self._require_human_approval()
         if mode == "autonomous" and not require_human:
             decision = {
@@ -1177,7 +1188,8 @@ class ActionService:
                     raise
                 row = self._get(action_id)
                 retryable_auto = row.get("mode") == "auto" and exc.code in AUTO_RETRYABLE_BLOCKS
-                if row["state"] == "approved" and not retryable_auto and not action_incident_block(self.db, row):
+                if (row["state"] == "approved" and not retryable_auto and exc.code not in TEMPORARY_SESSION_BLOCKS
+                        and not action_incident_block(self.db, row)):
                     with self.db.tx():
                         self._mark_need_human(row.get("incident_id") or "", f"execution_blocked:{action_id}")
                         self.db.audit(
@@ -1257,6 +1269,7 @@ class ActionService:
         # ---- 短事务：重查授权/期限/对象/占用/资产绑定 + 领取 ----
         dispatcher = ssh_ep.username if ssh_ep is not None else binding.write_alias
         reject: tuple[str, str] | None = None
+        reject_context: dict = {}
         tokens: list[str] = []
         with self.db.tx() as conn:
             if not conn.in_transaction:
@@ -1322,6 +1335,15 @@ class ActionService:
                     reject = (exc.code, exc.detail)
                 if authority_now and authority_now["access_mode"] == "readonly":
                     reject = ("readonly_mode_rejects_write", "Current session is read-only")
+                if authority_now and authority_now.get("lifecycle_block"):
+                    reject = (authority_now["lifecycle_block"],"当前会话已暂停或正在删除")
+                if reject is None:
+                    from .agent_work_scope import WorkScopeError,claim_target
+                    try:
+                        claim_target(self.db,authority_session_id,asset_id=fresh["asset_id"],object_id=fresh["object_id"],incident_id=fresh["incident_id"] or "",conn=conn)
+                    except WorkScopeError as exc:
+                        reject = (exc.code,str(exc))
+                        reject_context = exc.detail
             require_human_now = ((authority_now["approval_mode"] == "manual")
                                  if authority_now else self._require_human_approval())
             human_approved = fresh["approver_type"] in ("web_user", "qq_user", "wecom_user") and bool(fresh["approver_id"])
@@ -1466,6 +1488,7 @@ class ActionService:
                             "tokens": tokens,
                             "session_id": authority_session_id,
                             "authority": authority_now,
+                            "work_conflict": reject_context,
                         },
                         ensure_ascii=False,
                     ),
@@ -1474,7 +1497,7 @@ class ActionService:
                     "system",
                 )
                 # 客观原因终止提案；调用者无权仅拒绝本次请求
-                if code in ("dispatcher_denied", "readonly_mode_rejects_write", "approval_required"):
+                if code in ("dispatcher_denied", "readonly_mode_rejects_write", "approval_required") or code in TEMPORARY_SESSION_BLOCKS:
                     conn.execute(
                         "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, object_id,"
                         " action_id, detail_json, decision_id, incident_id, channel)"
@@ -1533,7 +1556,7 @@ class ActionService:
                     )
         if reject is not None:
             code, detail = reject
-            raise ActionError(code, detail)
+            raise ActionError(code, detail, context=reject_context)
 
         if row.get("incident_id"):
             from .incidents import IncidentService
@@ -1560,6 +1583,7 @@ class ActionService:
                     target=row["asset_id"],
                     params={"action_id": action_id, "tokens": list(tokens or [])[:20]},
                     claimed_by=f"{actor_type}:{actor_id}",
+                    **({"authority_session_id":authority_session_id} if authority_session_id else {}),
                 )
                 if not claim.get("claimed"):
                     raise ActionError("no_replay", f"write_ops:{claim.get('status')}")
@@ -1571,7 +1595,8 @@ class ActionService:
             write_kwargs = {}
             if authority_session_id:
                 write_kwargs = {"authority_session_id": authority_session_id,
-                                "require_automatic": not human_approved}
+                                "require_automatic": not human_approved,
+                                "object_id":row["object_id"],"incident_id":row.get("incident_id") or ""}
             res = await self._write_channel(row["asset_id"], tokens, timeout=15.0, **write_kwargs)
             state, detail = classify_exec_result(res)
         except Exception as e:
@@ -1580,9 +1605,12 @@ class ActionService:
                 # neither an unknown execution nor permission to replay one.
                 code = str(getattr(e, "code", "authority_unavailable"))
                 with self.db.tx() as conn:
+                    deleting = code in ("session_deleting", "session_deleted")
                     conn.execute(
-                        "UPDATE actions SET state='approved',dispatched_at=NULL,exec_account='',budget_claimed_at=NULL"
-                        " WHERE id=? AND state='dispatched'", (action_id,),
+                        "UPDATE actions SET state=?,finished_at=?,result_detail=?,dispatched_at=NULL,exec_account='',budget_claimed_at=NULL"
+                        " WHERE id=? AND state='dispatched'",
+                        ("cancelled" if deleting else "approved",now() if deleting else None,
+                         f"{code}:not_dispatched" if deleting else "",action_id),
                     )
                     if code == "approval_required":
                         self._return_to_human_approval(conn, action_id)
@@ -1599,7 +1627,8 @@ class ActionService:
                     )
                 if self.write_ops is not None and wo_key:
                     self.write_ops.release_write(wo_incident, wo_key, confirmed_safe=True, reason=code)
-                raise ActionError(code, str(e)) from e
+                context = getattr(e,"detail",{})
+                raise ActionError(code, str(e),context=context if isinstance(context,dict) else {}) from e
             # 不能证明是否执行：收敛为 unknown + 需人工，保留对象锁防止重放。
             log.exception("action write_channel failed")
             state, detail = "unknown", f"exec_exception:{str(e)[:120]}"

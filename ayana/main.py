@@ -331,6 +331,7 @@ class App:
             workdir=_native_paths["workdir"],
             serve_url=str(cfg.get("mimo_serve_url") or ""),
             unit_name=str(cfg.get("mimo_unit") or ""),
+            config_dir=str(cfg.get("mimo_config_dir") or ""),
         )
 
         def _mimo_runtime():
@@ -368,7 +369,8 @@ class App:
                     (row["id"],),
                 )
                 binding = self.db.query_one("SELECT receipt_id FROM agent_runtime_bindings WHERE session_id=?", (row["id"],))
-                if not pending and binding and binding["receipt_id"] == receipt_id:
+                unconfirmed=self.db.query_one("SELECT 1 FROM agent_native_submissions WHERE session_id=? AND state IN ('submitting','recovering','unknown')",(row["id"],))
+                if not pending and not unconfirmed and binding and binding["receipt_id"] == receipt_id:
                     self.duty.set_runtime_state(row["id"], "idle", receipt_id=receipt_id, receipt_status=state)
 
         self.mimo_read_client = MimoServeSessionClient(
@@ -1019,6 +1021,9 @@ class App:
     async def _reconcile_native_receipts_once(self) -> None:
         """Observe durable turns, including timed-out ones; never submit/replay."""
         from .mimo_serve import normalize_receipt_status
+        if getattr(self,"agent_tui",None):
+            from .native_turns import NativeTurns
+            await NativeTurns(self.db).reconcile(self.agent_tui)
         rows = self.db.query(
             "SELECT * FROM agent_runtime_receipts WHERE status IN ('accepted','pending','queued','running','unknown') ORDER BY updated_at LIMIT 40"
         )
@@ -1065,7 +1070,11 @@ class App:
                     idle = native is None or (isinstance(native, dict) and native.get("type") == "idle")
                     if pending or not rid or not idle:
                         continue
+                    if self.db.query_one("SELECT 1 FROM agent_native_submissions WHERE session_id=? AND state IN ('submitting','recovering','unknown')",(sid,)):
+                        continue
                     self.duty.set_runtime_state(sid, "idle", receipt_id=binding["receipt_id"], receipt_status=terminal["status"])
+                    from .native_turns import NativeTurns
+                    NativeTurns(self.db).ack(sid,state="idle" if terminal["status"]=="completed" else "interrupted",message="原生任务已完成。" if terminal["status"]=="completed" else "原生任务已中断，执行记录已保留。")
                     self.duty.maybe_start_archive_countdown(sid)
             except TimeoutError:
                 # A live Ayana owner is still processing this session.
@@ -1087,6 +1096,8 @@ class App:
         while not self._stop.is_set():
             try:
                 self.duty.tick_archives()
+                if getattr(self,"agent_tui",None):
+                    await self.agent_tui.reap_deleted_viewports()
             except Exception as e:  # noqa: BLE001
                 log.warning("duty tick_archives failed: %s", e)
             try:

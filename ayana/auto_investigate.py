@@ -219,9 +219,13 @@ class AutoInvestigator:
         if inc["status"] != "open":
             return {"ok": True, "skipped": "not_open"}
         gen = int(generation if generation is not None else (inc["generation"] or 1))
+        deleted=self.db.query_one("SELECT 1 FROM session_incidents si JOIN duty_sessions d ON d.id=si.session_id WHERE si.incident_id=? AND si.generation=? AND d.origin='auto' AND d.deleted_at>0",(incident_id,gen))
+        if deleted:return {"ok":True,"skipped":"session_deleted"}
         t = now()
         row = self._row(incident_id)
         if row:
+            if int(row.get("generation") or 1)==gen and row.get("status")=="cancelled":
+                return {"ok":True,"skipped":"operator_stopped"}
             if int(row.get("generation") or 1) == gen and row.get("status") in (
                 "queued",
                 "running",
@@ -292,7 +296,7 @@ class AutoInvestigator:
 
     def ready_jobs(self, limit: int = 10) -> list[dict[str, Any]]:
         rows = self.db.query(
-            "SELECT * FROM investigation_jobs WHERE status='queued'"
+            "SELECT * FROM investigation_jobs WHERE status='queued' AND NOT EXISTS (SELECT 1 FROM session_incidents si JOIN duty_sessions d ON d.id=si.session_id WHERE si.incident_id=investigation_jobs.incident_id AND d.origin='auto' AND d.status='open' AND (d.paused_at>0 OR d.delete_requested_at>0 OR d.deleted_at>0))"
             " ORDER BY updated_at ASC LIMIT ?",
             (limit,),
         )
@@ -372,6 +376,9 @@ class AutoInvestigator:
         mapping=await asyncio.to_thread(self.bridge.ensure_session,incident_id,generation=int(job.get("generation") or 1))
         if not mapping.get("ok"):return
         sid=mapping["session_id"]
+        current_session=duty.get(sid) or {}
+        if current_session.get("paused_at") or current_session.get("delete_requested_at") or current_session.get("deleted_at"):
+            self.db.execute("UPDATE investigation_jobs SET status='queued',lease_expires_at=0,updated_at=? WHERE incident_id=? AND status='running'",(now(),incident_id));return
         from .duty_session import NativeTurnBusyError
         try:
             async with duty.async_turn(sid,timeout=max(self.config.lease_ttl_sec,900),lease_sec=max(self.config.lease_ttl_sec,self.config.timeout_sec+self.config.decision_timeout_sec+600)):
@@ -395,6 +402,14 @@ class AutoInvestigator:
             ):
                 return
             started = now()
+            mapping=self.bridge.get_mapping(incident_id) if self.bridge and hasattr(self.bridge,"get_mapping") else None
+            human_sid=(mapping or {}).get("session_id") or ""
+            human_before=int(((getattr(self.bridge,"duty",None).get(human_sid) if human_sid and getattr(self.bridge,"duty",None) else {}) or {}).get("human_message_revision") or 0)
+            def human_intervened():
+                session = (getattr(self.bridge, "duty", None).get(human_sid)
+                           if human_sid and getattr(self.bridge, "duty", None) else {}) or {}
+                return bool(session.get("paused_at") or session.get("delete_requested_at")
+                            or int(session.get("human_message_revision") or 0) != human_before)
             rounds = int(job.get("rounds") or 0)
             if rounds >= self.config.max_rounds:
                 self._finish(incident_id, "failed", generation=generation, reason="max_rounds_exceeded", rounds=rounds)
@@ -413,22 +428,25 @@ class AutoInvestigator:
             except asyncio.TimeoutError:
                 self._finish(
                     incident_id,
-                    "timeout",
+                    "partial" if human_intervened() else "timeout",
                     generation=generation,
-                    reason=f"timeout:{self.config.timeout_sec}s",
+                    reason="human_guidance" if human_intervened() else f"timeout:{self.config.timeout_sec}s",
                     rounds=rounds + 1,
                 )
                 return
             except Exception as e:  # noqa: BLE001
                 self._finish(
                     incident_id,
-                    "failed",
+                    "partial" if human_intervened() else "failed",
                     generation=generation,
-                    reason=f"{type(e).__name__}:{e}",
+                    reason="human_guidance" if human_intervened() else f"{type(e).__name__}:{e}",
                     rounds=rounds + 1,
                 )
                 return
             status = result.get("status") or "partial"
+            if human_intervened():
+                self._finish(incident_id,"partial",generation=generation,reason="human_guidance",conclusion=result,rounds=rounds+1,duration=now()-started)
+                return
             job_status = {
                 "completed": "done",
                 "partial": "partial",
@@ -674,6 +692,14 @@ class AutoInvestigator:
         # The local Incident mapping, never model output, selects the authority scope.
         mapping = self.bridge.get_mapping(incident_id) if self.bridge is not None else None
         authority_session_id = str((mapping or {}).get("session_id") or "")
+        duty=getattr(self.bridge,"duty",None)
+        session_before=(duty.get(authority_session_id) if duty and authority_session_id else {}) or {}
+        human_revision=int(session_before.get("human_message_revision") or 0)
+        def operator_changed():
+            current=(duty.get(authority_session_id) if duty and authority_session_id else {}) or {}
+            return bool(current.get("paused_at") or current.get("delete_requested_at") or current.get("deleted_at")
+                        or int(current.get("human_message_revision") or 0)!=human_revision)
+        if operator_changed():return {**out,"skipped":"human_guidance"}
         if authority_session_id:
             from .agent_authority import AuthorityError, resolve_authority
 
@@ -688,6 +714,7 @@ class AutoInvestigator:
                 return {**out, "skipped": "readonly_mode_rejects_write", "result": "readonly"}
         decision = await self._decide_remediation(incident_id, conclusion, generation=generation)
         out["decision"] = decision
+        if operator_changed():return {**out,"skipped":"human_guidance"}
         if not self._incident_is_current(incident_id, generation):
             return {**out, "skipped": "incident_changed"}
         if not self._runtime_ready():
@@ -726,6 +753,7 @@ class AutoInvestigator:
             **({"authority_session_id": authority_session_id} if authority_session_id else {}),
         )
         out["action"] = res
+        if operator_changed():return {**out,"skipped":"human_guidance"}
         if res.get("permission_blocked"):
             return {**out, "result": "readonly"}
         if res.get("approval_required"):

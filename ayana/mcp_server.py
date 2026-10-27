@@ -171,10 +171,15 @@ class McpStdioServer:
                 invocation = meta.get(TURN_LIFECYCLE_CAPABILITY) if isinstance(meta, dict) else None
                 out = await self.tools.call(name, args, invocation_context=invocation)
             except McpToolError as e:
+                if e.code=="work_already_running":
+                    # The tool's claim transaction has rolled back. Persist the
+                    # refusal here so its audit is not rolled back with it.
+                    self.tools.ctx.db.audit("agent","native_mcp","agent_work_conflict",
+                                        detail={"tool":name,**e.detail},channel="mcp")
                 return _result(
                     mid,
                     {
-                        "content": [{"type": "text", "text": json.dumps({"ok": False, "error": e.code, "message": e.message}, ensure_ascii=False)}],
+                        "content": [{"type": "text", "text": json.dumps({"ok": False, "error": e.code, "message": e.message, **e.detail}, ensure_ascii=False)}],
                         "isError": True,
                     },
                 )
