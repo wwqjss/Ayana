@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 
 class MigrationError(RuntimeError):
@@ -1198,7 +1198,8 @@ def _migrate_v24_agent_authority(conn: sqlite3.Connection) -> None:
     approval = "automatic" if old and str(old[0]) in ("0", "false", "False", "") else "manual"
     if added_approval:
         conn.execute("UPDATE duty_sessions SET approval_mode=?", (approval,))
-    for key, value in (("auto_access_mode", "readwrite"), ("auto_approval_mode", approval), ("manual_approval_default", approval)):
+    # 点 1：自动处置默认自主执行；手动会话（人在场）默认仍须人工审批
+    for key, value in (("auto_access_mode", "readwrite"), ("auto_approval_mode", "automatic"), ("manual_approval_default", approval)):
         conn.execute("INSERT OR IGNORE INTO agent_settings(key,value,updated_at,updated_by) VALUES(?,?,?,'migration24')", (key,value,now()))
     conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('agent_authority_revision','0')")
 
@@ -1233,6 +1234,19 @@ def _migrate_v26_viewport_release(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE agent_runtime_bindings SET tmux_name=NULL WHERE tmux_name=''")
 
 
+def _migrate_v27_write_op_adjudication(conn: sqlite3.Connection) -> None:
+    """人工核销写结果：adjudication 与 actions.adjudicate 同语义（P4.1 补全）。"""
+    for ddl in (
+        "ALTER TABLE session_write_ops ADD COLUMN adjudication TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE session_write_ops ADD COLUMN adjudicated_at REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE session_write_ops ADD COLUMN adjudication_reason TEXT NOT NULL DEFAULT ''",
+    ):
+        try:
+            conn.execute(ddl)
+        except Exception:
+            pass
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_v1_baseline,
     2: _migrate_v2_p0_p1_columns,
@@ -1260,6 +1274,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     24: _migrate_v24_agent_authority,
     25: _migrate_v25_session_lifecycle,
     26: _migrate_v26_viewport_release,
+    27: _migrate_v27_write_op_adjudication,
 }
 
 _MIGRATION_NAMES = {
@@ -1289,6 +1304,7 @@ _MIGRATION_NAMES = {
     24: "live_session_authority",
     25: "native_guidance_and_session_lifecycle",
     26: "viewport_release_lifecycle",
+    27: "write_op_adjudication",
 }
 
 

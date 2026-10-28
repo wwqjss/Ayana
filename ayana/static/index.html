@@ -10,7 +10,7 @@
 
 <title>Ayana</title>
 
-<link rel="stylesheet" href="/static/app.css?v=20261028-workspace1">
+<link rel="stylesheet" href="/static/app.css?v=20261028-unified-authority1">
 
 <link rel="stylesheet" href="/static/workbench.css?v=20261027-lifecycle2">
 
@@ -125,7 +125,6 @@
 
         <button data-tab="knowledge" class="tab">知识</button>
 
-        <button data-tab="permissions" class="tab">权限</button>
 
         <button data-tab="audit" class="tab">审计</button>
 
@@ -481,7 +480,7 @@
                   <button type="button" class="btn primary small hidden" id="aw-term-acquire">接管控制</button>
                   <button type="button" class="btn ghost small hidden" id="aw-term-release">释放控制</button>
                   <button type="button" class="btn ghost small aw-access-switch" id="aw-access-mode" role="switch" aria-label="会话读写权限" title="接管后可临时切换权限，释放后恢复" aria-checked="false" disabled>只读</button>
-                  <select id="aw-approval-mode" aria-label="当前会话审批模式" title="接管期间的临时审批模式" disabled><option value="manual">人工审批</option><option value="automatic">自动审批</option></select>
+                  <select id="aw-approval-mode" aria-label="当前会话审批模式" title="接管期间的临时审批模式" disabled><option value="manual">人工审批</option><option value="automatic">自动执行</option></select>
                   <details class="aw-session-menu">
                     <summary class="btn ghost small" aria-label="会话操作">···</summary>
                     <div class="aw-menu-items">
@@ -584,7 +583,7 @@
               <div id="role-add-form" class="form-row workspace-form workspace-inset hidden">
                 <label>角色名<input id="role-name" placeholder="例如 deploy / monitor"></label>
                 <label>显示名<input id="role-label" placeholder="例如 发布账号"></label>
-                <label>权限<select id="role-kind"><option value="write">可执行</option><option value="read">只读</option></select></label>
+                <label>用途<select id="role-kind"><option value="write">执行</option><option value="read">调查</option></select></label>
                 <div class="workspace-actions"><button class="btn primary" id="role-save-btn" type="button">保存角色</button><button class="btn" id="role-cancel-btn" type="button">取消</button></div>
               </div>
               <p class="workspace-feedback" id="host-add-msg" aria-live="polite"></p>
@@ -818,103 +817,6 @@
         </div>
 
         <div id="knowledge-list"></div>
-
-      </section>
-
-
-
-      <section id="tab-permissions" class="tab-panel hidden">
-
-        <div class="card">
-          <h2>权限工作台</h2>
-          <p class="muted small">
-            用自然语言说想做什么，Ayana 会调出对应真实界面并帮你填写。你仍手动保存；AI 不会执行或改权限。
-          </p>
-          <div class="assist-box">
-            <div class="form-row">
-              <input id="perm-assist-input" placeholder="例如：查看 web-01 的 nginx 权限 / 所有服务器允许看日志、重启要确认 / 修改 db-01 的容器重启权限" style="flex:1;min-width:280px">
-              <button class="btn primary" id="perm-assist-go" type="button">定位并填写</button>
-            </div>
-            <div id="perm-assist-msg" class="muted small" aria-live="polite"></div>
-            <div id="perm-assist-followup" class="assist-followup"></div>
-            <details id="perm-assist-debug" class="assist-debug hidden"><summary>高级：识别与校验详情</summary><pre class="code-block"></pre></details>
-          </div>
-          <div class="perm-legend">
-            <span><span class="dot" style="background:var(--bad)"></span>禁止</span>
-            <span><span class="dot" style="background:var(--warn)"></span>需要人工确认</span>
-            <span><span class="dot" style="background:var(--ok)"></span>允许自动执行</span>
-          </div>
-        </div>
-
-        <div class="card" id="perm-panel-defaults">
-          <h2>默认授权策略</h2>
-          <p class="muted small">
-            按操作类型统一配置：禁止 / 需要人工确认 / 允许自动执行。新资产自动继承默认策略，无需逐项授权。
-          </p>
-          <p class="muted small">
-            主机侧 commands.json / forced-command / sudoers 仍是最终安全上限，此处不能扩大。
-          </p>
-          <div id="perm-defaults"></div>
-        </div>
-
-        <div class="card" id="perm-panel-exceptions">
-          <h2>资产例外</h2>
-          <p class="muted small">对指定主机、容器或服务覆盖默认策略。可一键恢复默认，避免重复配置。</p>
-          <div id="perm-exceptions"></div>
-          <div class="form-row" style="margin-top:12px">
-            <label>新增例外
-              <select id="perm-ex-cap"></select>
-            </label>
-            <label>资产
-              <select id="perm-ex-asset"></select>
-            </label>
-            <label>对象 <select id="perm-ex-object"><option value="*">全部对象</option></select></label>
-            <label>例外策略 <select id="perm-ex-state"><option value="">请选择策略</option></select></label>
-            <button class="btn primary" id="perm-ex-add">保存例外</button>
-          </div>
-          <div id="perm-diff-box" class="live-summary"></div>
-        </div>
-
-        <div class="card" id="perm-panel-effective">
-          <h2>查看最终生效权限</h2>
-          <p class="muted small">选择对象后显示命中的规则来源（默认策略 / 资产例外）与最终结论。</p>
-          <div class="form-row">
-            <label>操作 <select id="perm-eff-cap"></select></label>
-            <label>资产 <select id="perm-eff-asset"></select></label>
-            <label>对象 <select id="perm-eff-object"><option value="*">全部对象</option></select></label>
-            <button class="btn primary" id="perm-eff-lookup">查询</button>
-          </div>
-          <div id="perm-eff-result"></div>
-        </div>
-
-        <div class="card" id="perm-panel-ceiling">
-          <h3 style="margin:0 0 8px;font-size:14px">Agent 权限上限（ceiling）</h3>
-          <p class="muted small">后端强制：Agent（auto_rule / llm）不能超过此处上限，也不能超过源码能力目录。</p>
-          <div id="agent-ceiling"></div>
-        </div>
-
-        <details class="perm-adv card">
-          <summary>高级权限（QQ / Web 用户等细规则）</summary>
-          <div class="form-row">
-            <label>主体类型
-              <select id="perm-subject-type">
-                <option value="web_user">web_user</option>
-                <option value="qq_user">qq_user</option>
-                <option value="qq_group">qq_group</option>
-                <option value="auto_rule">auto_rule</option>
-              </select>
-            </label>
-            <label>主体 ID <input id="perm-subject-id" placeholder="用户名 / QQ 号"></label>
-            <label>能力 <select id="perm-cap"></select></label>
-            <label>资产 <select id="perm-asset"></select></label>
-            <label>对象 <input id="perm-object" value="*" ></label>
-            <label class="chk"><input type="checkbox" id="perm-allow" checked> 允许</label>
-            <label class="chk"><input type="checkbox" id="perm-approval" checked> 需批准</label>
-            <label class="chk"><input type="checkbox" id="perm-auto"> 允许自动</label>
-            <button class="btn primary" id="perm-save">保存</button>
-          </div>
-          <div id="perm-list"></div>
-        </details>
 
       </section>
 
@@ -1189,9 +1091,9 @@
 <script src="/static/xterm/xterm-addon-fit.js"></script>
 <script src="/static/terminal_clipboard.js?v=20261027-lifecycle2"></script>
 
-<script src="/static/app.js?v=20261028-workspace1"></script>
+<script src="/static/app.js?v=20261028-unified-authority1"></script>
 <script src="/static/settings.js?v=20261028-workspace1"></script>
-<script src="/static/workbench.js?v=20261027-lifecycle2"></script>
+<script src="/static/workbench.js?v=20261028-unified-authority1"></script>
 
 </body>
 

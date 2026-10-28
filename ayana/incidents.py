@@ -405,6 +405,51 @@ class IncidentService:
             (now(), inc_id),
         )
 
+    def resume_autonomy(self, inc_id: str, *, actor: str = "web") -> dict[str, Any]:
+        """人工处理后恢复自治：清 need_human、换代重置处置预算、重新入队调查。
+
+        换代即重置 OpsLoop/调查计数（新代不机械重试旧方案）；历史事件与审计保留。
+        """
+        with self.db.tx() as conn:
+            row = conn.execute(
+                "SELECT * FROM incidents WHERE id=?", (inc_id,)
+            ).fetchone()
+            if not row:
+                return {"ok": False, "error": "not_found"}
+            if row["status"] != "open":
+                return {"ok": False, "error": "incident_not_open"}
+            t = now()
+            gen = int(row["generation"] or 1) + 1
+            conn.execute(
+                "UPDATE incidents SET need_human=0, need_human_reason='', stage='pending',"
+                " generation=?, updated_at=? WHERE id=?",
+                (gen, t, inc_id),
+            )
+            conn.execute(
+                "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
+                (inc_id, t, "incident_resume_autonomy",
+                 f"人工确认后恢复自治（generation {gen}）",
+                 json.dumps({"actor": actor, "generation": gen,
+                             "previous_need_human_reason": row["need_human_reason"] or ""},
+                            ensure_ascii=False)),
+            )
+            conn.execute(
+                "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, object_id,"
+                " detail_json, incident_id, channel) VALUES(?,?,?,?,?,?,?,?,?)",
+                (t, "web_user", actor, "incident_resume_autonomy",
+                 row["asset_id"] or "", inc_id,
+                 json.dumps({"generation": gen}, ensure_ascii=False), inc_id, "web"),
+            )
+        queued = {}
+        if self.auto_investigator is not None:
+            try:
+                queued = self.auto_investigator.offer(inc_id, generation=gen) or {}
+            except Exception as exc:  # noqa: BLE001 — 恢复不因排队失败而回滚
+                queued = {"ok": False, "error": str(exc)[:120]}
+        return {"ok": True, "incident_id": inc_id, "generation": gen,
+                "need_human": False, "queued": queued}
+
+
     def clear_awaiting_approval(self, inc_id: str, action_id: str) -> None:
         self.clear_action_obligation(inc_id, action_id)
 

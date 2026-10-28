@@ -190,7 +190,6 @@ class CouncilAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.app.providers)
 
     def test_reviewed_actions_do_not_become_manual_approval_proposals(self):
-        self.app.policy.effective_decision.return_value = {"allowed": False}
         disposition = self.app._incident_disposition({"actions": [
             {"id": "a1", "mode": "reviewed", "state": "proposed", "council_grant_id": "g1"},
             {"id": "a2", "mode": "reviewed", "state": "approved", "council_grant_id": "g1"},

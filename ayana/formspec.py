@@ -138,77 +138,16 @@ CHECKS_CREATE: dict[str, Any] = {
     },
 }
 
-# ── 权限：默认策略 ─────────────────────────────────────────────
-PERM_DEFAULTS: dict[str, Any] = {
-    "id": "permissions.defaults",
-    "title": "默认授权策略",
-    "summary": "按操作类型配置禁止 / 需要人工确认 / 允许自动执行；新资产自动继承。",
-    "submit_label": "保存策略",
-    "ai_role": "定位界面并填草稿；保存必须由用户确认。",
-    "fields": [
-        {
-            "name": "capability",
-            "type": "string",
-            "required": True,
-            "label": "操作类型",
-            "source": "capabilities",
-            "help": "系统能力目录中的 capability 名，不可发明",
-        },
-        {
-            "name": "state",
-            "type": "enum",
-            "required": True,
-            "label": "策略",
-            "values": ["deny", "confirm", "auto"],
-            "help": "根据所选操作的真实支持范围选择策略。读取操作仅支持禁止或允许读取；人工确认只适用于写操作。",
-        },
-        {
-            "name": "scope",
-            "type": "enum",
-            "label": "范围",
-            "values": ["default", "exception"],
-            "default": "default",
-        },
-        {
-            "name": "asset_id",
-            "type": "string",
-            "required_if": "scope==exception",
-            "label": "资产",
-            "source": "assets",
-        },
-        {
-            "name": "object_id",
-            "type": "string",
-            "label": "对象",
-            "default": "*",
-            "source": "objects",
-            "help": "指定对象必须属于所选主机的登记对象。用户可用对象名称描述，系统解析为登记标识；不能用任意服务名或把未识别对象改为全部对象。",
-        },
-    ],
-    "constraints": [
-        "capability 必须来自系统能力目录",
-        "scope=default 表示全局默认；scope=exception 必须指定 asset_id",
-        "不得创建新资产；不得扩大主机侧 commands.json/sudoers 边界",
-        "用户未明确的 state 不要猜，放进 missing",
-        "读取操作仅支持禁止或允许读取，不支持读取前人工审批；其他策略必须来自操作目录的 allowed_states",
-        "自动执行仅适用于目录允许自动执行的写操作；人工交互终端不能授予自动 Agent",
-        "对象来自所选资产的 objects；用唯一匹配的登记名称/unit/container 自动解析为真实 id，无法唯一匹配时追问，不得扩大为 *",
-    ],
-}
-
 FORMS: dict[str, dict[str, Any]] = {
     "checks.create": CHECKS_CREATE,
-    "permissions.defaults": PERM_DEFAULTS,
 }
 
 # 操作场景 → 表单 id
 DOMAIN_FORM = {
     "checks": "checks.create",
-    "permissions": "permissions.defaults",
 }
 DOMAIN_ROUTES = {
     "checks": ["checks_form"],
-    "permissions": ["perm_defaults", "perm_exceptions", "perm_effective", "perm_workbench", "perm_ceiling"],
 }
 
 
@@ -234,8 +173,6 @@ _VALUE_LABELS = {
     "params.proto": {"tcp": "TCP", "udp": "UDP"},
     "expect.mode": {"exit0": "命令成功退出", "contains": "输出包含指定文字", "not_contains": "输出不包含指定文字"},
     "severity": {"info": "提示", "warning": "警告", "critical": "严重"},
-    "state": {"deny": "禁止", "confirm": "需要人工确认", "auto": "允许自动执行"},
-    "scope": {"default": "默认策略", "exception": "指定资产的例外策略"},
 }
 _CHECK_APPLICABLE = {
     "params.port": {"field": "kind", "equals": "port"},
@@ -263,24 +200,6 @@ for _field in CHECKS_CREATE["fields"]:
             _field["required_when"] = _CHECK_APPLICABLE[_key]
     if _key in _VALUE_LABELS:
         _field["value_labels"] = _VALUE_LABELS[_key]
-for _field in PERM_DEFAULTS["fields"]:
-    _control = {"capability": "perm-ex-cap", "state": "perm-ex-state",
-                "asset_id": "perm-ex-asset", "object_id": "perm-ex-object"}.get(_field["name"])
-    if _control:
-        _field["control"] = _control
-        _field["control_id"] = _control
-    if _field["name"] in _VALUE_LABELS:
-        _field["value_labels"] = _VALUE_LABELS[_field["name"]]
-    if _field["name"] == "asset_id":
-        _field["applicable_if"] = {"field": "scope", "equals": "exception"}
-        _field["required_when"] = _field["applicable_if"]
-        _field["validation_context"] = condition_dependencies(_field["applicable_if"])
-    if _field["name"] == "state":
-        _field["validation_context"] = ["capability"]
-    elif _field["name"] == "object_id":
-        _field["validation_context"] = ["asset_id", "capability", "scope"]
-
-
 def _issue(field: str, code: str, message: str, schema: dict[str, dict]) -> dict[str, str]:
     return {"field": field, "label": schema.get(field, {}).get("label", "配置项"), "code": code, "message": message}
 
@@ -320,41 +239,6 @@ def _asset_options(assets: list[Any] | None) -> dict[str, str] | None:
             result[asset] = asset
         elif isinstance(asset, dict) and asset.get("id") and asset.get("enabled", True):
             result[str(asset["id"])] = str(asset.get("display_name") or asset["id"])
-    return result
-
-
-def permission_capabilities(capabilities: list[Any] | None) -> dict[str, dict] | None:
-    """把可用能力切片扩充为真实策略范围；给提示词、UI 和校验共用。"""
-    if capabilities is None:
-        return None
-    from .capabilities import get_capability
-    result = {}
-    for item in capabilities:
-        name = item.get("name") if isinstance(item, dict) else item
-        if not isinstance(name, str) or not name:
-            continue
-        try:
-            actual = get_capability(name)
-            spec = dict(item) if isinstance(item, dict) else {}
-            spec.update({"name": name, "kind": actual.kind, "description": actual.description,
-                         "object_kinds": list(actual.object_kinds), "auto_allowed": actual.auto_allowed})
-        except KeyError:
-            spec = dict(item) if isinstance(item, dict) else {"name": name}
-        kind = spec.get("kind")
-        if name == "shell.interactive":
-            states = ["deny"]
-            meaning = "人工交互终端不能授权给自动 Agent；此表单只能将它禁止。"
-        elif kind == "read":
-            states = ["deny", "auto"]
-            meaning = "读取操作仅支持禁止或允许读取，不支持执行前人工确认。"
-        elif kind == "write":
-            states = ["deny", "confirm"] + (["auto"] if spec.get("auto_allowed") else [])
-            meaning = "此写操作支持禁止、人工确认" + ("或自动执行。" if spec.get("auto_allowed") else "；不能授权自动执行。")
-        else:
-            states = ["deny", "confirm", "auto"]
-            meaning = "策略需要符合系统实际操作目录。"
-        labels = {"deny": "禁止", "confirm": "需要人工确认", "auto": "允许读取" if kind == "read" else "允许自动执行"}
-        result[name] = {**spec, "allowed_states": states, "state_labels": {state: labels[state] for state in states}, "policy_meaning": meaning}
     return result
 
 
@@ -504,51 +388,6 @@ def validate_fields(
         issues.append(_issue("asset_id", "unknown_asset", "所选主机不存在、已停用或当前账号不可用，请重新选择主机。", schema))
         invalid.add("asset_id")
         values.pop("asset_id")
-    cap_options = permission_capabilities(capabilities) if domain == "permissions" else None
-    if domain == "permissions" and values.get("capability") and cap_options is not None and values["capability"] not in cap_options:
-        issues.append(_issue("capability", "unknown_capability", "系统不支持这项操作，请从可用操作中选择。", schema))
-        invalid.add("capability")
-        values.pop("capability")
-
-    if domain == "permissions":
-        capability = (cap_options or {}).get(values.get("capability"), {})
-        if not capability and values.get("capability") and capabilities is None:
-            capability = (permission_capabilities([values["capability"]]) or {}).get(values["capability"], {})
-        if values.get("state") and capability and values["state"] not in capability["allowed_states"]:
-            issues.append(_issue("state", "unsupported_state", capability["policy_meaning"], schema))
-            invalid.add("state")
-            values.pop("state")
-
-        target = values.get("object_id")
-        asset = next((a for a in (assets or []) if isinstance(a, dict) and a.get("id") == values.get("asset_id")), None)
-        if target and target != "*" and asset is not None and "objects" in asset:
-            objects = [obj for obj in asset["objects"] if isinstance(obj, dict) and isinstance(obj.get("id"), str)] if isinstance(asset["objects"], list) else []
-            matches = [obj for obj in objects if obj["id"] == target]
-            if not matches:
-                matches = [obj for obj in objects if any(target == obj.get(key) for key in ("name", "unit", "container"))]
-            if not matches:
-                issues.append(_issue("object_id", "unknown_object", "所选对象没有登记在这台主机上，请选择已登记对象。", schema))
-                invalid.add("object_id")
-                values.pop("object_id")
-            elif len(matches) > 1:
-                invalid.add("object_id")
-                values.pop("object_id")
-                additional_missing.append({"field": "object_id", "label": schema["object_id"]["label"],
-                    "question": "这台主机有多个名称匹配的对象，请选择希望配置权限的对象。",
-                    "options": [{"value": obj["id"], "label": str(obj.get("name") or obj.get("unit") or obj.get("container") or obj["id"]),
-                                 "description": str(obj.get("unit") or obj.get("container") or obj.get("kind") or "登记对象")} for obj in matches]})
-            else:
-                obj = matches[0]
-                kinds = capability.get("object_kinds") or ["*"]
-                if "*" not in kinds and obj.get("kind") not in kinds:
-                    issues.append(_issue("object_id", "object_kind_mismatch", "这项操作不适用于所选对象，请选择匹配的对象或调整操作类型。", schema))
-                    invalid.add("object_id")
-                    values.pop("object_id")
-                else:
-                    values["object_id"] = obj["id"]
-                    if target != obj["id"]:
-                        normalizations.append({"field": "object_id", "from": target, "to": obj["id"], "reason": "根据所选主机唯一匹配的登记对象解析。"})
-
     if domain == "checks" and values.get("params.cmd"):
         from .checks import CheckError, validate_argv
         try:
@@ -588,8 +427,6 @@ def validate_fields(
             if field["type"] == "enum":
                 choices = field["values"]
                 labels = field.get("value_labels", {})
-                if domain == "permissions" and key == "state" and capability:
-                    choices, labels = capability["allowed_states"], capability["state_labels"]
                 item["options"] = [{"value": value, "label": labels.get(value, value)} for value in choices]
             elif key == "asset_id" and asset_options and len(asset_options) <= 12:
                 item["options"] = [{"value": value, "label": label} for value, label in asset_options.items()]
@@ -690,12 +527,6 @@ def get_form(domain: str) -> dict[str, Any]:
         command["max_tokens"] = MAX_ARGV_TOKENS
         command["max_token_length"] = 120
         form["command_boundary"] = COMMAND_BOUNDARY
-    elif domain == "permissions":
-        from .capabilities import list_capabilities
-        options = permission_capabilities(list_capabilities()) or {}
-        state = next(f for f in form["fields"] if f["name"] == "state")
-        state["allowed_states_by_capability"] = {name: spec["allowed_states"] for name, spec in options.items()}
-        state["value_labels_by_capability"] = {name: spec["state_labels"] for name, spec in options.items()}
     return form
 
 
@@ -754,7 +585,7 @@ def form_prompt_payload(
         },
         "context": {
             "assets": assets,
-            "capabilities": list((permission_capabilities(capabilities) or {}).values()) if domain == "permissions" else capabilities or [],
+            "capabilities": capabilities or [],
             "extra": extra or {},
         },
         "interpretation_rules": [

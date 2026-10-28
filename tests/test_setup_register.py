@@ -180,7 +180,7 @@ class SetupRegisterApiTests(unittest.IsolatedAsyncioTestCase):
         data = json.loads(resp.text)
         self.assertEqual(data["error"], "mismatch")
 
-    async def test_register_api_seeds_admin_perms(self):
+    async def test_register_api_uses_admin_role_without_legacy_rules(self):
         info = self.auth.ensure_setup_initialized()
         await self.webapp.api_setup_register(
             _FakeRequest(
@@ -195,8 +195,9 @@ class SetupRegisterApiTests(unittest.IsolatedAsyncioTestCase):
             "SELECT allow FROM permissions WHERE subject_type='web_user'"
             " AND subject_id='opsroot' AND capability='asset.summary'"
         )
-        self.assertIsNotNone(row)
-        self.assertTrue(row["allow"])
+        self.assertIsNone(row)
+        user = self.db.query_one("SELECT is_admin FROM users WHERE username='opsroot'")
+        self.assertTrue(user["is_admin"])
 
 
 if __name__ == "__main__":

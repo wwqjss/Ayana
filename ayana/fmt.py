@@ -267,6 +267,5 @@ def approval_error(code: str) -> str:
         "expired": "这条授权请求已过期，请查看事件详情。",
         "permanent_agent_only": "只有系统提出的处置操作才能设置以后自动执行。",
         "permanent_allow_denied": "此目标已有禁止执行规则，永久允许不能覆盖禁止项。",
-        "denied_by_agent_ceiling": "系统权限上限不允许此类自动处置，请联系管理员。",
-        "control_plane_forbidden": "控制面服务不能永久允许自动执行，请人工处理。",
+            "control_plane_forbidden": "控制面服务不能永久允许自动执行，请人工处理。",
     }.get(code, "授权未完成，请在事件详情查看权限或执行条件。")

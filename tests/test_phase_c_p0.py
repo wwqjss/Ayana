@@ -126,10 +126,6 @@ def make_env():
     )
 
     policy = Policy(db)
-    policy.upsert_permission(
-        subject_type="web_user", subject_id="admin", capability="service.restart",
-        asset_id="nerv", object_id="*", allow=True, require_approval=False, actor="t",
-    )
     prom = FakeProm()
     actions = ActionService(db, FakeNT(), FakeGate(), policy, prom, verify_window=90, verify_timeout=2)
     inc = IncidentService(db)

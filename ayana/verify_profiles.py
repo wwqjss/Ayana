@@ -112,9 +112,11 @@ PROFILES: dict[str, VerificationProfile] = {
 # capability → 默认 profile（仅无歧义的通用能力）
 CAP_PROFILE = {
     "service.restart": "svc.recover",
+    "service.start": "svc.recover",
     "service.reset_failed": "svc.recover",
     "service.reload": "svc.recover",
     "service.stop": "svc.stop",
+    "container.restart": "svc.recover",
     "mysql.replica.start": "mysql.replica.recover",
 }
 

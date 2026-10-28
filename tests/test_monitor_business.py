@@ -296,14 +296,13 @@ class BusinessAPITest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("simulated", payload["errors"][0]["message"])
         self.assertEqual(self.snapshot(), before)
 
-    async def test_prometheus_permission_failure_does_not_hide_native_source(self):
+    async def test_legacy_rule_denial_does_not_hide_registered_business_data(self):
         self.policy.check.return_value = {"allowed": False}
         before = self.snapshot()
-        _, payload = await self.get("control")
-        self.assertEqual([row["source"] for row in payload["items"]], ["ayana"])
-        self.assertEqual(payload["errors"][0]["source"], "prometheus")
-        self.assertIn("权限", payload["errors"][0]["message"])
-        self.assertEqual(self.prom.calls, [])
+        _, payload = await self.get("asset-a")
+        self.assertEqual([row["source"] for row in payload["items"]], ["prometheus"])
+        self.assertEqual(payload["errors"], [])
+        self.policy.check.assert_not_called()
         self.assertEqual(self.snapshot(), before)
 
     async def test_native_permission_failure_does_not_hide_prometheus_source(self):

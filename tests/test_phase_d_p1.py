@@ -177,27 +177,9 @@ def make_env(
         (now(), now()),
     )
 
-    policy = Policy(db)
-    allow, require_approval, auto_allowed = auto_rule
-    policy.upsert_permission(
-        subject_type="auto_rule", subject_id="agent", capability="service.restart",
-        asset_id="nerv", object_id="*", allow=allow, require_approval=require_approval,
-        auto_allowed=auto_allowed, actor="t",
-    )
-    policy.upsert_permission(
-        subject_type="web_user", subject_id="admin", capability="service.restart",
-        asset_id="nerv", object_id="*", allow=True, require_approval=False, actor="t",
-    )
-    policy.upsert_permission(
-        subject_type="qq_user", subject_id="10001", capability="service.restart",
-        asset_id="nerv", object_id="*", allow=True, require_approval=False, actor="t",
-    )
-    # 读权限
-    policy.upsert_permission(
-        subject_type="auto_rule", subject_id="agent", capability="asset.summary",
-        asset_id="nerv", object_id="*", allow=True, require_approval=False,
-        auto_allowed=True, actor="t",
-    )
+    # Unified model: account roles only (admin web / configured QQ operator).
+    # The retired auto_rule tuple no longer grants anything.
+    policy = Policy(db, admin_qq="10001")
     nt = FakeNT()
     prom = FakeProm(probe_value=probe_value)
     gate = Gate(nt)
@@ -381,16 +363,12 @@ class TestP101HumanLoop(unittest.TestCase):
         )
         actions.approve(prop["id"], approver_type="web_user", approver_id="admin",
                         channel="web")
-        # 批准后收紧权限
-        policy.upsert_permission(
-            subject_type="web_user", subject_id="admin", capability="service.restart",
-            asset_id="nerv", object_id="*", allow=False, require_approval=True,
-            auto_allowed=False, actor="t",
-        )
+        # 批准后撤权（管理员降为 viewer）——派发门复查账号角色
+        db.execute("UPDATE users SET is_admin=0 WHERE username='admin'")
         with self.assertRaises(ActionError) as ctx:
             asyncio.run(actions.execute(prop["id"], actor_type="web_user",
                                         actor_id="admin", is_admin=True))
-        self.assertEqual(ctx.exception.code, "policy_revoked")
+        self.assertEqual(ctx.exception.code, "actor_access_revoked")
         self.assertFalse(nt.exec_calls)
 
     def test_web_qq_same_service_semantics(self):
@@ -428,42 +406,51 @@ class TestP101HumanLoop(unittest.TestCase):
         with self.assertRaises(RetiredAutonomyError):
             AgentLoop(db,None,actions,policy,None,None,auto_enabled=False)
         inv=InvestigationService(db,nt,gate,prom,policy)
-        asyncio.run(inv.run(incident_id="inc1",asset_id="nerv",object_id="frps",actor_type="auto_rule",actor_id="agent",capability="asset.summary"))
+        asyncio.run(inv.run(incident_id="inc1",asset_id="nerv",object_id="frps",actor_type="web_user",actor_id="admin",capability="asset.summary"))
         prop=actions.propose(asset_id="nerv",object_id="frps",capability="service.restart",reason="human request",incident_id="inc1",proposer_type="web_user",proposer_id="admin",mode="manual",template_id="tmpl_service_restart")
         self.assertGreaterEqual(db.query_one("SELECT COUNT(*) n FROM investigations")["n"],1)
         self.assertEqual(actions.get_action(prop["id"])["state"],"proposed")
         self.assertFalse(nt.exec_calls)
 
     def test_policy_three_state_values(self):
+        """Unified tiers: read=automatic, write=approval, automation=session-only."""
         tmp, db, policy, nt, prom, gate, actions, agent, incidents = make_env()
         self.addCleanup(close_env, tmp, db)
         d1 = policy.effective_decision(
-            subject_type="auto_rule", subject_id="agent", capability="service.restart",
+            subject_type="web_user", subject_id="admin", capability="service.logs",
             asset_id="nerv", object_id="nerv:service:frps",
         )
-        # 默认 (True, True, False) → approval_required
-        self.assertEqual(d1["decision"], "approval_required")
-        self.assertIsNotNone(d1["matched_rule"])
-        policy.upsert_permission(
-            subject_type="auto_rule", subject_id="agent", capability="service.restart",
-            asset_id="nerv", object_id="*", allow=False, require_approval=True,
-            auto_allowed=False, actor="t",
-        )
+        self.assertEqual(d1["decision"], "automatic")
+        self.assertFalse(d1["require_approval"])
         d2 = policy.effective_decision(
-            subject_type="auto_rule", subject_id="agent", capability="service.restart",
+            subject_type="web_user", subject_id="admin", capability="service.restart",
             asset_id="nerv", object_id="nerv:service:frps",
         )
-        self.assertEqual(d2["decision"], "forbidden")
-        policy.upsert_permission(
-            subject_type="auto_rule", subject_id="agent", capability="service.restart",
-            asset_id="nerv", object_id="*", allow=True, require_approval=False,
-            auto_allowed=True, actor="t",
-        )
+        self.assertEqual(d2["decision"], "approval_required")
+        self.assertTrue(d2["require_approval"])
         d3 = policy.effective_decision(
+            subject_type="web_user", subject_id="admin", capability="service.restart",
+            asset_id="nerv", object_id="nerv:service:frps", auto=True,
+        )
+        self.assertFalse(d3["allowed"])
+        self.assertEqual(d3["reason"], "trusted_session_context_required")
+        db.execute(
+            "INSERT INTO users(username,password_hash,is_admin,created_at,updated_at)"
+            " VALUES('viewer','x',0,?,?)",
+            (now(), now()),
+        )
+        d4 = policy.effective_decision(
+            subject_type="web_user", subject_id="viewer", capability="service.restart",
+            asset_id="nerv", object_id="nerv:service:frps",
+        )
+        self.assertFalse(d4["allowed"])
+        self.assertEqual(d4["reason"], "admin_required")
+        d5 = policy.effective_decision(
             subject_type="auto_rule", subject_id="agent", capability="service.restart",
             asset_id="nerv", object_id="nerv:service:frps",
         )
-        self.assertEqual(d3["decision"], "automatic")
+        self.assertFalse(d5["allowed"])
+        self.assertEqual(d5["reason"], "trusted_session_context_required")
 
     def test_approval_records_actor_channel_timestamp(self):
         tmp, db, policy, nt, prom, gate, actions, agent, incidents = make_env()

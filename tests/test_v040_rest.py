@@ -79,123 +79,40 @@ def make_env():
     return tmp, db, policy
 
 
-class TestPolicyManagement(unittest.TestCase):
+class TestRetiredPolicyManagement(unittest.TestCase):
     def setUp(self):
         self.tmp, self.db, self.policy = make_env()
 
     def tearDown(self):
-        try:
-            self.db.close()
-        except Exception:
-            pass
+        self.db.close()
         self.tmp.cleanup()
 
-    def test_upsert_records_before_after(self):
-        res = self.policy.upsert_permission(
-            subject_type="web_user",
-            subject_id="admin",
-            capability="service.restart",
-            allow=True,
-            asset_id="nerv",
-            object_id="nerv:service:nginx",
-            require_approval=True,
-            actor="admin",
-        )
-        self.assertIsNone(res["before"])
-        self.assertTrue(res["after"]["allow"])
-        res2 = self.policy.upsert_permission(
-            subject_type="web_user",
-            subject_id="admin",
-            capability="service.restart",
-            allow=True,
-            asset_id="nerv",
-            object_id="nerv:service:nginx",
-            require_approval=False,
-            auto_allowed=True,
-            actor="admin",
-        )
-        self.assertIsNotNone(res2["before"])
-        self.assertTrue(res2["before"]["require_approval"])
-        self.assertFalse(res2["after"]["require_approval"])
-        # auto_allowed 被目录截断（service.restart 目录允许 auto）
-        hist = self.policy.list_config_history(limit=10)
-        self.assertGreaterEqual(len(hist), 2)
-        self.assertIn("before", hist[0]["payload"])
-        self.assertIn("after", hist[0]["payload"])
+    def test_mutations_fail_without_writing_history_or_rules(self):
+        before = self.db.query_one("SELECT COUNT(*) n FROM config_versions")["n"]
+        for method, args in (("upsert_permission", {"capability": "service.restart", "allow": True}),
+                             ("delete_permission", {"permission_id": 1})):
+            with self.subTest(method=method), self.assertRaises(PolicyDeny) as caught:
+                getattr(self.policy, method)(**args)
+            self.assertIn("permission_model_retired", caught.exception.reason)
+        self.assertEqual(self.db.query_one("SELECT COUNT(*) n FROM config_versions")["n"], before)
+        self.assertEqual(self.db.query_one("SELECT COUNT(*) n FROM permissions")["n"], 0)
 
-    def test_upsert_cannot_raise_auto_above_catalog(self):
-        # asset.summary 目录 auto_allowed=False
-        res = self.policy.upsert_permission(
-            subject_type="auto_rule",
-            subject_id="agent",
-            capability="asset.summary",
-            allow=True,
-            require_approval=False,
-            auto_allowed=True,
-            actor="admin",
-        )
-        self.assertFalse(res["after"]["auto_allowed"])
+    def test_legacy_preview_is_explicitly_retired(self):
+        with self.assertRaises(PolicyDeny) as caught:
+            self.policy.preview(subject_type="web_user", subject_id="admin", capability="service.restart")
+        self.assertIn("permission_model_retired", caught.exception.reason)
 
-    def test_upsert_validates_inputs(self):
-        with self.assertRaises(PolicyDeny):
-            self.policy.upsert_permission(
-                subject_type="nope",
-                subject_id="x",
-                capability="service.restart",
-                allow=True,
-            )
-        with self.assertRaises(PolicyDeny):
-            self.policy.upsert_permission(
-                subject_type="web_user",
-                subject_id="",
-                capability="service.restart",
-                allow=True,
-            )
-        with self.assertRaises(PolicyDeny):
-            self.policy.upsert_permission(
-                subject_type="web_user",
-                subject_id="a",
-                capability="shell.root",
-                allow=True,
-            )
-
-    def test_preview_dry_run_no_write(self):
-        d = self.policy.preview(
-            subject_type="web_user",
-            subject_id="admin",
-            capability="service.restart",
-            asset_id="nerv",
-            object_id="nerv:service:nginx",
-        )
-        self.assertEqual(d["decision"], "forbidden")
-        self.assertEqual(self.policy.list_permissions(), [])
-
-    def test_delete_records_before(self):
-        self.policy.upsert_permission(
-            subject_type="web_user",
-            subject_id="admin",
-            capability="service.restart",
-            allow=True,
-            asset_id="nerv",
-            object_id="x",
-            actor="admin",
-        )
-        perms = self.policy.list_permissions()
-        self.policy.delete_permission(perms[0]["id"], actor="admin")
-        hist = self.policy.list_config_history(limit=5)
-        kinds = {h["kind"] for h in hist}
-        self.assertIn("permission_delete", kinds)
+    def test_role_decision_does_not_require_seed_grants(self):
+        decision = self.policy.effective_decision(subject_type="web_user", subject_id="admin",
+                                                  capability="service.restart", asset_id="nerv")
+        self.assertTrue(decision["allowed"])
+        self.assertEqual(decision["source"], "account_role")
+        self.assertIsNone(decision["matched_rule"])
 
 
 class TestApprovalAudit(unittest.TestCase):
     def setUp(self):
         self.tmp, self.db, self.policy = make_env()
-        self.db.execute(
-            "INSERT INTO permissions(subject_type, subject_id, asset_id, capability, object_id,"
-            " allow, require_approval, auto_allowed, created_at, updated_at, created_by)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            ("web_user", "admin", "*", "service.restart", "*", 1, 1, 0, now(), now(), "seed"),
-        )
         self.actions = ActionService(
             self.db, FakeNT(), FakeGate(), self.policy, FakeProm(),
             action_ttl=1800, approval_ttl=900,

@@ -32,6 +32,11 @@ class TestTerminalPolicy(unittest.TestCase):
     def setUp(self):
         self.tmp, self.db = make_env()
         self.policy = Policy(self.db)
+        for username, admin in (("admin", 1), ("viewer", 0)):
+            self.db.execute(
+                "INSERT INTO users(username,password_hash,is_admin,created_at,updated_at) VALUES(?,?,?,?,?)",
+                (username, "test-hash", admin, now(), now()),
+            )
 
     def tearDown(self):
         try:
@@ -49,7 +54,7 @@ class TestTerminalPolicy(unittest.TestCase):
             object_id="*",
         )
         self.assertFalse(d["allowed"])
-        self.assertEqual(d["reason"], "denied_by_agent_ceiling")
+        self.assertEqual(d["reason"], "trusted_session_context_required")
 
     def test_llm_cannot_shell_interactive(self):
         d = self.policy.check(
@@ -59,18 +64,18 @@ class TestTerminalPolicy(unittest.TestCase):
         )
         self.assertFalse(d["allowed"])
 
-    def test_web_user_can_when_permitted(self):
-        self.policy.upsert_permission(
-            subject_type="web_user", subject_id="admin",
-            capability="shell.interactive", allow=True,
-            require_approval=False, actor="admin",
-        )
+    def test_authenticated_admin_can_open_terminal(self):
         d = self.policy.check(
             subject_type="web_user",
             subject_id="admin",
             capability="shell.interactive",
         )
         self.assertTrue(d["allowed"])
+
+    def test_viewer_cannot_open_interactive_terminal(self):
+        decision = self.policy.check(subject_type="web_user", subject_id="viewer", capability="shell.interactive")
+        self.assertFalse(decision["allowed"])
+        self.assertEqual(decision["reason"], "admin_required")
 
     def test_capability_in_catalog(self):
         from ayana.capabilities import assert_within_ceiling

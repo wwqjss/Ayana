@@ -152,9 +152,9 @@ class ClosedLoopE2E(unittest.IsolatedAsyncioTestCase):
         self.db = Database(Path(self.tmp.name) / "t.db")
         ensure_ops_loop_schema(self.db)
         _seed(self.db)
-        # 闭环 E2E：关闭人工审批以验证 P6 自动路径
+        # 闭环 E2E：自动处置自主执行（P6 自动路径）
         from ayana.duty_session import DutySessionManager
-        DutySessionManager(self.db).set_setting("require_human_approval", "0", actor="test")
+        DutySessionManager(self.db).set_setting("auto_approval_mode", "automatic", actor="test")
         self.incidents = IncidentService(self.db)
         self.transport = FakeTransport(ok=True)
         self.prom = FakeProm(healthy=True)
@@ -360,7 +360,9 @@ class ClosedLoopE2E(unittest.IsolatedAsyncioTestCase):
 
     async def test_human_approval_gate_blocks_auto_execute(self):
         from ayana.duty_session import DutySessionManager
-        DutySessionManager(self.db).set_setting("require_human_approval", "1", actor="test")
+        # 人工审批拦截属 manual 档语义（旧全局审批开关已退役）
+        DutySessionManager(self.db).set_setting("auto_approval_mode", "manual", actor="test")
+        self.db.execute("UPDATE duty_sessions SET approval_mode='manual'")
         conclusion = {
             "status": "completed",
             "root_cause": "service down",

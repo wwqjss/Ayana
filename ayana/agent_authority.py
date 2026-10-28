@@ -30,7 +30,7 @@ def resolve_authority(db: Any, session_id: str, *, conn=None) -> dict:
     session = dict(session)
     settings = dict((r["key"], r["value"]) for r in
         (conn.execute("SELECT key,value FROM agent_settings") if conn is not None else db.query("SELECT key,value FROM agent_settings")))
-    approval = settings.get("auto_approval_mode", "manual")
+    approval = settings.get("auto_approval_mode", "automatic")
     if session["origin"] == "auto":
         access, source = settings.get("auto_access_mode", "readwrite"), "auto_global"
     else:

@@ -164,8 +164,11 @@ class ActionService:
         self.db = db
         # self.nt 未使用；nt 仅作 transport 回退（见下行）
         self.gate = gate
-        self.policy = policy
+        # The compatibility argument now supplies account/channel access checks.
+        # Per-capability permission rules are retired; Agent writes use sessions.
+        self.access_control = policy
         self.prom = prom
+        self.notifier = None
         # 测试可传 Fake 作为 transport；生产为 SSH Router
         self.transport = transport if transport is not None else nt
         self.action_ttl = action_ttl
@@ -207,17 +210,39 @@ class ActionService:
         payload = json.loads(dict(action).get("params_json") or "{}")
         return str(payload.get("_ayana_session_id") or "")
 
-    def _require_human_approval(self) -> bool:
-        """Agent 设置总开关：需要人工审批（默认开）。"""
+    def _human_access(self, actor_type: str, actor_id: str, action: Any) -> dict[str, Any]:
+        """Account/channel roles, without legacy operation-specific rules."""
+        if actor_type not in ("web_user", "qq_user", "wecom_user") or not str(actor_id).strip():
+            return {"allowed": False, "reason": "human_required"}
+        row = dict(action)
+        return self.access_control.check(
+            subject_type=actor_type, subject_id=actor_id, capability=row["capability"],
+            asset_id=row["asset_id"], object_id=row["object_id"],
+        )
+
+    def _write_authority(self, action: Any, *, conn=None) -> dict[str, Any] | None:
+        """Recheck server-owned session authority, including on human approval."""
+        row = dict(action)
+        session_id = self._action_session_id(row)
+        if not session_id:
+            if (row.get("mode", "manual") != "manual"
+                    or row.get("proposer_type") not in ("web_user", "qq_user", "wecom_user")
+                    or not str(row.get("proposer_id") or "").strip()):
+                raise ActionError("authority_session_required", "Agent 操作需要关联有效会话")
+            return None
+        authority = self._session_authority(session_id, conn=conn)
+        if authority.get("lifecycle_block"):
+            raise ActionError(authority["lifecycle_block"], "当前会话已暂停或正在删除")
+        if not authority["write_allowed"]:
+            raise ActionError("readonly_mode_rejects_write", "当前会话为只读，审批不能覆盖只读限制")
+        from .agent_work_scope import WorkScopeError, claim_target
+
         try:
-            row = self.db.query_one(
-                "SELECT value FROM agent_settings WHERE key='require_human_approval'"
-            )
-            if not row:
-                return True
-            return str(row["value"] or "1") not in ("0", "false", "False", "")
-        except Exception:
-            return True
+            claim_target(self.db, session_id, asset_id=row["asset_id"], object_id=row["object_id"],
+                         incident_id=row.get("incident_id") or "", conn=conn)
+        except WorkScopeError as exc:
+            raise ActionError(exc.code, str(exc), context=exc.detail) from exc
+        return authority
 
     # ------------------------------------------------------------------
     # 提案
@@ -267,6 +292,10 @@ class ActionService:
             runbook_id = runbook_id or ""
             template_id = template_id or ""
         obj = self._object(asset_id, object_id)
+        dynamic_target = False
+        if not obj:
+            obj = dynamic_object(capability, asset_id, object_id, params)
+            dynamic_target = bool(obj)
         if not obj:
             raise ActionError("object_not_registered", object_id)
         try:
@@ -286,13 +315,15 @@ class ActionService:
         if incident_id:
             self._assert_incident_matches(incident_id, asset_id, obj)
 
-        # 自动语义与人工语义分开（P1-01：服务端三态）
-        # 工作台：require_human_approval 开启时，autonomous 仍走人工审批门；
-        # 关闭时保留 P6 自动闭环（硬保护：能力目录/对象绑定/host key/幂等不变）。
+        # Agent authority is always resolved from the trusted persisted session.
+        # A missing session must never fall back to a global automatic setting.
+        if not authority_session_id and (mode != "manual" or proposer_type not in
+                ("web_user", "qq_user", "wecom_user") or not str(proposer_id).strip()):
+            raise ActionError("authority_session_required", "Agent 操作需要关联有效会话")
         authority = self._session_authority(authority_session_id)
         if authority and authority.get("lifecycle_block"):
-            raise ActionError(authority["lifecycle_block"],"当前会话已暂停或正在删除")
-        if authority and authority["access_mode"] == "readonly":
+            raise ActionError(authority["lifecycle_block"], "当前会话已暂停或正在删除")
+        if authority and not authority["write_allowed"]:
             self.db.audit(
                 proposer_type, proposer_id, "action_propose_denied",
                 asset_id=asset_id, object_id=obj["id"], incident_id=incident_id,
@@ -301,71 +332,27 @@ class ActionService:
             )
             raise ActionError("readonly_mode_rejects_write", "Current session is read-only")
         if authority_session_id:
-            from .agent_work_scope import WorkScopeError,claim_target
+            from .agent_work_scope import WorkScopeError, claim_target
             try:
-                claim_target(self.db,authority_session_id,asset_id=asset_id,object_id=obj["id"],incident_id=incident_id)
+                claim_target(self.db, authority_session_id, asset_id=asset_id,
+                             object_id=obj["id"], incident_id=incident_id)
             except WorkScopeError as exc:
-                raise ActionError(exc.code,str(exc),context=exc.detail) from exc
-        require_human = (authority["approval_mode"] == "manual") if authority else self._require_human_approval()
-        if mode == "autonomous" and not require_human:
-            decision = {
-                "decision": "automatic",
-                "allowed": True,
-                "require_approval": False,
-                "auto_allowed": True,
-                "reason": "autonomous_ceiling_and_three_state_retired",
-                "rule": None,
-                "agent_ceiling": None,
-            }
-        elif mode == "autonomous" and require_human:
-            # 人工审批开启：提案等待人工。Policy 禁止规则仍生效，但不要求预授权 allow。
-            decision = {
-                "decision": "approval_required",
-                "allowed": True,
-                "require_approval": True,
-                "auto_allowed": False,
-                "reason": "require_human_approval",
-                "rule": None,
-                "agent_ceiling": None,
-            }
-            try:
-                probe = self.policy.effective_decision(
-                    subject_type=proposer_type,
-                    subject_id=proposer_id,
-                    capability=capability,
-                    asset_id=asset_id,
-                    object_id=obj["id"],
-                    auto=False,
-                )
-                if probe.get("decision") == "forbidden" or (
-                    probe.get("matched_rule") or {}
-                ).get("allow") is False:
-                    decision = {
-                        "decision": "forbidden",
-                        "allowed": False,
-                        "require_approval": True,
-                        "auto_allowed": False,
-                        "reason": probe.get("reason") or "policy_forbidden",
-                        "rule": probe.get("matched_rule"),
-                        "agent_ceiling": probe.get("agent_ceiling"),
-                    }
-            except Exception:
-                pass
+                raise ActionError(exc.code, str(exc), context=exc.detail) from exc
         else:
-            decision = self.policy.effective_decision(
-                subject_type=proposer_type,
-                subject_id=proposer_id,
-                capability=capability,
-                asset_id=asset_id,
-                object_id=obj["id"],
-                auto=(mode in ("auto", "reviewed")),
-            )
-        if decision.get("decision") == "forbidden" or not decision["allowed"]:
-            if mode == "auto" and decision.get("reason") == "auto_not_allowed":
-                raise ActionError("auto_not_allowed", decision.get("reason", ""))
-            raise ActionError("denied", decision.get("reason") or "forbidden")
-        if mode in ("auto", "reviewed") and decision.get("decision") != "automatic":
-            raise ActionError("auto_not_allowed", decision.get("reason", ""))
+            access = self._human_access(proposer_type, proposer_id,
+                {"capability": capability, "asset_id": asset_id, "object_id": obj["id"]})
+            if not access.get("allowed"):
+                raise ActionError("denied", access.get("reason") or "human_required")
+        require_human = mode == "manual" or authority["approval_mode"] == "manual"
+        decision = {
+            "decision": "approval_required" if require_human else "automatic",
+            "allowed": True,
+            "require_approval": require_human,
+            "auto_allowed": not require_human,
+            "reason": "session_manual_approval" if require_human else "session_automatic",
+            "authority": authority,
+            "source": "session_authority" if authority else "human_request",
+        }
         if mode in ("auto", "reviewed", "autonomous"):
             from .incidents import IncidentService
             from .verify_profiles import profile_for_action
@@ -393,6 +380,7 @@ class ActionService:
             "object_kind": obj.get("kind") or "",
             "object_ref": object_ref,
             "params_digest": params_digest,
+            "dynamic_target": dynamic_target,
             "mode": mode,
             "runbook_id": runbook_id,
             "runbook_rev": runbook_rev,
@@ -473,14 +461,18 @@ class ActionService:
             )
         state = "proposed"
         require_approval = decision.get("require_approval", True)
-        # 仅在「关闭人工审批」时 autonomous 系统即批
+        # Automatic approval remains tied to the live persisted session.
         if mode == "autonomous" and not require_human and not require_approval:
-            require_approval = False
-            self._system_approve_autonomous(
+            automatically_approved = self._system_approve_autonomous(
                 aid, incident_id=incident_id, asset_id=asset_id, object_id=obj["id"],
                 capability=capability, tokens=tokens,
             )
-            state = "approved"
+            if automatically_approved:
+                state = "approved"
+            else:
+                require_approval = True
+                decision = {**decision, "decision": "approval_required", "require_approval": True,
+                            "auto_allowed": False, "reason": "session_manual_approval"}
         return {
             "id": aid,
             "state": state,
@@ -503,24 +495,30 @@ class ActionService:
         object_id: str,
         capability: str,
         tokens: list[str],
-    ) -> None:
-        """autonomous 系统批准：记审计与 decision 快照，不走人工 Policy。"""
+    ) -> bool:
+        """Record approval derived from the current trusted session mode."""
         t = now()
         decision_id = new_id("dec")
         snapshot = {
             "decision": "automatic",
-            "reason": "autonomous_ceiling_and_three_state_retired",
+            "reason": "session_automatic",
             "require_approval": False,
-            "agent_ceiling": None,
         }
         with self.db.tx() as conn:
-            conn.execute(
+            row = conn.execute("SELECT * FROM actions WHERE id=?", (action_id,)).fetchone()
+            authority = self._write_authority(row, conn=conn)
+            if authority["approval_mode"] != "automatic":
+                return False
+            snapshot["authority"] = authority
+            cur = conn.execute(
                 "UPDATE actions SET state='approved', approver_type='system',"
                 " approver_id='autonomous', approved_at=?, decision_channel='autonomous',"
-                " decision_reason='autonomous_ceiling_and_three_state_retired', decided_at=?,"
+                " decision_reason='session_automatic', decided_at=?,"
                 " decision_id=?, decision_snapshot_json=? WHERE id=? AND state='proposed'",
                 (t, t, decision_id, json.dumps(snapshot, ensure_ascii=False), action_id),
             )
+            if cur.rowcount != 1:
+                raise ActionError("bad_state", "not_proposed")
             conn.execute(
                 "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, object_id,"
                 " action_id, detail_json, incident_id, channel) VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -531,6 +529,7 @@ class ActionService:
                     incident_id or "", "autonomous",
                 ),
             )
+        return True
 
     def _return_to_human_approval(self, conn: Any, action_id: str) -> None:
         conn.execute(
@@ -685,13 +684,7 @@ class ActionService:
                 )
                 raise ActionError("self_approve_denied", "proposer cannot approve own action")
 
-        decision = self.policy.effective_decision(
-            subject_type=approver_type,
-            subject_id=approver_id,
-            capability=row["capability"],
-            asset_id=row["asset_id"],
-            object_id=row["object_id"],
-        )
+        decision = self._human_access(approver_type, approver_id, row)
         if not decision["allowed"] or decision.get("decision") == "forbidden":
             self.db.audit(
                 approver_type,
@@ -714,6 +707,9 @@ class ActionService:
         t = now()
         decision_id = new_id("dec")
         with self.db.tx() as conn:
+            authority = self._write_authority(row, conn=conn)
+            decision = {**decision, "decision": "human_approved", "authority": authority,
+                        "source": "session_authority" if authority else "human_request"}
             cur = conn.execute(
                 "UPDATE actions SET state='approved', approver_type=?, approver_id=?,"
                 " approved_at=?, decision_channel=?, decision_reason=?, decided_at=?,"
@@ -823,10 +819,7 @@ class ActionService:
     ) -> dict[str, Any]:
         """拒绝提案：零派发。幂等。"""
         row = self._get(action_id)
-        decision = self.policy.effective_decision(
-            subject_type=actor_type, subject_id=actor_id, capability=row["capability"],
-            asset_id=row["asset_id"], object_id=row["object_id"],
-        )
+        decision = self._human_access(actor_type, actor_id, row)
         if not decision.get("allowed") or decision.get("decision") == "forbidden":
             self.db.audit(
                 actor_type, actor_id, "action_reject_denied", asset_id=row["asset_id"],
@@ -1266,6 +1259,12 @@ class ActionService:
             if binding.host_id_verified_at is None or not binding.expected_host_id:
                 raise ActionError("identity_gate", "host_id not registered/verified")
 
+        # 动态目标：执行前实际查到存在才放行（明确不存在拦截，探测失败不拦）
+        if self._object(row["asset_id"], row["object_id"]) is None:
+            dyn_obj = dynamic_object(row["capability"], row["asset_id"], row["object_id"], None)
+            if dyn_obj is not None:
+                await self._discover_target(row["asset_id"], dyn_obj)
+
         # ---- 短事务：重查授权/期限/对象/占用/资产绑定 + 领取 ----
         dispatcher = ssh_ep.username if ssh_ep is not None else binding.write_alias
         reject: tuple[str, str] | None = None
@@ -1317,60 +1316,29 @@ class ActionService:
             if reject is None and fresh["approval_deadline"] and now() > float(fresh["approval_deadline"]):
                 reject = ("approval_expired", "approval_deadline")
 
-            # 唯一派发门：当前 Policy 复查（P0-02）
-            # 工作台：无论是否人工审批，Policy 禁止规则始终生效。
-            action_mode = (fresh["mode"] or "manual") if "mode" in fresh.keys() else "manual"
-            if reject is None and action_mode in ("auto", "reviewed") and fresh["incident_id"]:
-                from .incidents import IncidentService
-
-                blocked = IncidentService(self.db).source_block_reason(fresh["incident_id"])
-                if blocked:
-                    reject = (_source_block_code(blocked), blocked)
+            # The final claim rechecks live session authority and human account
+            # roles. Historical capability rules and ceilings are never read.
+            action_mode = fresh["mode"] or "manual"
             authority_session_id = self._action_session_id(fresh)
             authority_now = None
-            if reject is None and authority_session_id:
+            if reject is None:
                 try:
-                    authority_now = self._session_authority(authority_session_id, conn=conn)
+                    authority_now = self._write_authority(fresh, conn=conn)
                 except ActionError as exc:
                     reject = (exc.code, exc.detail)
-                if authority_now and authority_now["access_mode"] == "readonly":
-                    reject = ("readonly_mode_rejects_write", "Current session is read-only")
-                if authority_now and authority_now.get("lifecycle_block"):
-                    reject = (authority_now["lifecycle_block"],"当前会话已暂停或正在删除")
-                if reject is None:
-                    from .agent_work_scope import WorkScopeError,claim_target
-                    try:
-                        claim_target(self.db,authority_session_id,asset_id=fresh["asset_id"],object_id=fresh["object_id"],incident_id=fresh["incident_id"] or "",conn=conn)
-                    except WorkScopeError as exc:
-                        reject = (exc.code,str(exc))
-                        reject_context = exc.detail
-            require_human_now = ((authority_now["approval_mode"] == "manual")
-                                 if authority_now else self._require_human_approval())
+                    reject_context = exc.context
+            require_human_now = authority_now is None or authority_now["approval_mode"] == "manual"
             human_approved = fresh["approver_type"] in ("web_user", "qq_user", "wecom_user") and bool(fresh["approver_id"])
-            if reject is None and action_mode == "autonomous" and require_human_now and not human_approved:
+            if reject is None and require_human_now and not human_approved:
                 reject = ("approval_required", "Current session requires human approval")
-            # 人工审批关闭时，autonomous 不查 Policy（权限=SSH 账号 + 能力目录硬保护）；
-            # 开启时走人工审批，Policy 在 ApprovalService.decide 强制。
-            if reject is None and not (action_mode == "autonomous" and not require_human_now):
-                for subject_type, subject_id in (
-                    (fresh["proposer_type"] or "web_user", fresh["proposer_id"] or "system"),
-                    (fresh["approver_type"] or "", fresh["approver_id"] or ""),
-                ):
-                    if not subject_type or not subject_id:
-                        continue
-                    decision = self.policy.check(
-                        subject_type=subject_type,
-                        subject_id=subject_id,
-                        capability=fresh["capability"],
-                        asset_id=fresh["asset_id"],
-                        object_id=fresh["object_id"],
-                        auto=(action_mode in ("auto", "reviewed")),
-                    )
-                    if not decision["allowed"]:
-                        reject = ("policy_revoked", f"{subject_type}:{subject_id}")
-                        break
-                    if action_mode in ("auto", "reviewed") and (not decision.get("auto_allowed") or decision.get("decision") != "automatic"):
-                        reject = ("auto_revoked", f"{subject_type}:{subject_id}")
+            if reject is None:
+                human_subjects = [(fresh["approver_type"], fresh["approver_id"])] if human_approved else []
+                if not authority_session_id:
+                    human_subjects.append((fresh["proposer_type"], fresh["proposer_id"]))
+                for subject_type, subject_id in human_subjects:
+                    access = self._human_access(subject_type, subject_id, fresh)
+                    if not access.get("allowed"):
+                        reject = ("actor_access_revoked", f"{subject_type}:{subject_id}")
                         break
 
             # runbook / 模板版本未变（先于派发者检查，便于精确拒绝）
@@ -1393,17 +1361,10 @@ class ActionService:
                 elif action_mode not in ("reviewed", "autonomous"):
                     reject = ("template_required", "no runbook/template on action")
 
-            # 实际派发人必须具备该能力（非管理员）；autonomous 跳过
-            if reject is None and not is_admin and action_mode != "autonomous":
-                d = self.policy.check(
-                    subject_type=actor_type,
-                    subject_id=actor_id,
-                    capability=fresh["capability"],
-                    asset_id=fresh["asset_id"],
-                    object_id=fresh["object_id"],
-                    auto=(action_mode in ("auto", "reviewed")),
-                )
-                if not d["allowed"] or (action_mode in ("auto", "reviewed") and not d.get("auto_allowed")):
+            # A caller-supplied admin flag never substitutes for an identity.
+            if reject is None and (not authority_session_id or actor_type in ("web_user", "qq_user", "wecom_user")):
+                access = self._human_access(actor_type, actor_id, fresh)
+                if not access.get("allowed"):
                     reject = ("dispatcher_denied", f"{actor_type}:{actor_id}")
 
             # 全局暂停（P0-03）
@@ -1419,10 +1380,13 @@ class ActionService:
                     "SELECT * FROM objects WHERE asset_id=? AND (id=? OR name=?)",
                     (fresh["asset_id"], fresh["object_id"], fresh["object_id"]),
                 ).fetchone()
-                if not obj:
+                obj_d = dict(obj) if obj else dynamic_object(
+                    fresh["capability"], fresh["asset_id"], fresh["object_id"], None
+                )
+                if not obj_d:
                     reject = ("object_missing", fresh["object_id"])
                 else:
-                    obj_d = dict(obj)
+                    obj_d = dict(obj_d)
                     if action_mode in ("auto", "reviewed"):
                         from .runbook import CONTROL_PLANE_MARKERS
                         from .verify_profiles import profile_for_action
@@ -1591,6 +1555,11 @@ class ActionService:
                 raise
             except Exception:
                 wo_key = ""
+        if looks_irreversible(tokens):
+            announce_irreversible(
+                self.db, self.notifier, asset_id=row["asset_id"], command=tokens,
+                action_id=action_id, incident_id=row.get("incident_id") or "",
+            )
         try:
             write_kwargs = {}
             if authority_session_id:
@@ -1706,7 +1675,11 @@ class ActionService:
                     "SELECT * FROM objects WHERE asset_id=? AND (id=? OR name=?)",
                     (row["asset_id"], row["object_id"], row["object_id"]),
                 ).fetchone()
-                service = resolve_object_name(dict(obj_row)) if obj_row else ""
+                if obj_row is not None:
+                    service = resolve_object_name(dict(obj_row))
+                else:
+                    dyn_obj = dynamic_object(row["capability"], row["asset_id"], row["object_id"], None)
+                    service = resolve_object_name(dyn_obj) if dyn_obj else ""
                 from .verify_profiles import profile_for_action
 
                 _prof = profile_for_action(
@@ -2354,12 +2327,143 @@ class ActionService:
             raise ActionError("not_found")
         return dict(row)
 
+    async def _discover_target(self, asset_id: str, obj: dict) -> None:
+        """动态目标执行前存在性确认：明确不存在才拦截，探测失败不拦截。"""
+        kind = str(obj.get("kind") or "")
+        name = resolve_object_name(obj)
+        try:
+            if kind == "service":
+                res = await self.transport.probe(
+                    asset_id,
+                    ["systemctl", "show", name, "-p", "LoadState", "--value"],
+                    timeout=10.0,
+                )
+                out = (getattr(res, "output", "") or "").strip().lower()
+                if getattr(res, "returncode", None) == 0 and "not-found" in out:
+                    raise ActionError("target_not_found", f"service:{name}")
+                return
+            if kind == "container":
+                res = await self.transport.probe(
+                    asset_id, ["docker", "inspect", name], timeout=10.0
+                )
+                out = (getattr(res, "output", "") or "").lower()
+                if getattr(res, "returncode", None) not in (None, 0) and (
+                    "no such" in out or "not found" in out
+                ):
+                    raise ActionError("target_not_found", f"container:{name}")
+                return
+        except ActionError:
+            raise
+        except Exception:  # noqa: BLE001 — 探测不可用时不阻断，由写入自身给出真相
+            return
+
     def _object(self, asset_id: str, object_id: str) -> dict | None:
         row = self.db.query_one(
             "SELECT * FROM objects WHERE asset_id=? AND (id=? OR name=?)",
             (asset_id, object_id, object_id),
         )
         return dict(row) if row else None
+
+
+IRREVERSIBLE_TOKENS = frozenset({
+    "rm", "rmdir", "mkfs", "mke2fs", "mkswap", "dd", "wipefs", "shred", "truncate",
+    "parted", "shutdown", "reboot", "halt", "poweroff", "drop", "del",
+})
+
+
+def looks_irreversible(command_or_tokens: Any) -> bool:
+    """不可逆操作提示（仅用于提前通知，绝不作为审批或安全保证）。"""
+    import re
+
+    if isinstance(command_or_tokens, (list, tuple)):
+        text = " ".join(str(x) for x in command_or_tokens)
+    else:
+        text = str(command_or_tokens or "")
+    tokens = re.split(r"[^A-Za-z0-9_./-]+", text.lower())
+    return any(tok in IRREVERSIBLE_TOKENS for tok in tokens)
+
+
+def announce_irreversible(db: Any, notifier: Any, *, asset_id: str, command: Any,
+                          action_id: str = "", incident_id: str = "") -> None:
+    """尽可能提前通知：时间线落事件，通知器可用时推送；失败不影响执行。"""
+    detail = (command if isinstance(command, str) else " ".join(str(x) for x in command or []))[:300]
+    try:
+        db.event(
+            "irreversible_write_notice",
+            f"即将执行不可逆操作 @ {asset_id}",
+            incident_id=incident_id or "",
+            payload={"asset_id": asset_id, "command": detail, "action_id": action_id,
+                     "note": "提前通知非审批，不阻断执行"},
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    if notifier is not None:
+        try:
+            notifier.on_event({
+                "type": "irreversible_write_notice",
+                "incident_id": incident_id or "",
+                "title": f"即将执行不可逆操作 @ {asset_id}",
+                "payload_json": json.dumps(
+                    {"asset_id": asset_id, "command": detail, "action_id": action_id,
+                     "note": "提前通知非审批，不阻断执行"},
+                    ensure_ascii=False,
+                ),
+            })
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def dynamic_object(
+    capability: str, asset_id: str, object_id: str, params: dict | None = None
+) -> dict | None:
+    """未登记目标的瞬态对象（动态发现）。
+
+    目标范围 = SSH 账户可达范围；名称仍走 resolve_object_name 的严格校验，
+    能力-类别绑定（object_matches_capability）照常生效。
+    """
+    from .capabilities import (
+        ObjectBindingError,
+        get_capability,
+        resolve_object_name,
+    )
+
+    try:
+        cap = get_capability(capability)
+    except KeyError:
+        return None
+    raw = str(object_id or "") or str((params or {}).get("service") or (params or {}).get("container") or "")
+    kind = str((params or {}).get("kind") or "")
+    if ":" in raw:
+        parts = raw.split(":")
+        if len(parts) == 3:
+            if not kind:
+                kind = parts[1]
+            raw = parts[2]
+    kinds = [k for k in cap.object_kinds if k != "*"] or ["service"]
+    if kind not in kinds:
+        kind = "service" if "service" in kinds else kinds[0]
+    obj = {
+        "id": f"{asset_id}:{kind}:{raw}",
+        "asset_id": asset_id,
+        "kind": kind,
+        "name": raw,
+        "unit": raw if kind == "service" else "",
+        "container": raw if kind == "container" else "",
+        "port": None,
+        "protocol": "",
+        "external_probe": "",
+        "auto_recover": 0,
+        "_dynamic": True,
+    }
+    try:
+        resolve_object_name(obj)
+    except ObjectBindingError:
+        return None
+    try:
+        object_matches_capability(capability, obj)
+    except ObjectBindingError:
+        return None
+    return obj
 
 
 def classify_exec_result(res) -> tuple[str, str]:

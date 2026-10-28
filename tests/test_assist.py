@@ -359,20 +359,6 @@ class AssistConfigureTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("nginx", text)
         self.assertEqual(result["diagnostics"]["model_result"], response)
 
-    async def test_permission_prose_uses_real_capability_description(self):
-        from ayana.capabilities import list_capabilities
-        capability = next(item for item in list_capabilities() if item["name"] == "service.logs")
-        response = {"route": "perm_exceptions", "fields": {"asset_id": "romi", "capability": "service.logs", "state": "auto"}, "confirm_question": "把romi的service.logs改为state=auto吗？"}
-        result = await self.configure(FakeLLM(response), domain="permissions", assets=[{"id": "romi", "display_name": "网站主机"}], capabilities=[capability])
-        self.assertTrue(result["ok"], result)
-        self.assertIn(capability["description"], result["confirm_question"])
-        self.assertIn("网站主机", result["confirm_question"])
-        self.assertNotIn("service.logs", result["confirm_question"])
-        self.assertNotIn("state=auto", result["confirm_question"])
-        self.assertEqual(result["fields"]["capability"], "service.logs")
-        self.assertEqual(result["fields"]["state"], "auto")
-        self.assertEqual(result["diagnostics"]["model_result"], response)
-
     async def test_questions_options_and_unsupported_explanations_hide_internal_identifiers(self):
         response = envelope({"asset_id": "romi", "kind": "service"}, missing=[{"field": "params.unit", "question": "请为romi选择params.unit。", "options": [{"label": "romi 的 params.unit nginx", "value": "nginx", "description": "kind=service 使用 systemctl is-active nginx 检查。"}]}])
         result = await self.configure(response, assets=[{"id": "romi", "display_name": "网站主机"}])
@@ -453,19 +439,6 @@ class AssistConfigureTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["fields"]["params.port"], 8443)
         self.assertNotIn("params.unit", result["fields"])
 
-    async def test_permissions_generated_from_supported_catalog(self):
-        response = {"route": "perm_exceptions", "fields": {"asset_id": "romi", "capability": "service.restart", "state": "confirm", "scope": "exception", "object_id": "nginx"}}
-        result = await self.configure(FakeLLM(response), domain="permissions", capabilities=["service.logs", "service.restart"])
-        self.assertTrue(result["ok"], result)
-        self.assertEqual(result["fields"]["capability"], "service.restart")
-        self.assertEqual(result["fields"]["state"], "confirm")
-
-    async def test_permission_exception_route_supplies_exception_scope(self):
-        response = {"route": "perm_exceptions", "fields": {"asset_id": "romi", "capability": "service.restart", "state": "confirm"}}
-        result = await self.configure(FakeLLM(response), domain="permissions", capabilities=["service.restart"])
-        self.assertTrue(result["ok"], result)
-        self.assertEqual(result["fields"]["scope"], "exception")
-
     async def test_permission_routes_cannot_silently_change_authorization_scope(self):
         for route, fields in (
             ("perm_defaults", {"asset_id": "romi", "capability": "service.logs", "state": "auto"}),
@@ -475,50 +448,16 @@ class AssistConfigureTest(unittest.IsolatedAsyncioTestCase):
             with self.subTest(route=route, fields=fields):
                 self.assert_human_failure(await self.configure(FakeLLM({"route": route, "fields": fields}), domain="permissions", capabilities=["service.logs"]))
 
-    async def test_permission_workbench_cannot_widen_specific_targets_into_defaults(self):
-        for target in ({"asset_id": "romi"}, {"object_id": "nginx"}):
-            with self.subTest(target=target):
-                fields = {"scope": "default", "capability": "service.logs", "state": "auto", **target}
-                llm = FakeLLM({"route": "perm_workbench", "fields": fields})
-                result = await self.configure(llm, domain="permissions", capabilities=["service.logs"])
-                self.assert_human_failure(result)
-                self.assertEqual(len(llm.calls), 2)
-
-    async def test_permission_workbench_can_prepare_explicit_asset_exception(self):
-        fields = {"scope": "exception", "asset_id": "romi", "object_id": "nginx", "capability": "service.logs", "state": "auto"}
-        result = await self.configure(FakeLLM({"route": "perm_workbench", "fields": fields}), domain="permissions", capabilities=["service.logs"])
-        self.assertTrue(result["ok"], result)
-        self.assertEqual(result["status"], "ready")
-        self.assertEqual(result["fields"]["scope"], "exception")
-        self.assertEqual(result["fields"]["asset_id"], "romi")
-        self.assertEqual(result["fields"]["object_id"], "nginx")
-
-    async def test_permission_ceiling_navigation_does_not_ask_for_edit_fields(self):
-        response = {"route": "perm_ceiling", "fields": {}}
-        result = await self.configure(FakeLLM(response), domain="permissions", capabilities=["service.logs"])
-        self.assertTrue(result["ok"], result)
-        self.assertEqual(result["action"], "navigate")
-        self.assertEqual(result["missing"], [])
-        self.assertFalse(result["ready_to_submit"])
-
-    async def test_permission_effective_query_does_not_ask_for_new_state(self):
-        response = {"route": "perm_effective", "fields": {"asset_id": "romi", "capability": "service.logs"}}
-        result = await self.configure(FakeLLM(response), domain="permissions", capabilities=["service.logs"])
-        self.assertTrue(result["ok"], result)
-        self.assertEqual(result["action"], "query")
-        self.assertEqual(result["missing"], [])
-        self.assertFalse(result["ready_to_submit"])
-
     async def test_unknown_capability_not_invented_permission(self):
         response = {"route": "perm_defaults", "fields": {"capability": "root.everything", "state": "auto", "scope": "default"}}
         self.assert_human_failure(await self.configure(FakeLLM(response), domain="permissions", capabilities=["service.logs"]))
 
-    async def test_permission_state_requested_when_not_specified(self):
-        response = {"route": "perm_defaults", "fields": {"capability": "service.logs", "scope": "default"}}
-        result = await self.configure(FakeLLM(response), domain="permissions", capabilities=["service.logs"])
-        self.assertTrue(result["ok"], result)
-        self.assertIn("state", {item.get("field") or item.get("key") for item in result["missing"]})
-        self.assertFalse(result.get("ready_to_submit", False))
+    async def test_permission_domain_configure_is_retired(self):
+        """Stored-grant permission forms are gone: the domain fails before any model call."""
+        for route in ("perm_defaults", "perm_exceptions", "perm_effective", "perm_workbench", "perm_ceiling"):
+            llm = FakeLLM({"route": route, "fields": {}})
+            self.assert_human_failure(await self.configure(llm, domain="permissions", capabilities=["service.logs"]))
+            self.assertEqual(llm.calls, [])
 
     async def test_empty_unknown_domain_fail_without_model_call(self):
         for kwargs in ({"text": " "}, {"domain": "execute"}):

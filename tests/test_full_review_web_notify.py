@@ -36,8 +36,6 @@ class ReviewWebNotifyTests(unittest.IsolatedAsyncioTestCase):
                             " VALUES(?,?,?,'open','pending',?,?)", ("inc-" + aid, "secret-" + aid, aid, now(), now()))
             self.ssh.upsert_endpoint(asset_id=aid, role="read", host="host-" + aid, username="root")
         self.sess = {"username": "reader", "is_admin": False}
-        self.policy.upsert_permission(subject_type="web_user", subject_id="reader", capability="asset.summary",
-                                      asset_id="a", allow=True)
         actions = SimpleNamespace(get_action=lambda aid: {"id": aid, "asset_id": "b"}, list_actions=lambda **kw: [])
         prom = SimpleNamespace(targets=self.empty_targets)
         self.app = WebApp(self.db, None, self.policy, self.incidents, None, actions, prom,
@@ -59,49 +57,45 @@ class ReviewWebNotifyTests(unittest.IsolatedAsyncioTestCase):
     async def empty_body(self):
         return {}
 
-    async def test_hidden_details_and_endpoints_denied(self):
+    async def test_authenticated_readers_can_view_registered_inventory(self):
         for handler, match in ((self.app.api_incident_detail, {"inc_id": "inc-b"}),
                                (self.app.api_action_detail, {"aid": "act-b"}),
                                (self.app.api_asset_detail, {"asset_id": "b"})):
             response = await handler(self.request(**match))
-            self.assertEqual(response.status, 403)
+            self.assertEqual(response.status, 200)
         req = self.request()
         req.rel_url.query = {"asset_id": "b"}
-        self.assertEqual((await self.app.api_ssh_endpoints(req)).status, 403)
+        self.assertEqual((await self.app.api_ssh_endpoints(req)).status, 200)
         response = await self.app.api_ssh_endpoints(self.request())
-        self.assertEqual([ep["asset_id"] for ep in json.loads(response.body)["endpoints"]], ["a"])
+        self.assertEqual({ep["asset_id"] for ep in json.loads(response.body)["endpoints"]}, {"a", "b"})
 
     async def test_reader_cannot_close_incident(self):
         with self.assertRaises(web.HTTPForbidden):
             await self.app.api_incident_close(self.request(inc_id="inc-a"))
         self.assertEqual(self.incidents.get_incident("inc-a")["status"], "open")
 
-    async def test_loops_and_overview_hide_unavailable_assets(self):
+    async def test_loops_and_overview_show_registered_assets_to_readers(self):
         response = await self.app.api_loops(self.request())
-        self.assertEqual([inc["asset_id"] for inc in json.loads(response.body)["loops"]], ["a"])
+        self.assertEqual({inc["asset_id"] for inc in json.loads(response.body)["loops"]}, {"a", "b"})
         response = await self.app.api_overview(self.request())
         data = json.loads(response.body)
-        self.assertEqual([inc["asset_id"] for inc in data["open_incidents"]], ["a"])
+        self.assertEqual({inc["asset_id"] for inc in data["open_incidents"]}, {"a", "b"})
         self.assertIsNone(data["health_ratio"]["ratio"])
         self.assertEqual(data["health_ratio"]["color"], "dim")
 
-    def test_message_incidents_are_filtered_for_qq_and_wecom(self):
+    def test_unrecognized_message_identities_cannot_read_incidents(self):
         bot = QQBot.__new__(QQBot)
         bot.db, bot.policy, bot.incidents = self.db, self.policy, self.incidents
         for actor_type in ("qq_user", "wecom_user"):
-            self.policy.upsert_permission(subject_type=actor_type, subject_id="reader", capability="asset.summary",
-                                          asset_id="a", allow=True)
-            self.assertNotIn("secret-b", bot._incident_text("", actor_type, "reader"))
-            self.assertNotIn("secret-b", bot._incident_text("inc-b", actor_type, "reader"))
-            self.assertNotIn("secret-b", bot._status_text(actor_type, "reader"))
-            self.assertIn("secret-a", bot._incident_text("inc-a", actor_type, "reader"))
+            self.assertNotIn("secret-a", bot._incident_text("inc-a", actor_type, "unknown"))
+            self.assertNotIn("secret-b", bot._incident_text("inc-b", actor_type, "unknown"))
+            self.assertNotIn("secret-a", bot._status_text(actor_type, "unknown"))
 
-    async def test_terminal_rechecks_policy_before_input(self):
+    async def test_terminal_rechecks_live_admin_role_before_input(self):
         self.sess = {"username": "admin", "is_admin": True}
-        self.policy.upsert_permission(subject_type="web_user", subject_id="admin", capability="shell.interactive",
-                                      asset_id="a", allow=True, require_approval=False)
         writes, closed, sent = [], [], []
         app = self.app
+        self_test = self
         class Socket:
             def __init__(self, **kwargs):
                 self.closed = False
@@ -116,8 +110,7 @@ class ReviewWebNotifyTests(unittest.IsolatedAsyncioTestCase):
             async def __anext__(self):
                 if self.closed:
                     raise StopAsyncIteration
-                app.policy.upsert_permission(subject_type="web_user", subject_id="admin", capability="shell.interactive",
-                                             asset_id="a", allow=False)
+                self_test.sess["is_admin"] = False
                 return SimpleNamespace(type=web.WSMsgType.BINARY, data=b"id\n")
         tsess = SimpleNamespace(session_id="terminal-1", write=writes.append, alive=lambda: True,
                                 read=lambda: b"", close_reason="", resize=lambda *args: None)
@@ -141,11 +134,10 @@ class ReviewWebNotifyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_idle_terminal_closes_when_permission_is_revoked(self):
         self.sess = {"username": "admin", "is_admin": True}
-        self.policy.upsert_permission(subject_type="web_user", subject_id="admin", capability="shell.interactive",
-                                      asset_id="a", allow=True, require_approval=False)
         closed_event = asyncio.Event()
         sent, closed = [], []
         app = self.app
+        self_test = self
         class Socket:
             def __init__(self, **kwargs):
                 self.closed = False
@@ -154,8 +146,7 @@ class ReviewWebNotifyTests(unittest.IsolatedAsyncioTestCase):
             async def send_json(self, data):
                 sent.append(data)
                 if data.get("type") == "ready":
-                    app.policy.upsert_permission(subject_type="web_user", subject_id="admin", capability="shell.interactive",
-                                                 asset_id="a", allow=False)
+                    self_test.sess["is_admin"] = False
             async def close(self, **kwargs):
                 self.closed = True
                 closed_event.set()

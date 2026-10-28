@@ -16,7 +16,7 @@ const find = (env, label) => buttons(env).find((button) => button.textContent ==
 
 (async () => {
   let passed = 0;
-  for (const [label, decision] of [["执行一次", "execute_once"], ["不执行", "reject"], ["永久允许执行", "allow_always"]]) {
+  for (const [label, decision] of [["执行一次", "execute_once"], ["不执行", "reject"]]) {
     const env = setup(({ body }) => body ? { ok: true } : detail);
     await env.run('openIncidentDetail("inc1")');
     env.promptReplies.push("", "");
@@ -29,10 +29,25 @@ const find = (env, label) => buttons(env).find((button) => button.textContent ==
     console.log(`PASS ${label} targets one explicit action and refreshes incident state`); passed++;
   }
 
+  {
+    const env = setup(() => detail);
+    await env.run('openIncidentDetail("inc1")');
+    assert.equal(find(env, "永久允许执行"), undefined);
+    assert.deepEqual(Array.from(buttons(env)).slice(0, 2).map((button) => button.textContent), ["执行一次", "不执行"]);
+    console.log("PASS only per-operation approval choices are offered"); passed++;
+  }
+  {
+    const env = setup(() => ({ ...detail, disposition: { authority: { access_mode: "readonly", approval_mode: "automatic" } } }));
+    await env.run('openIncidentDetail("inc1")');
+    assert.ok(env.nodes.get("modal-body").textContent.includes("当前 Agent 会话：只读 · 自动执行"));
+    assert.ok(!env.nodes.get("modal-body").textContent.includes("命中规则"));
+    console.log("PASS incident context displays the actual session permission instead of legacy rules"); passed++;
+  }
+
   for (const responses of [[null], ["", null]]) {
     const env = setup(() => detail); await env.run('openIncidentDetail("inc1")');
     env.promptReplies.push(...responses);
-    await find(env, "永久允许执行").click();
+    await find(env, "执行一次").click();
     assert.equal(env.calls.length, 1);
     console.log("PASS canceled authorization or TOTP prompt submits no decision"); passed++;
   }
@@ -45,7 +60,7 @@ const find = (env, label) => buttons(env).find((button) => button.textContent ==
     env.promptReplies.push("", "");
     const first = find(env, "执行一次").click();
     assert.equal(find(env, "不执行").disabled, true);
-    await find(env, "永久允许执行").click();
+    await find(env, "不执行").click();
     assert.equal(env.calls.filter((call) => call.body).length, 1);
     finish({ ok: true }); await first;
     console.log("PASS concurrent choices cannot create a second in-flight decision"); passed++;
@@ -70,5 +85,5 @@ const find = (env, label) => buttons(env).find((button) => button.textContent ==
     assert.equal(Object.keys(env.calls[1].body).length, 1);
     console.log("PASS an approved but undispatched action can resume through the execution gate"); passed++;
   }
-  console.log(`${passed}/8 approval UI checks passed`);
+  console.log(`${passed}/${passed} approval UI checks passed`);
 })().catch((error) => { console.error(error); process.exitCode = 1; });

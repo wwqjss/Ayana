@@ -589,24 +589,11 @@ class OpsTools:
 
         br = getattr(self.ctx, "session_bridge", None)
         duty = getattr(self.ctx, "duty", None)
-        require_human = True
-        if duty is not None:
-            try:
-                require_human = bool(duty.require_human_approval())
-            except Exception:
-                require_human = True
-        else:
-            db = getattr(self.ctx, "db", None)
-            try:
-                row = db.query_one("SELECT value FROM agent_settings WHERE key='require_human_approval'") if db else None
-                if row is not None:
-                    require_human = str(row["value"] or "1") not in ("0", "false", "False", "")
-            except Exception:
-                require_human = True
+        # 默认自主执行：审批只由会话权威决定（manual 才挂起），无全局审批开关。
         authority_sid = getattr(self.ctx, "authority_session_id", "")
-        if authority_sid:
-            # The mode is trusted per-call state, separate from global defaults.
-            require_human = self.ctx.authority_approval_mode == "manual"
+        require_human = bool(
+            authority_sid and getattr(self.ctx, "authority_approval_mode", "") == "manual"
+        )
         incident_id = str(getattr(self.ctx, "mcp_incident_scope", "") or "_mcp_")
         action_key = ""
         if br is not None:
@@ -661,6 +648,14 @@ class OpsTools:
                     "detail": claim,
                     "action_key": action_key,
                 }
+        from .actions import announce_irreversible, looks_irreversible
+
+        if looks_irreversible(command):
+            announce_irreversible(
+                self.ctx.db, getattr(self.ctx, "notifier", None),
+                asset_id=asset_id, command=command,
+                action_id=action_key, incident_id=incident_id,
+            )
         try:
             with session_dispatch_guard(self.ctx.db, authority_sid, require_automatic=bool(authority_sid),asset_id=asset_id):
                 res = await self.ctx.transport.exec_shell(

@@ -143,15 +143,6 @@ def make_env(describe_json=None, verified=True):
     )
 
     policy = Policy(db)
-    policy.upsert_permission(
-        subject_type="web_user", subject_id="admin", capability="service.restart",
-        asset_id="nerv", object_id="*", allow=True, require_approval=False, actor="t",
-    )
-    policy.upsert_permission(
-        subject_type="auto_rule", subject_id="agent", capability="service.restart",
-        asset_id="nerv", object_id="*", allow=True, require_approval=False,
-        auto_allowed=True, actor="t",
-    )
     nt = FakeNT(describe_json=describe_json)
     prom = FakeProm()
     gate = Gate(nt, verified=verified)
@@ -332,17 +323,15 @@ class TestP002DispatchGate(unittest.TestCase):
             mode="manual", template_id="tmpl_service_restart",
         )
         actions.approve(prop["id"], approver_type="web_user", approver_id="admin")
-        policy.upsert_permission(
-            subject_type="web_user", subject_id="admin", capability="service.restart",
-            asset_id="nerv", object_id="*", allow=False, actor="t",
-        )
+        # 批准后撤权（admin 降为 viewer）：派发门复查账号角色，越权拒绝
+        db.execute("UPDATE users SET is_admin=0 WHERE username='admin'")
 
         async def run():
             return await actions.execute(prop["id"], actor_type="web_user", actor_id="admin")
 
         with self.assertRaises(ActionError) as ctx:
             asyncio.run(run())
-        self.assertEqual(ctx.exception.code, "policy_revoked")
+        self.assertEqual(ctx.exception.code, "actor_access_revoked")
         self.assertFalse(nt.exec_calls)
 
 
@@ -375,11 +364,7 @@ class TestP003Preconditions(unittest.TestCase):
         )
         policy = Policy(db)
         for cap, auto in (("asset.summary", False), ("service.restart", True)):
-            policy.upsert_permission(
-                subject_type="auto_rule", subject_id="agent", capability=cap,
-                asset_id="*", object_id="*", allow=True, require_approval=False,
-                auto_allowed=auto, actor="t",
-            )
+            pass  # account roles replace stored grants
         nt = FakeNT()
         prom = FakeProm()
         if probe_value is not None:

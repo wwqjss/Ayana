@@ -208,11 +208,7 @@ def make_env(
         ("service.restart", True, False, True),
     ]
     for cap, allow, req_appr, auto in (grants or default_grants):
-        policy.upsert_permission(
-            subject_type="auto_rule", subject_id="agent", capability=cap,
-            asset_id=asset, object_id="*", allow=allow, require_approval=req_appr,
-            auto_allowed=auto, actor="t",
-        )
+        pass  # account roles replace stored grants
     nt = nt or FakeNT()
     prom = FakeProm()
     kb = KnowledgeBase(db, root=kb_root) if kb_root else KnowledgeBase(db, root=Path(tmp.name) / "kn")
@@ -267,7 +263,7 @@ class TestFiniteLoop(unittest.TestCase):
         llm = FakeLLM(responses=responses)
         tmp, db, policy, nt, prom, kb, inv = make_env(llm=llm)
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         self.assertLessEqual(res["rounds"], 3)
         self.assertLessEqual(res["tool_calls"], 6)
         self.assertLessEqual(res["tool_calls"], res["rounds"] * 2)
@@ -286,7 +282,7 @@ class TestFiniteLoop(unittest.TestCase):
         llm = FakeLLM(responses=responses)
         tmp, db, policy, nt, prom, kb, inv = make_env(llm=llm)
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         # 第 1 轮确定性 2 个；第 2 轮 LLM 最多 2 个
         self.assertLessEqual(res["tool_calls"], 4)
 
@@ -294,7 +290,7 @@ class TestFiniteLoop(unittest.TestCase):
         tmp, db, policy, nt, prom, kb, inv = make_env()
         self.addCleanup(close_env, tmp, db)
         inv.deadline_sec = 0.0  # 立即到期
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         self.assertEqual(res["stop_reason"], STOP_DEADLINE)
         self.assertEqual(res["tool_calls"], 0)
 
@@ -304,7 +300,7 @@ class TestFiniteLoop(unittest.TestCase):
         ])
         tmp, db, policy, nt, prom, kb, inv = make_env(llm=llm)
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         self.assertEqual(res["stop_reason"], STOP_ENOUGH)
 
     def test_tool_budget_exhausted(self):
@@ -312,7 +308,7 @@ class TestFiniteLoop(unittest.TestCase):
         self.addCleanup(close_env, tmp, db)
         inv.max_tool_calls = 1
         inv.max_rounds = 3
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         self.assertLessEqual(res["tool_calls"], 1)
         self.assertIn(res["stop_reason"], (STOP_BUDGET, STOP_ENOUGH, "no_progress"))
 
@@ -333,7 +329,7 @@ class TestInvestigationSafety(unittest.TestCase):
         ])
         tmp, db, policy, nt, prom, kb, inv = make_env(llm=llm)
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         # 写能力必须被拒，且不能出现在 nt.exec
         self.assertFalse(nt.exec_calls)
         rej = res.get("rejected_tools") or []
@@ -348,7 +344,7 @@ class TestInvestigationSafety(unittest.TestCase):
         ])
         tmp, db, policy, nt, prom, kb, inv = make_env(llm=llm)
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         rej = res.get("rejected_tools") or []
         self.assertTrue(any("unknown_capability" in (r.get("reason") or "") for r in rej), rej)
         self.assertFalse(nt.exec_calls)
@@ -362,7 +358,7 @@ class TestInvestigationSafety(unittest.TestCase):
         ])
         tmp, db, policy, nt, prom, kb, inv = make_env(llm=llm)
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         rej = res.get("rejected_tools") or []
         self.assertTrue(
             any("object_not_registered" in (r.get("reason") or "") for r in rej), rej
@@ -374,7 +370,7 @@ class TestInvestigationSafety(unittest.TestCase):
     def test_investigation_cannot_expand_write_set(self):
         tmp, db, policy, nt, prom, kb, inv = make_env()
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         self.assertFalse(res.get("ok_for_auto_write"))
         self.assertFalse(nt.exec_calls)
         # Policy 仍然拒绝未授权写
@@ -391,7 +387,7 @@ class TestInvestigationSafety(unittest.TestCase):
                       ("ss", NTResult(ok=False, output="connection refused", returncode=255)))
         tmp, db, policy, nt, prom, kb, inv = make_env(nt=nt)
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         self.assertFalse(res.get("ok_for_auto_write"))
         self.assertEqual(res.get("confidence"), "low")
         self.assertIn(res.get("stop_reason"), (STOP_TRANSPORT, STOP_NEED_HUMAN, STOP_ENOUGH))
@@ -440,7 +436,7 @@ class TestEvidenceModel(unittest.TestCase):
         )
         tmp, db, policy, nt, prom, kb, inv = make_env(nt=nt)
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         classes = [e["classification"] for e in res["evidence"]]
         self.assertIn(EV_OBSERVED, classes)
         self.assertIn(EV_TRANSPORT_FAILURE, classes)
@@ -450,7 +446,7 @@ class TestEvidenceModel(unittest.TestCase):
     def test_evidence_keeps_source_timestamp_object_tool(self):
         tmp, db, policy, nt, prom, kb, inv = make_env()
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         self.assertTrue(res["evidence"])
         e = res["evidence"][0]
         for key in ("evidence_id", "asset_id", "object_id", "tool", "observed_at", "classification"):
@@ -462,7 +458,7 @@ class TestEvidenceModel(unittest.TestCase):
         nt.set_script(("systemctl", NTResult(ok=False, output="connection reset", returncode=255)))
         tmp, db, policy, nt, prom, kb, inv = make_env(nt=nt)
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         self.assertEqual(res.get("confidence"), "low")
 
 
@@ -480,7 +476,7 @@ class TestLLMDegradation(unittest.TestCase):
 
         tmp, db, policy, nt, prom, kb, inv = make_env(llm=BrokenLLM())
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         self.assertTrue(res.get("id"))
         self.assertFalse(nt.exec_calls)
 
@@ -488,14 +484,14 @@ class TestLLMDegradation(unittest.TestCase):
         llm = FakeLLM(responses=["not json at all"])
         tmp, db, policy, nt, prom, kb, inv = make_env(llm=llm)
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         self.assertTrue(res.get("id"))
         self.assertFalse(nt.exec_calls)
 
     def test_llm_unavailable_deterministic_tools(self):
         tmp, db, policy, nt, prom, kb, inv = make_env(llm=None)
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         self.assertGreaterEqual(res["tool_calls"], 1)
         # 确定性计划：service.status / service.logs
         used = {e.get("tool") for e in res["evidence"]}
@@ -515,7 +511,7 @@ class TestFrpsScenarios(unittest.TestCase):
         )
         tmp, db, policy, nt, prom, kb, inv = make_env(nt=nt)
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         facts = res["facts"]
         self.assertTrue(any(
             f.get("kind") == "service_state" and f.get("service_state") == "inactive"
@@ -533,7 +529,7 @@ class TestFrpsScenarios(unittest.TestCase):
         )
         tmp, db, policy, nt, prom, kb, inv = make_env(nt=nt)
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         self.assertTrue(any(
             f.get("kind") == "service_state" and f.get("healthy") for f in res["facts"]
         ) or any(f.get("kind") == "service_state" for f in res["facts"]))
@@ -549,18 +545,27 @@ class TestFrpsScenarios(unittest.TestCase):
         nt.default = NTResult(ok=False, output="connection reset", returncode=255)
         tmp, db, policy, nt, prom, kb, inv = make_env(nt=nt)
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         self.assertIn(res["stop_reason"], (STOP_TRANSPORT, STOP_NEED_HUMAN, STOP_ENOUGH))
         self.assertEqual(res["confidence"], "low")
         self.assertFalse(res.get("ok_for_auto_write"))
 
     def test_frps_evidence_insufficient(self):
-        # 只 grant asset.summary，目标工具全被拒 → 无 service_state 事实
-        tmp, db, policy, nt, prom, kb, inv = make_env(
-            grants=[("asset.summary", True, False, True)],
-        )
+        # 仅 asset.summary 可用、其余工具被拒 → 无 service_state 事实、置信度低
+        tmp, db, policy, nt, prom, kb, inv = make_env()
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+
+        class LimitedGate:
+            def check(self, **kw):
+                if kw.get("capability") != "asset.summary":
+                    return {"allowed": False, "reason": "test_tool_rejected", "kind": "read",
+                            "role": "admin", "decision": "forbidden", "require_approval": False,
+                            "auto_allowed": False, "readable": "禁止", "source": "account_role",
+                            "rule": None, "matched_rule": None}
+                return policy.check(**kw)
+
+        inv.policy = LimitedGate()
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         self.assertFalse(any(f.get("kind") == "service_state" for f in res["facts"]))
         self.assertTrue(res.get("rejected_tools"))
         self.assertEqual(res.get("confidence"), "low")
@@ -585,7 +590,7 @@ class TestHysteriaScenarios(unittest.TestCase):
         nt.set_script(("is-active", NTResult(ok=False, output="inactive", returncode=3)))
         tmp, db, policy, nt, prom, kb, inv = self._hy_env(nt)
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="hysteria-server"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="hysteria-server", actor_type="web_user", actor_id="admin"))
         self.assertTrue(any(
             f.get("kind") == "service_state" and f.get("service_state") == "inactive"
             for f in res["facts"]
@@ -601,7 +606,7 @@ class TestHysteriaScenarios(unittest.TestCase):
         self.addCleanup(close_env, tmp, db)
         res = asyncio.run(inv.run_loop(
             asset_id="nerv", object_id="hy2-443",
-        ))
+            actor_type="web_user", actor_id="admin"))
         # port 对象：port.listen
         self.assertTrue(any(
             f.get("kind") == "port_listen" for f in res["facts"]
@@ -612,13 +617,13 @@ class TestHysteriaScenarios(unittest.TestCase):
         nt.default = NTResult(ok=False, output="connection reset", returncode=255)
         tmp, db, policy, nt, prom, kb, inv = self._hy_env(nt)
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="hysteria-server"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="hysteria-server", actor_type="web_user", actor_id="admin"))
         self.assertEqual(res.get("confidence"), "low")
 
     def test_hy_no_new_auto_restart(self):
         tmp, db, policy, nt, prom, kb, inv = self._hy_env()
         self.addCleanup(close_env, tmp, db)
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="hysteria-server"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="hysteria-server", actor_type="web_user", actor_id="admin"))
         self.assertFalse(res.get("ok_for_auto_write"))
         self.assertFalse(nt.exec_calls)
         # 不给 hysteria 新增自动 restart
@@ -687,7 +692,7 @@ class TestKnowledgeWiring(unittest.TestCase):
             encoding="utf-8",
         )
         kb.reload()
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         self.assertTrue(res.get("knowledge_refs") or res.get("knowledge_revision") is not None)
         row = db.query_one("SELECT knowledge_refs_json, knowledge_revision FROM investigations WHERE id=?",
                            (res["id"],))
@@ -724,7 +729,7 @@ class TestKnowledgeWiring(unittest.TestCase):
         self.addCleanup(close_env, tmp2, db)
         res = asyncio.run(inv.run_loop(
             asset_id="nerv", object_id="frps", extra_failures=["a", "b"],
-        ))
+            actor_type="web_user", actor_id="admin"))
         hyps = res.get("hypotheses") or []
         shared_hyps = [h for h in hyps if "共同" in (h.get("text") or "") or "shared" in (h.get("text") or "").lower()]
         if shared_hyps:
@@ -741,7 +746,7 @@ class TestKnowledgeWiring(unittest.TestCase):
             encoding="utf-8",
         )
         kb.reload()
-        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps"))
+        res = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", actor_type="web_user", actor_id="admin"))
         self.assertFalse(res.get("ok_for_auto_write"))
         self.assertFalse(nt.exec_calls)
         d = policy.check(

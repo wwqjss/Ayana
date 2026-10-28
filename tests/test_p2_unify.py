@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ayana.business import host_health_view
-from ayana.db import Database
+from ayana.db import Database, now
 from ayana.fmt import ZH_EVENT, ZH_STAGE, ZH_STATE, ZH_STATUS
 from ayana.health import sample_state
 from ayana.policy import Policy
@@ -106,82 +106,50 @@ class TestHostHealthView(unittest.TestCase):
 
 
 class TestPolicyUnifiedEvaluation(unittest.TestCase):
-    """P2-2: check / effective_decision 共用核心，三态一致。"""
+    """Display and execution use the same authenticated-account decision."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.db = Database(Path(self.tmp.name) / "t.db")
         self.policy = Policy(self.db)
+        for username, admin in (("admin", 1), ("viewer", 0)):
+            self.db.execute(
+                "INSERT INTO users(username,password_hash,is_admin,created_at,updated_at) VALUES(?,?,?,?,?)",
+                (username, "test-hash", admin, now(), now()),
+            )
 
     def tearDown(self):
         self.db.close()
         self.tmp.cleanup()
 
-    def test_three_state_matches_between_check_and_effective(self):
-        self.policy.upsert_permission(
-            subject_type="web_user", subject_id="u1", capability="service.restart",
-            asset_id="a1", object_id="*", allow=True, require_approval=True,
-            auto_allowed=False, actor="t",
-        )
-        c = self.policy.check(
-            subject_type="web_user", subject_id="u1", capability="service.restart",
-            asset_id="a1", object_id="o1",
-        )
-        e = self.policy.effective_decision(
-            subject_type="web_user", subject_id="u1", capability="service.restart",
-            asset_id="a1", object_id="o1",
-        )
-        self.assertEqual(c["decision"], e["decision"])
-        self.assertEqual(c["allowed"], e["allowed"])
-        self.assertEqual(c["require_approval"], e["require_approval"])
-        self.assertEqual(c["auto_allowed"], e["auto_allowed"])
-        self.assertEqual(e["decision"], "approval_required")
+    def test_check_and_display_match_for_human_write(self):
+        args = dict(subject_type="web_user", subject_id="admin", capability="service.restart",
+                    asset_id="a1", object_id="o1")
+        self.assertEqual(self.policy.check(**args), self.policy.effective_decision(**args))
+        self.assertEqual(self.policy.check(**args)["decision"], "approval_required")
 
-    def test_auto_gate_differs_by_design(self):
-        self.policy.upsert_permission(
-            subject_type="web_user", subject_id="u1", capability="service.restart",
-            asset_id="a1", object_id="*", allow=True, require_approval=True,
-            auto_allowed=True, actor="t",
-        )
-        # check(auto=True) 派发门：需审批 → 不允许
-        c = self.policy.check(
-            subject_type="web_user", subject_id="u1", capability="service.restart",
-            asset_id="a1", object_id="o1", auto=True,
-        )
-        self.assertFalse(c["allowed"])
-        self.assertEqual(c["reason"], "approval_required")
-        # effective_decision(auto=True)：三态收紧为 forbidden，但规则仍算 allowed
-        e = self.policy.effective_decision(
-            subject_type="web_user", subject_id="u1", capability="service.restart",
-            asset_id="a1", object_id="o1", auto=True,
-        )
-        self.assertEqual(e["decision"], "forbidden")
-        self.assertEqual(e["reason"], "auto_not_allowed")
-        self.assertTrue(e["allowed"])
+    def test_auto_write_requires_trusted_session_in_both_views(self):
+        args = dict(subject_type="web_user", subject_id="admin", capability="service.restart", auto=True)
+        checked = self.policy.check(**args)
+        self.assertEqual(checked, self.policy.effective_decision(**args))
+        self.assertFalse(checked["allowed"])
+        self.assertEqual(checked["reason"], "trusted_session_context_required")
 
-    def test_read_view_always_automatic_when_allowed(self):
-        self.policy.upsert_permission(
-            subject_type="web_user", subject_id="u1", capability="asset.summary",
-            asset_id="a1", object_id="*", allow=True, require_approval=True,
-            auto_allowed=False, actor="t",
-        )
-        e = self.policy.effective_decision(
-            subject_type="web_user", subject_id="u1", capability="asset.summary",
-            asset_id="a1", object_id="o1",
-        )
-        self.assertTrue(e["allowed"])
-        self.assertEqual(e["decision"], "automatic")
-        self.assertFalse(e["require_approval"])
-        self.assertEqual(e["readable"], "允许读取")
+    def test_authenticated_viewer_reads_without_approval(self):
+        decision = self.policy.effective_decision(subject_type="web_user", subject_id="viewer",
+                                                  capability="asset.summary", asset_id="a1")
+        self.assertTrue(decision["allowed"])
+        self.assertEqual(decision["decision"], "automatic")
+        self.assertFalse(decision["require_approval"])
+        self.assertEqual(decision["readable"], "允许读取")
 
-    def test_ceiling_deny_still_forbidden(self):
-        self.policy.agent_ceiling.set("service.restart", allowed=False, allow_auto=False)
-        e = self.policy.effective_decision(
-            subject_type="auto_rule", subject_id="agent", capability="service.restart",
-            asset_id="a1", object_id="o1",
-        )
-        self.assertEqual(e["decision"], "forbidden")
-        self.assertEqual(e["reason"], "denied_by_agent_ceiling")
+    def test_machine_identity_alone_never_grants_access(self):
+        for subject in ("auto_rule", "agent", "llm", "system"):
+            with self.subTest(subject=subject):
+                decision = self.policy.effective_decision(subject_type=subject, subject_id="agent",
+                                                          capability="service.restart")
+                self.assertFalse(decision["allowed"])
+                self.assertEqual(decision["reason"], "trusted_session_context_required")
 
 
 class TestFmtWordTables(unittest.TestCase):

@@ -23,7 +23,7 @@ def make_app(*, asset=None, endpoints=()):
     app._require_auth = Mock(return_value={"username": "admin"})
     app._check_csrf = Mock()
     app._require_asset = Mock(return_value=asset or {"id": "yomi", "host": ""})
-    app._policy_for = Mock(return_value={"allowed": True, "require_approval": False})
+    app._account_capability = Mock(return_value={"allowed": True, "require_approval": False})
     app._ne_transport = Mock(return_value=object())
     service = SimpleNamespace(adopt_node=AsyncMock(return_value={"ok": True}))
     app._promconfig = Mock(return_value=service)
@@ -184,7 +184,7 @@ class TestMonitoringAddressAPI(unittest.IsolatedAsyncioTestCase):
         for capability, blocked, error in cases:
             with self.subTest(capability=capability, decision=blocked):
                 app, service = make_app(endpoints=[endpoint("write", "203.0.113.50")])
-                app._policy_for.side_effect = lambda sess, cap, **kwargs: (
+                app._account_capability.side_effect = lambda sess, cap, **kwargs: (
                     blocked if cap == capability else {"allowed": True, "require_approval": False}
                 )
                 request = SimpleNamespace(json=AsyncMock(return_value={"asset_id": "yomi"}))

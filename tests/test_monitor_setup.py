@@ -1,4 +1,4 @@
-"""监控接入：admin 权限种子、首登配置、未接入 vs 采集故障、示例资产。"""
+"""监控接入：账户角色、首登配置、未接入 vs 采集故障、示例资产。"""
 from __future__ import annotations
 
 import json
@@ -11,9 +11,9 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ayana.auth import AuthService
-from ayana.db import Database
+from ayana.db import Database, now
 from ayana.health import host_health
-from ayana.main import ensure_checks_admin_perms, ensure_promconfig_admin_perms, seed_assets
+from ayana.main import seed_assets
 from ayana.monitor import PromError
 from ayana.policy import Policy
 from ayana.web import SESSION_COOKIE, WebApp
@@ -39,9 +39,12 @@ class AdminMonitorPermTests(unittest.TestCase):
         self.addCleanup(self.db.close)
         self.addCleanup(self.tmp.cleanup)
         seed_assets(self.db)
-        ensure_checks_admin_perms(self.db)
-        ensure_promconfig_admin_perms(self.db)
         self.policy = Policy(self.db)
+        for username, admin in (("admin", 1), ("viewer", 0)):
+            self.db.execute(
+                "INSERT INTO users(username,password_hash,is_admin,created_at,updated_at) VALUES(?,?,?,?,?)",
+                (username, "test-hash", admin, now(), now()),
+            )
 
     def test_admin_has_monitor_read_caps(self):
         for cap in ("asset.summary", "probe.status", "promconfig.read", "node_exporter.manage"):
@@ -54,37 +57,18 @@ class AdminMonitorPermTests(unittest.TestCase):
             )
             self.assertTrue(d["allowed"], f"{cap} should be allowed for admin, got {d}")
 
-    def test_ensure_does_not_overwrite_existing_deny(self):
-        self.policy.upsert_permission(
-            subject_type="web_user",
-            subject_id="admin",
-            capability="probe.status",
-            asset_id="*",
-            object_id="*",
-            allow=False,
-            require_approval=False,
-            auto_allowed=False,
-            actor="admin",
-        )
-        ensure_promconfig_admin_perms(self.db)
-        d = self.policy.check(
-            subject_type="web_user",
-            subject_id="admin",
-            capability="probe.status",
-            asset_id="demo-web",
-            object_id="*",
-        )
-        self.assertFalse(d["allowed"])
+    def test_seed_assets_does_not_create_permission_rules(self):
+        self.assertEqual(self.db.query_one("SELECT COUNT(*) n FROM permissions")["n"], 0)
+        self.assertEqual(self.db.query_one("SELECT COUNT(*) n FROM agent_ceiling")["n"], 0)
 
-    def test_non_admin_still_denied_by_default(self):
-        d = self.policy.check(
-            subject_type="web_user",
-            subject_id="someone",
-            capability="probe.status",
-            asset_id="demo-web",
-            object_id="*",
-        )
-        self.assertFalse(d["allowed"])
+    def test_viewer_can_read_monitor_but_cannot_manage_it(self):
+        args = dict(subject_type="web_user", subject_id="viewer", asset_id="demo-web")
+        self.assertTrue(self.policy.check(**args, capability="probe.status")["allowed"])
+        self.assertFalse(self.policy.check(**args, capability="node_exporter.manage")["allowed"])
+
+    def test_unknown_account_denied(self):
+        self.assertFalse(self.policy.check(subject_type="web_user", subject_id="absent",
+                                          capability="probe.status")["allowed"])
 
 
 class StatusSemanticsTests(unittest.TestCase):
@@ -127,7 +111,6 @@ class SetupMonitorApiTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.db.close)
         self.addCleanup(self.tmp.cleanup)
         seed_assets(self.db)
-        ensure_promconfig_admin_perms(self.db)
         self.auth = AuthService(self.db, pepper="p", session_ttl=3600, max_failed=5, lockout=60)
         self.bootstrap = self.auth.ensure_bootstrap_admin("admin")
         self.uid = int(self.db.query_one("SELECT id FROM users WHERE username='admin'")["id"])

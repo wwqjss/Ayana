@@ -71,7 +71,7 @@ def build_ops_context(cfg: dict[str, Any]) -> OpsContext:
     from .ntsafe import AssetBinding, IdentityGate, NTClient
     from .ops_constraints import OpsConstraints
     from .ops_loop import OpsLoop, ensure_ops_loop_schema
-    from .policy import Policy
+    from .access import AccessControl
     from .promconfig import build_prom_config_service
 
     def _load_bindings(database: Database) -> list:
@@ -92,7 +92,7 @@ def build_ops_context(cfg: dict[str, Any]) -> OpsContext:
         return out
 
     ensure_ops_loop_schema(db)
-    policy = Policy(db)
+    policy = AccessControl(db)
     nt = NTClient(privilege_mode="restricted_dispatcher")
     gate = IdentityGate(nt, _load_bindings(db))
     actions = ActionService(

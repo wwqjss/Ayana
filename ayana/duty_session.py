@@ -57,14 +57,6 @@ class DutySessionManager:
         except Exception:
             return DEFAULT_ARCHIVE_DELAY_SEC
 
-    def require_human_approval(self) -> bool:
-        row = self.db.query_one(
-            "SELECT value FROM agent_settings WHERE key='require_human_approval'"
-        )
-        if not row:
-            return True
-        return str(row["value"] or "1") not in ("0", "false", "False", "")
-
     def set_setting(self, key: str, value: str, *, actor: str = "web") -> dict[str, Any]:
         self.set_settings({key: value}, actor=actor)
         return {"ok": True, "key": key, "value": str(value)}
@@ -76,9 +68,7 @@ class DutySessionManager:
         if "auto_approval_mode" in changes:
             if changes["auto_approval_mode"] not in ("manual", "automatic"):
                 raise ValueError("invalid_approval_mode")
-            changes["require_human_approval"] = "1" if changes["auto_approval_mode"] == "manual" else "0"
-        elif "require_human_approval" in changes:
-            changes["auto_approval_mode"] = "automatic" if changes["require_human_approval"] in ("0", "false", "False", "") else "manual"
+        changes.pop("require_human_approval", None)  # 旧全局审批开关已退役
         t = now()
         with self.db.tx() as conn:
             if not conn.in_transaction: conn.execute("BEGIN IMMEDIATE")
@@ -97,8 +87,7 @@ class DutySessionManager:
         out = {str(r["key"]): str(r["value"] or "") for r in rows}
         return {
             "auto_access_mode": out.get("auto_access_mode", "readwrite"),
-            "auto_approval_mode": out.get("auto_approval_mode", "manual"),
-            "require_human_approval": str(out.get("require_human_approval", "1")) not in ("0", "false", "False", ""),
+            "auto_approval_mode": out.get("auto_approval_mode", "automatic"),
             "archive_delay_sec": int(float(out.get("archive_delay_sec") or DEFAULT_ARCHIVE_DELAY_SEC)),
             "ssh_investigate_role": out.get("ssh_investigate_role", "read"),
             "ssh_execute_role": out.get("ssh_execute_role", "write"),
@@ -347,7 +336,10 @@ class DutySessionManager:
             if session.get("deleted_at"):return {"ok":True,"deleted":True,"session_id":session_id}
             blockers=self.deletion_blockers(session_id)
             if blockers and not stop:
-                return {"ok":False,"error":"session_has_tasks","blockers":blockers,"message":"会话仍有任务或结果待确认，可选择停止并删除。"}
+                msg = "会话仍有任务或结果待确认，可选择停止并删除。"
+                if "write_result_pending" in blockers or "action_result_pending" in blockers:
+                    msg = "存在待核销的执行结果，请先在执行与验证中人工核销；其余任务可停止后删除。"
+                return {"ok":False,"error":"session_has_tasks","blockers":blockers,"message":msg}
             t=now()
             conn.execute("UPDATE duty_sessions SET delete_requested_at=CASE WHEN delete_requested_at>0 THEN delete_requested_at ELSE ? END,deleted_by=?,paused_at=CASE WHEN paused_at>0 THEN paused_at ELSE ? END,pause_reason='delete_requested',archive_due_at=0,delete_error='',updated_at=? WHERE id=?",(t,actor,t,t,session_id))
             # Cancel only not-yet-dispatched work owned by this session.
@@ -401,8 +393,11 @@ class DutySessionManager:
         elif busy:state="queued" if runtime.get("receipt_status") in ("queued","pending") else "running"
         else:state="idle"
         labels={"deleted":"会话已删除","deleting":"正在停止并删除" if busy else "正在删除","unknown":"执行结果待核对","stopping":"正在暂停，等待任务停止","paused":"已暂停","archived":"已归档","interrupted":"任务已中断，等待恢复","queued":"消息已排队","running":"任务执行中","idle":"空闲"}
+        del_blockers = self.deletion_blockers(session_id)
+        if state == "deleting" and "write_result_pending" in del_blockers:
+            labels["deleting"] = "正在删除 · 执行结果待核销"
         recoverable=runtime.get("receipt_status") in ("cancelled","canceled","aborted","interrupted","failed","error") and not busy and not unknown and not session.get("delete_requested_at") and session.get("status") == "open"
-        return {"task_state":state,"task_state_label":labels[state],"can_recover":bool(recoverable),"deletion_blockers":self.deletion_blockers(session_id)}
+        return {"task_state":state,"task_state_label":labels[state],"can_recover":bool(recoverable),"deletion_blockers":del_blockers}
 
     def archive_blockers(self, session_id: str) -> list[str]:
         """Business and runtime facts, never a UI-only busy flag."""

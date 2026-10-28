@@ -686,6 +686,101 @@ class SessionBridge:
             )
         return {"ok": True, "action_key": action_key, "status": "released"}
 
+    def adjudicate_write(
+        self,
+        incident_id: str,
+        action_key: str,
+        *,
+        outcome: str,
+        reason: str = "",
+        actor_type: str = "web_user",
+        actor_id: str = "system",
+        channel: str = "web",
+        evidence_note: str = "",
+    ) -> dict[str, Any]:
+        """人工核销 unknown 写结果。
+
+        outcome: executed | not_executed | still_unknown
+        不伪造原始执行结果（result 原文保留）；核销进入 audit + timeline。
+        删除会话本身永远不能代替核销（见 deletion_blockers）。
+        """
+        if outcome not in ("executed", "not_executed", "still_unknown"):
+            return {"ok": False, "error": "bad_adjudication", "action_key": action_key}
+        row = self.db.query_one(
+            "SELECT * FROM session_write_ops WHERE incident_id=? AND action_key=?",
+            (incident_id, action_key),
+        )
+        if not row:
+            return {"ok": False, "error": "not_found", "action_key": action_key}
+        st = (row["status"] if "status" in row.keys() else "") or ""
+        if st != "unknown":
+            return {"ok": False, "error": "bad_state", "status": st, "action_key": action_key}
+        t = now()
+        original = (row["result"] if "result" in row.keys() else "") or ""
+        detail = {
+            "outcome": outcome,
+            "reason": (reason or "")[:200],
+            "evidence_note": (evidence_note or "")[:500],
+            "original_result": original[:200],
+            "note": "lock retained" if outcome == "still_unknown" else "released_to="
+            + ("done" if outcome == "executed" else "released"),
+        }
+        if outcome == "still_unknown":
+            with self.db.tx() as conn:
+                conn.execute(
+                    "UPDATE session_write_ops SET adjudication='still_unknown', adjudicated_at=?,"
+                    " adjudication_reason=? WHERE incident_id=? AND action_key=? AND status='unknown'",
+                    (t, (reason or "still_unknown")[:200], incident_id, action_key),
+                )
+        else:
+            status = "done" if outcome == "executed" else "released"
+            with self.db.tx() as conn:
+                conn.execute(
+                    "UPDATE session_write_ops SET status=?, adjudication=?, adjudicated_at=?,"
+                    " adjudication_reason=?, lease_expires_at=0"
+                    " WHERE incident_id=? AND action_key=? AND status='unknown'",
+                    (status, outcome, t, (reason or outcome)[:200], incident_id, action_key),
+                )
+        try:
+            self.db.audit(
+                actor_type,
+                actor_id,
+                "write_result_adjudicated",
+                asset_id=(row["target"] if "target" in row.keys() else "") or "",
+                object_id="",
+                action_id=action_key,
+                detail=detail,
+                incident_id=incident_id or "",
+                channel=channel,
+            )
+        except Exception:
+            pass
+        try:
+            self.duty.record_event(
+                (self._session_id_for(incident_id) or (row["session_id"] if "session_id" in row.keys() else "")) or "",
+                type="write_result_adjudicated",
+                title=f"写结果已人工核销：{outcome}",
+                payload={"action_key": action_key, "outcome": outcome, "reason": (reason or "")[:200]},
+            )
+        except Exception:
+            pass
+        return {
+            "ok": True,
+            "action_key": action_key,
+            "status": "unknown" if outcome == "still_unknown" else ("done" if outcome == "executed" else "released"),
+            "adjudication": outcome,
+        }
+
+    def list_pending_write_results(self, session_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        """本会话待核销的写结果（claimed/unknown），供执行与验证面板人工核销。"""
+        rows = self.db.query(
+            "SELECT id, incident_id, session_id, action_key, status, result, target, params_hash,"
+            " claimed_by, created_at, updated_at, adjudication FROM session_write_ops"
+            " WHERE session_id=? AND status IN ('claimed','unknown') ORDER BY created_at DESC LIMIT ?",
+            (session_id, int(limit)),
+        )
+        return [dict(r) for r in rows]
+
     def is_write_done(self, incident_id: str, action_key: str) -> bool:
         row = self.db.query_one(
             "SELECT status FROM session_write_ops WHERE incident_id=? AND action_key=?",

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext as _public_command
 from typing import Any
 
 from .actions import ActionError, ActionService
@@ -22,7 +23,7 @@ from .investigation import InvestigationService
 from .msgentry import ERR_TARGET_UNAVAILABLE, error_reply, parse_entry, usage_hint_for_controlled
 from .notify import Notifier
 from .onewbot import OneBotServer, extract_text
-from .policy import Policy
+from .access import AccessControl, authenticated_channel_operator
 
 log = logging.getLogger("ayana.qq")
 
@@ -65,7 +66,7 @@ class QQBot:
         incidents: IncidentService,
         investigation: InvestigationService,
         actions: ActionService,
-        policy: Policy,
+        policy: AccessControl,
         notifier: Notifier,
         *,
         admin_qq: str = "",
@@ -227,19 +228,22 @@ class QQBot:
 
     async def _handle_controlled(
         self, entry, *, user_id: str, group_id: str, log_id: str = "",
-        actor_type: str = "qq_user", channel: str = "qq",
+        actor_type: str = "qq_user", channel: str = "qq", channel_id: str = "",
     ) -> str:
-        """-c 受控命令：跳过 Agent，保留只读/写判定、Policy、审批、审计。"""
+        """已配置的渠道管理员可发起受控命令；写操作仍逐次审批。"""
+        if not self._is_channel_admin(actor_type, user_id, channel_id):
+            return ERR_TARGET_UNAVAILABLE
         if not self.controlled:
             return "受控命令服务未就绪"
-        res = await self.controlled.execute(
-            host=entry.host,
-            cmd_tokens=entry.cmd_tokens,
-            is_write=entry.is_write,
-            actor_type=actor_type,
-            actor_id=user_id,
-            channel=channel,
-        )
+        with authenticated_channel_operator(actor_type, user_id):
+            res = await self.controlled.execute(
+                host=entry.host,
+                cmd_tokens=entry.cmd_tokens,
+                is_write=entry.is_write,
+                actor_type=actor_type,
+                actor_id=user_id,
+                channel=channel,
+            )
         # 消息记录：关联执行状态
         if log_id and self.mlog:
             try:
@@ -261,19 +265,22 @@ class QQBot:
     async def _handle_approval(
         self, entry, *, user_id: str, actor_type: str = "qq_user", channel: str = "qq", channel_id: str = "",
     ) -> str:
-        """三句授权共用服务层；管理身份只能来自已配置的通道用户。"""
+        """管理身份来自本渠道配置；批准仅作用于当前一次操作。"""
+        if not self._is_channel_admin(actor_type, user_id, channel_id):
+            return ERR_TARGET_UNAVAILABLE
         from .fmt import approval_error
         try:
-            result = await ApprovalService(self.actions).decide(
-                entry.approval_decision,
-                actor_type=actor_type, actor_id=user_id, channel=channel,
-                is_admin=self._is_channel_admin(actor_type, user_id, channel_id),
-            )
+            with authenticated_channel_operator(actor_type, user_id):
+                result = await ApprovalService(self.actions).decide(
+                    entry.approval_decision,
+                    actor_type=actor_type, actor_id=user_id, channel=channel,
+                    is_admin=self._is_channel_admin(actor_type, user_id, channel_id),
+                )
         except ActionError as e:
             return approval_error(e.code)
         if result.get("decision") == "reject":
             return "已选择不执行，本次处置已跳过。"
-        prefix = "已允许以后自动执行。" if result.get("permanent_granted") else ""
+        prefix = ""
         if result.get("already"):
             return prefix + "这条操作已经处理，没有重复执行。"
         if result.get("executed"):
@@ -295,19 +302,22 @@ class QQBot:
 
     async def _handle_nl(
         self, entry, *, user_id: str, group_id: str, log_id: str = "",
-        actor_type: str = "qq_user",
+        actor_type: str = "qq_user", channel_id: str = "",
     ) -> str:
-        """自然语言：交给 Agent 查询（只读监控数据）。"""
+        """已配置的渠道管理员可查询监控数据。"""
+        if not self._is_channel_admin(actor_type, user_id, channel_id):
+            return ERR_TARGET_UNAVAILABLE
         log.info("_handle_nl actor=%s/%s text=%r", actor_type, user_id, entry.nl_text[:60])
         if not self.agent_query:
             log.warning("agent_query not configured")
             return "查询服务未就绪"
-        reply = await self.agent_query.handle(
-            entry.nl_text,
-            actor_type=actor_type,
-            actor_id=user_id,
-            policy=self.policy,
-        )
+        with authenticated_channel_operator(actor_type, user_id):
+            reply = await self.agent_query.handle(
+                entry.nl_text,
+                actor_type=actor_type,
+                actor_id=user_id,
+                policy=self.policy,
+            )
         log.info("_handle_nl reply=%r", reply[:80])
         # 消息记录：关联 Agent 处理结果
         if log_id and self.mlog:
@@ -326,7 +336,7 @@ class QQBot:
         return "qq_user", user_id
 
     def _visible_assets(self, actor_type: str, actor_id: str) -> list[dict[str, Any]]:
-        """S04: 按主体×资产×asset.summary 过滤可见资产，不泄露无权资产。"""
+        """Only authenticated channel operators can inspect registered assets."""
         rows = self.db.query("SELECT id, display_name, enabled FROM assets ORDER BY id")
         out = []
         for r in rows:
@@ -341,7 +351,19 @@ class QQBot:
                 out.append(dict(r))
         return out
 
-    async def dispatch(
+    async def dispatch(self, text: str, *, user_id: str, group_id: str = "",
+                       actor_type: str = "qq_user", channel: str = "qq", channel_id: str = "") -> str:
+        parts = text.strip().split()
+        if not parts:
+            return ""
+        public = parts[0].lower() in ("/ping", "/health", "/help")
+        if not public and not self._is_channel_admin(actor_type, user_id, channel_id):
+            return ERR_TARGET_UNAVAILABLE
+        with authenticated_channel_operator(actor_type, user_id) if not public else _public_command():
+            return await self._dispatch_authorized(text, user_id=user_id, group_id=group_id,
+                actor_type=actor_type, channel=channel, channel_id=channel_id)
+
+    async def _dispatch_authorized(
         self,
         text: str,
         *,

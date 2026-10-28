@@ -36,8 +36,7 @@ from .wecom_aibot import WeComAibotManager
 from .wecom_bot import WeComBot
 from .messagelog import MessageLog
 from .onewbot import OneBotServer
-from .permission_change import PermissionChangeService
-from .policy import Policy
+from .access import AccessControl
 from .prom import PromClient
 from .promconfig import build_prom_config_service
 from .checks import CheckService
@@ -134,89 +133,14 @@ def seed_assets(db: Database) -> None:
             )
     db.audit("system", "seed", "assets_seeded")
     # 知识正文在 knowledge/*.md；此处仅建索引可重建，不再写 object_knowledge 正文
-    # auto_rule 基础权限：只读调查 + runbook 执行
-    from .policy import Policy
-
-    policy = Policy(db)
-    policy.upsert_permission(
-        subject_type="auto_rule", subject_id="agent", capability="asset.summary",
-        asset_id="*", object_id="*", allow=True, require_approval=False, auto_allowed=False, actor="system",
-    )
-    for cap in ("service.restart", "service.start", "service.stop"):
-        policy.upsert_permission(
-            subject_type="auto_rule", subject_id="agent", capability=cap,
-            asset_id="*", object_id="*", allow=True, require_approval=False,
-            auto_allowed=True, actor="system",
-        )
-    # 人工 Web 终端：仅 admin；Agent 不可（policy 层硬拦）。S02: 不再通配给所有 web 用户
-    policy.upsert_permission(
-        subject_type="web_user", subject_id="admin", capability="shell.interactive",
-        asset_id="*", object_id="*", allow=True, require_approval=False, auto_allowed=False, actor="system",
-    )
-    for cap in ("checks.read", "checks.write"):
-        row = db.query_one(
-            "SELECT id FROM permissions WHERE subject_type='web_user' AND subject_id='admin'"
-            " AND capability=? AND asset_id='*' AND object_id='*'",
-            (cap,),
-        )
-        if not row:
-            policy.upsert_permission(
-                subject_type="web_user", subject_id="admin", capability=cap,
-                asset_id="*", object_id="*", allow=True, require_approval=False,
-                auto_allowed=False, actor="system",
-            )
 
 
 def ensure_checks_admin_perms(db: Database) -> None:
-    """已有库升级：补齐 admin 的 checks.* 种子（不覆盖已有决定）。"""
-    from .policy import Policy
-
-    policy = Policy(db)
-    for cap in ("checks.read", "checks.write"):
-        row = db.query_one(
-            "SELECT id FROM permissions WHERE subject_type='web_user' AND subject_id='admin'"
-            " AND capability=? AND asset_id='*' AND object_id='*'",
-            (cap,),
-        )
-        if row:
-            continue
-        policy.upsert_permission(
-            subject_type="web_user", subject_id="admin", capability=cap,
-            asset_id="*", object_id="*", allow=True, require_approval=False,
-            auto_allowed=False, actor="system",
-        )
+    """Compatibility hook: account roles no longer need capability seeds."""
 
 
 def ensure_promconfig_admin_perms(db: Database) -> None:
-    """已有库升级：仅为缺失的 admin 权限插入种子，不覆盖已有决定。
-
-    监控只读能力（asset.summary / probe.status）与 promconfig / node_exporter
-    一并补齐：admin 是初始运维账号，资源详情与业务检查只读必须可用。
-    """
-    from .policy import Policy
-
-    policy = Policy(db)
-    for cap in (
-        "asset.summary",
-        "probe.status",
-        "promconfig.read",
-        "promconfig.write",
-        "node_exporter.status",
-        "node_exporter.manage",
-    ):
-        row = db.query_one(
-            "SELECT id, allow, require_approval FROM permissions"
-            " WHERE subject_type='web_user' AND subject_id='admin' AND capability=?"
-            " AND asset_id='*' AND object_id='*'",
-            (cap,),
-        )
-        if row:
-            continue
-        policy.upsert_permission(
-            subject_type="web_user", subject_id="admin", capability=cap,
-            asset_id="*", object_id="*", allow=True, require_approval=False,
-            auto_allowed=False, actor="system",
-        )
+    """Compatibility hook: never recreate retired permission rules."""
 
 
 def load_bindings(db: Database) -> list[AssetBinding]:
@@ -263,7 +187,8 @@ class App:
             totp_key=cfg.get("totp_encrypt_key") or "",
             legacy_peppers=legacy,
         )
-        self.policy = Policy(self.db)
+        self.policy = AccessControl(self.db, admin_qq=str(cfg.get("admin_qq") or ""),
+                                    admin_wecom_users=cfg.get("admin_wecom_users") or [])
         self.nt = NTClient(privilege_mode="restricted_dispatcher")
         self.gate = IdentityGate(self.nt, load_bindings(self.db))
         self.knowledge = KnowledgeBase(self.db, root=knowledge_root(cfg))
@@ -439,7 +364,7 @@ class App:
                 return self._ssh._endpoint(asset_id, role)
 
         self.transport = _Router(self.ssh_transport, self.ssh_store)
-        # S02: 不再在每次启动时恢复通配 shell.interactive；权限由 seed_assets 仅建 admin 规则
+        # Human entry points use account roles; Agent writes use live session authority.
         self.investigation = InvestigationService(
             self.db, self.nt, self.gate, self.prom, self.policy,
             knowledge=self.knowledge,
@@ -477,6 +402,7 @@ class App:
             self.auto_investigator.incidents = self.incidents
         self.notifier = Notifier(self.db, default_target="")
         self.ops_loop.notifier = self.notifier
+        self.actions.notifier = self.notifier
         self.alert_ingest = AlertIngest(self.db, incidents=self.incidents, notifier=self.notifier)
         self.notifier.set_default_target(
             f"user:{cfg['admin_qq']}" if cfg.get("admin_qq") else ""
@@ -568,11 +494,6 @@ class App:
         )
         self.qq.agent_query = self.agent_query
         self.qq.controlled = self.controlled
-        self.permission_changes = PermissionChangeService(
-            self.db,
-            self.policy,
-            totp_verifier=lambda username, code: self.auth.verify_totp(username, code),
-        )
         self.webapp = WebApp(
             self.db,
             self.auth,
@@ -586,7 +507,6 @@ class App:
             webhook_token=cfg.get("webhook_token") or "",
             alert_ingest=self.alert_ingest,
             notifier=self.notifier,
-            permission_changes=self.permission_changes,
             ssh_store=self.ssh_store,
             cred_store=self.creds,
             transport=self.transport,
@@ -750,11 +670,6 @@ class App:
             log.info("setup state: %s", setup.get("state"))
         except Exception as e:
             log.warning("setup init failed: %s", e)
-        try:
-            ensure_promconfig_admin_perms(self.db)
-            ensure_checks_admin_perms(self.db)
-        except Exception as e:
-            log.warning("ensure promconfig admin perms failed: %s", e)
 
         ws_app = web.Application()
         ws_app.router.add_get(self.cfg.get("ws_path", "/ws"), self.ob.handle_ws)
@@ -1120,11 +1035,10 @@ class App:
                 pass
 
     async def _bg_maintenance(self) -> None:
-        """Expire manual proposals and permission changes without legacy agents."""
+        """Expire human proposals without recreating retired permission grants."""
         while not self._stop.is_set():
             for name, expire in (
                 ("proposals", self.actions.expire_stale_proposals),
-                ("permission_changes", self.permission_changes.expire_stale),
             ):
                 try:
                     expire()

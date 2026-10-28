@@ -13,7 +13,7 @@ from ayana.actions import ActionError, ActionService
 from ayana.alertmanager import AlertIngest, fingerprint_of
 from ayana.db import Database, now
 from ayana.ntsafe import NTError, NTResult
-from ayana.policy import Policy
+from ayana.policy import Policy, PolicyDeny
 
 
 class FakeNT:
@@ -64,66 +64,59 @@ class FakeProm:
 
 
 class TestPolicy(unittest.TestCase):
+    """Compatibility imports enforce account roles, never stored grants."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.db = Database(Path(self.tmp.name) / "t.db")
         self.policy = Policy(self.db)
+        for username, admin in (("admin", 1), ("viewer", 0)):
+            self.db.execute(
+                "INSERT INTO users(username,password_hash,is_admin,created_at,updated_at) VALUES(?,?,?,?,?)",
+                (username, "test-hash", admin, now(), now()),
+            )
 
     def tearDown(self):
         self.db.close()
         self.tmp.cleanup()
 
-    def test_default_deny(self):
-        d = self.policy.check(
-            subject_type="web_user", subject_id="admin", capability="service.restart",
-            asset_id="nerv", object_id="o1",
-        )
-        self.assertFalse(d["allowed"])
+    def test_unknown_user_denied(self):
+        decision = self.policy.check(subject_type="web_user", subject_id="absent",
+            capability="service.restart", asset_id="nerv", object_id="o1")
+        self.assertFalse(decision["allowed"])
+        self.assertEqual(decision["reason"], "authenticated_account_required")
 
-    def test_allow_and_auto(self):
-        self.policy.upsert_permission(
-            subject_type="web_user", subject_id="admin", capability="service.restart",
-            asset_id="nerv", object_id="o1", allow=True, require_approval=True, auto_allowed=True,
-            actor="t",
-        )
-        d = self.policy.check(
-            subject_type="web_user", subject_id="admin", capability="service.restart",
-            asset_id="nerv", object_id="o1",
-        )
-        self.assertTrue(d["allowed"])
-        self.assertTrue(d["require_approval"])
-        # S08: require_approval=True 时即使 auto_allowed=True，也不允许自动派发
-        d2 = self.policy.check(
-            subject_type="web_user", subject_id="admin", capability="service.restart",
-            asset_id="nerv", object_id="o1", auto=True,
-        )
-        self.assertFalse(d2["allowed"])
-        self.assertEqual(d2.get("reason"), "approval_required")
+    def test_admin_can_propose_but_cannot_automate_without_session(self):
+        args = dict(subject_type="web_user", subject_id="admin", capability="service.restart",
+                    asset_id="nerv", object_id="o1")
+        decision = self.policy.check(**args)
+        self.assertTrue(decision["allowed"])
+        self.assertTrue(decision["require_approval"])
+        automatic = self.policy.check(**args, auto=True)
+        self.assertFalse(automatic["allowed"])
+        self.assertEqual(automatic["reason"], "trusted_session_context_required")
 
-    def test_auto_allowed_without_approval(self):
-        """auto_allowed=True 且 require_approval=False → 可自动派发。"""
-        self.policy.upsert_permission(
-            subject_type="web_user", subject_id="admin", capability="service.restart",
-            asset_id="nerv", object_id="o1", allow=True, require_approval=False, auto_allowed=True,
-            actor="t",
-        )
-        d = self.policy.check(
-            subject_type="web_user", subject_id="admin", capability="service.restart",
-            asset_id="nerv", object_id="o1", auto=True,
-        )
-        self.assertTrue(d["allowed"])
-        self.assertEqual(d.get("decision"), "automatic")
+    def test_viewer_can_read_but_not_write(self):
+        args = dict(subject_type="web_user", subject_id="viewer", asset_id="nerv")
+        self.assertTrue(self.policy.check(**args, capability="service.logs")["allowed"])
+        decision = self.policy.check(**args, capability="service.restart")
+        self.assertFalse(decision["allowed"])
+        self.assertEqual(decision["reason"], "admin_required")
 
-    def test_auto_denied_when_not_allowed(self):
-        self.policy.upsert_permission(
-            subject_type="web_user", subject_id="admin", capability="service.restart",
-            asset_id="nerv", object_id="o1", allow=True, auto_allowed=False,
-        )
-        d = self.policy.check(
-            subject_type="web_user", subject_id="admin", capability="service.restart",
-            asset_id="nerv", object_id="o1", auto=True,
-        )
-        self.assertFalse(d["allowed"])
+    def test_old_rule_writes_are_retired(self):
+        for call in (
+            lambda: self.policy.upsert_permission(
+                subject_type="web_user", subject_id="admin", capability="service.restart",
+                asset_id="nerv", object_id="o1", allow=True, actor="t",
+            ),
+            lambda: self.policy.delete_permission(1),
+            lambda: self.policy.list_permissions(),
+            lambda: self.policy.preview(subject_type="web_user", subject_id="admin",
+                                        capability="service.restart"),
+            lambda: self.policy.default_policy(),
+        ):
+            with self.assertRaises(PolicyDeny):
+                call()
 
 
 class TestAlertIngest(unittest.TestCase):
@@ -157,6 +150,23 @@ class TestAlertIngest(unittest.TestCase):
         row = self.db.query_one("SELECT receive_count FROM alert_episodes LIMIT 1")
         self.assertEqual(row["receive_count"], 2)
 
+    def test_ingest_canonicalizes_asset_label_case(self):
+        t = now()
+        self.db.execute(
+            "INSERT INTO assets(id, display_name, read_alias, write_alias, created_at, updated_at)"
+            " VALUES('romi','R','romi','romi-exec',?,?)",
+            (t, t),
+        )
+        payload = {"alerts": [{
+            "status": "firing",
+            "labels": {"alertname": "TargetDown", "asset": "ROMI", "service": "nginx"},
+            "annotations": {"summary": "x"},
+            "startsAt": "2026-10-05T10:00:00Z",
+        }]}
+        self.ingest.ingest_webhook(payload)
+        row = self.db.query_one("SELECT asset_id FROM alert_episodes LIMIT 1")
+        self.assertEqual(row["asset_id"], "romi")
+
     def test_fingerprint_stable(self):
         a = {"alertname": "X", "asset": "n"}
         self.assertEqual(fingerprint_of(a), fingerprint_of(dict(a)))
@@ -184,10 +194,6 @@ class TestActions(unittest.TestCase):
             (t, t),
         )
         self.policy = Policy(self.db)
-        self.policy.upsert_permission(
-            subject_type="web_user", subject_id="admin", capability="service.restart",
-            asset_id="nerv", object_id="nerv:service:frps", allow=True,
-        )
         self.nt = FakeNT()
         self.prom = FakeProm()
         self.actions = ActionService(
@@ -218,10 +224,10 @@ class TestActions(unittest.TestCase):
         res = asyncio.run(run())
         self.assertEqual(res["state"], "success")
         self.assertEqual(self.nt.calls[0][0], "exec")
-        # NT 别名已移除：transport 以 asset_id 调用
         self.assertEqual(self.nt.calls[0][1], "nerv")
 
-    def test_deny_without_permission(self):
+    def test_viewer_cannot_propose_a_write(self):
+        self.db.execute("UPDATE users SET is_admin=0 WHERE username='admin'")
         with self.assertRaises(ActionError):
             self.actions.propose(
                 asset_id="nerv", object_id="frps", capability="service.stop",

@@ -146,11 +146,12 @@ class DutySessionTests(unittest.TestCase):
         out = self.duty.recover()
         self.assertIn(sid, out["countdown_restored"])
 
-    def test_settings_default_human_approval(self):
+    def test_settings_default_automatic_approval(self):
+        # 旧全局审批开关已退役：默认自主执行，审批档位由 auto_approval_mode 表达
         s = self.duty.settings()
-        self.assertTrue(s["require_human_approval"])
-        self.duty.set_setting("require_human_approval", "0", actor="t")
-        self.assertFalse(self.duty.require_human_approval())
+        self.assertEqual(s["auto_approval_mode"], "automatic")
+        self.duty.set_setting("auto_approval_mode", "manual", actor="t")
+        self.assertEqual(self.duty.settings()["auto_approval_mode"], "manual")
 
 
 class PendingWriteTests(unittest.TestCase):
@@ -192,43 +193,6 @@ class PendingWriteTests(unittest.TestCase):
         )
         self.assertEqual(row["status"], "failed")
 
-
-class ApprovalGateTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.db = Database(Path(self.tmp.name) / "t.db")
-        _seed(self.db)
-        self.actions = ActionService(
-            self.db, FakeTransport(), FakeGate(), FakePolicy(), FakeProm(),
-            transport=FakeTransport(), verify_timeout=1,
-        )
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def _set(self, on: bool) -> None:
-        self.db.execute(
-            "INSERT OR REPLACE INTO agent_settings(key,value,updated_at,updated_by)"
-            " VALUES('require_human_approval',?,?, 't')",
-            ("1" if on else "0", now()),
-        )
-
-    async def test_default_requires_approval(self):
-        res = self.actions.propose(
-            asset_id="host", object_id="obj", capability="service.restart",
-            incident_id="inc1", mode="autonomous", proposer_type="agent", proposer_id="x",
-        )
-        self.assertEqual(res["state"], "proposed")
-        self.assertTrue(res["require_approval"])
-
-    async def test_disabled_allows_auto(self):
-        self._set(False)
-        res = self.actions.propose(
-            asset_id="host", object_id="obj", capability="service.restart",
-            incident_id="inc1", mode="autonomous", proposer_type="agent", proposer_id="x",
-        )
-        self.assertEqual(res["state"], "approved")
-        self.assertFalse(res["require_approval"])
 
 
 if __name__ == "__main__":

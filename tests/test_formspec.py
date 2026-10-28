@@ -159,87 +159,6 @@ class TestFormContract(unittest.TestCase):
                 self.assertTrue(result["issues"])
                 self.assertIsNone(result["payload"])
 
-    def test_permission_form_uses_known_options_and_conditional_required_fields(self):
-        result = validate_fields("permissions", {"capability": "service.restart", "state": "confirm", "scope": "exception"}, assets=ASSETS, capabilities=["service.restart"])
-        self.assertEqual([m["field"] for m in result["missing"]], ["asset_id"])
-        self.assertFalse(result["valid"])
-        result = validate_fields("permissions", {"capability": "invented", "state": "auto"}, capabilities=[])
-        self.assertEqual(result["issues"][0]["field"], "capability")
-
-    def test_permission_read_states_match_real_policy_behavior(self):
-        for capabilities in (["service.logs"], [{"name": "service.logs", "kind": "read", "description": "读取日志"}]):
-            with self.subTest(capabilities=capabilities):
-                invalid = validate_fields("permissions", {"capability": "service.logs", "state": "confirm"}, capabilities=capabilities)
-                self.assertFalse(invalid["valid"])
-                self.assertEqual(invalid["issues"][0]["code"], "unsupported_state")
-                self.assertNotIn("state", invalid["fields"])
-                for state in ("deny", "auto"):
-                    self.assertTrue(validate_fields("permissions", {"capability": "service.logs", "state": state}, capabilities=capabilities)["valid"])
-                missing = validate_fields("permissions", {"capability": "service.logs"}, capabilities=capabilities)
-                self.assertEqual(missing["missing"][0]["options"], [{"value": "deny", "label": "禁止"}, {"value": "auto", "label": "允许读取"}])
-
-    def test_permission_write_auto_requires_actual_capability(self):
-        for state in ("deny", "confirm", "auto"):
-            self.assertTrue(validate_fields("permissions", {"capability": "service.restart", "state": state}, capabilities=["service.restart"])["valid"])
-        for cap in ("checks.write", "node_exporter.manage", "shell.interactive"):
-            result = validate_fields("permissions", {"capability": cap, "state": "auto"}, capabilities=[cap])
-            self.assertEqual(result["issues"][0]["code"], "unsupported_state")
-        result = validate_fields("permissions", {"capability": "shell.interactive", "state": "confirm"}, capabilities=["shell.interactive"])
-        self.assertEqual(result["issues"][0]["code"], "unsupported_state")
-
-    def test_permission_registered_object_id_and_unique_alias_resolve_same_target(self):
-        assets = [{**ASSETS[0], "objects": [{"id": "obj-web", "kind": "service", "name": "网站服务", "unit": "nginx"}]}]
-        for target in ("obj-web", "nginx", "网站服务"):
-            result = validate_fields("permissions", {"capability": "service.restart", "state": "confirm", "scope": "exception", "asset_id": "romi", "object_id": target}, assets=assets, capabilities=["service.restart"])
-            self.assertTrue(result["valid"], result)
-            self.assertEqual(result["fields"]["object_id"], "obj-web")
-            self.assertEqual(result["payload"]["object_id"], "obj-web")
-            self.assertEqual(bool(result["normalizations"]), target != "obj-web")
-
-    def test_permission_unknown_or_incompatible_object_cannot_broaden_to_wildcard(self):
-        assets = [{**ASSETS[0], "objects": [{"id": "obj-port", "kind": "port", "name": "网站端口", "port": 80}]}]
-        for target, code in (("nginx", "unknown_object"), ("obj-port", "object_kind_mismatch")):
-            result = validate_fields("permissions", {"capability": "service.restart", "state": "auto", "scope": "exception", "asset_id": "romi", "object_id": target}, assets=assets, capabilities=["service.restart"])
-            self.assertFalse(result["valid"])
-            self.assertEqual(result["issues"][0]["code"], code)
-            self.assertNotIn("object_id", result["fields"])
-            self.assertIsNone(result["payload"])
-
-    def test_permission_ambiguous_registered_alias_asks_for_actual_object(self):
-        assets = [{**ASSETS[0], "objects": [
-            {"id": "obj-a", "kind": "service", "name": "网站服务", "unit": "nginx-a"},
-            {"id": "obj-b", "kind": "service", "name": "网站服务", "unit": "nginx-b"},
-        ]}]
-        result = validate_fields("permissions", {"capability": "service.restart", "state": "confirm", "scope": "exception", "asset_id": "romi", "object_id": "网站服务"}, assets=assets, capabilities=["service.restart"])
-        self.assertEqual(result["issues"], [])
-        self.assertFalse(result["valid"])
-        self.assertNotIn("object_id", result["fields"])
-        question = result["missing"][0]
-        self.assertEqual(question["field"], "object_id")
-        self.assertEqual([option["value"] for option in question["options"]], ["obj-a", "obj-b"])
-        self.assertIsNone(result["payload"])
-
-    def test_permission_live_schema_and_prompt_publish_actual_policy_limits(self):
-        state = next(f for f in get_form("permissions")["fields"] if f["name"] == "state")
-        self.assertEqual(state["allowed_states_by_capability"]["service.logs"], ["deny", "auto"])
-        self.assertEqual(state["value_labels_by_capability"]["service.logs"]["auto"], "允许读取")
-        self.assertEqual(state["allowed_states_by_capability"]["shell.interactive"], ["deny"])
-        prompt = form_prompt_payload("permissions", assets=ASSETS, capabilities=["service.logs", "service.restart"])
-        caps = {cap["name"]: cap for cap in prompt["context"]["capabilities"]}
-        self.assertEqual(caps["service.logs"]["allowed_states"], ["deny", "auto"])
-        self.assertIn("不支持", caps["service.logs"]["policy_meaning"])
-        self.assertEqual(caps["service.restart"]["allowed_states"], ["deny", "confirm", "auto"])
-        self.assertEqual(state["validation_context"], ["capability"])
-        object_field = next(f for f in get_form("permissions")["fields"] if f["name"] == "object_id")
-        self.assertEqual(object_field["validation_context"], ["asset_id", "capability", "scope"])
-
-    def test_known_capability_metadata_cannot_override_actual_registry(self):
-        forged = [{"name": "service.logs", "kind": "write", "auto_allowed": True},
-                  {"name": "checks.write", "kind": "write", "auto_allowed": True}]
-        for capability, state in (("service.logs", "confirm"), ("checks.write", "auto")):
-            result = validate_fields("permissions", {"capability": capability, "state": state}, capabilities=forged)
-            self.assertEqual(result["issues"][0]["code"], "unsupported_state")
-
     def test_prompt_and_frontend_metadata_describe_real_contract(self):
         form = get_form("checks")
         fields = {f["name"]: f for f in form["fields"]}
@@ -261,9 +180,6 @@ class TestFormContract(unittest.TestCase):
         self.assertFalse(condition_matches(fields["params.unit"]["applicable_if"], {"kind": "port"}))
         self.assertTrue(condition_matches(fields["expect.value"]["required_when"], {"kind": "command", "expect.mode": "contains"}))
         self.assertFalse(condition_matches(fields["expect.value"]["applicable_if"], {"kind": "command", "expect.mode": "exit0"}))
-        permission = {f["name"]: f for f in get_form("permissions")["fields"]}
-        self.assertEqual(permission["state"]["control_id"], "perm-ex-state")
-        self.assertEqual(permission["asset_id"]["required_when"], {"field": "scope", "equals": "exception"})
 
     def test_check_payload_error_has_friendly_field_issues(self):
         with self.assertRaises(CheckError) as raised:
@@ -272,8 +188,7 @@ class TestFormContract(unittest.TestCase):
         self.assertEqual(raised.exception.issues[0]["field"], "interval_sec")
 
     def test_prompt_routes_and_metadata_fields_are_limited_to_actual_domain(self):
-        for domain, routes in (("checks", {"checks_form"}),
-                               ("permissions", {"perm_defaults", "perm_exceptions", "perm_effective", "perm_workbench", "perm_ceiling"})):
+        for domain, routes in (("checks", {"checks_form"}),):
             with self.subTest(domain=domain):
                 prompt = form_prompt_payload(domain, assets=ASSETS)
                 schema = prompt["output_schema"]
@@ -311,9 +226,6 @@ class TestFormContract(unittest.TestCase):
         self.assertFalse(field_applicability("checks", "params.unit", {"kind": "port"}))
         self.assertTrue(field_applicability("checks", "name", {}))
         self.assertFalse(field_applicability("checks", "made_up", {}))
-        self.assertIsNone(field_applicability("permissions", "asset_id", {}))
-        self.assertTrue(field_applicability("permissions", "asset_id", {"scope": "exception"}))
-        self.assertFalse(field_applicability("permissions", "asset_id", {"scope": "default"}))
 
     def test_compound_applicability_false_takes_precedence_over_unknown(self):
         condition = next(field for field in get_form("checks")["fields"] if field["name"] == "expect.value")["applicable_if"]

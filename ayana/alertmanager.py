@@ -144,6 +144,11 @@ def upsert_episode(
         alertname = labels.get("alertname") or "unknown"
     if not asset_id:
         asset_id = labels.get("asset") or ""
+    if asset_id:
+        # 外部标签大小写不稳（如 asset: ROMI），以登记资产 id 为准。
+        rows = db.execute("SELECT id FROM assets WHERE lower(id)=lower(?)", (asset_id,)).fetchall()
+        if len(rows) == 1:
+            asset_id = rows[0]["id"]
     if not problem_family:
         problem_family = problem_family_of(alertname, labels)
     if not canonical_object:

@@ -124,10 +124,17 @@
       incs.innerHTML = "";
       if (!incidents.length) incs.appendChild(el("div", { class: "aw-muted", text: "暂无" }));
       incidents.forEach((i) => {
-        incs.appendChild(el("div", { class: "aw-inc-row" }, [
+        const row = el("div", { class: "aw-inc-row" }, [
           el("div", { class: "aw-inc-title", text: i.title || i.incident_id }),
-          el("div", { class: "aw-inc-meta", text: `${i.severity || ""} · ${i.status || ""} · ${i.asset_id || ""}` }),
-        ]));
+          el("div", { class: "aw-inc-meta", text: `${i.severity || ""} · ${i.status || ""} · ${i.asset_id || ""}${i.need_human ? " · 需人工" : ""}` }),
+        ]);
+        if (i.need_human && i.status === "open") {
+          row.appendChild(el("button", {
+            type: "button", class: "btn primary small", text: "恢复自治",
+            onclick: () => resumeAutonomy(i),
+          }));
+        }
+        incs.appendChild(row);
       });
     }
     if (pend) {
@@ -176,14 +183,51 @@
     }
     if (res) {
       res.innerHTML = "";
+      const results = d.pending_write_results || [];
       const evs = (d.events || []).filter((e) =>
         ["tool_call", "tool_result", "action_proposed", "session_archived"].includes(e.type)
       );
-      if (!evs.length) res.appendChild(el("div", { class: "aw-muted", text: "暂无" }));
+      if (!results.length && !evs.length) res.appendChild(el("div", { class: "aw-muted", text: "暂无" }));
+      results.forEach((w) => {
+        const row = el("div", { class: "aw-pend-card" }, [
+          el("div", { class: "aw-pend-title", text: `写结果待核销${w.target ? " @ " + w.target : ""}` }),
+          el("div", { class: "aw-pend-meta", text: `${w.incident_id || ""} · ${fmtTime(w.created_at)} · ${w.result || w.status}` }),
+          el("div", { class: "aw-pend-actions" }, [
+            el("button", {
+              type: "button", class: "btn primary small", text: "已执行",
+              onclick: () => adjudicateResult(w, "executed"),
+            }),
+            el("button", {
+              type: "button", class: "btn ghost small", text: "未执行",
+              onclick: () => adjudicateResult(w, "not_executed"),
+            }),
+            el("button", {
+              type: "button", class: "btn ghost small", text: "仍未知",
+              onclick: () => adjudicateResult(w, "still_unknown"),
+            }),
+          ]),
+        ]);
+        res.appendChild(row);
+      });
+      res.querySelectorAll("button").forEach((button) => { button.disabled = !manageable(); });
       evs.slice(-8).forEach((e) => {
         res.appendChild(el("div", { class: "aw-res-row", text: `${fmtTime(e.created_at)} ${e.title || e.type}` }));
       });
     }
+  }
+  function resumeAutonomy(inc) {
+    const key = "resume:" + inc.incident_id;
+    if (pendingDecisions.has(key)) return;
+    if (!confirm("确认人工处理完成后恢复自治？将重置本轮失败计数并重新调查规划，历史审计保留。")) return;
+    return decide("/api/incidents/" + encodeURIComponent(inc.incident_id) + "/resume", {}, key);
+  }
+  function adjudicateResult(w, outcome) {
+    const key = "wop:" + w.id;
+    if (pendingDecisions.has(key)) return;
+    const names = { executed: "已执行", not_executed: "未执行", still_unknown: "仍未知" };
+    const reason = prompt(`核销写结果（${names[outcome]}）：请填写核对依据。`, outcome === "executed" ? "已在目标主机确认生效" : outcome === "not_executed" ? "已确认未执行" : "暂无法确认");
+    if (reason === null) return;
+    return decide("/api/agent/write-ops/" + encodeURIComponent(w.id) + "/adjudicate", { outcome, reason }, key);
   }
 
 
@@ -404,19 +448,19 @@
       });
       group.setValue(value); return group;
     }
-    const dutyCard = section("自动值班", "无人接管时按以下配置执行。接管期间的临时权限不会改动这里。");
+    const dutyCard = section("自动值班", "统一使用执行权限和审批模式控制 Agent。自动会话无人接管时采用这里的配置；手动会话保留各自权限，接管期间的临时切换会在释放后恢复。");
     const access = segmented("agent-auto-access", "自动值班执行权限", [["readonly", "只读"], ["readwrite", "读写"]], settings.auto_access_mode || "readwrite");
-    const approval = segmented("agent-auto-approval", "自动值班审批模式", [["manual", "人工审批"], ["automatic", "自动审批"]], settings.auto_approval_mode || (settings.require_human_approval === false ? "automatic" : "manual"));
+    const approval = segmented("agent-auto-approval", "自动值班审批模式", [["manual", "人工审批"], ["automatic", "自动执行"]], settings.auto_approval_mode || "automatic");
     dutyCard.appendChild(field("执行权限", access, "只读拒绝写操作；读写时再按审批模式执行。"));
-    dutyCard.appendChild(field("审批模式", approval, "自动审批继续遵守当前工具授权、凭据与审计规则。"));
-    const sshCard = section("SSH 账户", "选择实际连接角色。调查与执行可以使用不同账户。");
+    dutyCard.appendChild(field("审批模式", approval, "人工审批：修改前由你确认；自动执行：允许直接修改。只读模式始终禁止修改。"));
+    const sshCard = section("SSH 账户", "选择实际登录账户。角色名称只表示用途，服务器实际权限由账户和 sudo 配置决定。");
     const roles = (reply.ssh_roles || []).map((role) => typeof role === "string" ? { name: role } : role).filter((role) => role && role.name);
     endpoints.forEach((endpoint) => { if (endpoint.role && !roles.some((role) => role.name === endpoint.role)) roles.push({ name: endpoint.role }); });
     function rolePicker(id, label, selected) {
       const select = el("select", { id, "aria-label": label });
       const choices = roles.slice();
       if (!choices.some((role) => role.name === selected)) choices.push({ name: selected, missing: true });
-      choices.forEach((role) => select.appendChild(el("option", { value: role.name, disabled: role.enabled === false ? "disabled" : null, text: (role.display_name || role.name) + (role.missing ? "（待配置）" : role.enabled === false ? "（已停用）" : role.kind ? " · " + (role.kind === "write" ? "写角色" : "读角色") : "") })));
+      choices.forEach((role) => select.appendChild(el("option", { value: role.name, disabled: role.enabled === false ? "disabled" : null, text: (role.display_name || role.name) + (role.missing ? "（待配置）" : role.enabled === false ? "（已停用）" : role.kind ? " · " + (role.kind === "write" ? "执行角色" : "调查角色") : "") })));
       select.value = selected;
       const accounts = el("div", { class: "aw-role-accounts", "aria-live": "polite" });
       function renderAccounts() {
@@ -894,6 +938,7 @@
     state.active = false; ++state.mount; ++state.generation;
     stopPoll(); disconnectTerminal();
   }
+  window.openAgentSettings = openAgentSettings;
   window.renderAgentWorkbench = renderAgentWorkbench;
   window.suspendAgentWorkbench = suspendAgentWorkbench;
   window.agentWorkbenchState = state;

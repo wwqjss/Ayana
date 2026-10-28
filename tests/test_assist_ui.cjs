@@ -7,7 +7,6 @@ const { execFileSync } = require("node:child_process");
 const root = path.resolve(__dirname, "..");
 const source = fs.readFileSync(path.join(root, "ayana/static/app.js"), "utf8");
 const form = JSON.parse(execFileSync("python", ["-c", "import json; from ayana.formspec import get_form; print(json.dumps(get_form('checks')))"], { cwd: root, encoding: "utf8" }));
-const permissionForm = JSON.parse(execFileSync("python", ["-c", "import json; from ayana.formspec import get_form; print(json.dumps(get_form('permissions')))"], { cwd: root, encoding: "utf8" }));
 
 class Element {
   constructor(tag) {
@@ -53,17 +52,12 @@ function environment() {
     return node;
   };
   for (const field of form.fields) create(field.control, field.type === "enum" || field.source === "assets" ? "select" : "input", field.values || (field.source === "assets" ? ["", "romi", "sora"] : []));
-  for (const prefix of ["chk", "perm"]) {
+  for (const prefix of ["chk"]) {
     for (const suffix of ["assist-input", "assist-go", "assist-msg", "assist-followup"]) create(prefix + "-" + suffix, suffix === "assist-go" ? "button" : suffix.includes("input") ? "input" : "div");
     const debug = create(prefix + "-assist-debug", "details"); debug.appendChild(new Element("pre"));
   }
-  for (const id of ["chk-summary", "chk-params-port", "chk-params-service", "chk-params-command", "modal", "modal-body", "modal-title", "perm-diff-box", "perm-panel-defaults", "perm-panel-exceptions", "perm-panel-effective", "perm-panel-ceiling"]) create(id, "div");
+  for (const id of ["chk-summary", "chk-params-port", "chk-params-service", "chk-params-command", "modal", "modal-body", "modal-title"]) create(id, "div");
   create("chk-add", "button");
-  for (const id of ["perm-eff-cap", "perm-ex-cap", "perm-cap"]) create(id, "select", ["", "service.restart", "service.logs"]);
-  for (const id of ["perm-eff-asset", "perm-ex-asset", "perm-asset"]) create(id, "select", ["", "romi", "sora"]);
-  for (const id of ["perm-object", "perm-allow", "perm-approval", "perm-auto"]) create(id);
-  for (const id of ["perm-eff-object", "perm-ex-object"]) create(id, "select", ["", "*", "romi-nginx", "romi-redis"]);
-  create("perm-ex-state", "select", ["", "deny", "confirm", "auto"]);
   const calls = [], replies = [];
   const context = vm.createContext({
     console, setTimeout: () => 0,
@@ -78,20 +72,16 @@ function environment() {
       return typeof reply === "function" ? await reply() : reply;
     },
     showModal: (title, children) => { nodes.get("modal-title").textContent = title; nodes.get("modal-body").innerHTML = ""; children.forEach((child) => nodes.get("modal-body").appendChild(child)); nodes.get("modal").classList.remove("hidden"); },
-    chkKindChanged: () => {}, renderChecks: () => {}, renderPermissions: async () => {},
+    chkKindChanged: () => {}, renderChecks: () => {},
     fmtTime: () => "已执行时间",
-    PERM_CAP_LABEL: { "service.restart": "重启服务", "service.logs": "查看日志" },
   });
   const cut = (start, end) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)));
   vm.runInContext(cut("function el(", "async function api("), context);
-  vm.runInContext(cut("const PERM_STATE_META", "function permFlagsToState"), context);
-  vm.runInContext(cut("function permStateToFlags", "/** 在 agent"), context);
-  vm.runInContext(cut("function renderSeg", "async function saveAgentPerm"), context);
+  vm.runInContext(cut("function confirmFormAction(", 'on("kb-search"'), context);
   vm.runInContext(cut("function checkHostLabel", "async function renderChecks"), context);
   vm.runInContext(cut("function chkKindChanged", "/* ---- 自然语言辅助配置"), context);
   vm.runInContext(cut("/* ---- 自然语言辅助配置", 'on("monitor-detect"'), context);
   vm.runInContext(cut("function checkPayloadSummary", "/* ---- init ---- */"), context);
-  vm.runInContext("assistForms.permissions = " + JSON.stringify(permissionForm), context);
   return { nodes, calls, replies, run: (code) => vm.runInContext(code, context) };
 }
 
@@ -312,25 +302,6 @@ test("semantic questions without candidates accept text and reject an unanswered
   assert.ok(!env.calls.some((call) => call.url === "/api/checks"));
 });
 
-test("semantic permission questions prevent validation and saving until a continuation resolves them", async () => {
-  const env = environment();
-  env.nodes.get("perm-assist-input").value = "安排这个服务的权限";
-  const fields = { capability: "service.restart", scope: "default", state: "confirm" };
-  env.replies.push({ ok: true, route: "perm_defaults", status: "needs_input", fields, missing: [componentQuestion] });
-  await env.run("runAssist('permissions')");
-  env.run("assistState.permissions.manualResolved.add('clarification.target_component')");
-  await env.run("preparePermissionSubmit(" + JSON.stringify(fields) + ",()=>true,'确认权限变更')");
-  assert.equal(env.calls.length, 1);
-  assert.ok(env.nodes.get("perm-assist-msg").textContent.includes("请先回答"));
-  assert.equal(env.nodes.get("modal-body").children.length, 0);
-  const followup = env.nodes.get("perm-assist-followup"), custom = followup.querySelector("input");
-  custom.value = "我指的是报表处理器，重启前需要我确认";
-  env.replies.push({ ok: true, route: "perm_defaults", status: "ready", fields, missing: [] });
-  await followup.querySelector("button").click();
-  assert.deepEqual(env.calls.at(-1).body.context.answers, [{ field: componentQuestion.field, text: custom.value }]);
-  assert.ok(!env.calls.some((call) => call.url === "/api/permissions" || call.url === "/api/permissions/validate"));
-});
-
 test("a new semantic question invalidates a previously open creation preview", async () => {
   const env = environment(); await ready(env); setFields(env);
   env.replies.push({ ok: true, payload }); await env.run("prepareCheckSubmit()");
@@ -405,91 +376,10 @@ test("unsupported new intent clears stale ready draft and cannot create it", asy
   assert.ok(!env.calls.some((call) => call.url === "/api/checks/validate" || call.url === "/api/checks"));
 });
 
-test("permission state selection and AI fill never save implicitly", async () => {
+test("retired permission assistant cannot issue requests", async () => {
   const env = environment();
-  const control = env.run("permissionDraftControl('confirm', {capability:'service.restart',asset_id:'*',object_id:'*'})");
-  await control.querySelectorAll("button")[2].click();
+  await env.run("runAssist('permissions')");
   assert.equal(env.calls.length, 0);
-  await env.run("applyPermIntent({fields:{capability:'service.restart',scope:'default',state:'deny'},missing:[]})");
-  assert.equal(env.run("[...permDraftControls.values()][0].state"), "deny");
-  assert.equal(env.calls.length, 0);
-  const fields = { capability: "service.restart", scope: "default", state: "deny", object_id: "*" };
-  const permissionPayload = { subject_type: "auto_rule", subject_id: "agent", capability: "service.restart", asset_id: "*", object_id: "*", allow: false, require_approval: true, auto_allowed: false };
-  env.replies.push({ ok: true, fields, payload: permissionPayload });
-  await control.querySelectorAll("button")[3].click();
-  assert.equal(env.calls[0].url, "/api/permissions/validate");
-  assert.ok(!env.calls.some((call) => call.url === "/api/permissions"));
-  env.replies.push({ ok: true }); await env.nodes.get("modal-body").querySelectorAll("button")[1].click();
-  assert.deepEqual(env.calls.at(-1).body, permissionPayload);
-});
-
-test("read permissions only offer states supported by the actual catalog", async () => {
-  const env = environment();
-  const control = env.run("permissionDraftControl('auto', {capability:'service.logs',asset_id:'*',object_id:'*'})");
-  assert.deepEqual(control.querySelectorAll("button").map((button) => button.textContent), ["禁止", "允许读取", "保存策略"]);
-  env.nodes.get("perm-ex-cap").value = "service.logs";
-  env.run("updatePermissionStateSelect('confirm')");
-  assert.equal(env.nodes.get("perm-ex-state").value, "");
-  assert.ok(!env.nodes.get("perm-ex-state").children.some((option) => option.value === "confirm"));
-});
-
-test("permission validation errors prevent preview and saving", async () => {
-  const env = environment();
-  env.replies.push({ ok: false, issues: [{ label: "策略", message: "读取操作不支持需要人工确认。" }] });
-  await env.run("preparePermissionSubmit({capability:'service.logs',state:'confirm',scope:'default'},()=>true,'确认权限变更')");
-  assert.equal(env.calls.length, 1); assert.equal(env.calls[0].url, "/api/permissions/validate");
-  assert.equal(env.nodes.get("modal-body").children.length, 0);
-  assert.ok(env.nodes.get("perm-assist-msg").textContent.includes("读取操作不支持"));
-});
-
-test("registered object selection retains IDs internally and shows names", async () => {
-  const env = environment();
-  await env.run("applyPermIntent({fields:{scope:'exception',capability:'service.restart',asset_id:'romi',object_id:'nginx',state:'confirm'},missing:[]})");
-  assert.equal(env.nodes.get("perm-ex-object").value, "romi-nginx");
-  assert.ok(env.nodes.get("perm-ex-object").children.some((option) => option.value === "romi-nginx" && option.textContent === "网站服务"));
-  assert.ok(env.run("permissionSummary('service.restart','romi','romi-nginx','confirm').join(' ')").includes("网站服务"));
-  env.nodes.get("perm-ex-asset").value = "sora";
-  env.run("populatePermissionObjects('ex')");
-  assert.equal(env.nodes.get("perm-ex-object").value, "");
-});
-
-test("editing a permission during validation prevents a stale preview", async () => {
-  const env = environment();
-  let release;
-  env.run("globalThis.permissionCurrent = true");
-  env.replies.push(() => new Promise((resolve) => { release = resolve; }));
-  const request = env.run("preparePermissionSubmit({capability:'service.logs',state:'auto',scope:'default'},()=>permissionCurrent,'确认权限变更')");
-  await Promise.resolve();
-  env.run("permissionCurrent = false");
-  release({ ok: true, fields: { capability: "service.logs", state: "auto", scope: "default" }, payload: { allow: true } });
-  await request;
-  assert.equal(env.nodes.get("modal-body").children.length, 0);
-  assert.ok(env.nodes.get("perm-assist-msg").textContent.includes("校验期间权限草稿已修改"));
-});
-
-test("normalized permission object names appear in preview, cancel makes no writes", async () => {
-  const env = environment();
-  env.replies.push({ ok: true,
-    fields: { capability: "service.logs", state: "auto", scope: "exception", asset_id: "romi", object_id: "romi-nginx" },
-    payload: { subject_type: "auto_rule", subject_id: "agent", capability: "service.logs", asset_id: "romi", object_id: "romi-nginx", allow: true, require_approval: false, auto_allowed: true },
-  });
-  await env.run("preparePermissionSubmit({capability:'service.logs',state:'auto',scope:'exception',asset_id:'romi',object_id:'nginx'},()=>true,'确认资产例外')");
-  const preview = env.nodes.get("modal-body").textContent;
-  assert.ok(preview.includes("网站服务")); assert.ok(preview.includes("允许读取"));
-  assert.ok(!preview.includes("romi-nginx"));
-  await env.nodes.get("modal-body").querySelectorAll("button")[0].click();
-  assert.equal(env.calls.length, 1); assert.equal(env.calls[0].url, "/api/permissions/validate");
-});
-
-test("editing a permission after validation blocks the save until new preview", async () => {
-  const env = environment();
-  env.run("globalThis.permissionCurrent = true");
-  env.replies.push({ ok: true, fields: { capability: "service.logs", scope: "default", state: "auto" }, payload: { allow: true } });
-  await env.run("preparePermissionSubmit({capability:'service.logs',state:'auto',scope:'default'},()=>permissionCurrent,'确认权限变更')");
-  env.run("permissionCurrent = false");
-  await env.nodes.get("modal-body").querySelectorAll("button")[1].click();
-  assert.equal(env.calls.length, 1);
-  assert.ok(env.nodes.get("modal-body").textContent.includes("表单已修改"));
 });
 
 test("saved check labels stay readable and execution details stay advanced", async () => {

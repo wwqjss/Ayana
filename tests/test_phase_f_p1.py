@@ -434,10 +434,6 @@ class TestRestartAndAdjudication(unittest.TestCase):
     def _env(self):
         tmp, db = make_db_env()
         policy = Policy(db)
-        policy.upsert_permission(
-            subject_type="web_user", subject_id="admin", capability="service.restart",
-            asset_id="nerv", object_id="*", allow=True, require_approval=False, actor="t",
-        )
         nt = FakeNT()
         prom = FakeProm()
         actions = ActionService(db, nt, FakeGate(), policy, prom, verify_timeout=1)
@@ -697,21 +693,6 @@ class TestReplayFrps(unittest.TestCase):
              0, "", 1, "", now(), now()),
         )
         policy = Policy(db)
-        policy.upsert_permission(
-            subject_type="auto_rule", subject_id="agent", capability="service.status",
-            asset_id="nerv", object_id="*", allow=True, require_approval=False,
-            auto_allowed=True, actor="t",
-        )
-        policy.upsert_permission(
-            subject_type="auto_rule", subject_id="agent", capability="service.logs",
-            asset_id="nerv", object_id="*", allow=True, require_approval=False,
-            auto_allowed=True, actor="t",
-        )
-        policy.upsert_permission(
-            subject_type="web_user", subject_id="admin", capability="service.restart",
-            asset_id="nerv", object_id="*", allow=True, require_approval=True,
-            auto_allowed=False, actor="t",
-        )
         nt = FakeNT()
         nt.set_script(("is-active", NTResult(ok=False, output="inactive", returncode=3)))
         prom = FakeProm(value=0)
@@ -719,7 +700,7 @@ class TestReplayFrps(unittest.TestCase):
         actions = ActionService(db, nt, FakeGate(), policy, prom, verify_window=5, verify_timeout=1)
 
         # 1. Investigation
-        ires = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", incident_id="inc1"))
+        ires = asyncio.run(inv.run_loop(asset_id="nerv", object_id="frps", incident_id="inc1", actor_type="web_user", actor_id="admin"))
         self.assertTrue(any(
             f.get("kind") == "service_state" and f.get("service_state") == "inactive"
             for f in ires["facts"]
@@ -759,10 +740,6 @@ class TestReplayFrps(unittest.TestCase):
              0, "", 1, "", now(), now()),
         )
         policy = Policy(db)
-        policy.upsert_permission(
-            subject_type="web_user", subject_id="admin", capability="service.restart",
-            asset_id="nerv", object_id="*", allow=True, require_approval=True, actor="t",
-        )
         nt = FakeNT()
         actions = ActionService(db, nt, FakeGate(), policy, FakeProm())
         prop = actions.propose(
@@ -847,17 +824,16 @@ class TestReplayHysteria(unittest.TestCase):
                 " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (f"sora:{kind}:{name}", "sora", kind, name, name, "", port, proto, name, 1, t),
             )
+        db.execute(
+            "INSERT OR IGNORE INTO users(username, password_hash, totp_enabled, is_admin, created_at, updated_at)"
+            " VALUES('admin','x',0,1,?,?)",
+            (now(), now()),
+        )
         policy = Policy(db)
-        for cap in ("service.status", "service.logs", "port.listen", "probe.status", "asset.summary"):
-            policy.upsert_permission(
-                subject_type="auto_rule", subject_id="agent", capability=cap,
-                asset_id="sora", object_id="*", allow=True, require_approval=False,
-                auto_allowed=True, actor="t",
-            )
         nt = FakeNT()
         nt.set_script(("is-active", NTResult(ok=False, output="inactive", returncode=3)))
         inv = InvestigationService(db, nt, FakeGate(), FakeProm(), policy)
-        res = asyncio.run(inv.run_loop(asset_id="sora", object_id="hysteria-server"))
+        res = asyncio.run(inv.run_loop(asset_id="sora", object_id="hysteria-server", actor_type="web_user", actor_id="admin"))
         self.assertTrue(res["facts"])
         self.assertFalse(res.get("ok_for_auto_write"))
         self.assertFalse(nt.exec_calls)
@@ -913,15 +889,6 @@ class TestUserAcceptance(unittest.TestCase):
         tmp, db = make_db_env()
         self.addCleanup(close_env, tmp, db)
         policy = Policy(db)
-        policy.upsert_permission(
-            subject_type="auto_rule", subject_id="agent", capability="service.status",
-            asset_id="nerv", object_id="*", allow=True, require_approval=False,
-            auto_allowed=True, actor="t",
-        )
-        policy.upsert_permission(
-            subject_type="web_user", subject_id="admin", capability="service.restart",
-            asset_id="nerv", object_id="*", allow=True, require_approval=True, actor="t",
-        )
         nt = FakeNT()
         nt.set_script(("is-active", NTResult(ok=False, output="inactive", returncode=3)))
         prom = FakeProm(value=0)
@@ -943,7 +910,7 @@ class TestUserAcceptance(unittest.TestCase):
         # 2. investigation
         ires = asyncio.run(inv.run_loop(
             asset_id="nerv", object_id="frps", incident_id=inc_id,
-        ))
+            actor_type="web_user", actor_id="admin"))
         self.assertTrue(ires["facts"])
 
         # 3. proposal

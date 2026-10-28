@@ -1,4 +1,4 @@
-"""Human consent protocol: real policy/state transitions, without production IO."""
+"""One-action consent, account roles and live authority, without production IO."""
 
 from __future__ import annotations
 
@@ -58,13 +58,10 @@ class ApprovalProtocolTests(unittest.TestCase):
             "INSERT INTO incidents(id,title,asset_id,object_id,stage,created_at,updated_at)"
             " VALUES('inc','service down','host','service-a','awaiting_approval',?,?)", (t, t),
         )
-        self.policy = Policy(self.db)
-        for subject_type, subject_id in (("auto_rule", "agent"), ("web_user", "admin"),
-                                         ("qq_user", "123"), ("wecom_user", "operator")):
-            self.policy.upsert_permission(
-                subject_type=subject_type, subject_id=subject_id, capability="service.restart",
-                asset_id="host", object_id="*", allow=True, require_approval=True, auto_allowed=False,
-            )
+        self.policy = Policy(self.db, admin_qq="123", admin_wecom_users=["operator"])
+        for username, admin in (("admin", 1), ("viewer", 0)):
+            self.db.execute("INSERT INTO users(username,password_hash,is_admin,created_at,updated_at) VALUES(?,'unused',?,?,?)",
+                            (username, admin, t, t))
         self.transport = Transport()
         self.actions = ActionService(
             self.db, nt=self.transport, gate=Gate(), policy=self.policy,
@@ -76,7 +73,7 @@ class ApprovalProtocolTests(unittest.TestCase):
     def propose(self, *, object_name="service-a", incident_id="inc", **kwargs):
         return self.actions.propose(
             asset_id="host", object_id=f"host:service:{object_name}",
-            capability="service.restart", proposer_type="auto_rule", proposer_id="agent",
+            capability="service.restart", proposer_type="qq_user", proposer_id="123",
             incident_id=incident_id, **kwargs,
         )["id"]
 
@@ -86,12 +83,6 @@ class ApprovalProtocolTests(unittest.TestCase):
             actor_id=kwargs.pop("actor_id", "admin"), is_admin=kwargs.pop("is_admin", True),
             **kwargs,
         ))
-
-    def effective(self, name="service-a"):
-        return self.policy.effective_decision(
-            subject_type="auto_rule", subject_id="agent", capability="service.restart",
-            asset_id="host", object_id=f"host:service:{name}",
-        )
 
     def audit(self, entry):
         return [dict(r) for r in self.db.query("SELECT * FROM audit_log WHERE entry=?", (entry,))]
@@ -103,16 +94,6 @@ class ApprovalProtocolTests(unittest.TestCase):
             lambda: self.propose(mode="auto", runbook_id="rb_restart"),
         )
         return None
-        original = RUNBOOK[:]
-        self.addCleanup(lambda: RUNBOOK.__setitem__(slice(None), original))
-        rule = RunbookRule(id="rb_restart", name="Restart", asset_id="host", object_name="service-a",
-                           capability="service.restart")
-        RUNBOOK[:] = [rule]
-        self.policy.upsert_permission(
-            subject_type="auto_rule", subject_id="agent", capability="service.restart", asset_id="host",
-            object_id="host:service:service-a", allow=True, auto_allowed=True, require_approval=False,
-        )
-        return self.propose(mode="auto", runbook_id=rule.id, runbook_rev=rule.rev)
 
     def seed_episode(self, health="ok", state="firing"):
         t = now()
@@ -168,95 +149,63 @@ class ApprovalProtocolTests(unittest.TestCase):
         self.assertNotIn("awaiting_approval:", inc["need_human_reason"])
         self.assert_error("approval_not_found", lambda: self.decide("执行一次"))
 
-    def test_permanent_consent_targets_only_exact_agent_permission(self):
-        self.propose()
-        self.assertEqual(self.effective()["decision"], "approval_required")
-        result = self.decide("永久允许执行", channel="web")
+    def test_permanent_requests_are_retired_without_mutating_rules_or_settings(self):
+        aid = self.propose()
+        before_settings = [tuple(r) for r in self.db.query("SELECT * FROM agent_settings ORDER BY key")]
+        before_rules = [tuple(r) for r in self.db.query("SELECT * FROM permissions ORDER BY id")]
+        for text in ("永久允许执行", "以后自动执行", "allow_always"):
+            self.assert_error("permanent_permission_retired", lambda: self.decide(text, action_id=aid))
+        self.assertEqual(self.actions._get(aid)["state"], "proposed")
+        self.assertEqual(before_settings, [tuple(r) for r in self.db.query("SELECT * FROM agent_settings ORDER BY key")])
+        self.assertEqual(before_rules, [tuple(r) for r in self.db.query("SELECT * FROM permissions ORDER BY id")])
+        self.assertFalse(self.transport.calls)
+        self.assertFalse(self.audit("action_approved"))
+
+    def test_once_ignores_legacy_operation_denies_and_agent_ceiling(self):
+        t = now()
+        for subject_type, subject_id in (("qq_user", "123"), ("web_user", "admin")):
+            self.db.execute("INSERT INTO permissions(subject_type,subject_id,asset_id,capability,object_id,allow,created_at,updated_at) VALUES(?,?,'host','service.restart','*',0,?,?)",
+                            (subject_type, subject_id, t, t))
+        self.db.execute("INSERT OR REPLACE INTO agent_ceiling(capability,allowed,allow_auto,updated_at,updated_by) VALUES('service.restart',0,0,?,'old')", (t,))
+        aid = self.propose()
+        result = self.decide(action_id=aid)
         self.assertTrue(result["executed"])
-        self.assertTrue(result["permanent_granted"])
-        self.assertEqual(self.effective()["decision"], "automatic")
-        self.assertEqual(self.effective("service-b")["decision"], "approval_required")
-        broad = self.db.query_one("SELECT * FROM permissions WHERE subject_type='auto_rule' AND object_id='*'")
-        self.assertEqual((broad["allow"], broad["auto_allowed"], broad["require_approval"]), (1, 0, 1))
-        human = self.db.query_one("SELECT * FROM permissions WHERE subject_type='web_user'")
-        self.assertEqual((human["auto_allowed"], human["require_approval"]), (0, 1))
-        audit = self.audit("permission_auto_allowed_granted")
-        self.assertEqual(len(audit), 1)
-        self.assertEqual((audit[0]["actor_type"], audit[0]["actor_id"]), ("web_user", "admin"))
-        detail = json.loads(audit[0]["detail_json"])
-        self.assertTrue(detail["before"]["require_approval"])
-        self.assertFalse(detail["after"]["require_approval"])
-        self.assertTrue(detail["after"]["auto_allowed"])
+        self.assertEqual(len(self.transport.calls), 1)
+        self.assertEqual(self.db.query_one("SELECT COUNT(*) n FROM permissions WHERE allow=0")["n"], 2)
 
-    def test_permanent_consent_waives_existing_explicit_approval(self):
-        self.policy.upsert_permission(
-            subject_type="auto_rule", subject_id="agent", capability="service.restart", asset_id="host",
-            object_id="host:service:service-a", allow=True, auto_allowed=True, require_approval=True,
-        )
+    def test_revoked_account_cannot_approve(self):
+        aid = self.propose()
+        self.db.execute("UPDATE users SET is_admin=0 WHERE username='admin'")
+        self.assert_error("approve_denied", lambda: self.decide(action_id=aid))
+        self.assertEqual(self.actions._get(aid)["state"], "proposed")
+        self.assertFalse(self.transport.calls)
+
+    def test_unknown_account_cannot_approve_even_with_admin_flag(self):
+        aid = self.propose()
+        self.assert_error("approve_denied", lambda: self.decide(actor_id="stranger", is_admin=True))
+        self.assertEqual(self.actions._get(aid)["state"], "proposed")
+
+    def test_account_revoked_during_identity_wait_prevents_dispatch(self):
         self.propose()
-        self.decide("allow_always")
-        self.assertEqual(self.effective()["decision"], "automatic")
+        async def verify(asset, *, write=False):
+            self.db.execute("UPDATE users SET is_admin=0 WHERE username='admin'")
+            return {"ok": True, "mode": "exec"}
+        self.actions.gate.verify_account = verify
+        result = self.decide()
+        self.assertEqual(result["error"], "actor_access_revoked")
+        self.assertFalse(result["executed"])
+        self.assertFalse(self.transport.calls)
 
-    def test_permanent_requires_authenticated_administrator(self):
-        aid = self.propose()
-        self.assert_error("admin_required", lambda: self.decide("allow_always", is_admin=False))
-        self.assertEqual(self.actions._get(aid)["state"], "proposed")
-        self.assertEqual(self.transport.calls, [])
-        self.assertFalse(self.audit("permission_auto_allowed_granted"))
+    def test_machine_cannot_use_manual_mode_to_avoid_session_authority(self):
+        self.assert_error("authority_session_required", lambda: self.actions.propose(
+            asset_id="host", object_id="service-a", capability="service.restart",
+            proposer_type="auto_rule", proposer_id="agent", mode="manual"))
 
-    def test_permanent_never_overrides_revoked_agent_allow(self):
-        aid = self.propose()
-        self.policy.upsert_permission(
-            subject_type="auto_rule", subject_id="agent", capability="service.restart", asset_id="host",
-            object_id="host:service:service-a", allow=False, auto_allowed=False,
-        )
-        self.assert_error("permanent_allow_denied", lambda: self.decide("allow_always"))
-        self.assertEqual(self.actions._get(aid)["state"], "proposed")
-        self.assertEqual(self.effective()["decision"], "forbidden")
-        self.assertFalse(self.audit("action_approved"))
-
-    def test_permanent_never_bypasses_agent_ceiling(self):
-        self.propose()
-        self.policy.agent_ceiling.set("service.restart", allowed=True, allow_auto=False)
-        self.assert_error("denied_by_agent_ceiling", lambda: self.decide("allow_always"))
-        self.assertFalse(self.audit("permission_auto_allowed_granted"))
-
-    def test_permanent_never_automates_control_plane(self):
-        self.propose(object_name="ayana", incident_id="")
-        self.assert_error("control_plane_forbidden", lambda: self.decide("allow_always"))
-        self.assertEqual(self.transport.calls, [])
-        self.assertFalse(self.audit("permission_auto_allowed_granted"))
-
-    def test_permanent_checks_real_unit_even_if_object_has_harmless_name(self):
-        self.propose()
-        self.db.execute("UPDATE objects SET unit='ayana.service' WHERE name='service-a'")
-        self.assert_error("control_plane_forbidden", lambda: self.decide("allow_always"))
-
-    def test_admin_flag_does_not_bypass_human_capability_policy(self):
-        aid = self.propose()
-        self.policy.upsert_permission(
-            subject_type="web_user", subject_id="admin", capability="service.restart", asset_id="host",
-            object_id="*", allow=False,
-        )
-        self.assert_error("approve_denied", lambda: self.decide("allow_always", is_admin=True))
-        self.assertEqual(self.actions._get(aid)["state"], "proposed")
-        self.assertEqual(self.effective()["decision"], "approval_required")
-        self.assertFalse(self.audit("permission_auto_allowed_granted"))
-
-    def test_grant_failure_rolls_back_approval_and_permissions(self):
-        aid = self.propose()
-        original = self.approval._grant_permanent
-
-        def fail_after_write(*args, **kwargs):
-            original(*args, **kwargs)
-            raise ActionError("test_failure")
-
-        with patch.object(self.approval, "_grant_permanent", side_effect=fail_after_write):
-            self.assert_error("test_failure", lambda: self.decide("allow_always"))
-        self.assertEqual(self.actions._get(aid)["state"], "proposed")
-        self.assertEqual(self.effective()["decision"], "approval_required")
-        self.assertFalse(self.audit("action_approved"))
-        self.assertFalse(self.audit("permission_auto_allowed_granted"))
+    def test_autonomous_requires_session_even_when_global_mode_is_automatic(self):
+        from ayana.duty_session import DutySessionManager
+        DutySessionManager(self.db).set_settings({"auto_access_mode":"readwrite", "auto_approval_mode":"automatic"})
+        self.assert_error("authority_session_required", lambda: asyncio.run(self.actions.autonomous_execute(
+            asset_id="host", object_id="service-a", capability="service.restart")))
 
     def test_ambiguous_replies_never_choose_latest_action(self):
         first = self.propose()
@@ -293,16 +242,16 @@ class ApprovalProtocolTests(unittest.TestCase):
     def test_repeated_explicit_decision_does_not_replay(self):
         aid = self.propose()
         self.decide(action_id=aid)
-        self.assert_error("approval_not_found", lambda: self.decide("allow_always", action_id=aid))
+        self.assert_error("approval_not_found", lambda: self.decide("execute_once", action_id=aid))
         self.assertEqual(len(self.transport.calls), 1)
         self.assertFalse(self.audit("permission_auto_allowed_granted"))
 
-    def test_permanent_only_changes_agent_proposals(self):
+    def test_permanent_request_is_retired_for_human_proposals_too(self):
         aid = self.actions.propose(
             asset_id="host", object_id="host:service:service-a", capability="service.restart",
             proposer_type="qq_user", proposer_id="123", incident_id="inc",
         )["id"]
-        self.assert_error("permanent_agent_only", lambda: self.decide("allow_always", action_id=aid))
+        self.assert_error("permanent_permission_retired", lambda: self.decide("allow_always", action_id=aid))
         self.assertFalse(self.audit("permission_auto_allowed_granted"))
 
     def test_nonhuman_cannot_use_human_decision_api(self):
@@ -375,10 +324,6 @@ class ApprovalProtocolTests(unittest.TestCase):
         rule = RunbookRule(id="rb_control", name="Control", asset_id="host", object_name="ayana",
                            capability="service.restart")
         RUNBOOK[:] = [rule]
-        self.policy.upsert_permission(
-            subject_type="auto_rule", subject_id="agent", capability="service.restart", asset_id="host",
-            object_id="host:service:ayana", allow=True, auto_allowed=True, require_approval=False,
-        )
         # P4.4：即便 Policy/Runbook 允许，自动授权也永久拒绝
         self.assert_error(
             "legacy_autonomy_retired",

@@ -204,7 +204,6 @@ def _allow(policy: Policy, **kw) -> None:
     kw.setdefault("require_approval", False)
     kw.setdefault("auto_allowed", False)
     kw.setdefault("actor", "test")
-    policy.upsert_permission(**kw)
 
 
 def _make_actions(tmp: tempfile.TemporaryDirectory):
@@ -217,7 +216,7 @@ def _make_actions(tmp: tempfile.TemporaryDirectory):
     )
 
     policy = Policy(db)
-    _allow(policy)
+    pass  # account roles replace stored grants
     prom = RealContractProm()
     actions = ActionService(
         db,
@@ -321,7 +320,6 @@ class TestP002IdentityAndAuthz(unittest.TestCase):
         tmp=tempfile.TemporaryDirectory(); db,policy,prom,actions=_make_actions(tmp)
         self.addCleanup(_close_tmp,db,tmp)
         for allowed in (False,True):
-            policy.upsert_permission(subject_type="auto_rule",subject_id="agent",capability="service.restart",asset_id="nerv",object_id="*",allow=True,require_approval=not allowed,auto_allowed=allowed,actor="test")
             with self.assertRaises(ActionError) as denied:
                 actions.propose(asset_id="nerv",object_id="frps",capability="service.restart",proposer_type="auto_rule",proposer_id="agent",reason="legacy",mode="auto",runbook_id="rb_frps_down_restart")
             self.assertEqual(denied.exception.code,"legacy_autonomy_retired")
@@ -382,16 +380,6 @@ class TestP003Preconditions(unittest.TestCase):
              t, t, 1, "{}", "{}"),
         )
         policy = Policy(db)
-        policy.upsert_permission(
-            subject_type="auto_rule", subject_id="agent", capability="asset.summary",
-            asset_id="*", object_id="*", allow=True, require_approval=False,
-            auto_allowed=False, actor="test",
-        )
-        policy.upsert_permission(
-            subject_type="auto_rule", subject_id="agent", capability="service.restart",
-            asset_id="*", object_id="*", allow=True, require_approval=False,
-            auto_allowed=True, actor="test",
-        )
         nt = DenyNT()
         inv = InvestigationService(db, nt, DenyGate(), RealContractProm(), policy)
         actions = ActionService(

@@ -12,7 +12,7 @@ from . import formspec
 log = logging.getLogger("ayana.assist")
 ROUTES = {
     "checks": {"checks_form"},
-    "permissions": {"perm_defaults", "perm_exceptions", "perm_effective", "perm_workbench", "perm_ceiling"},
+    # The old permission domain is retired with the stored-grant model.
 }
 
 
@@ -167,7 +167,7 @@ def _choice(option: Any, *, field: str, issues: list, answer_only: bool = False)
 def _envelope(data: dict, domain: str) -> tuple[dict, list]:
     issues = []
     specs = {f["name"]: f for f in formspec.get_form(domain)["fields"]}
-    route = data.get("route") or ("checks_form" if domain == "checks" else "perm_defaults")
+    route = data.get("route") or "checks_form"
     if not isinstance(route, str) or route not in ROUTES[domain]:
         issues.append({"field": "route", "message": "识别结果指向了当前场景不支持的页面。"})
     if not isinstance(data.get("fields"), dict):
@@ -339,19 +339,6 @@ async def configure(*, domain: str, text: str, context: dict | None = None, llm:
             continue
         last_data = data
         meta, issues = _envelope(data, domain)
-        if domain == "permissions" and isinstance(meta["fields"], dict):
-            perm_fields = dict(meta["fields"])
-            if meta["route"] == "perm_exceptions":
-                perm_fields.setdefault("scope", "exception")
-                if perm_fields["scope"] != "exception":
-                    issues.append({"field": "scope", "message": "资产例外需要指定单台主机，不能作为全局默认保存。"})
-            if meta["route"] == "perm_defaults" and (perm_fields.get("scope", "default") != "default" or perm_fields.get("asset_id")):
-                issues.append({"field": "scope", "message": "单台主机的授权应填写资产例外，不能作为全部主机的默认策略。"})
-            if (meta["route"] in ("perm_defaults", "perm_workbench")
-                    and perm_fields.get("scope", "default") == "default"
-                    and (perm_fields.get("asset_id") or perm_fields.get("object_id", "*") != "*")):
-                issues.append({"field": "scope", "message": "指定主机或对象的授权需要填写资产例外，请明确适用范围。"})
-            meta["fields"] = perm_fields
         validation = formspec.validate_fields(domain, meta["fields"], assets=assets, capabilities=capabilities, partial=True)
         issues.extend(validation["issues"])
         if issues:
@@ -379,10 +366,6 @@ async def configure(*, domain: str, text: str, context: dict | None = None, llm:
         if ctx.get("asset_id") == fields.get("asset_id"):
             automatic.add("asset_id")
         missing = [m for m in missing if m.get("options") or m["key"] not in automatic]
-        if domain == "permissions" and meta["route"] in ("perm_effective", "perm_ceiling"):
-            missing = [m for m in missing if m["key"] not in ("state", "scope")]
-            if meta["route"] == "perm_ceiling" and not clarifying:
-                missing = []
         specs = {spec["name"]: spec for spec in formspec.get_form(domain)["fields"]}
         # Deferred questions stay hidden, but their assignable options must not
         # evade validation merely because a separate concept question is pending.
@@ -393,9 +376,6 @@ async def configure(*, domain: str, text: str, context: dict | None = None, llm:
             if item.get("mode") == "answer":
                 continue
             question_values = fields
-            if domain == "permissions" and meta["route"] == "perm_effective" and item["key"] in ("asset_id", "object_id"):
-                # A query selects an asset without editing an exception policy.
-                question_values = {**fields, "scope": "exception"}
             if formspec.field_applicability(domain, item["key"], question_values) is False:
                 issues.append({"field": item["key"], "label": specs[item["key"]]["label"],
                                "message": "这一问题与当前配置类型不一致，请重新确认检查对象。"})

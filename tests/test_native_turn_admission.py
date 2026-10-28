@@ -287,9 +287,10 @@ class NativeTurnAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.db.query_one("SELECT phase FROM investigation_jobs")["phase"], "interrupted")
 
     async def test_approval_setting_rejects_ambiguous_values_without_mutating_other_fields(self):
-        response = await self.app.api_agent_settings_post(self.request({"archive_delay_sec": 60, "require_human_approval": None}))
+        # 旧全局审批开关已退役；档位校验走 auto_approval_mode，原子性不变
+        response = await self.app.api_agent_settings_post(self.request({"archive_delay_sec": 60, "auto_approval_mode": None}))
         self.assertEqual(response.status, 400)
-        self.assertTrue(self.duty.require_human_approval())
+        self.assertEqual(self.duty.settings()["auto_approval_mode"], "automatic")
         self.assertEqual(self.duty.archive_delay_sec(), 300)
 
     async def test_detail_exposes_native_permissions_without_starting_a_task(self):

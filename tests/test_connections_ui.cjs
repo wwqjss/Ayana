@@ -68,7 +68,7 @@ function environment(reply, options = {}) {
     console, Promise, Date, Map, Set, Number, String, Array, state, location,
     history: { replaceState: (_, __, hash) => { location.hash = hash; } },
     queueMicrotask: (callback) => Promise.resolve().then(callback),
-    window: { addEventListener() {} },
+    window: { addEventListener() {}, renderAgentWorkbench: async () => {}, openAgentSettings: async () => { opened.push("agent"); } },
     document: { createElement: (tag) => new Element(tag, nodes), createTextNode: (text) => { const node = new Element("text", nodes); node.textContent = text; return node; }, getElementById: (id) => nodes.get(id),
       querySelectorAll: (selector) => selector === "#connections-subnav .subtab" ? connectionTabs : selector === "#notify-subnav .subtab" ? notifyTabs : selector === ".tab-panel" ? [nodes.get("tab-connections"), nodes.get("tab-notify")] : [], addEventListener: (type, callback) => { events[type] = callback; }, execCommand: () => options.copyResult === true },
     $: (id) => nodes.get(id), on: (id, type, callback) => nodes.get(id)?.addEventListener(type, callback),
@@ -95,6 +95,23 @@ test("legacy NodeWatch and channel bookmarks reach their new homes", async () =>
   env.run('activateTab("notify", "channels")'); await flush();
   assert.equal(env.state.notifySub, "messages"); assert.deepEqual(env.opened, ["notifications"]);
   assert.equal(env.location.hash, "#notify/messages");
+});
+test("legacy permission bookmarks open the unified Agent settings once", async () => {
+  const env = environment(); env.location.hash = "#permissions/effective";
+  assert.equal(env.run("currentTabFromHash().tab"), "agent");
+  assert.equal(env.run("currentTabFromHash().focus"), "settings");
+  env.run('activateTab("permissions", "effective")');
+  assert.equal(env.state.tab, "agent"); assert.equal(env.location.hash, "#agent/settings");
+  const start = source.indexOf("async function refreshTab() {"), end = source.indexOf("function syncChecksAsset()", start);
+  env.run(source.slice(start, end));
+  await env.run("refreshTab()"); await env.run("refreshTab()");
+  assert.deepEqual(env.opened, ["agent"]); assert.equal(env.location.hash, "#agent");
+  assert.equal(env.calls.length, 0);
+});
+test("retired permission UI has no navigation, rule editor, API calls, or permanent grants", () => {
+  const html = fs.readFileSync(path.join(__dirname, "../ayana/static/index.html"), "utf8");
+  assert.ok(!html.includes('data-tab="permissions"')); assert.ok(!html.includes('id="tab-permissions"'));
+  for (const retired of ["/api/permissions", "/api/agent-ceiling", "allow_always", "永久允许执行", "matched_rule"]) assert.ok(!source.includes(retired), retired);
 });
 test("connection subviews update both visibility and bookmark without posting", () => {
   const env = environment(); env.run('setConnectionsSub("nodewatch")');

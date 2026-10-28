@@ -1,4 +1,4 @@
-"""企微智能机器人命令入口：复用 QQBot 业务分发，权限走 Policy（wecom_user）。
+"""企微智能机器人命令入口：复用 QQBot 业务分发，权限由本渠道管理员身份控制。
 
 统一消息入口（与 QQ 一致）：
 - `@Ayana /cmd` → 斜杠命令
@@ -27,7 +27,7 @@ class WeComBot:
     """把 aibot 消息接到 Ayana 业务层，并发现推送目标。
 
     - 身份：from.userid → subject wecom_user
-    - 权限：Policy 默认拒绝，需在 Web「权限」页授权
+    - 权限：仅本渠道配置的管理员可调查和批准，写操作逐次审批
     - 发现：群聊记 chatid，单聊记 userid；可在 Web「已发现的推送目标」勾选保存
     """
 
@@ -198,12 +198,12 @@ class WeComBot:
             elif entry.kind == "controlled":
                 reply = await self.qqbot._handle_controlled(
                     entry, user_id=user_id, group_id=group_id, log_id=log_id,
-                    actor_type="wecom_user", channel="wecom_aibot",
+                    actor_type="wecom_user", channel="wecom_aibot", channel_id=channel_id,
                 )
             elif entry.kind == "nl":
                 reply = await self.qqbot._handle_nl(
                     entry, user_id=user_id, group_id=group_id, log_id=log_id,
-                    actor_type="wecom_user",
+                    actor_type="wecom_user", channel_id=channel_id,
                 )
             else:
                 reply = ""

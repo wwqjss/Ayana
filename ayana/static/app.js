@@ -8,7 +8,6 @@ const state = {
   connectionsSub: "hosts",
   incidentsSub: "list",
   assets: [],
-  caps: [],
   knowledge: [],
 };
 
@@ -694,6 +693,7 @@ function currentTabFromHash() {
   const assetM = h.match(/^assets\/(.+)$/);
   if (assetM) return { tab: "overview", focus: assetM[1], assetView: true };
   const m = h.match(/^(overview|incidents|monitor|agent|checks|promconfig|messages|connections|notify|knowledge|permissions|audit)(?:\/(.+))?$/);
+  if (m && m[1] === "permissions") return { tab: "agent", focus: "settings", assetView: false };
   if (m && m[1] === "notify" && m[2] === "nodewatch") return { tab: "connections", focus: "nodewatch", assetView: false };
   return m ? { tab: m[1], focus: m[2] || "", assetView: false } : { tab: "overview", focus: "", assetView: false };
 }
@@ -709,6 +709,7 @@ function setTabHash(tab, focus, assetView) {
 }
 
 function activateTab(tab, focus, assetView) {
+  if (tab === "permissions") { tab = "agent"; focus = "settings"; }
   if (tab === "notify" && focus === "nodewatch") { tab = "connections"; focus = "nodewatch"; }
   if (tab === "notify" && focus === "channels") {
     focus = "messages";
@@ -725,7 +726,7 @@ function activateTab(tab, focus, assetView) {
     tab = "monitor";
     queueMicrotask(() => setMonitorSub("checks"));
   }
-  const valid = ["overview", "incidents", "monitor", "agent", "connections", "notify", "knowledge", "permissions", "audit"];
+  const valid = ["overview", "incidents", "monitor", "agent", "connections", "notify", "knowledge", "audit"];
   if (!valid.includes(tab)) tab = "overview";
   if (tab !== "agent" && typeof window.suspendAgentWorkbench === "function") window.suspendAgentWorkbench();
   state.tab = tab;
@@ -889,16 +890,6 @@ async function boot() {
 async function loadMeta() {
   const assets = await api("/api/assets");
   if (assets.ok) state.assets = assets.assets || [];
-  const caps = await api("/api/capabilities");
-  if (caps.ok) state.caps = caps.capabilities || [];
-  fillSelects();
-}
-
-function fillSelects() {
-  const assetOpts = state.assets.map((a) => ({ v: a.id, t: a.id + " / " + a.display_name }));
-  const capOpts = state.caps.map((c) => ({ v: c.name, t: c.name + " (" + c.kind + ")" }));
-  fillSelect("perm-asset", [{ v: "*", t: "*(全部)" }, ...assetOpts]);
-  fillSelect("perm-cap", capOpts);
 }
 
 function fillSelect(id, opts) {
@@ -933,13 +924,16 @@ async function refreshTab() {
   }
   if (state.tab === "agent" && typeof window.renderAgentWorkbench === "function") {
     await window.renderAgentWorkbench();
+    if (state.tab === "agent" && state.focus === "settings" && typeof window.openAgentSettings === "function") {
+      state.focus = ""; setTabHash("agent", "", false);
+      await window.openAgentSettings();
+    }
   }
   if (state.tab === "notify") {
     if (state.notifySub === "messages") await renderMessages();
     else await renderNotify();
   }
   if (state.tab === "knowledge") await renderKnowledge();
-  if (state.tab === "permissions") await renderPermissions();
   if (state.tab === "audit") await renderAudit();
 }
 
@@ -1569,7 +1563,7 @@ async function openIncidentDetail(incId) {
         + (sum.automation_wait.retry_at ? ` · 下次自动检查: ${fmtTime(sum.automation_wait.retry_at)}` : ""),
     }));
   }
-  if ((disp.proposals || []).length || disp.evidence_summary) {
+  if ((disp.proposals || []).length || disp.evidence_summary || disp.authority) {
     body.appendChild(el("h3", { text: "处置上下文", style: "margin:16px 0 8px;font-size:14px" }));
     if (disp.evidence_summary) {
       const evBox = el("div", {
@@ -1636,12 +1630,14 @@ async function openIncidentDetail(incId) {
       ]));
       body.appendChild(box);
     });
-    if (disp.policy) {
+    if (disp.authority && ["readonly", "readwrite"].includes(disp.authority.access_mode)
+        && ["manual", "automatic"].includes(disp.authority.approval_mode)) {
+      const authority = disp.authority;
+      const access = authority.access_mode === "readwrite" ? "读写" : "只读";
+      const approval = authority.approval_mode === "automatic" ? "自动执行" : "人工审批";
       body.appendChild(el("div", {
-        class: "muted small",
-        text: `当前权限求值: ${disp.policy.readable || disp.policy.decision || ""}`
-          + (disp.policy.matched_rule ? ` · 命中规则 #${disp.policy.matched_rule.id}` : "")
-          + (disp.policy.reason ? ` · ${disp.policy.reason}` : ""),
+        class: "muted small", text: `当前 Agent 会话：${access} · ${approval}`
+          + (authority.lifecycle_block ? " · 当前已暂停或正在关闭，不能修改" : ""),
         style: "margin:6px 0",
       }));
     }
@@ -1660,16 +1656,13 @@ async function openIncidentDetail(incId) {
     const choices = a.state === "approved" ? [["resume_execution", "继续执行"]] : [
       ["execute_once", "执行一次"],
       ["reject", "不执行"],
-      ["allow_always", "永久允许执行"],
     ];
     choices.forEach(([decision, label]) => controls.appendChild(el("button", {
       class: decision === "reject" ? "btn danger" : "btn", text: label,
       onclick: async (event) => {
         if (event && event.stopPropagation) event.stopPropagation();
         if (submitting) return;
-        const reason = prompt(decision === "allow_always"
-          ? "永久允许此目标的同类处置，以后自动执行。授权原因（可空）:"
-          : `${label}的原因（可空）:`, "");
+        const reason = prompt(`${label}的原因（可空）:`, "");
         if (reason === null) return;
         let totp = "";
         if (decision !== "reject") {
@@ -1745,6 +1738,18 @@ async function openIncidentDetail(incId) {
 
   // 操作按钮
   const actions = el("div", { class: "row-actions", style: "margin-top:16px" });
+  if (inc.status === "open" && inc.need_human) {
+    actions.appendChild(el("button", {
+      class: "btn primary", text: "恢复自治",
+      onclick: async () => {
+        if (!confirm("确认人工处理完成后恢复自治？将重置本轮失败计数并重新调查规划，历史审计保留。")) return;
+        const r = await api(`/api/incidents/${incId}/resume`, { method: "POST", body: JSON.stringify({}) });
+        if (!r || !r.ok) { alert((r && (r.message || r.error)) || "恢复失败"); return; }
+        $("modal").classList.add("hidden");
+        refreshTab();
+      },
+    }));
+  }
   if (inc.status === "open" || inc.status === "resolved") {
     actions.appendChild(el("button", {
       class: "btn danger", text: "手动关闭",
@@ -1870,144 +1875,6 @@ function openActionDetail(a) {
   showModal(a.id, kids);
 }
 
-/* ---- 权限：三态 UI ↔ policy 字段映射（不改数据模型）----
-   禁止       → allow=0, require_approval=1, auto_allowed=0
-   需要我确认 → allow=1, require_approval=1, auto_allowed=0
-   自动执行   → allow=1, require_approval=0, auto_allowed=1
-*/
-const PERM_CAP_LABEL = {
-  "asset.summary": "查看状态",
-  "service.status": "查看服务状态",
-  "service.logs": "查看日志",
-  "service.restart": "重启服务",
-  "service.start": "启动服务",
-  "service.stop": "停止服务",
-  "container.restart": "重启容器",
-  "port.listen": "查看端口",
-  "disk.usage": "磁盘使用",
-  "memory.available": "内存可用",
-  "load.current": "系统负载",
-  "probe.status": "外部探测",
-};
-
-const PERM_STATE_META = {
-  deny: { key: "deny", label: "禁止", cls: "on-deny" },
-  confirm: { key: "confirm", label: "需要我确认", cls: "on-confirm" },
-  auto: { key: "auto", label: "Ayana 可以自动执行", cls: "on-auto" },
-};
-const permDraftControls = new Map();
-const effectivePermissionState = { sequence: 0 };
-function effectivePermissionParameters() {
-  return [
-    ($("perm-eff-cap") || {}).value || "",
-    ($("perm-eff-asset") || {}).value || "",
-    ($("perm-eff-object") || {}).value || "",
-  ];
-}
-function invalidateEffectivePermission() {
-  effectivePermissionState.sequence++;
-  const box = $("perm-eff-result");
-  if (box) box.textContent = "请选择目标后查询当前权限。";
-}
-function permissionCapabilityLabel(capability) {
-  const spec = (state.caps || []).find((item) => item.name === capability || item.capability === capability);
-  return PERM_CAP_LABEL[capability] || (spec && (spec.label || String(spec.description || "").split("（")[0])) || "已选择的操作";
-}
-
-function permissionStateSchema() {
-  return ((assistForms.permissions || {}).fields || []).find((field) => field.name === "state") || {};
-}
-
-function permissionAllowedStates(capability) {
-  return (permissionStateSchema().allowed_states_by_capability || {})[capability] || [];
-}
-
-function permissionStateLabel(capability, policyState) {
-  const schema = permissionStateSchema();
-  return ((schema.value_labels_by_capability || {})[capability] || {})[policyState]
-    || (schema.value_labels || {})[policyState] || "待选择";
-}
-
-function permissionObjects(assetId) {
-  return (((state.assets || []).find((asset) => asset.id === assetId) || {}).objects || []);
-}
-
-function permissionObjectLabel(assetId, objectId) {
-  if (!objectId || objectId === "*") return "全部对象";
-  const objects = permissionObjects(assetId);
-  const object = objects.find((item) => item.id === objectId);
-  if (object) return object.name;
-  const names = objects.filter((item) => [item.name, item.unit, item.container].includes(objectId));
-  return names.length === 1 ? names[0].name : "待确认对象";
-}
-
-function populatePermissionObjects(prefix, desired) {
-  const select = $("perm-" + prefix + "-object");
-  if (!select) return;
-  const asset = ($("perm-" + prefix + "-asset") || {}).value;
-  const objects = permissionObjects(asset);
-  const value = desired == null ? select.value : desired;
-  select.innerHTML = "";
-  select.appendChild(el("option", { value: "", text: "请选择对象" }));
-  select.appendChild(el("option", { value: "*", text: "全部对象" }));
-  objects.forEach((object) => select.appendChild(el("option", { value: object.id, text: object.name })));
-  const matches = objects.filter((object) => [object.name, object.unit, object.container].includes(value));
-  select.value = value === "*" || objects.some((object) => object.id === value) ? value : matches.length === 1 ? matches[0].id : "";
-}
-
-function updatePermissionStateSelect(desired) {
-  const select = $("perm-ex-state");
-  if (!select) return;
-  const capability = ($("perm-ex-cap") || {}).value;
-  const value = desired == null ? select.value : desired;
-  select.innerHTML = "";
-  select.appendChild(el("option", { value: "", text: "请选择策略" }));
-  permissionAllowedStates(capability).forEach((policy) => select.appendChild(el("option", {
-    value: policy, text: permissionStateLabel(capability, policy),
-  })));
-  select.value = value;
-}
-
-async function preparePermissionSubmit(fields, isCurrent, title, button) {
-  if (button && button.disabled) return;
-  if (assistState.permissions.pending) return;
-  if (unresolvedAssistQuestions("permissions").some(isAssistAnswerQuestion)) {
-    assistNote("perm-assist-msg", ["请先回答下方的需求确认问题，再核对并保存权限。"], "error");
-    return;
-  }
-  const assistSequence = assistState.permissions.sequence;
-  if (button) button.disabled = true;
-  try {
-    await ensureAssistForm("permissions");
-    const validation = await api("/api/permissions/validate", { method: "POST", body: JSON.stringify({ fields }) });
-    renderAssistDebug("permissions", { stage: "permission_validation", ...validation });
-    if (!isCurrent() || assistSequence !== assistState.permissions.sequence || assistState.permissions.pending) {
-      assistNote("perm-assist-msg", ["校验期间权限草稿已修改，请重新提交以核对最新配置。"], "error");
-      return;
-    }
-    if (!validation.ok || !validation.payload) {
-      const issues = (validation.issues || []).map((issue) => (issue.label || "配置") + "：" + issue.message);
-      assistNote("perm-assist-msg", issues.length ? issues : [humanFormError(validation, "权限草稿尚不完整，请核对目标和策略后重试。")], "error");
-      return;
-    }
-    const normalized = validation.fields || {};
-    const payload = validation.payload;
-    confirmFormAction(title, permissionSummary(normalized.capability,
-      normalized.scope === "default" ? "*" : normalized.asset_id, normalized.object_id, normalized.state), async () => {
-      const res = await api("/api/permissions", { method: "POST", body: JSON.stringify(payload) });
-      if (res.ok) renderPermissions();
-      else renderAssistDebug("permissions", { stage: "permission_save", ...res });
-      return res;
-    }, () => isCurrent() && !assistState.permissions.pending
-      && assistSequence === assistState.permissions.sequence
-      && !unresolvedAssistQuestions("permissions").some(isAssistAnswerQuestion));
-  } catch (_) {
-    assistNote("perm-assist-msg", ["未能完成权限校验，请稍后重试。权限尚未保存。"], "error");
-  } finally {
-    if (button) button.disabled = false;
-  }
-}
-
 function confirmFormAction(title, summary, action, verifySnapshot) {
   const errorBox = el("p", { class: "error small" });
   const confirmButton = el("button", {
@@ -2042,140 +1909,6 @@ function confirmFormAction(title, summary, action, verifySnapshot) {
       confirmButton,
     ]),
   ]);
-}
-
-function permissionSummary(capability, assetId, objectId, policyState) {
-  const asset = ((state.assets || []).find((a) => a.id === assetId) || {}).display_name || assetId || "全部资产";
-  return [
-    "操作：" + permissionCapabilityLabel(capability),
-    "范围：" + (assetId === "*" ? "全部资产（默认策略）" : asset) + "；对象：" + permissionObjectLabel(assetId, objectId),
-    "策略：" + permissionStateLabel(capability, policyState),
-    "保存后会修改授权策略；主机现有执行限制仍然生效。",
-  ];
-}
-
-function permissionDraftControl(current, target) {
-  const key = JSON.stringify([target.capability, target.asset_id, target.object_id]);
-  const box = el("div");
-  const note = el("span", { class: "perm-draft-note" });
-  const allowed = permissionAllowedStates(target.capability);
-  const seg = el("div", { class: "seg" });
-  const pick = (next) => {
-    control.set(next);
-    assistState.permissions.revision += 1;
-    assistState.permissions.manualResolved.add("state");
-  };
-  const control = {
-    state: current, original: current, element: box,
-    set(next) {
-      if (!allowed.includes(next)) return;
-      this.state = next;
-      [...seg.children].forEach((button, index) => {
-        const policy = allowed[index];
-        button.className = policy === next ? PERM_STATE_META[policy].cls : "";
-      });
-      note.textContent = next === this.original ? "" : "草稿已修改，点击保存才生效。";
-    },
-    reset() { this.set(this.original); },
-  };
-  allowed.forEach((policy) => seg.appendChild(el("button", {
-    type: "button", text: permissionStateLabel(target.capability, policy),
-    class: current === policy ? PERM_STATE_META[policy].cls : "", onclick: () => pick(policy),
-  })));
-  permDraftControls.set(key, control);
-  box.appendChild(seg);
-  box.appendChild(note);
-  box.appendChild(el("button", {
-    type: "button", class: "btn small", text: "保存策略",
-    onclick: async (event) => {
-      const snapshot = control.state;
-      const fields = { capability: target.capability, state: snapshot,
-        scope: target.asset_id === "*" && target.object_id === "*" ? "default" : "exception" };
-      if (fields.scope === "exception") Object.assign(fields, { asset_id: target.asset_id, object_id: target.object_id });
-      await preparePermissionSubmit(fields, () => control.state === snapshot, "确认权限变更", event.target);
-    },
-  }));
-  return box;
-}
-
-function permFlagsToState(p) {
-  if (!p) return "deny";
-  // 优先使用服务端 effective decision，前端不重算优先级
-  if (p.decision === "forbidden") return "deny";
-  if (p.decision === "approval_required") return "confirm";
-  if (p.decision === "automatic") return "auto";
-  if (!p.allow) return "deny";
-  if (p.auto_allowed && !p.require_approval) return "auto";
-  return "confirm";
-}
-
-function permStateToFlags(state) {
-  if (state === "deny") return { allow: false, require_approval: true, auto_allowed: false };
-  if (state === "confirm") return { allow: true, require_approval: true, auto_allowed: false };
-  return { allow: true, require_approval: false, auto_allowed: true };
-}
-
-/** 在 agent 规则里找最具体的一条（对象 > * > 空） */
-function findAgentRule(perms, assetId, objectId, capability) {
-  const rows = perms.filter(
-    (p) =>
-      p.subject_type === "auto_rule" &&
-      p.subject_id === "agent" &&
-      p.capability === capability &&
-      (p.asset_id === assetId || p.asset_id === "*" || p.asset_id === "")
-  );
-  const byObj = rows.filter((p) => p.object_id === objectId);
-  if (byObj.length) return byObj[0];
-  const star = rows.filter((p) => p.object_id === "*" || p.object_id === "");
-  if (star.length) return star[0];
-  return null;
-}
-
-function kindCaps(kind) {
-  const KIND_CAPS = {
-    service: ["asset.summary", "service.status", "service.logs", "service.restart", "service.start", "service.stop"],
-    container: ["asset.summary", "service.status", "service.logs", "container.restart"],
-    port: ["port.listen", "asset.summary"],
-    probe: ["probe.status"],
-    filesystem: ["disk.usage", "asset.summary"],
-    "": ["asset.summary", "disk.usage", "memory.available", "load.current"],
-  };
-  return KIND_CAPS[kind] || KIND_CAPS[""];
-}
-
-function renderSeg(current, onPick) {
-  const seg = el("div", { class: "seg" });
-  ["deny", "confirm", "auto"].forEach((k) => {
-    const meta = PERM_STATE_META[k];
-    const b = el("button", {
-      type: "button",
-      text: meta.label,
-      class: current === k ? meta.cls : "",
-      onclick: () => onPick(k),
-    });
-    seg.appendChild(b);
-  });
-  return seg;
-}
-
-async function saveAgentPerm(assetId, objectId, capability, state) {
-  const flags = permStateToFlags(state);
-  const res = await api("/api/permissions", {
-    method: "POST",
-    body: JSON.stringify({
-      subject_type: "auto_rule",
-      subject_id: "agent",
-      capability,
-      asset_id: assetId,
-      object_id: objectId,
-      ...flags,
-    }),
-  });
-  if (!res.ok) {
-    showModal("保存失败", [el("pre", { text: res.message || res.error || "unknown" })]);
-    return false;
-  }
-  return true;
 }
 
 on("kb-search", "click", () => {
@@ -2319,288 +2052,6 @@ async function renderKnowledgeDoc(docId, root) {
   layout.appendChild(main);
   root.appendChild(layout);
 }
-
-async function renderPermissions() {
-  renderAgentCeiling();
-  const [mRes, aRes] = await Promise.all([
-    api("/api/permissions/model"),
-    api("/api/assets"),
-    ensureAssistForm("permissions").catch(() => null),
-  ]);
-  const rootD = $("perm-defaults");
-  const rootE = $("perm-exceptions");
-  const adv = $("perm-list");
-  if (rootD) rootD.innerHTML = "";
-  if (rootE) rootE.innerHTML = "";
-  if (adv) adv.innerHTML = "";
-  if (!mRes.ok) {
-    if (rootD) rootD.appendChild(el("p", { class: "error", text: "无法加载权限模型" }));
-    return;
-  }
-  const caps = mRes.capabilities || [];
-  const defaults = mRes.defaults || {};
-  const exceptions = mRes.exceptions || [];
-  const assets = (aRes && aRes.ok && aRes.assets) || state.assets || [];
-  state.assets = assets;
-  permDraftControls.clear();
-
-  // ---- 默认策略：按操作类型 ----
-  if (rootD) {
-    const table = el("table", { class: "perm-default-table" });
-    table.appendChild(el("tr", {}, [
-      el("th", { text: "操作" }),
-      el("th", { text: "说明" }),
-      el("th", { text: "默认策略" }),
-      el("th", { text: "来源" }),
-    ]));
-    caps.forEach((c) => {
-      const d = defaults[c.capability] || { state: "deny", source: "implicit_deny" };
-      const stateKey = d.state === "auto" ? "auto" : d.state === "confirm" ? "confirm" : "deny";
-      const src = d.source === "default" ? "默认策略"
-        : d.source === "implicit_deny" ? "未配置 · 默认拒绝"
-        : d.source || "默认策略";
-      const row = el("tr", {});
-      row.appendChild(el("td", {}, [
-        el("div", { text: permissionCapabilityLabel(c.capability) }),
-      ]));
-      row.appendChild(el("td", { class: "muted small", text: c.description || "" }));
-      row.appendChild(el("td", {}, [
-        permissionDraftControl(stateKey, { capability: c.capability, asset_id: "*", object_id: "*" }),
-      ]));
-      row.appendChild(el("td", { class: "muted small", text: src }));
-      table.appendChild(row);
-    });
-    rootD.appendChild(table);
-  }
-
-  // ---- 资产例外 ----
-  if (rootE) {
-    if (!exceptions.length) {
-      rootE.appendChild(el("p", {
-        class: "muted small",
-        text: "当前没有资产例外。所有资产继承上方默认策略。",
-      }));
-    } else {
-      const table = el("table");
-      table.appendChild(el("tr", {}, [
-        el("th", { text: "资产" }), el("th", { text: "对象" }),
-        el("th", { text: "操作" }), el("th", { text: "例外策略" }),
-        el("th", { text: "来源" }), el("th", { text: "操作" }),
-      ]));
-      exceptions.forEach((x) => {
-        const stateKey = x.state === "auto" ? "auto" : x.state === "confirm" ? "confirm" : "deny";
-        table.appendChild(el("tr", {}, [
-          el("td", { text: checkHostLabel(x.asset_id) }),
-          el("td", { text: permissionObjectLabel(x.asset_id, x.object_id) }),
-          el("td", { text: permissionCapabilityLabel(x.capability) }),
-          el("td", {}, [
-            permissionDraftControl(stateKey, { capability: x.capability, asset_id: x.asset_id, object_id: x.object_id }),
-          ]),
-          el("td", { class: "muted small", text: "资产例外" }),
-          el("td", {}, [
-            el("button", {
-              class: "btn small", text: "恢复默认",
-              onclick: async () => {
-                if (x.id) {
-                  await api("/api/permissions/delete", {
-                    method: "POST",
-                    body: JSON.stringify({ id: x.id }),
-                  });
-                }
-                renderPermissions();
-              },
-            }),
-          ]),
-        ]));
-      });
-      rootE.appendChild(table);
-    }
-
-    // 新增例外表单控件
-    const capSel = $("perm-ex-cap");
-    const assetSel = $("perm-ex-asset");
-    if (capSel) {
-      capSel.innerHTML = "";
-      caps.forEach((c) => {
-        const op = document.createElement("option");
-        op.value = c.capability;
-        op.textContent = permissionCapabilityLabel(c.capability);
-        capSel.appendChild(op);
-      });
-    }
-    if (assetSel) {
-      assetSel.innerHTML = "";
-      assets.forEach((a) => {
-        const op = document.createElement("option");
-        op.value = a.id;
-        op.textContent = a.display_name || a.id;
-        assetSel.appendChild(op);
-      });
-    }
-  }
-
-  // 重建查询参数后，原来的结果与尚未完成的查询均不再有效。
-  invalidateEffectivePermission();
-  // 生效权限查询控件
-  const effCap = $("perm-eff-cap");
-  if (effCap) {
-    effCap.innerHTML = "";
-    caps.forEach((c) => {
-      const op = document.createElement("option");
-      op.value = c.capability;
-      op.textContent = permissionCapabilityLabel(c.capability);
-      effCap.appendChild(op);
-    });
-  }
-  const effAsset = $("perm-eff-asset");
-  if (effAsset) {
-    effAsset.innerHTML = "";
-    assets.forEach((a) => {
-      const op = document.createElement("option");
-      op.value = a.id;
-      op.textContent = a.display_name || a.id;
-      effAsset.appendChild(op);
-    });
-  }
-  populatePermissionObjects("ex");
-  populatePermissionObjects("eff");
-  updatePermissionStateSelect();
-
-  // 高级原始表
-  const pRes = await api("/api/permissions");
-  if (adv && pRes.ok) {
-    const perms = pRes.permissions || [];
-    adv.appendChild(el("p", {
-      class: "muted small",
-      text: pRes.note || "主机侧 commands.json / forced-command / sudoers 为独立最终安全上限。",
-    }));
-    const table = el("table");
-    table.appendChild(el("tr", {}, [
-      el("th", { text: "id" }), el("th", { text: "主体" }), el("th", { text: "能力" }),
-      el("th", { text: "资产" }), el("th", { text: "对象" }), el("th", { text: "允许" }),
-      el("th", { text: "批准" }), el("th", { text: "自动" }), el("th", { text: "" }),
-    ]));
-    perms.forEach((p) => {
-      table.appendChild(el("tr", {}, [
-        el("td", { text: String(p.id) }),
-        el("td", { text: p.subject_type + ":" + p.subject_id }),
-        el("td", { text: (PERM_CAP_LABEL[p.capability] || p.capability) + " (" + p.capability + ")" }),
-        el("td", { text: p.asset_id }),
-        el("td", { text: p.object_id }),
-        el("td", {}, [badge(p.allow ? "是" : "否", p.allow ? "ok" : "bad")]),
-        el("td", { text: p.require_approval ? "是" : "否" }),
-        el("td", { text: p.auto_allowed ? "是" : "否" }),
-        el("td", {}, [
-          el("button", {
-            class: "btn danger small", text: "删除",
-            onclick: async () => {
-              await api("/api/permissions/delete", { method: "POST", body: JSON.stringify({ id: p.id }) });
-              refreshTab();
-            },
-          }),
-        ]),
-      ]));
-    });
-    adv.appendChild(table);
-  }
-}
-
-on("perm-ex-add", "click", async (event) => {
-  const capability = ($("perm-ex-cap") || {}).value;
-  const asset_id = ($("perm-ex-asset") || {}).value;
-  const object_id = (($("perm-ex-object") || {}).value || "");
-  const policyState = (($("perm-ex-state") || {}).value || "");
-  if (!capability || !asset_id || !object_id || !permissionAllowedStates(capability).includes(policyState)) {
-    assistNote("perm-assist-msg", ["请先选择操作、主机、对象和可用的例外策略。"], "error");
-    return;
-  }
-  const snapshot = JSON.stringify([capability, asset_id, object_id, policyState]);
-  await preparePermissionSubmit({ capability, asset_id, object_id, state: policyState, scope: "exception" }, () => snapshot === JSON.stringify([
-    (($("perm-ex-cap") || {}).value), (($("perm-ex-asset") || {}).value),
-    (($("perm-ex-object") || {}).value || ""), (($("perm-ex-state") || {}).value),
-  ]), "确认资产例外", event.target);
-});
-
-on("perm-ex-cap", "change", () => updatePermissionStateSelect());
-on("perm-ex-asset", "change", () => populatePermissionObjects("ex"));
-on("perm-eff-cap", "change", invalidateEffectivePermission);
-on("perm-eff-object", "change", invalidateEffectivePermission);
-on("perm-eff-asset", "change", () => {
-  invalidateEffectivePermission();
-  populatePermissionObjects("eff");
-});
-
-on("perm-eff-lookup", "click", async () => {
-  const parameters = effectivePermissionParameters();
-  const [capability, asset_id, object_id] = parameters;
-  const sequence = ++effectivePermissionState.sequence;
-  const box = $("perm-eff-result");
-  if (!box) return;
-  if (!capability || !asset_id || !object_id) {
-    box.textContent = "请先选择要查看的操作、主机和对象。";
-    return;
-  }
-  box.innerHTML = '<p class="muted small">查询中…</p>';
-  let res;
-  try {
-    res = await api(`/api/permissions/effective?capability=${encodeURIComponent(capability)}&asset_id=${encodeURIComponent(asset_id)}&object_id=${encodeURIComponent(object_id)}`);
-  } catch (_) {
-    res = { ok: false, hint: "连接中断，请重试权限查询。" };
-  }
-  if (sequence !== effectivePermissionState.sequence
-      || JSON.stringify(parameters) !== JSON.stringify(effectivePermissionParameters())) return;
-  box.innerHTML = "";
-  if (!res.ok) {
-    box.appendChild(el("p", { class: "error", text: humanFormError(res, "无法查询当前权限，请核对操作与目标后重试。") }));
-    return;
-  }
-  const e = res.effective || {};
-  const src = e.source === "exception" ? "资产例外" : e.source === "default" ? "默认策略" : "默认拒绝（无规则）";
-  box.appendChild(el("div", { class: "perm-eff-box" }, [
-    el("div", { class: "perm-eff-row" }, [
-      el("span", { class: "muted", text: "操作：" }),
-      el("span", { text: permissionCapabilityLabel(capability) }),
-    ]),
-    el("div", { class: "perm-eff-row" }, [
-      el("span", { class: "muted", text: "目标：" }),
-      el("span", { text: `${checkHostLabel(asset_id)} / ${permissionObjectLabel(asset_id, object_id)}` }),
-    ]),
-    el("div", { class: "perm-eff-row" }, [
-      el("span", { class: "muted", text: "结论：" }),
-      badge(e.readable || e.state || "—", e.state === "auto" ? "ok" : e.state === "confirm" ? "warn" : "bad"),
-    ]),
-    el("div", { class: "perm-eff-row" }, [
-      el("span", { class: "muted", text: "来源：" }),
-      el("span", { text: src }),
-    ]),
-  ]));
-});
-
-function collectAdvancedPermission() {
-  return {
-    subject_type: $("perm-subject-type").value,
-    subject_id: $("perm-subject-id").value,
-    capability: $("perm-cap").value,
-    asset_id: $("perm-asset").value,
-    object_id: $("perm-object").value || "*",
-    allow: $("perm-allow").checked,
-    require_approval: $("perm-approval").checked,
-    auto_allowed: $("perm-auto").checked,
-  };
-}
-on("perm-save", "click", () => {
-  const body = collectAdvancedPermission();
-  const snapshot = JSON.stringify(body);
-  const policyState = permFlagsToState(body);
-  confirmFormAction("确认高级权限变更", [
-    ...permissionSummary(body.capability, body.asset_id, body.object_id, policyState),
-    "授权主体：" + body.subject_id,
-  ], async () => {
-    const res = await api("/api/permissions", { method: "POST", body: JSON.stringify(body) });
-    if (res.ok) refreshTab();
-    return res;
-  }, () => snapshot === JSON.stringify(collectAdvancedPermission()));
-});
 
 async function renderAudit() {
   const root = $("audit-list");
@@ -3353,91 +2804,6 @@ on("ssh-test-btn", "click", async () => {
   const summary = $("ssh-test-summary"); if (summary) { summary.textContent = r.ok ? "连接测试通过。" : (r.hint || r.detail || "连接测试未通过。"); summary.className = r.ok ? "workspace-feedback success" : "workspace-feedback error"; }
   out.textContent = `${r.ok ? "通" : "不通"} · ${r.channel} · ${r.hint || r.detail || ""}`;
 });
-
-/* ---- Agent ceiling ---- */
-const agentCeilingState = { sequence: 0, pending: 0, rows: new Map() };
-function saveAgentCeiling(row, field, value) {
-  if (agentCeilingState.rows.get(row.capability) !== row) return;
-  row.desired[field] = value;
-  const snapshot = { capability: row.capability, ...row.desired };
-  // 两个开关共用当前草稿，同一能力的整行写入按操作顺序完成。
-  agentCeilingState.sequence++;
-  agentCeilingState.pending++;
-  row.pending++;
-  row.status.textContent = "保存中…";
-  row.status.className = "muted small";
-  row.queue = row.queue.then(async () => {
-    try {
-      const res = await api("/api/agent-ceiling", { method: "POST", body: JSON.stringify(snapshot) });
-      if (!res.ok) {
-        row.error = humanFormError(res, "保存失败，请重试。");
-      } else {
-        row.saved = { allowed: snapshot.allowed, allow_auto: snapshot.allow_auto };
-        row.error = "";
-        row.source.textContent = "用户配置";
-      }
-    } catch (_) {
-      row.error = "保存失败，请检查连接后重试。";
-    }
-  }).finally(() => {
-    agentCeilingState.pending--;
-    row.pending--;
-    if (row.pending) return;
-    row.desired = { ...row.saved };
-    row.allowed.checked = row.saved.allowed;
-    row.auto.checked = row.saved.allow_auto;
-    row.status.textContent = row.error || "已保存";
-    row.status.className = row.error ? "error small" : "muted small";
-  });
-  return row.queue;
-}
-async function renderAgentCeiling() {
-  const box = $("agent-ceiling");
-  if (!box || agentCeilingState.pending) return;
-  const sequence = ++agentCeilingState.sequence;
-  const res = await api("/api/agent-ceiling");
-  if (sequence !== agentCeilingState.sequence || agentCeilingState.pending) return;
-  box.innerHTML = "";
-  if (!res.ok) {
-    box.appendChild(el("p", { class: "muted small", text: "无法加载 Agent ceiling" }));
-    return;
-  }
-  const rows = res.agent_ceiling || [];
-  agentCeilingState.rows.clear();
-  const table = el("table");
-  table.appendChild(el("tr", {}, [
-    el("th", { text: "能力" }), el("th", { text: "允许 Agent" }),
-    el("th", { text: "允许自动" }), el("th", { text: "来源" }), el("th", { text: "操作" }),
-  ]));
-  rows.forEach((r) => {
-    const row = {
-      capability: r.capability,
-      desired: { allowed: !!r.allowed, allow_auto: !!r.allow_auto },
-      saved: { allowed: !!r.allowed, allow_auto: !!r.allow_auto },
-      queue: Promise.resolve(), pending: 0, error: "",
-      source: el("td", { class: "muted small", text: r.configured ? "用户配置" : "目录默认" }),
-      status: el("td", { class: "muted small", text: r.updated_by || "" }),
-    };
-    row.allowed = el("input", {
-      type: "checkbox", ...(r.allowed ? { checked: "checked" } : {}),
-      onchange: (e) => saveAgentCeiling(row, "allowed", e.target.checked),
-    });
-    row.auto = el("input", {
-      type: "checkbox", ...(r.allow_auto ? { checked: "checked" } : {}),
-      onchange: (e) => saveAgentCeiling(row, "allow_auto", e.target.checked),
-    });
-    agentCeilingState.rows.set(r.capability, row);
-    const tr = el("tr", {}, [
-      el("td", { text: r.capability }),
-      el("td", {}, [row.allowed]),
-      el("td", {}, [row.auto]),
-      row.source,
-      row.status,
-    ]);
-    table.appendChild(tr);
-  });
-  box.appendChild(table);
-}
 
 /* ---- Web SSH Terminal (xterm.js) ---- */
 const termState = {
@@ -4700,7 +4066,7 @@ async function openAibotAdmins(ch) {
   const candidates = [...new Set([...(res.users || []), ...selected])];
   const wrap = el("div");
   wrap.appendChild(el("p", { class: "muted small", text: "可选配置：勾选成员 UserID，或手动填写。名单仅对本消息渠道有效；留空不授予管理员资格。" }));
-  wrap.appendChild(el("p", { class: "muted small", text: "管理员可批准「永久允许执行」，具体操作仍需已有执行权限。请填写成员 UserID，群会话 ID 不能代表成员身份。" }));
+  wrap.appendChild(el("p", { class: "muted small", text: "管理员可审批本次处置；后续是否自动执行由 Agent 设置和会话权限决定。请填写成员 UserID，群会话 ID 不能代表成员身份。" }));
   const choices = candidates.map((userId) => {
     const check = el("input", { type: "checkbox" });
     check.checked = selected.has(userId);
@@ -5828,11 +5194,10 @@ on("chk-asset", "change", () => {
 /* ---- 自然语言辅助配置：真实表单草稿与追问，不保存、不执行 ---- */
 const assistState = {
   checks: { sequence: 0, revision: 0, pending: false, response: null, originalText: "", answers: [], manualResolved: new Set() },
-  permissions: { sequence: 0, revision: 0, pending: false, response: null, originalText: "", answers: [], manualResolved: new Set() },
 };
 const assistForms = {};
 const assistFormLoads = {};
-const assistPrefix = (domain) => domain === "checks" ? "chk" : "perm";
+const assistPrefix = () => "chk";
 
 async function ensureAssistForm(domain) {
   if (assistForms[domain]) return assistForms[domain];
@@ -5941,20 +5306,6 @@ function resetCheckConditionalFields() {
 function getSchemaDefault(domain, name) {
   const field = ((assistForms[domain] || {}).fields || []).find((item) => item.name === name);
   return field && field.default != null ? field.default : null;
-}
-
-function collectPermissionDraft() {
-  const response = assistState.permissions.response || {};
-  const fields = { ...(response.fields || {}) };
-  if (fields.scope === "default") {
-    const control = permDraftControls.get(JSON.stringify([fields.capability, "*", "*"]));
-    if (control) fields.state = control.state;
-  } else {
-    [["capability", "perm-ex-cap"], ["asset_id", "perm-ex-asset"], ["object_id", "perm-ex-object"], ["state", "perm-ex-state"]].forEach(([field, id]) => {
-      if ($(id)) fields[field] = $(id).value;
-    });
-  }
-  return fields;
 }
 
 function humanFormError(res, fallback) {
@@ -6110,8 +5461,7 @@ function renderAssistResult(domain, res) {
   } else if ((res.missing || []).some(isAssistAnswerQuestion)) {
     lines.push("还需要确认你的意思，尚未完成配置。", "请回答下方问题；可以选择候选，也可以自己说明。");
   } else {
-    const queryOnly = domain === "permissions" && ["perm_effective", "perm_ceiling"].includes(res.route);
-    lines.push(domain === "checks" ? "已准备可修改的检查草稿，尚未创建。" : queryOnly ? "已定位权限查询，并填写查询目标。" : "已填写权限草稿，尚未保存。" );
+    lines.push("已准备可修改的检查草稿，尚未创建。");
     (res.inferred_detail || []).forEach((item) => {
       lines.push("请核对「" + (item.label || assistFieldLabel(domain, item.field)) + "」：" + (item.reason || "根据描述推断。"));
     });
@@ -6119,7 +5469,7 @@ function renderAssistResult(domain, res) {
     if (defaultLabels.length) lines.push("采用默认设置：" + defaultLabels.join("、") + "，可以直接修改。");
     if (res.confirm_question) lines.push("需要确认：" + res.confirm_question);
     if ((res.missing || []).length) lines.push("还有必要信息需要补充，请回答下方问题，或直接修改对应表单字段。");
-    else if (!queryOnly) lines.push("核对摘要并提交后，还会显示最终确认。");
+    else lines.push("核对摘要并提交后，还会显示最终确认。");
   }
   assistNote(prefix + "-assist-msg", lines);
   renderAssistDebug(domain, res);
@@ -6188,11 +5538,12 @@ function renderAssistFollowup(domain, res) {
 }
 
 async function runAssist(domain, options = {}) {
+  if (domain !== "checks") return;
   const prefix = assistPrefix(domain);
   const session = assistState[domain];
   const text = options.continuation ? session.originalText : (($(prefix + "-assist-input") || {}).value || "").trim();
   if (!text) {
-    assistNote(prefix + "-assist-msg", [domain === "checks" ? "请先描述希望监控什么。" : "请描述要查看或修改的权限。"]);
+    assistNote(prefix + "-assist-msg", ["请先描述希望监控什么。"]);
     return;
   }
   const sequence = ++session.sequence;
@@ -6209,10 +5560,10 @@ async function runAssist(domain, options = {}) {
   assistNote(prefix + "-assist-msg", ["正在结合当前表单和已登记资产理解需求…"]);
   try {
     await ensureAssistForm(domain);
-    const context = { asset_id: domain === "checks" ? (($("chk-asset") || {}).value || "") : "" };
+    const context = { asset_id: ($("chk-asset") || {}).value || "" };
     if (options.continuation && session.response) {
       context.draft = {
-        fields: domain === "checks" ? collectCheckFields() : collectPermissionDraft(),
+        fields: collectCheckFields(),
         original_text: session.originalText, confirm_question: session.response.confirm_question || "",
       };
       context.answers = answers;
@@ -6232,11 +5583,10 @@ async function runAssist(domain, options = {}) {
     session.answers = answers;
     session.manualResolved.clear();
     if (res.status !== "unsupported" && !res.unsupported) {
-      if (domain === "checks") applyCheckFields(res.fields || {});
-      else await applyPermIntent(res, () => sequence === session.sequence && revision === session.revision);
+      applyCheckFields(res.fields || {});
       if (sequence !== session.sequence || revision !== session.revision) return;
       markAssistSources(domain, res);
-    } else if (domain === "checks") applyCheckFields({});
+    } else applyCheckFields({});
     renderAssistResult(domain, res);
   } catch (error) {
     if (sequence === session.sequence) assistNote(prefix + "-assist-msg", ["未完成智能填写，请稍后重试。现有配置未保存。"], "error");
@@ -6246,7 +5596,7 @@ async function runAssist(domain, options = {}) {
   }
 }
 
-["checks", "permissions"].forEach((domain) => {
+["checks"].forEach((domain) => {
   const prefix = assistPrefix(domain);
   on(prefix + "-assist-go", "click", () => runAssist(domain));
   on(prefix + "-assist-input", "input", () => {
@@ -6256,61 +5606,6 @@ async function runAssist(domain, options = {}) {
     setAssistBusy(domain, false);
   });
 });
-
-async function applyPermIntent(res, isCurrent = () => true) {
-  const f = res.fields || {};
-  const route = res.route || (f.scope === "exception" ? "perm_exceptions" : "perm_defaults");
-  if (f.state && !permDraftControls.size) await renderPermissions();
-  if (!isCurrent()) return;
-  permDraftControls.forEach((control) => control.reset());
-  // 滚动到真实面板（可交互组件）
-  const panelMap = {
-    perm_defaults: "perm-panel-defaults",
-    perm_exceptions: "perm-panel-exceptions",
-    perm_effective: "perm-panel-effective",
-    perm_workbench: f.scope === "exception" ? "perm-panel-exceptions" : "perm-panel-defaults",
-    perm_ceiling: "perm-panel-ceiling",
-  };
-  const pid = panelMap[route] || "perm-panel-defaults";
-  const panel = $(pid);
-  if (panel) {
-    panel.scrollIntoView({ behavior: "smooth", block: "start" });
-    panel.style.outline = "1px solid rgba(108,182,255,.45)";
-    setTimeout(() => { panel.style.outline = ""; }, 1600);
-  }
-
-  // 每份草稿重置目标与策略；赋值不会触发保存事件。
-  invalidateEffectivePermission();
-  ["perm-eff-cap", "perm-ex-cap", "perm-cap"].forEach((id) => setVal(id, f.capability || ""));
-  ["perm-eff-asset", "perm-ex-asset", "perm-asset"].forEach((id) => setVal(id, f.asset_id || ""));
-  populatePermissionObjects("ex", f.object_id || "*");
-  populatePermissionObjects("eff", f.object_id || "*");
-  setVal("perm-object", f.object_id || "*");
-  updatePermissionStateSelect(f.state || "");
-  if (f.state && f.capability && f.scope === "default") {
-    const control = permDraftControls.get(JSON.stringify([f.capability, "*", "*"]));
-    if (control) {
-      control.set(f.state);
-      control.element.scrollIntoView({ behavior: "smooth", block: "center" });
-    }
-  }
-  if (f.state) {
-    const flags = permStateToFlags(f.state);
-    if ($("perm-allow")) $("perm-allow").checked = flags.allow;
-    if ($("perm-approval")) $("perm-approval").checked = flags.require_approval;
-    if ($("perm-auto")) $("perm-auto").checked = flags.auto_allowed;
-  }
-  const preview = $("perm-diff-box");
-  if (preview) preview.textContent = f.state && f.capability
-    ? permissionSummary(f.capability, f.scope === "default" ? "*" : f.asset_id, f.object_id, f.state).join(" ") + " 尚未保存。"
-    : "请选择需要配置的策略，保存前会显示确认摘要。";
-
-  // 查询类意图自动跑一次真实查询（只读）
-  if (route === "perm_effective" && f.capability && !(res.missing || []).length) {
-    const btn = $("perm-eff-lookup");
-    if (btn) btn.click();
-  }
-}
 
 on("monitor-detect", "click", () => {
   const asset = monitorState.host || (($("monitor-host") || {}).value || "") || (($("pc-ne-asset") || {}).value || "");

@@ -1,4 +1,4 @@
-"""Web 控制台：本地认证（密码+TOTP）、资产/事件/操作/权限/审计。"""
+"""Web console with authenticated reader/admin roles and live Agent authority."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from .auth import AuthError, AuthService
 from .db import Database, now
 from .incidents import IncidentService
 from .investigation import InvestigationService
-from .policy import Policy, PolicyDeny
+from .policy import Policy
 from .prom import PromClient, summarize_probe
 from .agent_authority import resolve_authority
 
@@ -139,7 +139,6 @@ class WebApp:
     ):
         self.db = db
         self.auth = auth
-        self.policy = policy
         self.incidents = incidents
         self.investigation = investigation
         self.actions = actions
@@ -244,6 +243,7 @@ class WebApp:
         app.router.add_post("/api/agent/sessions", self.api_agent_session_create)
         app.router.add_get("/api/agent/sessions/{sid}", self.api_agent_session_detail)
         app.router.add_delete("/api/agent/sessions/{sid}", self.api_agent_session_delete)
+        app.router.add_post("/api/agent/write-ops/{wid}/adjudicate", self.api_agent_write_result_adjudicate)
         app.router.add_get("/api/agent/sessions/{sid}/copy-text", self.api_agent_session_copy_text)
         app.router.add_post("/api/agent/sessions/{sid}/pause", self.api_agent_session_pause)
         app.router.add_post("/api/agent/sessions/{sid}/resume-duty", self.api_agent_session_resume_duty)
@@ -284,6 +284,7 @@ class WebApp:
         app.router.add_get("/api/autonomy/usage", self.api_autonomy_usage)
         app.router.add_get("/api/loops", self.api_loops)
         app.router.add_post("/api/incidents/{inc_id}/close", self.api_incident_close)
+        app.router.add_post("/api/incidents/{inc_id}/resume", self.api_incident_resume)
         app.router.add_get("/api/actions", self.api_actions)
         app.router.add_get("/api/actions/{aid}", self.api_action_detail)
         app.router.add_post("/api/actions", self.api_action_propose)
@@ -293,16 +294,16 @@ class WebApp:
         app.router.add_post("/api/actions/{aid}/cancel", self.api_action_cancel)
         app.router.add_post("/api/actions/{aid}/execute", self.api_action_execute)
         app.router.add_post("/api/actions/{aid}/verify", self.api_action_verify)
-        app.router.add_get("/api/permissions", self.api_permissions)
-        app.router.add_get("/api/permissions/model", self.api_permissions_model)
-        app.router.add_get("/api/permissions/effective", self.api_permissions_effective)
-        app.router.add_post("/api/permissions/validate", self.api_permission_validate)
-        app.router.add_post("/api/permissions", self.api_permission_upsert)
-        app.router.add_post("/api/permissions/delete", self.api_permission_delete)
-        app.router.add_post("/api/permissions/preview", self.api_permission_preview)
-        app.router.add_get("/api/permissions/history", self.api_permission_history)
-        app.router.add_get("/api/agent-ceiling", self.api_agent_ceiling_list)
-        app.router.add_post("/api/agent-ceiling", self.api_agent_ceiling_set)
+        app.router.add_get("/api/permissions", self.api_legacy_permissions_retired)
+        app.router.add_get("/api/permissions/model", self.api_legacy_permissions_retired)
+        app.router.add_get("/api/permissions/effective", self.api_legacy_permissions_retired)
+        app.router.add_post("/api/permissions/validate", self.api_legacy_permissions_retired)
+        app.router.add_post("/api/permissions", self.api_legacy_permissions_retired)
+        app.router.add_post("/api/permissions/delete", self.api_legacy_permissions_retired)
+        app.router.add_post("/api/permissions/preview", self.api_legacy_permissions_retired)
+        app.router.add_get("/api/permissions/history", self.api_legacy_permissions_retired)
+        app.router.add_get("/api/agent-ceiling", self.api_legacy_permissions_retired)
+        app.router.add_post("/api/agent-ceiling", self.api_legacy_permissions_retired)
         # SSH 资产 / 凭据
         app.router.add_get("/api/ssh/endpoints", self.api_ssh_endpoints)
         app.router.add_post("/api/ssh/endpoints", self.api_ssh_endpoint_upsert)
@@ -323,11 +324,11 @@ class WebApp:
         # 人工 Web 终端（仅登录管理员；Agent 不注册）
         app.router.add_get("/api/terminal/check", self.api_terminal_check)
         app.router.add_get("/ws/terminal", self.ws_terminal)
-        app.router.add_get("/api/permission-changes", self.api_permission_changes)
-        app.router.add_post("/api/permission-changes", self.api_permission_change_propose)
-        app.router.add_get("/api/permission-changes/{cid}", self.api_permission_change_present)
-        app.router.add_post("/api/permission-changes/{cid}/authorize", self.api_permission_change_authorize)
-        app.router.add_post("/api/permission-changes/{cid}/reject", self.api_permission_change_reject)
+        app.router.add_get("/api/permission-changes", self.api_legacy_permissions_retired)
+        app.router.add_post("/api/permission-changes", self.api_legacy_permissions_retired)
+        app.router.add_get("/api/permission-changes/{cid}", self.api_legacy_permissions_retired)
+        app.router.add_post("/api/permission-changes/{cid}/authorize", self.api_legacy_permissions_retired)
+        app.router.add_post("/api/permission-changes/{cid}/reject", self.api_legacy_permissions_retired)
         app.router.add_get("/api/knowledge", self.api_knowledge)
         app.router.add_get("/api/audit", self.api_audit)
         app.router.add_get("/api/notifications", self.api_notifications)
@@ -412,6 +413,9 @@ class WebApp:
         from . import formspec
 
         domain = request.rel_url.query.get("domain", "checks")
+        if domain == "permissions":
+            return _json({"ok": False, "error": "legacy_permissions_retired", "retired": True,
+                          "message": "旧权限策略已停用，请在 Agent 设置或会话顶部调整权限。"}, 410)
         try:
             form = formspec.get_form(domain)
         except KeyError:
@@ -454,7 +458,10 @@ class WebApp:
         ctx = body.get("context", {})
         if not isinstance(ctx, dict) or len(json.dumps(ctx, ensure_ascii=False)) > 20000:
             return _json({"ok": False, "error": "bad_context", "message": "补充内容格式不正确或过长，请重新填写。"}, 400)
-        if domain not in ("checks", "permissions"):
+        if domain == "permissions":
+            return _json({"ok": False, "error": "legacy_permissions_retired", "retired": True,
+                          "message": "旧权限策略已停用，请在 Agent 设置或会话顶部调整权限。"}, 410)
+        if domain != "checks":
             return _json({"ok": False, "error": "bad_domain", "message": "当前页面尚不支持智能填表。"}, 400)
         if not text or len(text) > 4000:
             return _json({"ok": False, "error": "bad_text", "message": "请输入不超过 4000 字的配置描述。"}, 400)
@@ -462,9 +469,7 @@ class WebApp:
             self._check_read(request)
 
         assets = self._assist_assets(sess)
-        from .capabilities import list_capabilities
-
-        caps = list_capabilities() if domain == "permissions" else []
+        caps = []
         names: list[str] = []
         if domain == "checks":
             visible_ids = {a["id"] for a in assets}
@@ -983,7 +988,6 @@ class WebApp:
             "admin_registered",
             detail={"ip": ip, "method": "setup_token"},
         )
-        self._try_seed_admin_perms(str(username))
         resp = _json(
             {
                 "ok": True,
@@ -1000,48 +1004,6 @@ class WebApp:
             path="/",
         )
         return resp
-
-    def _try_seed_admin_perms(self, username: str) -> None:
-        """注册后补齐 admin 种子权限（只补缺失）。"""
-        try:
-            if not self.db.query_one(
-                "SELECT id FROM users WHERE username=? AND is_admin=1", (username,)
-            ):
-                return
-            from .policy import Policy as _P
-
-            policy = _P(self.db)
-            for cap in (
-                "asset.summary",
-                "probe.status",
-                "checks.read",
-                "checks.write",
-                "promconfig.read",
-                "promconfig.write",
-                "node_exporter.status",
-                "node_exporter.manage",
-                "shell.interactive",
-            ):
-                row = self.db.query_one(
-                    "SELECT id FROM permissions WHERE subject_type='web_user' AND subject_id=?"
-                    " AND capability=? AND asset_id='*' AND object_id='*'",
-                    (username, cap),
-                )
-                if row:
-                    continue
-                policy.upsert_permission(
-                    subject_type="web_user",
-                    subject_id=username,
-                    capability=cap,
-                    asset_id="*",
-                    object_id="*",
-                    allow=True,
-                    require_approval=False,
-                    auto_allowed=False,
-                    actor="system",
-                )
-        except Exception as e:
-            log.warning("seed admin perms after register failed: %s", e)
 
     # ---- monitoring setup (resource page; not on first-login) ----
 
@@ -1645,7 +1607,7 @@ class WebApp:
             return False
         assets = {str(row.get("asset_id") or "") for row in duty.incidents(session["id"])} - {""}
         visible = self._visible_asset_ids(user)
-        if assets and not assets.issubset(visible):
+        if assets and not {a.lower() for a in assets} <= {v.lower() for v in visible}:
             return False
         if session.get("origin") == "manual":
             return bool(user.get("is_admin") or session.get("created_by") == user.get("username"))
@@ -1960,6 +1922,13 @@ class WebApp:
                 pending_writes = [w for w in pending_writes if w.get("session_id") == sid]
         except Exception:
             pending_writes = []
+        pending_write_results = []
+        try:
+            bridge2 = self._bridge()
+            if bridge2:
+                pending_write_results = bridge2.list_pending_write_results(sid)
+        except Exception:
+            pending_write_results = []
         pending_actions = []
         try:
             pending_actions = [
@@ -1981,6 +1950,7 @@ class WebApp:
             "messages": msgs,
             "events": events,
             "pending_writes": pending_writes,
+            "pending_write_results": pending_write_results,
             "pending_actions": pending_actions,
             "can_prepare": bool(sess.get("is_admin")),
             "can_control": bool(sess.get("is_admin") and s.get("status") == "open" and not s.get("delete_requested_at")),
@@ -1991,6 +1961,41 @@ class WebApp:
             "effective_permissions": resolve_authority(self.db, sid),
             "runtime": (await self.agent_tui.status(sid)).get("binding") if getattr(self, "agent_tui", None) else None,
         })
+
+    async def api_agent_write_result_adjudicate(self, request: web.Request) -> web.Response:
+        """人工核销一条 unknown 写结果：executed | not_executed | still_unknown。"""
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return _json({"ok": False, "error": "invalid_json", "message": "请求格式错误"}, 400)
+        if not isinstance(body, dict):
+            return _json({"ok": False, "error": "invalid_json", "message": "请求格式错误"}, 400)
+        outcome = body.get("outcome")
+        if outcome not in ("executed", "not_executed", "still_unknown"):
+            return _json({"ok": False, "error": "bad_adjudication",
+                          "message": "请选择已执行、未执行或仍未知"}, 400)
+        if outcome != "still_unknown":
+            mfa_err = self._sensitive_totp(sess, body)
+            if mfa_err:
+                return _json(mfa_err, 401)
+        wid = request.match_info.get("wid") or ""
+        row = self.db.query_one("SELECT * FROM session_write_ops WHERE id=?", (wid,))
+        if not row:
+            return _json({"ok": False, "error": "not_found", "message": "写记录不存在"}, 404)
+        bridge = self._bridge()
+        if not bridge:
+            return _json({"ok": False, "error": "bridge_unavailable"}, 503)
+        result = bridge.adjudicate_write(
+            row["incident_id"], row["action_key"],
+            outcome=outcome, reason=str(body.get("reason") or ""),
+            actor_type="web_user", actor_id=sess["username"], channel="web",
+            evidence_note=str(body.get("evidence_note") or ""),
+        )
+        if not result.get("ok"):
+            return _json(result, 409)
+        return _json(result)
 
     async def api_agent_session_prompt(self, request: web.Request) -> web.Response:
         import uuid
@@ -2142,7 +2147,6 @@ class WebApp:
         if not isinstance(body, dict):
             return _json({"ok": False, "error": "bad_json"}, 400)
         allowed = {
-            "require_human_approval",
             "auto_access_mode",
             "auto_approval_mode",
             "archive_delay_sec",
@@ -2154,11 +2158,7 @@ class WebApp:
         for key, value in body.items():
             if key not in allowed:
                 continue
-            if key == "require_human_approval":
-                if type(value) is not bool:
-                    return _json({"ok": False, "error": "boolean_required", "field": key}, 400)
-                val = "1" if value else "0"
-            elif key in ("auto_access_mode", "auto_approval_mode"):
+            if key in ("auto_access_mode", "auto_approval_mode"):
                 options = ("readonly", "readwrite") if key == "auto_access_mode" else ("manual", "automatic")
                 if value not in options:
                     return _json({"ok": False, "error": "invalid_permission_mode", "field": key}, 400)
@@ -2175,9 +2175,6 @@ class WebApp:
                     return _json({"ok":False,"error":"ssh_role_not_found","field":key,"message":"请选择已配置的 SSH 角色。"},400)
                 val = str(value)
             changed[key] = val
-        if ("require_human_approval" in changed and "auto_approval_mode" in changed
-                and (changed["require_human_approval"] == "1") != (changed["auto_approval_mode"] == "manual")):
-            return _json({"ok": False, "error": "conflicting_approval_modes"}, 400)
         duty.set_settings(changed, actor=actor)
         self.db.audit("web_user", actor, "agent_settings_saved",
                       detail={"changed": changed}, channel="web")
@@ -2441,25 +2438,10 @@ class WebApp:
         return _json(data)
 
     def _visible_asset_ids(self, sess: dict) -> set[str]:
-        """S10: 返回调用者有 asset.summary 权限的资产 ID 集合。admin 见全部。"""
-        if not sess:
+        """Authenticated console users may read inventory; mutations require admin."""
+        if not sess or not sess.get("username"):
             return set()
-        username = sess.get("username") or ""
-        if username == "admin" or sess.get("is_admin"):
-            return {r["id"] for r in self.db.query("SELECT id FROM assets")}
-        rows = self.db.query("SELECT id FROM assets")
-        out = set()
-        for r in rows:
-            decision = self.policy.check(
-                subject_type="web_user",
-                subject_id=username,
-                capability="asset.summary",
-                asset_id=r["id"],
-                object_id="*",
-            )
-            if decision.get("allowed"):
-                out.add(r["id"])
-        return out
+        return {r["id"] for r in self.db.query("SELECT id FROM assets")}
 
     @staticmethod
     def _is_sample_asset(row: Any) -> bool:
@@ -2769,25 +2751,11 @@ class WebApp:
         data["objects"] = [
             dict(o) for o in self.db.query("SELECT * FROM objects WHERE asset_id=?", (asset_id,))
         ]
-        sess = self._session(request)
-        probe_allowed = False
-        if sess:
-            d = self.policy.check(
-                subject_type="web_user",
-                subject_id=sess["username"],
-                capability="probe.status",
-                asset_id=asset_id,
-                object_id="*",
-            )
-            probe_allowed = bool(d["allowed"])
-        if probe_allowed:
-            try:
-                probe = await self.prom.probe_success(asset_id, "")
-                data["probe"] = summarize_probe(probe)
-            except Exception as e:
-                data["probe"] = {"state": "unavailable", "reason": str(e)}
-        else:
-            data["probe"] = {"state": "denied", "reason": "policy"}
+        try:
+            probe = await self.prom.probe_success(asset_id, "")
+            data["probe"] = summarize_probe(probe)
+        except Exception as e:
+            data["probe"] = {"state": "unavailable", "reason": str(e)}
         data["incidents"] = [inc for inc in self.incidents.list_incidents()
                              if inc.get("asset_id") == asset_id][:5]
         return _json({"ok": True, "asset": data})
@@ -2796,6 +2764,8 @@ class WebApp:
         sess = self._require_auth(request)
         self._check_csrf(request, sess)
         asset_id = request.match_info["asset_id"]
+        if asset_id not in self._visible_asset_ids(sess):
+            return _json({"ok": False, "error": "permission_denied"}, 403)
         body = await request.json()
         res = await self.investigation.run(
             asset_id=asset_id,
@@ -2910,7 +2880,7 @@ class WebApp:
         return _legacy_autonomy_retired()
 
     def _incident_disposition(self, inc: dict) -> dict:
-        """P1-01：事件详情处置上下文（服务端求值，前端不重算 Policy）。"""
+        """Incident context displays the same live session authority used at dispatch."""
         from .fmt import ZH_CAP
 
         actions_list = inc.get("actions") or []
@@ -2967,7 +2937,6 @@ class WebApp:
                 "created_at": a.get("created_at"),
                 "decision": eff.get("decision", ""),
                 "decision_reason": eff.get("reason", ""),
-                "matched_rule": eff.get("matched_rule") or (eff.get("rule") or {}),
                 "readable": eff.get("readable", ""),
                 "verification_target": ver_target,
                 "tokens": payload.get("tokens") or [],
@@ -2975,35 +2944,24 @@ class WebApp:
                 "proposer_id": a.get("proposer_id", ""),
             })
 
-        policy_view = None
-        ref = items[0] if items else (actions_list[-1] if actions_list else None)
+        authority = None
+        ref = pending[0] if pending else (actions_list[-1] if actions_list else None)
         if ref:
-            asset_id = ref.get("asset_id") or ""
-            object_id = ref.get("object_id") or ""
-            capability = ref.get("capability") or ""
-            obj_row = self.db.query_one(
-                "SELECT id FROM objects WHERE asset_id=? AND (id=? OR name=?)",
-                (asset_id, object_id, object_id),
-            )
-            policy_obj = (obj_row["id"] if obj_row else object_id) or "*"
-            subject_type = ref.get("proposer_type") or "web_user"
-            subject_id = ref.get("proposer_id") or "system"
-            try:
-                policy_view = self.policy.effective_decision(
-                    subject_type=subject_type,
-                    subject_id=subject_id,
-                    capability=capability,
-                    asset_id=asset_id,
-                    object_id=policy_obj,
-                )
-            except Exception:
-                policy_view = None
+            session_id = ActionService._action_session_id(ref)
+            if session_id:
+                try:
+                    authority = resolve_authority(self.db, session_id)
+                except Exception:
+                    authority = {"session_id": session_id, "write_allowed": False,
+                                 "error": "authority_unavailable"}
+            elif ref.get("mode") == "manual":
+                authority = {"source": "human_admin", "approval_mode": "manual"}
 
         return {
             "evidence_summary": evidence_summary,
             "investigation_id": (last_inv or {}).get("id", ""),
             "proposals": items,
-            "policy": policy_view,
+            "authority": authority,
         }
 
     def _incident_human_summary(self, inc: dict, action: dict | None) -> dict:
@@ -3043,7 +3001,7 @@ class WebApp:
             if "verify" in why_human or "exec_unknown" in why_human:
                 suggestion = "手动检查服务状态，确认后可重新发起处置"
             elif "no_runbook" in why_human or "policy" in why_human:
-                suggestion = "手动处理或添加处置规则/权限"
+                suggestion = "查看 Agent 会话权限，或手动处理"
             elif "budget" in why_human:
                 suggestion = "等待冷却期结束或手动处置"
             elif "action_rejected" in why_human:
@@ -3082,6 +3040,22 @@ class WebApp:
             } if action else None,
         }
 
+    async def api_incident_resume(self, request: web.Request) -> web.Response:
+        """人工处理后恢复自治：need_human 复位、换代重置预算、重新入队。"""
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        inc_id = request.match_info["inc_id"]
+        inc = self.incidents.get_incident(inc_id)
+        if not inc:
+            return _json({"ok": False, "error": "not_found"}, 404)
+        if inc.get("asset_id") not in self._visible_asset_ids(sess):
+            return _json({"ok": False, "error": "permission_denied"}, 403)
+        res = self.incidents.resume_autonomy(inc_id, actor=sess["username"])
+        if not res.get("ok"):
+            status = 409 if res.get("error") == "incident_not_open" else 404
+            return _json(res, status)
+        return _json(res)
+
     async def api_incident_close(self, request: web.Request) -> web.Response:
         sess = self._require_admin(request)
         self._check_csrf(request, sess)
@@ -3095,7 +3069,7 @@ class WebApp:
         reason = body.get("reason", "人工关闭")
         # P0-04：closed ≠ recovered，不伪造 resolved_at
         res = self.incidents.close_manual(
-            inc_id, reason, actor=sess["username"], policy=self.policy,
+            inc_id, reason, actor=sess["username"],
             actor_type="web_user", is_admin=bool(sess.get("is_admin")),
         )
         if not res.get("ok"):
@@ -3131,7 +3105,7 @@ class WebApp:
         return _json({"ok": True, "action": data})
 
     async def api_action_propose(self, request: web.Request) -> web.Response:
-        sess = self._require_auth(request)
+        sess = self._require_admin(request)
         self._check_csrf(request, sess)
         body = await request.json()
         try:
@@ -3175,9 +3149,9 @@ class WebApp:
         return None
 
     async def api_action_decision(self, request: web.Request) -> web.Response:
-        """事件详情三选项；一次授权与长期授权共享对象和权限校验。"""
+        """Approve or reject one operation; persistent rule grants are retired."""
         from .fmt import approval_error
-        sess = self._require_auth(request)
+        sess = self._require_admin(request)
         self._check_csrf(request, sess)
         try:
             body = await request.json()
@@ -3186,8 +3160,11 @@ class WebApp:
         if not isinstance(body, dict):
             return _json({"ok": False, "error": "invalid_json", "message": "请求格式错误"}, 400)
         decision = body.get("decision")
-        if decision not in ("execute_once", "reject", "allow_always"):
-            return _json({"ok": False, "error": "invalid_decision", "message": "请选择执行一次、不执行或永久允许执行"}, 400)
+        if decision == "allow_always":
+            return _json({"ok": False, "error": "legacy_permissions_retired", "retired": True,
+                          "message": "永久授权已停用，请在 Agent 设置或会话顶部调整审批模式。"}, 410)
+        if decision not in ("execute_once", "reject"):
+            return _json({"ok": False, "error": "invalid_decision", "message": "请选择执行一次或不执行"}, 400)
         if decision != "reject":
             mfa_err = self._sensitive_totp(sess, body)
             if mfa_err:
@@ -3203,7 +3180,7 @@ class WebApp:
         return _json({"ok": True, **result})
 
     async def api_action_approve(self, request: web.Request) -> web.Response:
-        sess = self._require_auth(request)
+        sess = self._require_admin(request)
         self._check_csrf(request, sess)
         body = {}
         try:
@@ -3238,7 +3215,7 @@ class WebApp:
         return _json({"ok": True, **res})
 
     async def api_action_reject(self, request: web.Request) -> web.Response:
-        sess = self._require_auth(request)
+        sess = self._require_admin(request)
         self._check_csrf(request, sess)
         body = {}
         try:
@@ -3259,7 +3236,7 @@ class WebApp:
         return _json({"ok": True, **res})
 
     async def api_action_cancel(self, request: web.Request) -> web.Response:
-        sess = self._require_auth(request)
+        sess = self._require_admin(request)
         self._check_csrf(request, sess)
         try:
             self.actions.cancel(
@@ -3273,7 +3250,7 @@ class WebApp:
         return _json({"ok": True})
 
     async def api_action_execute(self, request: web.Request) -> web.Response:
-        sess = self._require_auth(request)
+        sess = self._require_admin(request)
         self._check_csrf(request, sess)
         body = {}
         try:
@@ -3308,262 +3285,15 @@ class WebApp:
             return _json({"ok": False, "error": str(e)}, 400)
         return _json({"ok": True, **res})
 
-    async def api_permissions(self, request: web.Request) -> web.Response:
-        self._require_auth(request)
-        data = self.policy.effective_summary()
-        # 服务端附带三态，前端不自行求优先级
-        for p in data.get("permissions") or []:
-            try:
-                cap_kind = "write"
-                from .capabilities import get_capability
-
-                cap_kind = get_capability(p.get("capability") or "").kind
-            except Exception:
-                cap_kind = "write"
-            decision = Policy._three_state(
-                allow=bool(p.get("allow")),
-                require_approval=bool(p.get("require_approval")),
-                auto_allowed=bool(p.get("auto_allowed")),
-            )
-            if cap_kind != "write":
-                decision = "automatic" if p.get("allow") else "forbidden"
-            p["decision"] = decision
-            p["readable"] = {
-                "forbidden": "禁止",
-                "approval_required": "需要我确认",
-                "automatic": "自动执行" if cap_kind == "write" else "允许读取",
-            }.get(decision, decision)
-        return _json({"ok": True, **data})
-
-    async def api_permissions_model(self, request: web.Request) -> web.Response:
-        self._require_auth(request)
-        return _json({"ok": True, **self.policy.model_view()})
-
-    async def api_permissions_effective(self, request: web.Request) -> web.Response:
-        self._require_auth(request)
-        q = request.rel_url.query
-        try:
-            data = self.policy.effective_for(
-                capability=q.get("capability", ""),
-                asset_id=q.get("asset_id", ""),
-                object_id=q.get("object_id", ""),
-                subject_type=q.get("subject_type", "auto_rule"),
-                subject_id=q.get("subject_id", "agent"),
-            )
-        except Exception as e:
-            return _json({"ok": False, "error": str(e)}, 400)
-        return _json({"ok": True, "effective": data})
-
-    def _validate_permission_fields(self, sess: dict, fields: Any) -> dict:
-        from . import formspec
-        from .capabilities import list_capabilities
-        result = formspec.validate_fields("permissions", fields, assets=self._assist_assets(sess),
-                                          capabilities=list_capabilities(), partial=False)
-        values = result["fields"]
-        if values.get("scope") == "default" and (values.get("asset_id") or values.get("object_id", "*") != "*"):
-            result["issues"].append({"field": "scope", "label": "范围", "code": "bad_scope",
-                                      "message": "指定主机或对象的授权需要填写资产例外，请明确适用范围。"})
-            result["valid"] = False
-        result["ok"] = result["valid"]
-        result["payload"] = None
-        if result["valid"]:
-            state = values["state"]
-            result["payload"] = {"subject_type": "auto_rule", "subject_id": "agent", "capability": values["capability"],
-                                 "asset_id": "*" if values["scope"] == "default" else values["asset_id"],
-                                 "object_id": values.get("object_id", "*"), "allow": state != "deny",
-                                 "require_approval": state != "auto", "auto_allowed": state == "auto"}
-        result["message"] = "配置校验通过，请核对并确认保存。" if result["valid"] else "授权配置尚未完整或未通过校验，请核对提示。"
-        return result
-
-    async def api_permission_validate(self, request: web.Request) -> web.Response:
+    async def api_legacy_permissions_retired(self, request: web.Request) -> web.Response:
+        """Old rule APIs cannot create grants after session authority migration."""
         sess = self._require_auth(request)
         self._check_csrf(request, sess)
-        try:
-            body = await request.json()
-        except Exception:
-            return _json({"ok": False, "error": "bad_json", "message": "提交内容无法读取，请重新填写。"}, 400)
-        if not isinstance(body, dict) or set(body) != {"fields"}:
-            return _json({"ok": False, "error": "bad_fields", "message": "请提交需要校验的授权表单字段。"}, 400)
-        return _json(self._validate_permission_fields(sess, body["fields"]))
-
-    async def api_permission_upsert(self, request: web.Request) -> web.Response:
-        sess = self._require_admin(request)
-        self._check_csrf(request, sess)
-        try:
-            body = await request.json()
-        except Exception:
-            return _json({"ok": False, "error": "bad_json", "message": "提交内容无法读取，请重新填写。"}, 400)
-        if not isinstance(body, dict):
-            return _json({"ok": False, "error": "bad_fields", "message": "授权配置内容的格式不正确。"}, 400)
-        if body.get("subject_type") == "auto_rule" and body.get("subject_id") == "agent":
-            for flag in ("allow", "require_approval", "auto_allowed"):
-                if flag in body and not isinstance(body[flag], bool):
-                    return _json({"ok": False, "error": "bad_state", "message": "请选择禁止、人工确认或允许执行中的一种策略。"}, 400)
-            allow, approval, auto = body.get("allow", True), body.get("require_approval", True), body.get("auto_allowed", False)
-            if allow and not approval and not auto:
-                return _json({"ok": False, "error": "bad_state", "message": "允许执行的策略需要选择人工确认或自动执行。"}, 400)
-            if allow and approval and auto:
-                return _json({"ok": False, "error": "bad_state", "message": "人工确认和自动执行不能同时选择。"}, 400)
-            asset_id = body.get("asset_id", "*")
-            fields = {"capability": body.get("capability"), "state": "deny" if not allow else "confirm" if approval else "auto",
-                      "scope": "default" if asset_id in ("", "*") else "exception", "object_id": body.get("object_id", "*")}
-            if fields["scope"] == "exception":
-                fields["asset_id"] = asset_id
-            validated = self._validate_permission_fields(sess, fields)
-            if not validated["valid"]:
-                return _json(validated, 400)
-            body = validated["payload"]
-        try:
-            res = self.policy.upsert_permission(
-                subject_type=body["subject_type"],
-                subject_id=body["subject_id"],
-                capability=body["capability"],
-                allow=bool(body.get("allow", True)),
-                asset_id=body.get("asset_id", "*"),
-                object_id=body.get("object_id", "*"),
-                require_approval=bool(body.get("require_approval", True)),
-                auto_allowed=bool(body.get("auto_allowed", False)),
-                actor=sess["username"],
-            )
-        except (PolicyDeny, KeyError) as e:
-            return _json({"ok": False, "error": str(e), "message": "授权未能保存，请核对操作、适用范围及当前账号权限。"}, 400)
-        return _json(res)
-
-    async def api_permission_preview(self, request: web.Request) -> web.Response:
-        self._require_auth(request)
-        body = await request.json()
-        try:
-            data = self.policy.preview(
-                subject_type=body["subject_type"],
-                subject_id=body["subject_id"],
-                capability=body["capability"],
-                asset_id=body.get("asset_id") or "",
-                object_id=body.get("object_id") or "",
-                auto=bool(body.get("auto", False)),
-            )
-        except (PolicyDeny, KeyError) as e:
-            return _json({"ok": False, "error": str(e)}, 400)
-        return _json({"ok": True, "preview": data})
-
-    async def api_permission_history(self, request: web.Request) -> web.Response:
-        self._require_auth(request)
-        limit = min(200, int(request.rel_url.query.get("limit", "50")))
         return _json({
-            "ok": True,
-            "history": self.policy.list_config_history(limit=limit),
-        })
-
-    async def api_permission_delete(self, request: web.Request) -> web.Response:
-        sess = self._require_admin(request)
-        self._check_csrf(request, sess)
-        body = await request.json()
-        try:
-            self.policy.delete_permission(int(body["id"]), actor=sess["username"])
-        except (PolicyDeny, KeyError, ValueError) as e:
-            return _json({"ok": False, "error": str(e)}, 400)
-        return _json({"ok": True})
-
-    # ---- Agent ceiling（用户可配上限，后端强制 ⊆ 源码能力目录）----
-
-    async def api_agent_ceiling_list(self, request: web.Request) -> web.Response:
-        self._require_auth(request)
-        return _legacy_autonomy_retired()
-
-    async def api_agent_ceiling_set(self, request: web.Request) -> web.Response:
-        self._require_admin(request)
-        sess = self._require_admin(request)
-        self._check_csrf(request, sess)
-        return _legacy_autonomy_retired()
-
-    # ---- Permission Change（0.4：TOTP 只签一笔）----
-
-    def _pcsvc(self):
-        if not self.permission_changes:
-            return None
-        return self.permission_changes
-
-    async def api_permission_changes(self, request: web.Request) -> web.Response:
-        self._require_auth(request)
-        svc = self._pcsvc()
-        if not svc:
-            return _json({"ok": False, "error": "unavailable"}, 503)
-        state = request.rel_url.query.get("state", "")
-        return _json({"ok": True, "changes": svc.list_changes(state=state)})
-
-    async def api_permission_change_propose(self, request: web.Request) -> web.Response:
-        sess = self._require_auth(request)
-        self._check_csrf(request, sess)
-        svc = self._pcsvc()
-        if not svc:
-            return _json({"ok": False, "error": "unavailable"}, 503)
-        body = await request.json()
-        try:
-            res = svc.propose(
-                subject_type=body.get("subject_type") or "auto_rule",
-                subject_id=body.get("subject_id") or "",
-                capability=body.get("capability") or "",
-                asset_id=body.get("asset_id") or "*",
-                object_id=body.get("object_id") or "*",
-                to_allow=bool(body.get("to_allow", True)),
-                to_require_approval=bool(body.get("to_require_approval", True)),
-                to_auto_allowed=bool(body.get("to_auto_allowed", False)),
-                reason=body.get("reason", ""),
-                incident_id=body.get("incident_id", ""),
-                created_by=sess["username"],
-                created_channel="web",
-            )
-        except Exception as e:
-            return _json({"ok": False, "error": str(e)}, 400)
-        return _json({"ok": True, **res})
-
-    async def api_permission_change_present(self, request: web.Request) -> web.Response:
-        self._require_auth(request)
-        svc = self._pcsvc()
-        if not svc:
-            return _json({"ok": False, "error": "unavailable"}, 503)
-        try:
-            return _json({"ok": True, "change": svc.present(request.match_info["cid"])})
-        except Exception as e:
-            return _json({"ok": False, "error": str(e)}, 404)
-
-    async def api_permission_change_authorize(self, request: web.Request) -> web.Response:
-        sess = self._require_admin(request)
-        self._check_csrf(request, sess)
-        svc = self._pcsvc()
-        if not svc:
-            return _json({"ok": False, "error": "unavailable"}, 503)
-        body = await request.json()
-        try:
-            res = svc.authorize(
-                request.match_info["cid"],
-                actor_id=sess["username"],
-                totp_code=body.get("totp") or body.get("totp_code") or "",
-                channel="web",
-                is_admin=bool(sess.get("is_admin")),
-            )
-        except Exception as e:
-            code = getattr(e, "code", "error")
-            return _json({"ok": False, "error": code, "message": str(e)}, 400)
-        return _json({"ok": True, **res})
-
-    async def api_permission_change_reject(self, request: web.Request) -> web.Response:
-        sess = self._require_admin(request)
-        self._check_csrf(request, sess)
-        svc = self._pcsvc()
-        if not svc:
-            return _json({"ok": False, "error": "unavailable"}, 503)
-        body = await request.json()
-        try:
-            res = svc.reject(
-                request.match_info["cid"],
-                actor_id=sess["username"],
-                reason=body.get("reason", ""),
-                channel="web",
-                is_admin=bool(sess.get("is_admin")),
-            )
-        except Exception as e:
-            return _json({"ok": False, "error": str(e)}, 400)
-        return _json({"ok": True, **res})
+            "ok": False, "error": "legacy_permissions_retired", "retired": True,
+            "message": "旧权限策略已停用。请在 Agent 设置或会话顶部调整只读／读写与审批模式。",
+            "settings_api": "/api/agent/settings", "settings_page": "#agent",
+        }, 410)
 
     async def api_knowledge(self, request: web.Request) -> web.Response:
         """运维知识库只读：Markdown 主题（front matter + 正文）。"""
@@ -4055,8 +3785,7 @@ class WebApp:
         if asset_id not in self._visible_asset_ids(sess):
             return _json({"ok": False, "error": "denied", "message": "当前账户不能查看这台主机。"}, 403)
         items, errors = [], []
-        probe_allowed = self.policy.check(subject_type="web_user", subject_id=sess["username"],
-                                          capability="probe.status", asset_id=asset_id, object_id="*")["allowed"]
+        probe_allowed = asset_id in self._visible_asset_ids(sess)
         if probe_allowed:
             prom_items, prom_errors = await self._prom_business_items(dict(row))
             items.extend(prom_items)
@@ -4134,19 +3863,8 @@ class WebApp:
         sess = self._require_auth(request)
         asset_id = request.match_info["asset_id"]
         range_key = request.rel_url.query.get("range", "1h")
-        # 与 _visible_asset_ids 一致：admin 全部可见；其余走 asset.summary
-        if sess.get("is_admin") or sess.get("username") == "admin":
-            pass
-        else:
-            decision = self.policy.check(
-                subject_type="web_user",
-                subject_id=sess["username"],
-                capability="asset.summary",
-                asset_id=asset_id,
-                object_id="*",
-            )
-            if not decision["allowed"]:
-                return _json({"ok": False, "error": "denied"}, 403)
+        if asset_id not in self._visible_asset_ids(sess):
+            return _json({"ok": False, "error": "denied"}, 403)
         row = self.db.query_one(
             "SELECT id, display_name, prom_asset, host FROM assets WHERE id=?", (asset_id,)
         )
@@ -4782,24 +4500,17 @@ class WebApp:
     # ---- 人工 Web 终端（Agent 不可达）----
 
     def _terminal_ok(self, sess: dict, asset_id: str = "") -> dict | None:
-        """需登录 + shell.interactive（按目标资产核权）。S02/S03: 不再用通配资产授权。"""
-        if not sess:
+        """Human terminals follow live console admin status, never legacy rules."""
+        if not sess or not sess.get("username"):
             return {"ok": False, "error": "unauthorized"}
-        username = sess.get("username") or ""
-        # 仅 admin 可开人工终端（S02: 取消 web_user:* 通配恢复）
-        if username != "admin":
+        if sess.get("must_change_password"):
+            return {"ok": False, "error": "password_change_required", "hint": "请先修改密码"}
+        if not sess.get("is_admin"):
             return {"ok": False, "error": "permission_denied", "hint": "需要管理员权限"}
-        # 若指定资产，核对对该资产的 shell.interactive；未指定时仅允许已有全局 admin 规则
-        check_asset = asset_id or "*"
-        decision = self.policy.check(
-            subject_type="web_user",
-            subject_id=username,
-            capability="shell.interactive",
-            asset_id=check_asset,
-            object_id="*",
-        )
-        if not decision.get("allowed"):
-            return {"ok": False, "error": "permission_denied", "hint": "需要 shell.interactive 权限"}
+        if asset_id:
+            asset = self.db.query_one("SELECT enabled FROM assets WHERE id=?", (asset_id,))
+            if not asset or not asset["enabled"]:
+                return {"ok": False, "error": "asset_unavailable", "hint": "主机不存在或已停用"}
         return None
 
     async def api_terminal_check(self, request: web.Request) -> web.Response:
@@ -5080,8 +4791,7 @@ class WebApp:
         sess = self._require_auth(request)
         asset = request.rel_url.query.get("asset", "")
         service = request.rel_url.query.get("service", "")
-        # 授权用登记对象 ID；查询用登记名称
-        object_id = service or "*"
+        # 查询使用登记对象名称
         service_label = service
         if service:
             row = self.db.query_one(
@@ -5089,16 +4799,8 @@ class WebApp:
                 (asset, service, service),
             )
             if row:
-                object_id = row["id"]
                 service_label = row["name"]
-        decision = self.policy.check(
-            subject_type="web_user",
-            subject_id=sess["username"],
-            capability="probe.status",
-            asset_id=asset or "*",
-            object_id=object_id,
-        )
-        if not decision["allowed"]:
+        if asset and asset not in self._visible_asset_ids(sess):
             return _json({"ok": False, "error": "denied"}, 403)
         try:
             data = await self.prom.probe_success(asset, service_label)
@@ -5113,97 +4815,12 @@ class WebApp:
             raise web.HTTPNotFound(text=json.dumps({"error": "checks_not_configured"}))
         return self.checks
 
-    def _require_cap(
-        self,
-        sess: dict[str, Any],
-        capability: str,
-        *,
-        admin: bool = False,
-        respect_deny: bool = True,
-        no_approval: bool = True,
-        asset_id: str = "*",
-        object_id: str = "*",
-        deny_body: dict | None = None,
-        admin_body: dict | None = None,
-        approval_body: dict | None = None,
-    ) -> dict[str, Any]:
-        """统一能力门（P2-2）。
-
-        admin=True          → 必须管理员（否则 admin_required）
-        respect_deny=True   → 显式 deny 不因 admin 绕过（promconfig 语义）
-        respect_deny=False  → admin 可读绕过 deny（checks.read 历史语义）
-        no_approval=True    → require_approval 视为不可直接提交
-        返回 policy 判定；失败抛 HTTPForbidden。不得放宽权限。
-        """
-        if admin and not sess.get("is_admin"):
-            raise web.HTTPForbidden(
-                text=json.dumps(admin_body or {"error": "admin_required"}),
-                content_type="application/json",
-            )
-        d = self.policy.effective_decision(
-            subject_type="web_user",
-            subject_id=sess["username"],
-            capability=capability,
-            asset_id=asset_id,
-            object_id=object_id,
-        )
-        if not d["allowed"]:
-            # respect_deny=True：显式 deny 连 admin 也不绕过
-            # respect_deny=False：admin 可读（历史 _check_read 语义）
-            if respect_deny or not sess.get("is_admin"):
-                body = deny_body or {"error": "denied", "reason": d.get("reason")}
-                raise web.HTTPForbidden(
-                    text=json.dumps(body), content_type="application/json"
-                )
-            return d
-        if no_approval and d.get("require_approval"):
-            body = approval_body or {
-                "error": "approval_required",
-                "require_approval": True,
-            }
-            raise web.HTTPForbidden(
-                text=json.dumps(body), content_type="application/json"
-            )
-        return d
-
     def _check_read(self, request: web.Request) -> dict[str, Any]:
-        sess = self._require_auth(request)
-        # admin 拥有管理台读权限；其余用户需显式 checks.read
-        self._require_cap(
-            sess,
-            "checks.read",
-            admin=False,
-            respect_deny=False,
-            deny_body={
-                "ok": False,
-                "error": "denied",
-                "message": "当前账户没有查看业务检查的权限，请联系管理员授权。",
-            },
-        )
-        return sess
+        return self._require_auth(request)
 
     def _check_write(self, request: web.Request) -> dict[str, Any]:
-        sess = self._require_auth(request)
+        sess = self._require_admin(request)
         self._check_csrf(request, sess)
-        self._require_cap(
-            sess,
-            "checks.write",
-            admin=True,
-            respect_deny=True,
-            no_approval=True,
-            admin_body={
-                "error": "admin_required",
-                "message": "创建或修改业务检查需要管理员权限。",
-            },
-            deny_body={
-                "error": "denied",
-                "message": "当前策略禁止修改业务检查，请先调整授权。",
-            },
-            approval_body={
-                "error": "approval_required",
-                "message": "修改业务检查需要审批，当前页面不能直接提交。",
-            },
-        )
         return sess
 
     @staticmethod
@@ -5329,39 +4946,28 @@ class WebApp:
             raise web.HTTPForbidden(text=json.dumps({"error": "asset_disabled"}))
         return dict(row)
 
-    def _policy_for(self, sess: dict, capability: str, asset_id: str = "*", object_id: str = "*") -> dict[str, Any]:
-        return self.policy.effective_decision(
-            subject_type="web_user",
-            subject_id=sess["username"],
-            capability=capability,
-            asset_id=asset_id,
-            object_id=object_id,
-        )
+    def _account_capability(self, sess: dict, capability: str, asset_id: str = "*", object_id: str = "*") -> dict[str, Any]:
+        """Authenticated viewers read; admins may submit explicit human writes."""
+        from .capabilities import get_capability
+
+        try:
+            cap = get_capability(capability)
+        except KeyError:
+            return {"allowed": False, "require_approval": False, "reason": "unknown_capability"}
+        authenticated = bool(sess and sess.get("username"))
+        allowed = authenticated and (cap.kind == "read" or bool(sess.get("is_admin")))
+        return {"allowed": allowed, "require_approval": False, "auto_allowed": False,
+                "decision": "automatic" if allowed else "forbidden",
+                "reason": "authenticated_console_role" if allowed else "admin_required" if authenticated else "unauthorized",
+                "source": "console_role"}
 
     def _check_prom_write(self, request: web.Request, *, asset_id: str = "*") -> dict[str, Any]:
-        sess = self._require_auth(request)
+        sess = self._require_admin(request)
         self._check_csrf(request, sess)
-        self._require_cap(
-            sess,
-            "promconfig.write",
-            admin=True,
-            respect_deny=True,
-            no_approval=True,
-            asset_id=asset_id,
-        )
         return sess
 
     def _check_prom_read(self, request: web.Request) -> dict[str, Any]:
-        sess = self._require_auth(request)
-        # 尊重显式 deny，不因 admin 绕过
-        self._require_cap(
-            sess,
-            "promconfig.read",
-            admin=False,
-            respect_deny=True,
-            no_approval=False,
-        )
-        return sess
+        return self._require_auth(request)
 
     async def api_promconfig_overview(self, request: web.Request) -> web.Response:
         self._check_prom_read(request)
@@ -5483,7 +5089,7 @@ class WebApp:
             asset = self._require_asset(asset_id)
         except web.HTTPException as e:
             return e
-        decision = self._policy_for(sess, "node_exporter.status", asset_id=asset["id"])
+        decision = self._account_capability(sess, "node_exporter.status", asset_id=asset["id"])
         if not decision["allowed"]:
             return _json({"ok": False, "error": "denied"}, 403)
         try:
@@ -5538,7 +5144,7 @@ class WebApp:
             asset = self._require_asset(asset_id)
         except web.HTTPException as e:
             return e
-        decision = self._policy_for(sess, "node_exporter.manage", asset_id=asset["id"])
+        decision = self._account_capability(sess, "node_exporter.manage", asset_id=asset["id"])
         if not decision["allowed"]:
             return _json({"ok": False, "error": "denied"}, 403)
         if decision.get("require_approval") and action in ("install", "start", "stop"):
@@ -5570,13 +5176,13 @@ class WebApp:
             asset = self._require_asset(asset_id)
         except web.HTTPException as e:
             return e
-        decision = self._policy_for(sess, "node_exporter.manage", asset_id=asset["id"])
+        decision = self._account_capability(sess, "node_exporter.manage", asset_id=asset["id"])
         if not decision["allowed"]:
             return _json({"ok": False, "error": "denied"}, 403)
         if decision.get("require_approval"):
             return _json({"ok": False, "error": "approval_required"}, 403)
         # 写权限：注册目标
-        d2 = self._policy_for(sess, "promconfig.write", asset_id=asset["id"])
+        d2 = self._account_capability(sess, "promconfig.write", asset_id=asset["id"])
         if not d2["allowed"] or d2.get("require_approval"):
             return _json({"ok": False, "error": "denied"}, 403)
         address = (body.get("address") or "").strip()
@@ -5613,7 +5219,7 @@ class WebApp:
             asset = self._require_asset(asset_id)
         except web.HTTPException as e:
             return e
-        d = self._policy_for(sess, "node_exporter.status", asset_id=asset["id"])
+        d = self._account_capability(sess, "node_exporter.status", asset_id=asset["id"])
         if not d["allowed"] and not sess.get("is_admin"):
             return _json({"ok": False, "error": "denied"}, 403)
         try:
@@ -5632,7 +5238,7 @@ class WebApp:
             asset = self._require_asset(asset_id)
         except web.HTTPException as e:
             return e
-        d = self._policy_for(sess, "node_exporter.manage", asset_id=asset["id"])
+        d = self._account_capability(sess, "node_exporter.manage", asset_id=asset["id"])
         if not d["allowed"] or d.get("require_approval"):
             return _json({"ok": False, "error": "denied"}, 403)
         try:

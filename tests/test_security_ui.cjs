@@ -40,7 +40,7 @@ const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve()
 
 function environment(reply = () => ({ ok: true })) {
   const nodes = new Map(), calls = [], sockets = [], terminals = [], dialogs = [], promptReplies = [];
-  for (const id of ["term-status", "term-title", "term-host-label", "term-modal", "term-container", "term-close", "term-disconnect", "term-reconnect", "modal", "modal-title", "modal-body", "agent-ceiling", "host-list", "ssh-creds", "perm-eff-cap", "perm-eff-asset", "perm-eff-object", "perm-eff-result", "perm-eff-lookup"]) {
+  for (const id of ["term-status", "term-title", "term-host-label", "term-modal", "term-container", "term-close", "term-disconnect", "term-reconnect", "modal", "modal-title", "modal-body", "host-list", "ssh-creds"]) {
     const node = new Element("div"); nodes.set(id, node);
   }
   const actions = new Element("div"); actions.className = "modal-actions";
@@ -70,10 +70,7 @@ function environment(reply = () => ({ ok: true })) {
     prompt: () => promptReplies.shift(), confirm: () => true,
     showModal: (title, children) => { dialogs.push(title); nodes.get("modal-title").textContent = title; nodes.get("modal-body").innerHTML = ""; children.forEach((child) => nodes.get("modal-body").appendChild(child)); nodes.get("modal").classList.remove("hidden"); },
     humanFormError: (res, fallback) => res.hint || fallback,
-    permissionCapabilityLabel: (capability) => capability,
-    permissionObjectLabel: (_, object) => object,
     checkHostLabel: (asset) => asset === "control" ? "Control" : "Sora",
-    populatePermissionObjects: () => {},
     badge: (text) => { const node = new Element("span"); node.textContent = text; return node; },
     setTabHash: () => {}, fmtTime: () => "", loopOutcome: () => ({}), renderLoopSteps: () => new Element("div"),
     fillSelect: () => {}, credLabel: (credential) => credential.name,
@@ -84,13 +81,10 @@ function environment(reply = () => ({ ok: true })) {
   };
   for (const [start, end] of [
     ["function el(", "async function api("],
-    ["const effectivePermissionState", "function permissionCapabilityLabel("],
-    ['on("perm-eff-cap", "change"', "function collectAdvancedPermission("],
-    ["/* ---- Agent ceiling ---- */", "/* ---- modal ---- */"],
+    ["/* ---- Web SSH Terminal (xterm.js) ---- */", "/* ---- modal ---- */"],
     ["async function openIncidentDetail(", "function openActionDetail("],
     ["async function renderConnections(", 'on("host-auth", "change"'],
   ]) vm.runInContext(cut(start, end), context);
-  for (const [id, value] of [["perm-eff-cap", "service.restart"], ["perm-eff-asset", "control"], ["perm-eff-object", "*"]]) nodes.get(id).value = value;
   return { nodes, calls, sockets, terminals, dialogs, actions, promptReplies, run: (code) => vm.runInContext(code, context) };
 }
 const tests = [];
@@ -206,81 +200,6 @@ test("confirming an empty approval reason still approves exactly once", async ()
   env.promptReplies.push("");
   await env.nodes.get("modal-body").querySelectorAll("button").find((n) => n.textContent === "批准并执行").click(); await flush();
   assert.deepEqual(env.calls.filter((call) => call.body).map((call) => call.body), [{ execute: true, reason: "" }]);
-});
-
-test("permission responses cannot overwrite the result for a newer host", async () => {
-  const control = deferred(), sora = deferred();
-  const env = environment(({ url }) => url.includes("control") ? control.promise : sora.promise);
-  const oldLookup = env.nodes.get("perm-eff-lookup").click();
-  env.nodes.get("perm-eff-asset").value = "sora"; await env.nodes.get("perm-eff-asset").dispatch("change");
-  const lookup = env.nodes.get("perm-eff-lookup").click();
-  sora.resolve({ ok: true, effective: { state: "deny", readable: "禁止" } }); await lookup;
-  control.resolve({ ok: true, effective: { state: "auto", readable: "自动执行" } }); await oldLookup;
-  assert.ok(env.nodes.get("perm-eff-result").textContent.includes("Sora"));
-  assert.ok(env.nodes.get("perm-eff-result").textContent.includes("禁止"));
-  assert.ok(!env.nodes.get("perm-eff-result").textContent.includes("自动执行"));
-});
-
-test("a network failure from the previous permission query cannot replace current results", async () => {
-  const old = deferred(); const env = environment(({ url }) => url.includes("control") ? old.promise : { ok: true, effective: { state: "deny", readable: "禁止" } });
-  const first = env.nodes.get("perm-eff-lookup").click();
-  env.nodes.get("perm-eff-asset").value = "sora"; await env.nodes.get("perm-eff-asset").dispatch("change");
-  await env.nodes.get("perm-eff-lookup").click(); old.reject(new Error("offline")); await first;
-  assert.ok(env.nodes.get("perm-eff-result").textContent.includes("Sora"));
-  assert.ok(!env.nodes.get("perm-eff-result").textContent.includes("连接中断"));
-});
-
-for (const [id, value] of [["perm-eff-cap", "service.logs"], ["perm-eff-asset", "sora"], ["perm-eff-object", "redis"]]) {
-  test(`${id} changes immediately invalidate both displayed and pending results`, async () => {
-    const pending = deferred(); let count = 0;
-    const env = environment(() => ++count === 1 ? { ok: true, effective: { state: "auto", readable: "自动执行" } } : pending.promise);
-    await env.nodes.get("perm-eff-lookup").click(); const lookup = env.nodes.get("perm-eff-lookup").click();
-    const node = env.nodes.get(id), original = node.value;
-    node.value = value; await node.dispatch("change"); node.value = original; await node.dispatch("change");
-    assert.equal(env.nodes.get("perm-eff-result").textContent, "请选择目标后查询当前权限。");
-    pending.resolve({ ok: true, effective: { state: "auto", readable: "自动执行" } }); await lookup;
-    assert.equal(env.nodes.get("perm-eff-result").textContent, "请选择目标后查询当前权限。");
-  });
-}
-
-const ceilingReply = { ok: true, agent_ceiling: [{ capability: "service.restart", allowed: true, allow_auto: true }] };
-test("quick ceiling changes preserve both fields and serialize full-row writes", async () => {
-  const firstSave = deferred(), oldRender = deferred(); let getCount = 0, postCount = 0;
-  const env = environment(({ body }) => body ? ++postCount === 1 ? firstSave.promise : { ok: true } : ++getCount === 1 ? ceilingReply : oldRender.promise);
-  await env.run("renderAgentCeiling()"); const oldLoad = env.run("renderAgentCeiling()");
-  const [allowed, auto] = env.nodes.get("agent-ceiling").querySelectorAll("input");
-  allowed.checked = false; const a = allowed.dispatch("change");
-  auto.checked = false; const b = auto.dispatch("change"); await flush();
-  assert.equal(env.calls.filter((call) => call.body).length, 1);
-  oldRender.resolve(ceilingReply); await oldLoad;
-  assert.equal(env.nodes.get("agent-ceiling").querySelectorAll("input")[0], allowed);
-  firstSave.resolve({ ok: true }); await Promise.all([a, b]);
-  assert.deepEqual(env.calls.filter((call) => call.body).map((call) => call.body), [
-    { capability: "service.restart", allowed: false, allow_auto: true },
-    { capability: "service.restart", allowed: false, allow_auto: false },
-  ]);
-  assert.equal(allowed.checked, false); assert.equal(auto.checked, false);
-  assert.ok(env.nodes.get("agent-ceiling").textContent.includes("已保存"));
-});
-
-test("failed ceiling saves restore the confirmed state and explain the failure", async () => {
-  const env = environment(({ body }) => body ? { ok: false, hint: "没有管理权限" } : ceilingReply);
-  await env.run("renderAgentCeiling()"); const allowed = env.nodes.get("agent-ceiling").querySelectorAll("input")[0];
-  allowed.checked = false; await allowed.dispatch("change");
-  assert.equal(allowed.checked, true); assert.ok(env.nodes.get("agent-ceiling").textContent.includes("没有管理权限"));
-  assert.equal(env.run("agentCeilingState.pending"), 0);
-});
-
-test("a network failure does not poison subsequent ceiling saves", async () => {
-  let posts = 0; const env = environment(({ body }) => {
-    if (!body) return ceilingReply;
-    if (++posts === 1) throw new Error("offline");
-    return { ok: true };
-  });
-  await env.run("renderAgentCeiling()"); const allowed = env.nodes.get("agent-ceiling").querySelectorAll("input")[0];
-  allowed.checked = false; await allowed.dispatch("change"); assert.equal(allowed.checked, true);
-  allowed.checked = false; await allowed.dispatch("change"); assert.equal(allowed.checked, false);
-  assert.ok(env.nodes.get("agent-ceiling").textContent.includes("已保存"));
 });
 
 test("private-key rotation lets the server derive the new public key", async () => {

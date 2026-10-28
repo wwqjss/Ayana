@@ -238,6 +238,76 @@ class ExecutionAuthorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.code,"readonly_mode_rejects_write")
         self.assertFalse(self.transport.calls)
 
+    def action_admin(self):
+        from ayana.access import AccessControl
+        self.db.execute("INSERT INTO users(username,password_hash,is_admin,created_at,updated_at) VALUES('approver','unused',1,0,0)")
+        self.actions.access_control = AccessControl(self.db)
+
+    async def test_human_approval_cannot_override_session_downgrade_to_readonly(self):
+        from ayana.actions import ActionError
+        self.action_service()
+        self.action_admin()
+        self.duty.set_setting("auto_approval_mode", "manual")
+        action = self.propose()
+        self.duty.set_setting("auto_access_mode", "readonly")
+        with self.assertRaises(ActionError) as caught:
+            self.actions.approve(action["id"], approver_id="approver")
+        self.assertEqual(caught.exception.code, "readonly_mode_rejects_write")
+        self.assertEqual(self.actions._get(action["id"])["state"], "proposed")
+        self.assertFalse(self.transport.calls)
+
+    async def test_human_approval_rechecks_paused_session(self):
+        from ayana.actions import ActionError
+        self.action_service()
+        self.action_admin()
+        self.duty.set_setting("auto_approval_mode", "manual")
+        action = self.propose()
+        self.db.execute("UPDATE duty_sessions SET paused_at=1 WHERE id=?", (self.auto,))
+        with self.assertRaises(ActionError) as caught:
+            self.actions.approve(action["id"], approver_id="approver")
+        self.assertEqual(caught.exception.code, "session_paused")
+        self.assertEqual(self.actions._get(action["id"])["state"], "proposed")
+
+    async def test_structured_agent_ignores_retired_rules_in_manual_approval_mode(self):
+        self.action_service()
+        self.action_admin()
+        self.duty.set_setting("auto_approval_mode", "manual")
+        self.db.execute("INSERT INTO permissions(subject_type,subject_id,asset_id,capability,object_id,allow,created_at,updated_at) VALUES('agent','mimo','host','service.restart','obj',0,0,0)")
+        self.db.execute("INSERT OR REPLACE INTO agent_ceiling(capability,allowed,allow_auto,updated_at,updated_by) VALUES('service.restart',0,0,0,'old')")
+        action = self.propose()
+        self.assertEqual(action["state"], "proposed")
+        approved = self.actions.approve(action["id"], approver_id="approver")
+        self.assertEqual(approved["state"], "approved")
+        self.assertFalse(self.transport.calls)
+
+    async def test_missing_persisted_session_never_falls_back_to_global_automatic(self):
+        from ayana.actions import ActionError
+        self.action_service()
+        self.duty.set_setting("auto_approval_mode", "automatic")
+        action = self.propose()
+        row = self.actions._get(action["id"])
+        payload = json.loads(row["params_json"])
+        payload.pop("_ayana_session_id")
+        self.db.execute("UPDATE actions SET params_json=? WHERE id=?", (json.dumps(payload), action["id"]))
+        with self.assertRaises(ActionError) as caught:
+            await self.actions.execute(action["id"], actor_type="agent", actor_id="mimo")
+        self.assertEqual(caught.exception.code, "authority_session_required")
+        self.assertFalse(self.transport.calls)
+
+    async def test_system_approval_rechecks_mode_before_recording_consent(self):
+        self.action_service()
+        self.duty.set_setting("auto_approval_mode", "automatic")
+        approve = self.actions._system_approve_autonomous
+        def switch_before_approval(*args, **kwargs):
+            self.duty.set_setting("auto_approval_mode", "manual")
+            return approve(*args, **kwargs)
+        self.actions._system_approve_autonomous = switch_before_approval
+        action = self.propose()
+        self.assertEqual(action["state"], "proposed")
+        self.assertTrue(action["require_approval"])
+        self.assertEqual(action["decision"], "approval_required")
+        self.assertFalse(self.actions._get(action["id"])["approver_id"])
+
     async def test_pending_command_preserves_long_command_and_unknown_blocks(self):
         from tests.test_p61_closed_loop_e2e import FakeTransport
         self.ctx.transport=FakeTransport()
@@ -275,6 +345,7 @@ class ExecutionAuthorityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_generic_pending_executes_once_via_actual_web_handler(self):
         from ayana.web import WebApp
+        self.duty.set_setting("auto_approval_mode","manual")
         t=time.time()
         self.db.execute("INSERT INTO incidents(id,title,status,created_at,updated_at) VALUES('probe','Probe','open',?,?)",(t,t))
         self.duty.join_incident(self.auto,"probe")
