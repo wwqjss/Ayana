@@ -10,7 +10,7 @@
 
 <title>Ayana</title>
 
-<link rel="stylesheet" href="/static/app.css?v=20261028-auth1">
+<link rel="stylesheet" href="/static/app.css?v=20261028-workspace1">
 
 <link rel="stylesheet" href="/static/workbench.css?v=20261027-lifecycle2">
 
@@ -532,197 +532,90 @@
           <button type="button" class="aw-toggle aw-toggle-right" id="aw-toggle-right" title="折叠右栏">▤</button>
         </div>
       </section>
-      <section id="tab-connections" class="tab-panel hidden">
-
-        <div class="card">
-
-          <h2>添加主机</h2>
-
-          <p class="muted small">
-
-            主机 = 资产。填写连接信息即可新增；可选绑定凭据。保存后自动登记 SSH 端点，无需再单独选资产。
-
-          </p>
-
-          <div class="form-row" id="host-add-form">
-
-            <label>主机 ID <input id="host-id" placeholder="例如 web-01"></label>
-
-            <label>名称 <input id="host-name" placeholder="显示名"></label>
-
-            <label>地址 <input id="host-addr" placeholder="IP / 域名"></label>
-
-            <label>端口 <input id="host-port" type="number" value="22" style="width:80px"></label>
-
-            <label>用户 <input id="host-user" placeholder="root"></label>
-
-            <label>角色
-
-              <select id="host-role"></select>
-
-            </label>
-
-            <button class="btn small" id="role-add-btn" type="button">+ 角色</button>
-
-            <label>认证
-
-              <select id="host-auth">
-
-                <option value="password">密码</option>
-
-                <option value="key">私钥</option>
-
-                <option value="cred">已有凭据</option>
-
-                <option value="none">暂不配置</option>
-
-              </select>
-
-            </label>
-
-            <label id="host-auth-password-wrap">密码 <input id="host-password" type="password" placeholder="SSH 密码"></label>
-
-            <label id="host-auth-key-wrap" class="hidden" style="flex:2">私钥 <input id="host-private-key" placeholder="粘贴 PEM 私钥"></label>
-
-            <label id="host-auth-cred-wrap" class="hidden">凭据 <select id="host-cred"><option value="">（无）</option></select></label>
-
-            <button class="btn primary" id="host-add-btn" type="button">添加主机</button>
-
-          </div>
-
-          <div id="role-add-form" class="form-row hidden" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--line)">
-
-            <label>角色名 <input id="role-name" placeholder="例如 deploy / monitor"></label>
-
-            <label>显示名 <input id="role-label" placeholder="例如 发布账号"></label>
-
-            <label>权限
-
-              <select id="role-kind">
-
-                <option value="write">可执行（exec）</option>
-
-                <option value="read">只读（query）</option>
-
-              </select>
-
-            </label>
-
-            <button class="btn primary" id="role-save-btn" type="button">保存角色</button>
-
-            <button class="btn" id="role-cancel-btn" type="button">取消</button>
-
-          </div>
-
-          <p class="muted small" id="host-add-msg"></p>
-
-        </div>
-
-
-
-        <div class="card">
-
-          <h2>主机列表</h2>
-
-          <div id="host-list"></div>
-
-        </div>
-
-
-
-        <div class="card">
-
-          <h2>凭据库</h2>
-
-          <p class="muted small">密码或私钥加密入库；可生成密钥对并部署公钥。列表不显示明文。</p>
-
-          <div class="form-row">
-
-            <label>名称 <input id="ssh-cred-name" placeholder="web-01-root"></label>
-
-            <label>类型
-
-              <select id="ssh-cred-kind">
-
-                <option value="password">password 密码</option>
-
-                <option value="private_key">private_key 私钥</option>
-
-              </select>
-
-            </label>
-
-            <label style="flex:2">密钥/密码 <input id="ssh-cred-secret" placeholder="密码或粘贴私钥 PEM" type="password"></label>
-
-            <button class="btn" id="ssh-cred-save" type="button">导入凭据</button>
-
-            <button class="btn" id="ssh-cred-gen" type="button">生成密钥对</button>
-
-          </div>
-
-          <div id="ssh-creds"></div>
-
-        </div>
-
-
-
-        <div class="card">
-
-          <h2>连接测试</h2>
-
-          <div class="form-row">
-
-            <label>主机 <select id="ssh-test-asset"></select></label>
-
-            <label>角色
-
-              <select id="ssh-test-role">
-
-                <option value="read">read</option>
-
-                <option value="write">write</option>
-
-              </select>
-
-            </label>
-
-            <button class="btn primary" id="ssh-test-btn" type="button">测试连接</button>
-
-          </div>
-
-          <pre id="ssh-test-out" class="muted small" style="white-space:pre-wrap;min-height:40px"></pre>
-
-        </div>
-
-      </section>
-
-
-
-      <section id="tab-notify" class="tab-panel hidden">
-
-        <div class="subnav" id="notify-subnav">
-          <button data-sub="channels" class="subtab active">通知渠道</button>
-          <button data-sub="messages" class="subtab">消息记录</button>
-          <button data-sub="outbox" class="subtab">发送记录</button>
-          <button data-sub="nodewatch" class="subtab">节点守望</button>
-        </div>
-
-        <div id="notify-sub-nodewatch" class="subpanel hidden">
-          <div class="card">
-            <h2>节点守望 · 配对</h2>
-            <p class="muted small">
-              接收端生成邀请串（含地址 + 节点名 + 密钥），粘贴到发送端完成配对。
-              IP 只是路由，信任靠密钥指纹核对。密钥不回显明文。
-            </p>
-            <div class="form-row">
-              <label>本机角色
-                <select id="nw-role">
-                  <option value="recv">接收端（生成邀请串）</option>
-                  <option value="send">发送端（粘贴邀请串）</option>
-                </select>
-              </label>
+      <section id="tab-connections" class="tab-panel workspace-page hidden">
+        <header class="workspace-head">
+          <div><h1>连接</h1><p>管理主机、连接凭据与节点之间的心跳。</p></div>
+          <button id="connections-add-open" class="btn primary" type="button">添加主机</button>
+        </header>
+        <nav class="subnav workspace-tabs" id="connections-subnav" aria-label="连接分类">
+          <button data-sub="hosts" class="subtab active" type="button">主机与凭据</button>
+          <button data-sub="nodewatch" class="subtab" type="button">节点守望</button>
+        </nav>
+        <div id="connections-sub-hosts" class="subpanel">
+          <p id="connections-load-error" class="workspace-feedback" role="alert" aria-live="polite"></p>
+          <details id="hosts-panel" class="workspace-disclosure">
+            <summary><span class="workspace-summary-text"><span class="workspace-summary-title">主机列表</span><span class="workspace-summary-note">展开查看主机状态、连接账户与操作</span></span><span id="host-list-count" class="workspace-count" aria-live="polite">—</span></summary>
+            <div class="workspace-disclosure-body"><div id="host-list"></div></div>
+          </details>
+          <details id="credentials-panel" class="workspace-disclosure">
+            <summary><span class="workspace-summary-text"><span class="workspace-summary-title">凭据库</span><span class="workspace-summary-note">管理密码与密钥，列表仅显示凭据摘要</span></span><span id="ssh-creds-count" class="workspace-count" aria-live="polite">—</span></summary>
+            <div class="workspace-disclosure-body">
+              <div id="ssh-creds"></div>
+              <details id="credential-editor-panel" class="workspace-inset-disclosure">
+                <summary>导入或生成凭据</summary>
+                <div class="workspace-inset-body">
+                  <p class="workspace-description">已有凭据可直接绑定到主机；私钥请粘贴完整 PEM 内容并保留换行。</p>
+                  <div class="form-row workspace-form">
+                    <label>名称<input id="ssh-cred-name" placeholder="例如 web-01-root" autocomplete="off"></label>
+                    <label>类型<select id="ssh-cred-kind"><option value="password">密码</option><option value="private_key">私钥</option></select></label>
+                    <label class="workspace-field-wide">密码或私钥<input id="ssh-cred-secret" placeholder="输入密码" type="password" autocomplete="new-password"></label>
+                  </div>
+                  <div class="workspace-actions"><button class="btn primary" id="ssh-cred-save" type="button">导入凭据</button><button class="btn" id="ssh-cred-gen" type="button">生成密钥对</button></div>
+                </div>
+              </details>
             </div>
-            <div id="nw-recv-box">
+          </details>
+          <details id="host-add-panel" class="workspace-disclosure">
+            <summary><span class="workspace-summary-text"><span class="workspace-summary-title">添加主机</span><span class="workspace-summary-note">填写 SSH 连接信息，或绑定已有凭据</span></span></summary>
+            <div class="workspace-disclosure-body">
+              <div class="form-row workspace-form" id="host-add-form">
+                <label>主机 ID<input id="host-id" placeholder="例如 web-01" autocomplete="off"></label>
+                <label>名称<input id="host-name" placeholder="主机显示名称"></label>
+                <label>地址<input id="host-addr" placeholder="IP 地址或域名" autocomplete="off"></label>
+                <label>端口<input id="host-port" type="number" value="22" min="1" max="65535"></label>
+                <label>用户<input id="host-user" placeholder="root" autocomplete="off"></label>
+                <label>角色<span class="workspace-inline"><select id="host-role"></select><button class="btn" id="role-add-btn" type="button">添加角色</button></span></label>
+                <label>认证方式<select id="host-auth"><option value="password">密码</option><option value="key">私钥</option><option value="cred">已有凭据</option><option value="none">暂不配置</option></select></label>
+                <label id="host-auth-password-wrap">密码<input id="host-password" type="password" placeholder="SSH 密码" autocomplete="new-password"></label>
+                <label id="host-auth-key-wrap" class="workspace-field-wide hidden">私钥<textarea id="host-private-key" class="secret-editor" rows="4" placeholder="粘贴完整 PEM 私钥，保留换行" autocomplete="off" spellcheck="false"></textarea></label>
+                <label id="host-auth-cred-wrap" class="hidden">凭据<select id="host-cred"><option value="">（无）</option></select></label>
+                <div class="workspace-actions workspace-field-wide"><button class="btn primary" id="host-add-btn" type="button">添加主机</button></div>
+              </div>
+              <div id="role-add-form" class="form-row workspace-form workspace-inset hidden">
+                <label>角色名<input id="role-name" placeholder="例如 deploy / monitor"></label>
+                <label>显示名<input id="role-label" placeholder="例如 发布账号"></label>
+                <label>权限<select id="role-kind"><option value="write">可执行</option><option value="read">只读</option></select></label>
+                <div class="workspace-actions"><button class="btn primary" id="role-save-btn" type="button">保存角色</button><button class="btn" id="role-cancel-btn" type="button">取消</button></div>
+              </div>
+              <p class="workspace-feedback" id="host-add-msg" aria-live="polite"></p>
+            </div>
+          </details>
+          <details id="connection-test-panel" class="workspace-disclosure">
+            <summary><span class="workspace-summary-text"><span class="workspace-summary-title">连接测试</span><span class="workspace-summary-note">选择主机和角色，验证已保存的连接</span></span></summary>
+            <div class="workspace-disclosure-body">
+              <div class="form-row workspace-form">
+                <label>主机<select id="ssh-test-asset"></select></label>
+                <label>角色<select id="ssh-test-role"><option value="read">只读</option><option value="write">可执行</option></select></label>
+              </div>
+              <div class="workspace-actions"><button class="btn primary" id="ssh-test-btn" type="button">测试连接</button></div>
+              <p id="ssh-test-summary" class="workspace-feedback" aria-live="polite"></p>
+              <details class="workspace-diagnostics"><summary>测试详情</summary><pre id="ssh-test-out" class="small"></pre></details>
+            </div>
+          </details>
+        </div>
+        <div id="connections-sub-nodewatch" class="subpanel hidden">
+          <div class="card workspace-card">
+            <div class="workspace-card-head"><div><h2>节点守望</h2><p class="workspace-description">通过节点间心跳确认对端状态。</p></div><button id="nw-refresh" class="btn" type="button">刷新状态</button></div>
+            <div id="nw-status-summary" class="nodewatch-status-grid" aria-live="polite"><p class="muted small">正在读取节点状态…</p></div>
+            <details class="workspace-diagnostics"><summary>诊断数据</summary><pre id="nw-status" class="small"></pre></details>
+          </div>
+          <p id="nw-err" class="workspace-feedback" role="status" aria-live="polite"></p>
+          <details id="nw-pair-panel" class="workspace-disclosure">
+            <summary><span class="workspace-summary-text"><span class="workspace-summary-title">配对与心跳设置</span><span class="workspace-summary-note">生成接收邀请，或配置发送目标与周期</span></span></summary>
+            <div class="workspace-disclosure-body">
+              <p class="workspace-description">接收端生成邀请后，在发送端粘贴并核对指纹。已有配对优先复用现有密钥。</p>
+              <div class="form-row"><label>配置方向<select id="nw-role"><option value="recv">接收心跳（生成邀请）</option><option value="send">发送心跳（粘贴邀请）</option></select></label></div>
+              <div id="nw-recv-box">
               <div class="form-row">
                 <label>允许的对端节点名
                   <input id="nw-node-id" placeholder="如 node-1" />
@@ -732,22 +625,23 @@
                 </label>
               </div>
               <div class="form-row">
-                <button id="nw-gen" class="primary">生成邀请串</button>
-                <button id="nw-gen-keep" type="button">复用现有密钥生成</button>
+                <button id="nw-gen-keep" class="btn primary" type="button">生成配对邀请</button>
+                <button id="nw-gen" class="btn danger" type="button">轮换密钥并生成</button>
               </div>
               <div id="nw-invite-box" class="hidden">
                 <p class="small muted">指纹 <b id="nw-fp"></b> · 请与发送端核对 · 请在 10 分钟内完成粘贴</p>
                 <textarea id="nw-invite" rows="3" readonly></textarea>
                 <div class="form-row">
-                  <button id="nw-copy" type="button">复制邀请串</button>
+                  <button id="nw-copy" class="btn" type="button">复制邀请串</button>
                 </div>
               </div>
             </div>
-            <div id="nw-send-box" class="hidden">
+<div id="nw-send-box" class="hidden">
               <div class="form-row">
                 <label>心跳间隔（秒）
                   <input id="nw-interval" type="number" min="10" step="1" placeholder="默认 60" />
                 </label>
+                <button id="nw-save-interval" class="btn" type="button">保存心跳周期</button>
               </div>
               <div class="form-row">
                 <label>粘贴邀请串
@@ -755,7 +649,7 @@
                 </label>
               </div>
               <div class="form-row">
-                <button id="nw-parse" type="button">解析</button>
+                <button id="nw-parse" class="btn" type="button">解析</button>
               </div>
               <div id="nw-parse-box" class="hidden">
                 <p class="small">目标 <b id="nw-p-url"></b></p>
@@ -765,28 +659,25 @@
                   <label>核对指纹后确认
                     <input id="nw-p-fp-in" placeholder="输入指纹确认" />
                   </label>
-                  <button id="nw-apply" class="primary">保存并启用发送</button>
+                  <button id="nw-apply" class="btn primary" type="button">保存并启用发送</button>
                 </div>
               </div>
             </div>
-            <div class="error" id="nw-err"></div>
-            <div class="form-row">
-              <button id="nw-refresh" type="button">刷新状态</button>
-              <button id="nw-save-interval" type="button">保存心跳周期</button>
             </div>
-            <pre id="nw-status" class="small muted" style="white-space:pre-wrap"></pre>
-          </div>
+          </details>
         </div>
+      </section>
 
-        <div id="notify-sub-channels" class="subpanel">
-          <div class="card">
-            <h2>通知渠道</h2>
-            <p class="muted small">通知渠道配置已集中到设置中的「系统连接」。消息记录、发送队列和节点状态仍可在这里查看。</p>
-            <button id="notify-settings-open" class="btn" type="button" style="margin-top:14px">管理通知渠道</button>
-          </div>
-        </div>
 
-        <div id="notify-sub-messages" class="subpanel hidden">
+
+      <section id="tab-notify" class="tab-panel workspace-page hidden">
+        <header class="workspace-head"><div><h1>通知</h1><p>查看消息与发送记录，渠道配置独立管理。</p></div><button id="notify-settings-open" class="btn primary" type="button">管理通知渠道</button></header>
+        <nav class="subnav workspace-tabs" id="notify-subnav" aria-label="通知记录分类">
+          <button data-sub="messages" class="subtab active" type="button">消息记录</button>
+          <button data-sub="outbox" class="subtab" type="button">发送记录</button>
+        </nav>
+        <div id="notify-sub-channels" class="subpanel hidden"><p class="workspace-description">渠道配置位于设置中的「通知渠道」。</p></div>
+        <div id="notify-sub-messages" class="subpanel">
           <div class="card">
             <h2>消息记录</h2>
             <p class="muted small">
@@ -839,11 +730,10 @@
             </div>
           </div>
         </div>
-
-        <div id="notify-sub-outbox" class="subpanel hidden">
+<div id="notify-sub-outbox" class="subpanel hidden">
         <div class="card">
 
-          <h2>发送记录（outbox）</h2>
+          <h2>发送记录</h2>
 
           <div class="form-row">
 
@@ -873,7 +763,6 @@
 
         </div>
         </div>
-
       </section>
 
 
@@ -1049,9 +938,9 @@
 <div id="settings-storage" class="hidden" aria-hidden="true">
   <div id="settings-notification-content" class="settings-notification-content">
 
-        <div class="card">
+        <details id="notify-editor-panel" class="settings-channel-editor"><summary><span><strong>添加通知渠道</strong><span class="settings-hint">选择消息平台与接入方式</span></span></summary><div class="settings-channel-editor-body">
 
-          <h2>通知渠道</h2>
+
 
           <p class="muted small">
 
@@ -1207,13 +1096,13 @@
 
           <p class="muted small" id="notify-msg"></p>
 
-          <div id="notify-guide" class="notify-guide"></div>
+          <details class="settings-guide-disclosure"><summary>查看接入说明</summary><div id="notify-guide" class="notify-guide"></div></details>
 
-        </div>
+        </div></details>
 
         <div class="card">
 
-          <h2>渠道列表</h2>
+          <h2>已有渠道 <span id="notify-channel-count" class="workspace-count">—</span></h2>
 
           <div id="notify-list"></div>
 
@@ -1300,8 +1189,8 @@
 <script src="/static/xterm/xterm-addon-fit.js"></script>
 <script src="/static/terminal_clipboard.js?v=20261027-lifecycle2"></script>
 
-<script src="/static/app.js?v=47-native1"></script>
-<script src="/static/settings.js?v=20261026"></script>
+<script src="/static/app.js?v=20261028-workspace1"></script>
+<script src="/static/settings.js?v=20261028-workspace1"></script>
 <script src="/static/workbench.js?v=20261027-lifecycle2"></script>
 
 </body>

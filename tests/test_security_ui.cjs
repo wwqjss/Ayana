@@ -8,7 +8,7 @@ const source = fs.readFileSync(path.resolve(__dirname, "../ayana/static/app.js")
 class Element {
   constructor(tag) {
     this.tagName = tag.toUpperCase(); this.children = []; this.listeners = {};
-    this.className = ""; this.style = {}; this.value = ""; this.checked = false; this._text = "";
+    this.className = ""; this.style = {}; this.dataset = {}; this.value = ""; this.checked = false; this._text = "";
     this.classList = {
       add: (...names) => { this.className = [...new Set([...this.className.split(" "), ...names])].join(" "); },
       remove: (...names) => { this.className = this.className.split(" ").filter((name) => !names.includes(name)).join(" "); },
@@ -25,7 +25,7 @@ class Element {
   get nextSibling() { return this.parent?.children[this.parent.children.indexOf(this) + 1]; }
   setAttribute(name, value) { if (name === "class") this.className = value; else if (name === "checked") this.checked = true; else this[name] = value; }
   addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener); }
-  async dispatch(type) { for (const listener of this.listeners[type] || []) await listener({ target: this }); }
+  async dispatch(type) { for (const listener of this.listeners[type] || []) await listener({ target: this, preventDefault() {} }); }
   async click() { if (!this.disabled) await this.dispatch("click"); }
   querySelectorAll(selector) {
     const result = [];
@@ -286,8 +286,13 @@ test("a network failure does not poison subsequent ceiling saves", async () => {
 test("private-key rotation lets the server derive the new public key", async () => {
   const credential = { id: "cred1", name: "Key", kind: "key", public_key: "ssh-ed25519 OLD" };
   const env = environment(({ url }) => url === "/api/assets" ? { ok: true, assets: [] } : url === "/api/ssh/credentials" ? { ok: true, credentials: [credential] } : url === "/api/ssh/roles" ? { ok: true, roles: [] } : { ok: true });
-  await env.run("renderConnections()"); env.promptReplies.push("NEW PRIVATE KEY");
-  await env.nodes.get("ssh-creds").querySelectorAll("button").find((node) => node.textContent === "轮换").click();
+  await env.run("renderConnections()");
+  await env.nodes.get("ssh-creds").querySelectorAll("button").find((node) => node.textContent === "更新凭据").click();
+  const editor = env.nodes.get("modal-body").querySelector("textarea");
+  assert.ok(editor, "private-key editing must preserve PEM newlines");
+  editor.value = "NEW PRIVATE KEY";
+  assert.ok(!env.calls.some((call) => call.url.endsWith("/rotate")), "opening a credential editor must not rotate it");
+  await env.nodes.get("modal-body").querySelector("form").dispatch("submit");
   const rotation = env.calls.find((call) => call.url.endsWith("/rotate"));
   assert.deepEqual(rotation.body, { id: "cred1", secret: "NEW PRIVATE KEY" });
 });

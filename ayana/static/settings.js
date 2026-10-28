@@ -9,7 +9,8 @@ const settingsSections = [
   { key: "security", label: "双重验证", icon: "◇" },
   { key: "prompts", label: "提示词", icon: "≡", admin: true },
   { key: "skills", label: "技能", icon: "▦", admin: true },
-  { key: "connections", label: "系统连接", icon: "⌁", admin: true },
+  { key: "connections", label: "监控接入", icon: "⌁", admin: true },
+  { key: "notifications", label: "通知渠道", icon: "◉", admin: true },
   { key: "about", label: "关于", icon: "ⓘ" },
 ];
 
@@ -148,6 +149,7 @@ async function renderSettingsSection(section, confirmed = false) {
   document.querySelectorAll("#settings-nav button").forEach((button) => {
     const selected = button.dataset.section === section;
     button.classList.toggle("active", selected); button.setAttribute("aria-current", selected ? "page" : "false");
+    if (selected && typeof button.scrollIntoView === "function") button.scrollIntoView({ block: "nearest", inline: "nearest" });
   });
   const feedback = el("p", { id: "settings-feedback", class: "settings-feedback settings-footer-note", "aria-live": "polite" });
   const actions = el("div", { class: "settings-toolbar" });
@@ -170,7 +172,7 @@ async function renderSettingsSection(section, confirmed = false) {
   };
   content.appendChild(settingsDescription("正在加载…"));
   try {
-    const renderers = { model: settingsModel, profile: settingsProfile, security: settingsSecurity, prompts: settingsPrompts, skills: settingsSkills, connections: settingsConnections, about: settingsAbout };
+    const renderers = { model: settingsModel, profile: settingsProfile, security: settingsSecurity, prompts: settingsPrompts, skills: settingsSkills, connections: settingsConnections, notifications: settingsNotifications, about: settingsAbout };
     await renderers[section](context);
   } catch (_) {
     if (active()) { content.innerHTML = ""; content.appendChild(settingsDescription("内容暂时无法加载，请重试。")); settingsFeedback("加载失败，请检查连接或重新登录。", true); }
@@ -179,7 +181,7 @@ async function renderSettingsSection(section, confirmed = false) {
 }
 on("settings-close", "click", () => closeSettings());
 on("settings-dialog", "click", (event) => { if (event.target === $("settings-dialog")) closeSettings(); });
-on("notify-settings-open", "click", () => openSettings("connections"));
+on("notify-settings-open", "click", () => openSettings("notifications"));
 window.addEventListener("beforeunload", (event) => {
   if (settingsState.opened && (settingsState.dirty || settingsState.busy)) { event.preventDefault(); event.returnValue = ""; }
 });
@@ -230,6 +232,10 @@ async function settingsModel(context) {
     finally { context.setBusy(false); }
   } }));
   details.appendChild(message);
+  context.root.appendChild(el("details", { class: "settings-detail" }, [
+    el("summary", { text: "Agent 工具连接" }),
+    settingsDescription("Ayana 在模型会话启动时自动连接 MCP，并绑定当前事件数据库。每个会话按自身权限使用工具，无需在监控接入中另行配置。"),
+  ]));
 }
 
 async function settingsProfile(context) {
@@ -413,55 +419,59 @@ async function settingsConnections(context) {
   const reply = await api("/api/settings/global"); if (!context.active()) return;
   if (!reply?.ok) throw new Error("connections_unavailable");
   context.root.innerHTML = "";
-  context.root.appendChild(settingsDescription("集中管理监控与通知连接。资源、事件、消息记录和发送队列继续保留在工作台。"));
-  const card = settingsCard("监控连接"), prom = settingsInput("settings-prometheus-url", "url", reply.prometheus_url || ""), am = settingsInput("settings-alertmanager-url", "url", reply.alertmanager_url || "");
+  context.root.appendChild(settingsDescription("配置 Prometheus 与 Alertmanager，接入指标和告警。通知发送目标请在左侧「通知渠道」中管理。"));
+  const card = settingsCard("监控接入"), prom = settingsInput("settings-prometheus-url", "url", reply.prometheus_url || ""), am = settingsInput("settings-alertmanager-url", "url", reply.alertmanager_url || "");
   card.appendChild(settingsField("Prometheus 地址", prom)); card.appendChild(settingsField("Alertmanager 地址", am));
   card.appendChild(el("p", { class: "settings-status", text: reply.prometheus_ok ? "Prometheus 连接正常" : reply.prometheus_error || "Prometheus 暂未连接，请检查服务状态和地址。" }));
-  let monitorDirty = false, notificationDirty = false;
-  const markConnectionDirty = () => context.setDirty(monitorDirty || notificationDirty);
-  [prom, am].forEach((input) => input.addEventListener("input", () => { monitorDirty = true; markConnectionDirty(); }));
+  [prom, am].forEach((input) => input.addEventListener("input", () => context.setDirty(true)));
   context.root.appendChild(card);
-  context.button("保存连接", async () => {
-    if (notificationDirty) { context.feedback("通知渠道还有未保存的输入，请先添加渠道或放弃该草稿后保存监控连接。", true); return; }
+  context.button("保存监控接入", async () => {
     context.setBusy(true);
+    prom.disabled = true; am.disabled = true;
     try {
       const saved = await api("/api/settings/global", { method: "POST", body: JSON.stringify({ prometheus_url: prom.value.trim(), alertmanager_url: am.value.trim() }) });
       if (!context.active()) return;
       if (!saved?.ok) { context.feedback(saved?.message || "保存失败。", true); return; }
-      context.setDirty(false); await renderSettingsSection("connections", true); settingsFeedback("连接配置已保存。");
-    } finally { context.setBusy(false); }
+      context.setDirty(false);
+      const refreshed = renderSettingsSection("connections", true), refreshedGeneration = settingsState.generation;
+      await refreshed;
+      if (settingsState.opened && settingsState.page === "connections" && settingsState.generation === refreshedGeneration) settingsFeedback("监控接入已保存。");
+    } finally { prom.disabled = false; am.disabled = false; context.setBusy(false); }
   }, true);
-  context.button("检测已保存连接", () => renderSettingsSection("connections"));
-  const mcp = settingsCard("MCP", "Ayana 在模型会话启动时自动注入 MCP，绑定当前事件数据库。调查和决策会话使用受限工具权限。" );
-  mcp.appendChild(el("span", { class: "settings-badge", text: "按会话连接" })); context.root.appendChild(mcp);
-  const notifications = el("details", { class: "settings-detail" });
-  notifications.appendChild(el("summary", { text: "通知渠道" }));
-  notifications.appendChild(settingsDescription("渠道配置保留现有凭据保护。发送测试会向目标真实发送消息，请按需操作。"));
-  const host = el("div", { class: "settings-notification-host" }); notifications.appendChild(host); context.root.appendChild(notifications);
-  let channelsLoaded = false;
-  notifications.addEventListener("toggle", async () => {
-    if (!notifications.open || !context.active() || channelsLoaded) return;
-    channelsLoaded = true;
-    const node = $("settings-notification-content");
-    if (node && node.parentNode !== host) {
-      host.appendChild(node);
-      const edited = () => { notificationDirty = true; markConnectionDirty(); };
-      node.addEventListener("input", edited); node.addEventListener("change", edited);
-      settingsState.notificationScope = {
-        active: context.active, busy: context.setBusy,
-        saved: () => { notificationDirty = false; markConnectionDirty(); },
-        cleanup: () => { node.removeEventListener("input", edited); node.removeEventListener("change", edited); },
-      };
+  context.button("检测已保存地址", () => renderSettingsSection("connections"));
+}
+
+async function settingsNotifications(context) {
+  context.root.innerHTML = "";
+  context.root.appendChild(settingsDescription("管理告警与消息的发送目标。每个渠道分别保存；发送测试会向已配置的目标实际发送消息。"));
+  const host = el("div", { class: "settings-notification-host" }); context.root.appendChild(host);
+  host.appendChild(settingsDescription("正在加载通知渠道…"));
+  const node = $("settings-notification-content");
+  if (!node) throw new Error("notification_manager_unavailable");
+  context.button("刷新渠道", () => renderSettingsSection("notifications"));
+  try {
+    if (typeof loadNotifyKinds === "function") await loadNotifyKinds();
+    if (!context.active()) return;
+    if (typeof fillNotifyMethods === "function") fillNotifyMethods();
+    if (typeof toggleNotifyKind === "function") toggleNotifyKind();
+    host.innerHTML = ""; host.appendChild(node);
+    const edited = () => context.setDirty(true, "通知渠道还有未保存的输入，离开后草稿会被清除。");
+    node.addEventListener("input", edited); node.addEventListener("change", edited);
+    settingsState.notificationScope = {
+      active: context.active, busy: context.setBusy,
+      saved: () => context.setDirty(false),
+      cleanup: () => { node.removeEventListener("input", edited); node.removeEventListener("change", edited); },
+    };
+    if (typeof loadAibotStatus === "function") await loadAibotStatus();
+    if (!context.active()) return;
+    if (typeof loadNotifyChannels === "function") await loadNotifyChannels({ active: context.active });
+  } catch (_) {
+    if (!context.active()) return;
+    if (!host.contains(node)) {
+      host.innerHTML = ""; host.appendChild(settingsDescription("通知渠道暂时无法加载，请刷新重试。"));
     }
-    try {
-      if (typeof loadNotifyKinds === "function") await loadNotifyKinds();
-      if (!context.active()) return;
-      if (typeof fillNotifyMethods === "function") fillNotifyMethods();
-      if (typeof toggleNotifyKind === "function") toggleNotifyKind();
-      if (typeof loadNotifyChannels === "function") await loadNotifyChannels();
-    }
-    catch (_) { channelsLoaded = false; context.feedback("通知渠道暂时无法加载。", true); }
-  });
+    context.feedback("通知渠道暂时无法加载，请刷新重试。", true);
+  }
 }
 
 async function settingsAbout(context) {

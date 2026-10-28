@@ -4,7 +4,8 @@ const state = {
   user: null,
   tab: "overview",
   monitorSub: "metrics",
-  notifySub: "channels",
+  notifySub: "messages",
+  connectionsSub: "hosts",
   incidentsSub: "list",
   assets: [],
   caps: [],
@@ -693,6 +694,7 @@ function currentTabFromHash() {
   const assetM = h.match(/^assets\/(.+)$/);
   if (assetM) return { tab: "overview", focus: assetM[1], assetView: true };
   const m = h.match(/^(overview|incidents|monitor|agent|checks|promconfig|messages|connections|notify|knowledge|permissions|audit)(?:\/(.+))?$/);
+  if (m && m[1] === "notify" && m[2] === "nodewatch") return { tab: "connections", focus: "nodewatch", assetView: false };
   return m ? { tab: m[1], focus: m[2] || "", assetView: false } : { tab: "overview", focus: "", assetView: false };
 }
 
@@ -707,6 +709,11 @@ function setTabHash(tab, focus, assetView) {
 }
 
 function activateTab(tab, focus, assetView) {
+  if (tab === "notify" && focus === "nodewatch") { tab = "connections"; focus = "nodewatch"; }
+  if (tab === "notify" && focus === "channels") {
+    focus = "messages";
+    queueMicrotask(() => { if (typeof openSettings === "function") openSettings("notifications"); });
+  }
   // 旧 hash 兼容：promconfig → 资源-Prometheus，messages → 通知-消息记录，checks → 资源-业务监控
   if (tab === "promconfig") {
     tab = "monitor";
@@ -730,6 +737,8 @@ function activateTab(tab, focus, assetView) {
   document.querySelectorAll(".tab-panel").forEach((p) => p.classList.add("hidden"));
   const panel = $("tab-" + tab);
   if (panel) panel.classList.remove("hidden");
+  if (tab === "connections") setConnectionsSub(focus === "nodewatch" ? "nodewatch" : "hosts", false);
+  if (tab === "notify") { setNotifySub(focus === "outbox" ? "outbox" : "messages"); state.focus = state.notifySub; }
   setTabHash(tab, state.focus, state.assetView);
   refreshTab();
 }
@@ -747,16 +756,40 @@ function setMonitorSub(sub) {
   });
 }
 
+function setConnectionsSub(sub, updateHash = true) {
+  sub = sub === "nodewatch" ? "nodewatch" : "hosts";
+  state.connectionsSub = sub;
+  document.querySelectorAll("#connections-subnav .subtab").forEach((button) => {
+    button.classList.toggle("active", button.dataset.sub === sub);
+    button.setAttribute("aria-selected", String(button.dataset.sub === sub));
+  });
+  ["hosts", "nodewatch"].forEach((key) => {
+    const panel = $("connections-sub-" + key);
+    if (panel) panel.classList.toggle("hidden", key !== sub);
+  });
+  if (state.tab === "connections") {
+    state.focus = sub === "hosts" ? "" : sub;
+    if (updateHash) setTabHash("connections", state.focus, false);
+  }
+}
+
 function setNotifySub(sub) {
-  if (!sub) return;
+  if (sub === "nodewatch") { activateTab("connections", "nodewatch"); return; }
+  if (sub === "channels") {
+    sub = "messages";
+    if (typeof openSettings === "function") openSettings("notifications");
+  }
+  sub = sub === "outbox" ? "outbox" : "messages";
   state.notifySub = sub;
-  document.querySelectorAll("#notify-subnav .subtab").forEach((b) => {
-    b.classList.toggle("active", b.dataset.sub === sub);
+  document.querySelectorAll("#notify-subnav .subtab").forEach((button) => {
+    button.classList.toggle("active", button.dataset.sub === sub);
+    button.setAttribute("aria-selected", String(button.dataset.sub === sub));
   });
-  ["channels", "messages", "outbox", "nodewatch"].forEach((k) => {
-    const el = document.getElementById("notify-sub-" + k);
-    if (el) el.classList.toggle("hidden", k !== sub);
+  ["channels", "messages", "outbox"].forEach((key) => {
+    const panel = $("notify-sub-" + key);
+    if (panel) panel.classList.toggle("hidden", key !== sub);
   });
+  if (state.tab === "notify") { state.focus = sub; setTabHash("notify", sub, false); }
 }
 
 function setIncidentsSub(sub) {
@@ -774,8 +807,13 @@ function setIncidentsSub(sub) {
 document.addEventListener("click", (e) => {
   const t = e.target.closest(".subtab");
   if (!t) return;
-  const nav = t.closest("#monitor-subnav") || t.closest("#notify-subnav") || t.closest("#incidents-subnav");
+  const nav = t.closest("#monitor-subnav") || t.closest("#notify-subnav") || t.closest("#connections-subnav") || t.closest("#incidents-subnav");
   if (!nav) return;
+  if (nav.id === "connections-subnav") {
+    setConnectionsSub(t.dataset.sub);
+    if (t.dataset.sub === "nodewatch") renderNodeWatch(); else renderConnections();
+    return;
+  }
   if (nav.id === "monitor-subnav") setMonitorSub(t.dataset.sub);
   else if (nav.id === "incidents-subnav") {
     setIncidentsSub(t.dataset.sub);
@@ -890,7 +928,9 @@ async function refreshTab() {
     }
     else await renderMonitor();
   }
-  if (state.tab === "connections") await renderConnections();
+  if (state.tab === "connections") {
+    if (state.connectionsSub === "nodewatch") await renderNodeWatch(); else await renderConnections();
+  }
   if (state.tab === "agent" && typeof window.renderAgentWorkbench === "function") {
     await window.renderAgentWorkbench();
   }
@@ -1163,7 +1203,7 @@ function buildNodeWatchCard(nw) {
   } else if (!peers.length) {
     card.appendChild(el("p", {
       class: "muted small",
-      text: data.level === "off" ? "尚未开启节点守望，可到「通知 → 节点守望」配对。" : "还没有对端记录，完成配对后会出现在这里。",
+      text: data.level === "off" ? "尚未开启节点守望，可到「连接 → 节点守望」配对。" : "还没有对端记录，完成配对后会出现在这里。",
     }));
   } else {
     peers.forEach((p) => {
@@ -1173,9 +1213,7 @@ function buildNodeWatchCard(nw) {
       card.appendChild(el("div", {
         style: "display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--line);cursor:pointer",
         onclick: () => {
-          activateTab("notify", "");
-          const btn = document.querySelector('[data-sub="nodewatch"]');
-          if (btn) btn.click();
+          activateTab("connections", "nodewatch");
         },
       }, [
         el("div", {}, [
@@ -2827,49 +2865,72 @@ function showChannelResult(assetId, out, role) {
 }
 
 async function renderConnections() {
+  const view = renderConnections.view || (renderConnections.view = { sequence: 0, hosts: new Map(), credentials: new Map() });
+  const sequence = ++view.sequence;
+  const feedback = $("connections-load-error");
+  const preserveSelect = (id, options) => {
+    const input = $(id), value = input && input.value;
+    fillSelect(id, options);
+    if (input && options.some((option) => option.v === value)) input.value = value;
+  };
   const [assetRes, credRes, roleRes] = await Promise.all([
-    api("/api/assets"),
+    api("/api/assets").catch(() => ({ ok: false })),
     api("/api/ssh/credentials").catch(() => ({ ok: false })),
     api("/api/ssh/roles").catch(() => ({ ok: false })),
   ]);
+  if (sequence !== view.sequence) return;
+  const errors = [];
+  if (!assetRes?.ok) errors.push("主机列表暂时无法加载，已保留当前列表。");
+  if (!credRes?.ok) errors.push("凭据库暂时无法加载，已保留当前列表。");
+  if (!roleRes?.ok) errors.push("连接角色暂时无法加载。");
+  if (feedback) { feedback.textContent = errors.join(" "); feedback.classList.toggle("hidden", !errors.length); }
   const hosts = (assetRes && assetRes.ok && assetRes.assets) || [];
-  const creds = (credRes && credRes.ok && credRes.credentials) || [];
-  const roles = (roleRes && roleRes.ok && roleRes.roles) || [
+  if (credRes?.ok) view.credentialsSnapshot = credRes.credentials || [];
+  const creds = view.credentialsSnapshot || [];
+  if (roleRes?.ok) view.rolesSnapshot = roleRes.roles || [];
+  const roles = view.rolesSnapshot || [
     { name: "write", kind: "write", label: "可执行" },
     { name: "read", kind: "read", label: "只读" },
   ];
 
-  fillSelect("host-cred", [{ v: "", t: "（无）" }, ...creds.map((c) => ({ v: c.id, t: credLabel(c) }))]);
-  fillSelect("host-role", roles.map((r) => ({
+  if (credRes?.ok) preserveSelect("host-cred", [{ v: "", t: "（无）" }, ...creds.map((c) => ({ v: c.id, t: credLabel(c) }))]);
+  if (roleRes?.ok) preserveSelect("host-role", roles.map((r) => ({
     v: r.name,
     t: `${r.name} · ${r.label || r.kind}`,
   })));
-  fillSelect("ssh-test-asset", hosts.map((a) => ({ v: a.id, t: a.id + " / " + (a.display_name || "") })));
-  fillSelect("ssh-test-role", roles.map((r) => ({ v: r.name, t: `${r.name} (${r.kind})` })));
+  if (assetRes?.ok) preserveSelect("ssh-test-asset", hosts.map((a) => ({ v: a.id, t: a.id + " / " + (a.display_name || "") })));
+  if (roleRes?.ok) preserveSelect("ssh-test-role", roles.map((r) => ({ v: r.name, t: `${r.name} (${r.kind})` })));
 
   // ---- host list ----
   const box = $("host-list");
+  const hostCount = $("host-list-count"); if (hostCount && assetRes?.ok) hostCount.textContent = String(hosts.length);
+  if (box && assetRes?.ok) {
+  box.querySelectorAll("details").forEach((row) => { if (row.dataset.assetId) view.hosts.set(row.dataset.assetId, row.open); });
   box.innerHTML = "";
   if (!hosts.length) {
-    box.appendChild(el("p", { class: "muted small", text: "还没有主机。在上方「添加主机」填写连接信息。" }));
+    box.appendChild(el("p", { class: "muted small", text: "还没有主机，添加后可在这里管理连接。" }));
+    box.appendChild(el("button", { type: "button", class: "btn primary", text: "添加第一台主机", onclick: () => {
+      const panel = $("host-add-panel"); if (panel) { panel.open = true; panel.scrollIntoView({ block: "start", behavior: "smooth" }); }
+      $("host-id")?.focus();
+    } }));
   } else {
     hosts.forEach((a) => {
       const eps = a.ssh_endpoints || [];
       const writeEp = eps.find((e) => e.role === "write") || eps[0];
-      const card = el("div", {
-        style: "border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:10px",
-      });
-      const head = el("div", {
-        style: "display:flex;align-items:center;gap:10px;flex-wrap:wrap",
-      }, [
-        el("span", { text: a.id, style: "font-weight:600;font-size:15px" }),
-        el("span", { text: a.display_name || "", class: "muted small" }),
-        hostStatusBadge(writeEp),
-        el("span", {
-          class: "badge " + (a.enabled ? "ok" : "bad"),
-          text: a.enabled ? "启用" : "停用",
-        }),
-        el("div", { style: "flex:1" }),
+      const card = el("details", { class: "connection-row" });
+      card.dataset.assetId = a.id;
+      card.open = view.hosts.get(a.id) === true;
+      card.addEventListener("toggle", () => view.hosts.set(a.id, card.open));
+      const head = el("summary", { class: "connection-row-head" }, [
+        el("div", { class: "connection-title" }, [
+          el("span", { text: a.display_name || a.id, class: "connection-row-name" }),
+          el("span", { text: a.display_name && a.display_name !== a.id ? a.id : "", class: "muted small" }),
+        ]),
+        el("span", { class: "connection-row-meta", text: writeEp ? `${writeEp.username}@${writeEp.host}:${writeEp.port}` : "未配置 SSH" }),
+        el("div", { class: "connection-summary-status" }, [hostStatusBadge(writeEp), badge(a.enabled ? "已启用" : "已停用", a.enabled ? "ok" : "dim")]),
+      ]);
+      card.appendChild(head);
+      const tools = el("div", { class: "connection-actions" }, [
         el("button", {
           class: "btn small", text: "测试",
           onclick: async () => {
@@ -2880,10 +2941,11 @@ async function renderConnections() {
         el("button", {
           class: "btn small", text: a.enabled ? "停用" : "启用",
           onclick: async () => {
-            await api(`/api/assets/${a.id}/update`, {
+            const result = await api(`/api/assets/${a.id}/update`, {
               method: "POST",
               body: JSON.stringify({ enabled: !a.enabled }),
-            });
+            }).catch(() => ({ ok: false, error: "请求失败，请稍后重试。" }));
+            if (!result.ok) { showModal("操作失败", [el("p", { text: result.hint || result.error || "主机状态未保存，请重试。" })]); return; }
             renderConnections();
           },
         }),
@@ -2891,15 +2953,13 @@ async function renderConnections() {
           class: "btn danger small", text: "删除",
           onclick: async () => {
             if (!confirm(`删除主机 ${a.id}？会一并删除其对象与 SSH 端点。`)) return;
-            const r = await api(`/api/assets/${a.id}`, { method: "DELETE" });
-            if (!r.ok) showModal("删除失败", [el("pre", { text: JSON.stringify(r, null, 2) })]);
+            const r = await api(`/api/assets/${a.id}`, { method: "DELETE" }).catch(() => ({ ok: false, error: "请求失败，请稍后重试。" }));
+            if (!r.ok) { showModal("删除失败", [el("p", { text: r.hint || r.error || "主机未删除，请重试。" })]); return; }
             renderConnections();
           },
         }),
       ]);
-      card.appendChild(head);
-
-      const body = el("div", { style: "margin-top:10px;display:flex;flex-direction:column;gap:8px" });
+      const body = el("div", { class: "connection-row-body" });
       if (writeEp) {
         const credId = writeEp.credential_id || "";
         const cred = creds.find((c) => c.id === credId);
@@ -2998,31 +3058,7 @@ async function renderConnections() {
                 kids.push(el("p", { class: "muted small", text: "已安装的公钥：" }));
                 kids.push(el("pre", { class: "small", text: r.public_key }));
                 if (!r.deleted_password) {
-                  kids.push(el("button", {
-                    class: "btn small danger", text: "删除密码凭据",
-                    style: "margin-top:10px",
-                    onclick: async () => {
-                      if (!confirm("确定删除该主机的密码凭据？删除后只能用密钥登录。")) return;
-                      const list = await api("/api/ssh/credentials");
-                      const pw = (list.credentials || []).filter((c) => c.kind === "password");
-                      if (!pw.length) {
-                        showModal("提示", [el("p", { text: "凭据库中没有密码凭据。" })]);
-                        return;
-                      }
-                      const names = pw.map((c, i) => `${i + 1}. ${c.name || c.id}`).join("\n");
-                      const pick = prompt(`删除哪一个密码凭据？输入序号：\n${names}`, "1");
-                      const idx = parseInt(pick || "0", 10) - 1;
-                      if (idx < 0 || idx >= pw.length) return;
-                      const del = await api("/api/ssh/credentials", {
-                        method: "DELETE",
-                        body: JSON.stringify({ id: pw[idx].id }),
-                      });
-                      showModal(del.ok ? "已删除" : "删除失败", [
-                        el("p", { text: del.ok ? "密码凭据已删除，当前为密钥登录。" : (del.error || "") }),
-                      ]);
-                      renderConnections();
-                    },
-                  }));
+                  kids.push(el("p", { class: "muted small", text: "原密码凭据已保留。请先核对其他连接是否仍在使用，再到凭据库处理。" }));
                 }
               }
               showModal("改用密钥登录", kids);
@@ -3054,6 +3090,9 @@ async function renderConnections() {
             },
           }),
         ]);
+        if (cred && (cred.kind === "private_key" || cred.kind === "key")) {
+          Array.from(actions.querySelectorAll("button")).filter((button) => ["改用密钥登录", "信任并更换密钥"].includes(button.textContent)).forEach((button) => button.remove());
+        }
         body.appendChild(actions);
       } else {
         body.appendChild(el("div", {
@@ -3096,73 +3135,107 @@ async function renderConnections() {
       if (objs.length) {
         body.appendChild(el("div", { class: "muted small", text: "对象: " + objs.join(" · ") }));
       }
+      body.appendChild(tools);
       card.appendChild(body);
       box.appendChild(card);
     });
   }
 
+  }
+
   // ---- credentials list ----
   const cbox = $("ssh-creds");
+  const credentialCount = $("ssh-creds-count"); if (credentialCount && credRes?.ok) credentialCount.textContent = String(creds.length);
+  if (!cbox || !credRes?.ok) return;
+  cbox.querySelectorAll("details").forEach((row) => { if (row.dataset.credentialId) view.credentials.set(row.dataset.credentialId, row.open); });
   cbox.innerHTML = "";
   if (!creds.length) {
-    cbox.appendChild(el("p", { class: "muted small", text: "凭据库为空。可导入密码/私钥，或生成密钥对。" }));
+    cbox.appendChild(el("p", { class: "muted small", text: "凭据库为空。可导入密码或私钥，也可生成密钥对。" }));
+    cbox.appendChild(el("button", { type: "button", class: "btn", text: "添加凭据", onclick: () => {
+      const panel = $("credential-editor-panel"); if (panel) panel.open = true;
+      $("ssh-cred-name")?.focus();
+    } }));
   } else {
-    const table = el("table");
-    table.appendChild(el("tr", {}, [
-      el("th", { text: "ID" }), el("th", { text: "名称" }), el("th", { text: "类型" }),
-      el("th", { text: "公钥" }), el("th", { text: "操作" }),
-    ]));
-    creds.forEach((c) => {
-      const pub = c.public_key || "";
-      table.appendChild(el("tr", {}, [
-        el("td", { class: "muted small", text: c.id.slice(0, 14) }),
-        el("td", { text: c.name || "-" }),
-        el("td", { text: c.kind }),
-        el("td", {
-          class: "muted small",
-          text: pub ? (pub.slice(0, 28) + "…") : "—",
-          title: pub,
-        }),
-        el("td", {}, [
-          el("button", {
-            class: "btn small", text: "部署公钥",
-            onclick: async () => {
-              if (!pub) { showModal("提示", [el("p", { text: "该凭据没有公钥" })]); return; }
-              const host = prompt("目标主机地址:", "127.0.0.1");
-              if (!host) return;
-              const user = prompt("SSH 用户:", "root");
-              if (!user) return;
-              const port = prompt("端口:", "22") || "22";
-              const r = await api("/api/ssh/credentials/deploy-pubkey", {
-                method: "POST",
-                body: JSON.stringify({
-                  host, port: Number(port), username: user,
-                  public_key: pub, credential_id: c.id,
-                }),
-              });
-              showModal("部署公钥结果", [el("pre", { text: JSON.stringify(r, null, 2) })]);
-            },
-          }),
-          " ",
-          el("button", {
-            class: "btn small", text: "轮换",
-            onclick: async () => {
-              const secret = prompt("输入新的密码或私钥（不显示）:");
-              if (!secret) return;
-              const r = await api("/api/ssh/credentials/rotate", {
-                method: "POST",
-                body: JSON.stringify({ id: c.id, secret }),
-              });
-              showModal("轮换结果", [el("pre", { text: JSON.stringify(r, null, 2) })]);
-              renderConnections();
-            },
-          }),
-        ]),
+    creds.forEach((credential) => {
+      const pub = credential.public_key || "";
+      const row = el("details", { class: "connection-row credential-row" });
+      row.dataset.credentialId = credential.id;
+      row.open = view.credentials.get(credential.id) === true;
+      row.addEventListener("toggle", () => view.credentials.set(credential.id, row.open));
+      row.appendChild(el("summary", { class: "connection-row-head" }, [
+        el("span", { class: "connection-row-name", text: credential.name || "未命名凭据" }),
+        badge(credential.kind === "password" ? "密码" : "密钥", "dim"),
       ]));
+      const content = el("div", { class: "connection-row-body" });
+      content.appendChild(el("p", { class: "muted small", text: "凭据 ID：" + credential.id }));
+      if (pub) { content.appendChild(el("p", { class: "muted small", text: "公钥" })); content.appendChild(el("pre", { class: "credential-public-key", text: pub })); }
+      else content.appendChild(el("p", { class: "muted small", text: "密码已加密保存，不在界面回显。" }));
+      const deploy = el("button", { type: "button", class: "btn small", text: "部署公钥", onclick: () => {
+        if (!pub) return;
+        sshFormModal("部署公钥 · " + (credential.name || credential.id), [
+          { name: "host", label: "目标主机地址", required: true },
+          { name: "username", label: "SSH 用户", value: "root", required: true },
+          { name: "port", label: "端口", value: "22", type: "number" },
+        ], (data) => api("/api/ssh/credentials/deploy-pubkey", { method: "POST", body: JSON.stringify({
+          host: data.host, port: Number(data.port || 22), username: data.username, public_key: pub, credential_id: credential.id,
+        }) }));
+      } });
+      deploy.disabled = !pub;
+      content.appendChild(el("div", { class: "connection-actions" }, [
+        deploy,
+        el("button", { type: "button", class: "btn small", text: "更新凭据", onclick: () => openCredentialRotation(credential) }),
+      ]));
+      row.appendChild(content); cbox.appendChild(row);
     });
-    cbox.appendChild(table);
   }
 }
+
+function openCredentialRotation(credential) {
+  const isPassword = credential.kind === "password";
+  const form = el("form", { class: "connection-editor" });
+  const input = isPassword
+    ? el("input", { type: "password", autocomplete: "new-password", required: "", placeholder: "输入新密码" })
+    : el("textarea", { rows: 6, autocomplete: "off", required: "", placeholder: "粘贴完整私钥 PEM，保留换行" });
+  const label = el("label", {}, [document.createTextNode(isPassword ? "新密码" : "新私钥"), input]);
+  const error = el("p", { class: "error", role: "alert" });
+  const save = el("button", { type: "submit", class: "btn primary", text: "保存凭据" });
+  let pending = false;
+  form.appendChild(label); form.appendChild(error); form.appendChild(save);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (pending || form.isConnected === false || $("modal")?.classList.contains("hidden")) return;
+    const secret = input.value || "";
+    if (!secret) { error.textContent = isPassword ? "请输入新密码。" : "请粘贴完整私钥。"; return; }
+    pending = true; save.disabled = true; error.textContent = "";
+    try {
+      const result = await api("/api/ssh/credentials/rotate", { method: "POST", body: JSON.stringify({ id: credential.id, secret }) });
+      if (form.isConnected === false || $("modal")?.classList.contains("hidden")) return;
+      if (!result.ok) { error.textContent = result.hint || result.error || "凭据未更新，请重试。"; return; }
+      input.value = "";
+      showModal("凭据已更新", [el("p", { text: "后续连接将使用更新后的凭据。" })]);
+      renderConnections();
+    } catch (_) { if (form.isConnected !== false) error.textContent = "保存失败，原凭据保持不变，请重试。"; }
+    finally { pending = false; save.disabled = false; }
+  });
+  showModal("更新凭据 · " + (credential.name || credential.id), [form]);
+}
+
+on("connections-add-open", "click", () => {
+  setConnectionsSub("hosts");
+  const panel = $("host-add-panel"); if (panel) { panel.open = true; panel.scrollIntoView({ behavior: "smooth", block: "start" }); }
+  $("host-id")?.focus();
+});
+function syncCredentialSecretEditor() {
+  const current = $("ssh-cred-secret"), kind = $("ssh-cred-kind")?.value;
+  if (!current) return;
+  const multiline = kind === "private_key" || kind === "key";
+  if ((current.tagName === "TEXTAREA") === multiline) return;
+  const replacement = multiline
+    ? el("textarea", { id: "ssh-cred-secret", rows: 5, class: "secret-editor", autocomplete: "off", placeholder: "粘贴完整私钥 PEM，保留换行" })
+    : el("input", { id: "ssh-cred-secret", type: "password", autocomplete: "new-password", placeholder: "输入密码" });
+  current.replaceWith(replacement);
+}
+on("ssh-cred-kind", "change", syncCredentialSecretEditor);
 
 on("host-auth", "change", () => {
   const m = $("host-auth").value;
@@ -3277,6 +3350,7 @@ on("ssh-test-btn", "click", async () => {
   const assetId = $("ssh-test-asset").value;
   const role = $("ssh-test-role").value;
   const r = await testHostChannel(assetId, role);
+  const summary = $("ssh-test-summary"); if (summary) { summary.textContent = r.ok ? "连接测试通过。" : (r.hint || r.detail || "连接测试未通过。"); summary.className = r.ok ? "workspace-feedback success" : "workspace-feedback error"; }
   out.textContent = `${r.ok ? "通" : "不通"} · ${r.channel} · ${r.hint || r.detail || ""}`;
 });
 
@@ -3654,6 +3728,7 @@ function sshFormModal(title, fields, onSubmit) {
               value: f.value == null ? "" : String(f.value),
             });
     if (f.value != null && f.type !== "password" && f.type !== "textarea") input.value = String(f.value);
+    if (f.required) input.required = true;
     inputs[f.name] = input;
     const lab = el("label", { style: "display:block;margin:8px 0 4px;font-size:12px;color:var(--dim)" }, [
       document.createTextNode(f.label + (f.required ? " *" : "")),
@@ -3672,7 +3747,10 @@ function sshFormModal(title, fields, onSubmit) {
       err.textContent = "";
       const data = {};
       for (const k of Object.keys(inputs)) {
-        data[k] = (inputs[k].value || "").trim();
+        const field = fields.find((entry) => entry.name === k);
+        const raw = inputs[k].value || "";
+        data[k] = field && (field.type === "password" || field.type === "textarea") ? raw : raw.trim();
+        if (field?.required && !raw.trim()) { err.textContent = "请填写" + field.label; return; }
       }
       okBtn.disabled = true;
       try {
@@ -4526,12 +4604,7 @@ function toggleNotifyKind() {
 }
 
 async function renderNotify() {
-  await loadNotifyKinds();
-  fillNotifyMethods();
-  toggleNotifyKind();
-  await loadNotifyChannels();
-  await loadNotifyOutbox();
-  await loadAibotStatus();
+  if (state.notifySub === "outbox") await loadNotifyOutbox();
 }
 
 async function loadAibotStatus() {
@@ -4661,11 +4734,15 @@ async function openAibotAdmins(ch) {
   showModal("管理员 · " + ch.name, [wrap]);
 }
 
-async function loadNotifyChannels() {
+async function loadNotifyChannels(options = {}) {
+  const active = typeof options.active === "function" ? options.active : () => true;
+  const request = (loadNotifyChannels.request || 0) + 1;
+  loadNotifyChannels.request = request;
   const root = $("notify-list");
-  if (!root) return;
+  if (!root || !active()) return;
   root.innerHTML = '<p class="muted small">加载中…</p>';
-  const res = await api("/api/notify/channels");
+  const res = await api("/api/notify/channels").catch(() => ({ ok: false, error: "通知渠道暂时无法加载，请重试。" }));
+  if (!active() || request !== loadNotifyChannels.request || $("notify-list") !== root) return;
   if (!res.ok) {
     root.innerHTML = "";
     root.appendChild(el("p", { class: "error", text: res.error || "加载失败" }));
@@ -4673,10 +4750,12 @@ async function loadNotifyChannels() {
   }
   root.innerHTML = "";
   const chans = res.channels || [];
+  const count = $("notify-channel-count"); if (count) count.textContent = String(chans.length);
   if (!chans.length) {
+    const editor = $("notify-editor-panel"); if (editor) editor.open = true;
     root.appendChild(el("p", {
       class: "muted small",
-      text: "还没有通知渠道。请在上方选择消息平台并添加（全新安装不会自动创建渠道）。",
+      text: "还没有通知渠道。展开「添加通知渠道」开始配置。",
     }));
     return;
   }
@@ -6325,59 +6404,87 @@ async function prepareCheckSubmit() {
 on("chk-add", "click", prepareCheckSubmit);
 
 /* ---- 节点守望配对 ---- */
-function nwErr(msg) {
-  const el = $("nw-err");
-  if (el) el.textContent = msg || "";
+function nwErr(msg, isError = true) {
+  const node = $("nw-err");
+  if (!node) return;
+  node.textContent = msg || "";
+  node.classList.toggle("error", !!msg && isError);
+  node.classList.toggle("success", !!msg && !isError);
+  node.setAttribute("role", msg && isError ? "alert" : "status");
 }
 
 function nwShowRole() {
-  const role = ($("nw-role") && $("nw-role").value) || "recv";
-  const r = $("nw-recv-box");
-  const s = $("nw-send-box");
-  if (r) r.classList.toggle("hidden", role !== "recv");
-  if (s) s.classList.toggle("hidden", role !== "send");
+  const role = $("nw-role")?.value || "recv";
+  $("nw-recv-box")?.classList.toggle("hidden", role !== "recv");
+  $("nw-send-box")?.classList.toggle("hidden", role !== "send");
 }
 
-async function renderNodeWatch() {
-  nwErr("");
-  nwShowRole();
-  try {
-    const res = await api("/api/node-watch/status");
-    const st = (res && res.status) || {};
-    const intervalInput = $("nw-interval");
-    if (intervalInput && !intervalInput.dataset.touched && st.send && st.send.interval_sec != null) {
-      intervalInput.value = String(st.send.interval_sec);
-    }
-    const el = $("nw-status");
-    if (el) {
-      el.textContent = JSON.stringify(
-        {
-          send: st.send,
-          recv: {
-            enabled: st.recv && st.recv.enabled,
-            allowed_nodes: st.recv && st.recv.allowed_nodes,
-            timeout_sec: st.recv && st.recv.timeout_sec,
-            fp: st.recv && st.recv.fp,
-            public_base_url: st.recv && st.recv.public_base_url,
-            probes_configured: st.recv && st.recv.probes_configured,
-          },
-          peers: (st.peers || []).map((p) => ({
-            node_id: p.node_id,
-            status: p.status,
-            last_seen_at: p.last_seen_at,
-            incident_open: p.incident_open,
-          })),
-        },
-        null,
-        2
-      );
-    }
-  } catch (e) {
-    nwErr(String(e.message || e));
+function renderNodeWatchSummary(status) {
+  const root = $("nw-status-summary");
+  if (!root) return;
+  root.innerHTML = "";
+  const send = status.send || {}, recv = status.recv || {}, peers = status.peers || [];
+  function card(title, label, color, fields) {
+    const box = el("div", { class: "nodewatch-status-card" });
+    box.appendChild(el("h3", { text: title }));
+    box.appendChild(badge(label, color));
+    const list = el("dl");
+    fields.forEach(([name, value]) => { list.appendChild(el("dt", { text: name })); list.appendChild(el("dd", { text: value })); });
+    box.appendChild(list); root.appendChild(box);
+  }
+  const last = send.last_send || {};
+  card("发送心跳", !send.enabled ? "未启用" : last.ok === true ? "发送正常" : last.ok === false ? "发送失败" : "等待发送",
+    !send.enabled ? "dim" : last.ok === true ? "ok" : last.ok === false ? "bad" : "warn", [
+      ["本机节点", send.node_id || "未配置"], ["目标地址", send.target_url || "未配置"],
+      ["心跳间隔", send.interval_sec != null ? `${send.interval_sec} 秒` : "未设置"],
+      ["最近发送", last.at ? fmtTime(last.at) : "尚未发送"],
+    ]);
+  const allowed = recv.allowed_nodes || [];
+  card("接收心跳", !recv.enabled ? "未启用" : allowed.length ? "接收已启用" : "等待配对", !recv.enabled ? "dim" : allowed.length ? "ok" : "warn", [
+    ["允许的节点", allowed.length ? allowed.join("、") : "尚未配对"],
+    ["失联超时", recv.timeout_sec != null ? `${recv.timeout_sec} 秒` : "未设置"],
+    ["已观测节点", `${peers.length} 个`],
+    ["对外地址", recv.public_base_url || "按当前地址推断"],
+  ]);
+  if (peers.length) {
+    const box = el("div", { class: "nodewatch-status-card nodewatch-peers" });
+    box.appendChild(el("h3", { text: "对端状态" }));
+    peers.forEach((peer) => {
+      const cls = peer.status === "online" ? "ok" : peer.status === "down" || peer.incident_open ? "bad" : "warn";
+      const label = peer.status === "online" ? "在线" : peer.status === "down" ? "失联" : peer.status === "suspect" ? "待确认" : "等待心跳";
+      box.appendChild(el("div", { class: "nodewatch-peer" }, [
+        el("span", { text: peer.node_id || "未命名节点" }), badge(label, cls),
+        el("span", { class: "muted small", text: peer.last_seen_at ? "最近心跳 " + fmtTime(peer.last_seen_at) : "尚未收到心跳" }),
+      ]));
+    }); root.appendChild(box);
   }
 }
 
-on("nw-role", "change", nwShowRole);
+async function renderNodeWatch(options = {}) {
+  if (!options.preserveFeedback) nwErr("");
+  const sequence = (renderNodeWatch.sequence || 0) + 1; renderNodeWatch.sequence = sequence;
+  nwShowRole();
+  try {
+    const res = await api("/api/node-watch/status");
+    if (sequence !== renderNodeWatch.sequence) return;
+    if (!res?.ok) throw new Error(res?.hint || res?.error || "节点状态暂时无法读取，请重试。");
+    const st = res.status || {};
+    const intervalInput = $("nw-interval");
+    if (intervalInput && !intervalInput.dataset.touched && st.send?.interval_sec != null) intervalInput.value = String(st.send.interval_sec);
+    const role = $("nw-role");
+    if (role && !role.dataset.touched) { role.value = st.send?.enabled && !st.recv?.enabled ? "send" : "recv"; nwShowRole(); }
+    renderNodeWatchSummary(st);
+    const output = $("nw-status");
+    if (output) output.textContent = JSON.stringify({
+      send: st.send,
+      recv: { enabled: st.recv?.enabled, allowed_nodes: st.recv?.allowed_nodes, timeout_sec: st.recv?.timeout_sec,
+        fp: st.recv?.fp, public_base_url: st.recv?.public_base_url, probes_configured: st.recv?.probes_configured },
+      peers: (st.peers || []).map((peer) => ({ node_id: peer.node_id, status: peer.status, last_seen_at: peer.last_seen_at, incident_open: peer.incident_open })),
+    }, null, 2);
+  } catch (error) { if (sequence === renderNodeWatch.sequence) nwErr(error.message || "节点状态暂时无法读取，请重试。"); }
+}
+
+on("nw-role", "change", () => { if ($("nw-role")) $("nw-role").dataset.touched = "1"; nwShowRole(); });
 on("nw-refresh", "click", renderNodeWatch);
 on("nw-interval", "input", () => {
   const input = $("nw-interval");
@@ -6392,7 +6499,7 @@ on("nw-save-interval", "click", async () => {
       return;
     }
     const n = Number(raw);
-    if (!Number.isFinite(n) || n < 10) {
+    if (!Number.isInteger(n) || n < 10) {
       nwErr("心跳间隔至少 10 秒");
       return;
     }
@@ -6404,70 +6511,48 @@ on("nw-save-interval", "click", async () => {
       nwErr(res.error || "save_failed");
       return;
     }
-    nwErr(`已保存：心跳间隔 ${res.interval_sec} 秒`);
-    await renderNodeWatch();
+    if ($("nw-interval")?.value.trim() === raw) delete $("nw-interval").dataset.touched;
+    nwErr(`已保存：心跳间隔 ${res.interval_sec} 秒`, false);
+    await renderNodeWatch({ preserveFeedback: true });
   } catch (e) {
     nwErr(String(e.message || e));
   }
 });
-on("nw-gen", "click", async () => {
+async function nwGenerateInvite(rotate) {
+  if (nwGenerateInvite.pending) return;
+  if (rotate && !confirm("轮换密钥会使使用旧密钥的节点配对失效，需要重新配对。确定轮换并生成新邀请？")) return;
+  nwGenerateInvite.pending = true;
+  ["nw-gen", "nw-gen-keep"].forEach((id) => { if ($(id)) $(id).disabled = true; });
   nwErr("");
   try {
-    const body = {
-      node_id: ($("nw-node-id") && $("nw-node-id").value.trim()) || "",
-      url: ($("nw-url") && $("nw-url").value.trim()) || "",
-      rotate: true,
-    };
-    const res = await api("/api/node-watch/invite/generate", {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      nwErr(res.error || "generate_failed");
-      return;
-    }
-    $("nw-invite-box").classList.remove("hidden");
-    $("nw-invite").value = res.invite || "";
-    $("nw-fp").textContent = res.fp || "";
-  } catch (e) {
-    nwErr(String(e.message || e));
-  }
-});
-on("nw-gen-keep", "click", async () => {
-  nwErr("");
-  try {
-    const body = {
-      node_id: ($("nw-node-id") && $("nw-node-id").value.trim()) || "",
-      url: ($("nw-url") && $("nw-url").value.trim()) || "",
-      rotate: false,
-    };
-    const res = await api("/api/node-watch/invite/generate", {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      nwErr(res.error || "generate_failed");
-      return;
-    }
-    $("nw-invite-box").classList.remove("hidden");
-    $("nw-invite").value = res.invite || "";
-    $("nw-fp").textContent = res.fp || "";
-  } catch (e) {
-    nwErr(String(e.message || e));
-  }
-});
+    const result = await api("/api/node-watch/invite/generate", { method: "POST", body: JSON.stringify({
+      node_id: $("nw-node-id")?.value.trim() || "", url: $("nw-url")?.value.trim() || "", rotate,
+    }) });
+    if (!result.ok) { nwErr(result.hint || result.error || "邀请未生成，请重试。"); return; }
+    $("nw-invite-box")?.classList.remove("hidden");
+    if ($("nw-invite")) $("nw-invite").value = result.invite || "";
+    if ($("nw-fp")) $("nw-fp").textContent = result.fp || "";
+    nwErr(rotate ? "新邀请已生成，请使用新指纹重新配对。" : "配对邀请已生成，请在有效期内完成配对。", false);
+    await renderNodeWatch({ preserveFeedback: true });
+  } catch (_) { nwErr("邀请暂时无法生成，请稍后重试。"); }
+  finally { nwGenerateInvite.pending = false; ["nw-gen", "nw-gen-keep"].forEach((id) => { if ($(id)) $(id).disabled = false; }); }
+}
+on("nw-gen", "click", () => nwGenerateInvite(true));
+on("nw-gen-keep", "click", () => nwGenerateInvite(false));
+
 on("nw-copy", "click", () => {
   const t = $("nw-invite");
   if (t) {
     t.select();
     try {
-      document.execCommand("copy");
-      nwErr("已复制");
+      const copied = document.execCommand("copy");
+      nwErr(copied ? "已复制邀请串" : "复制未完成，请选中邀请串手动复制。", !copied);
     } catch (e) {
       nwErr("请手动复制");
     }
   }
 });
+on("nw-paste", "input", () => { $("nw-parse-box")?.classList.add("hidden"); if ($("nw-p-fp-in")) $("nw-p-fp-in").value = ""; });
 on("nw-parse", "click", async () => {
   nwErr("");
   try {
@@ -6476,6 +6561,7 @@ on("nw-parse", "click", async () => {
       method: "POST",
       body: JSON.stringify({ invite }),
     });
+    if (($("nw-paste")?.value || "") !== invite) return;
     if (!res.ok) {
       nwErr(res.error || "parse_failed");
       return;
@@ -6484,7 +6570,7 @@ on("nw-parse", "click", async () => {
     $("nw-p-url").textContent = res.url || "";
     $("nw-p-node").textContent = res.node_id || "";
     $("nw-p-fp").textContent = res.fp || "";
-    $("nw-p-fp-in").value = res.fp || "";
+    $("nw-p-fp-in").value = "";
   } catch (e) {
     nwErr(String(e.message || e));
   }
@@ -6495,6 +6581,8 @@ on("nw-apply", "click", async () => {
     const invite = ($("nw-paste") && $("nw-paste").value) || "";
     const fp = ($("nw-p-fp-in") && $("nw-p-fp-in").value.trim()) || "";
     const intervalRaw = ($("nw-interval") && $("nw-interval").value.trim()) || "";
+    if (!invite || $("nw-parse-box")?.classList.contains("hidden")) { nwErr("请先解析配对邀请。"); return; }
+    if (!fp || fp !== ($("nw-p-fp")?.textContent || "").trim()) { nwErr("指纹不匹配，请与接收端核对后手动输入。"); return; }
     const body = { invite, fp };
     if (intervalRaw) body.interval_sec = Number(intervalRaw);
     const res = await api("/api/node-watch/invite/apply", {
@@ -6505,8 +6593,8 @@ on("nw-apply", "click", async () => {
       nwErr(res.error || "apply_failed");
       return;
     }
-    nwErr("已保存并启用发送");
-    await renderNodeWatch();
+    nwErr("已保存并启用发送", false);
+    await renderNodeWatch({ preserveFeedback: true });
   } catch (e) {
     nwErr(String(e.message || e));
   }

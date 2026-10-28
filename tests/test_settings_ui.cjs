@@ -219,13 +219,28 @@ test("settings opens directly on the model form and stays in one window", async 
   assert.equal(env.document.querySelectorAll("#settings-section-title").length,1);
 });
 
+test("selected settings navigation stays visible without moving keyboard focus", async () => {
+  const env=environment();await env.run("openSettings('profile')");
+  const focused=env.document.activeElement,scrolled=[];
+  env.node("settings-nav").querySelectorAll("button").forEach(button=>{
+    button.scrollIntoView=options=>scrolled.push({id:button.id,block:options.block,inline:options.inline,current:button.getAttribute("aria-current")});
+  });
+  await env.run("renderSettingsSection('notifications')");
+  await env.run("renderSettingsSection('connections')");
+  assert.deepEqual(scrolled,[
+    {id:"settings-nav-notifications",block:"nearest",inline:"nearest",current:"page"},
+    {id:"settings-nav-connections",block:"nearest",inline:"nearest",current:"page"},
+  ]);
+  assert.equal(env.document.activeElement,focused);
+});
+
 test("nonadministrators cannot open model or system controls", async () => {
   const env=environment(undefined,{user:{is_admin:false}});await env.run("openSettings('model')");
   assert.equal(env.modelCalls.length,0);
   const nav=env.node("settings-nav").textContent;
   assert.ok(nav.includes("个人资料"));
   assert.ok(nav.includes("双重验证"));
-  for(const caption of ["模型","提示词","技能","系统连接"])assert.ok(!nav.includes(caption),caption);
+  for(const caption of ["模型","提示词","技能","监控接入","通知渠道"])assert.ok(!nav.includes(caption),caption);
   assert.equal(env.calls.filter(call=>call.url.includes("/mimo/provider")).length,0);
 });
 
@@ -464,9 +479,7 @@ test("saving the autonomous model does not discard an unsaved auxiliary-model dr
 test("notification configuration moves the original nodes and returns them without duplicate IDs", async () => {
   const env=environment(),original=env.node("settings-notification-content"),name=env.node("notify-name");
   let edits=0;name.addEventListener("input",()=>edits++);name.value="draft channel name";
-  await env.run("openSettings('connections')");
-  const details=env.node("settings-content").querySelectorAll("details").find(node=>node.querySelector("summary")?.textContent==="通知渠道");
-  details.open=true;await details.dispatch("toggle");
+  await env.run("openSettings('notifications')");
   assert.ok(env.node("settings-content").contains(original));assert.equal(env.node("notify-name"),name);
   await name.dispatch("input");assert.equal(edits,1);assert.equal(env.run("settingsState.dirty"),true);
   await env.input("notify-hook-token","dummy-private-notification-token");
@@ -484,7 +497,7 @@ test("notification configuration moves the original nodes and returns them witho
 
 test("repeated section changes do not accumulate save buttons or duplicate section titles", async () => {
   const env=environment();await env.run("openSettings('profile')");
-  for(const page of ["connections","about","prompts","model","profile","model"]){
+  for(const page of ["connections","notifications","about","prompts","model","profile","model"]){
     await env.run(`renderSettingsSection('${page}')`);
     assert.equal(env.document.querySelectorAll("#settings-section-title").length,1);
     assert.equal(env.document.querySelectorAll("#settings-actions").length,1);
@@ -508,32 +521,116 @@ test("a busy operation blocks logout as well as closing settings", async () => {
   assert.equal(env.run("state.user.username"),"admin");assert.equal(env.node("settings-dialog").classList.contains("hidden"),false);
 });
 
-test("monitor save explicitly blocks while a separate notification draft is unsaved", async () => {
-  const env=environment();await env.run("openSettings('connections')");
-  const details=env.node("settings-content").querySelectorAll("details").find(node=>node.querySelector("summary")?.textContent==="通知渠道");
-  details.open=true;await details.dispatch("toggle");await env.input("notify-name","not saved channel");await env.input("notify-hook-token","dummy-notification-secret");
-  await env.input("settings-prometheus-url","http://127.0.0.1:9191");await env.button("保存连接","settings-actions").click();
+test("notification settings has its own navigation and the workbench shortcut opens it directly", async () => {
+  const env=environment(),original=env.node("settings-notification-content");
+  env.run("var notifyLoads=0;loadNotifyChannels=async(options)=>{if(!options.active())throw new Error('inactive');notifyLoads++;};");
+  await env.node("notify-settings-open").click();
+  assert.equal(env.run("settingsState.page"),"notifications");
+  assert.equal(env.node("settings-section-title").textContent,"通知渠道");
+  assert.equal(env.node("settings-nav-notifications").getAttribute("aria-current"),"page");
+  assert.ok(env.node("settings-nav-connections").textContent.includes("监控接入"));
+  assert.ok(env.node("settings-content").contains(original));assert.equal(env.run("notifyLoads"),1);
+  assert.equal(env.node("settings-prometheus-url"),null);
+  assert.equal(env.calls.filter(call=>call.url==="/api/settings/global").length,0);
+  assert.equal(env.calls.filter(call=>call.method!=="GET").length,0);
+});
+
+test("switching from a notification draft to monitoring asks before discarding and saves only monitoring addresses", async () => {
+  const env=environment();await env.run("openSettings('notifications')");
+  await env.input("notify-name","not saved channel");await env.input("notify-hook-token","dummy-notification-secret");
+  await env.run("renderSettingsSection('connections')");
+  assert.equal(env.run("settingsState.page"),"notifications");
+  await env.button("继续编辑","modal-actions").click();
   assert.equal(env.node("notify-name").value,"not saved channel");assert.equal(env.node("notify-hook-token").value,"dummy-notification-secret");
-  assert.equal(env.run("settingsState.dirty"),true);
-  assert.equal(env.calls.filter(call=>call.body).length,0);
-  assert.ok(env.node("settings-feedback").textContent.includes("通知渠道还有未保存"));
-  env.run("settingsNotificationSaved()");
-  await env.button("保存连接","settings-actions").click();
-  const sent=env.calls.filter(call=>call.body);assert.equal(sent.length,1);assert.equal(sent[0].url,"/api/settings/global");
+  await env.run("renderSettingsSection('connections')");await env.button("放弃修改","modal-actions").click();await flush();
+  assert.equal(env.node("settings-section-title").textContent,"监控接入");
+  assert.equal(env.node("notify-hook-token").value,"");
+  assert.equal(env.node("settings-notification-content").parentElement,env.node("settings-storage"));
+  assert.ok(!env.node("settings-content").textContent.includes("Agent 工具连接"));
+  await env.input("settings-prometheus-url","http://127.0.0.1:9191");
+  await env.button("保存监控接入","settings-actions").click();
+  const sent=env.calls.filter(call=>call.method!=="GET");assert.equal(sent.length,1);assert.equal(sent[0].url,"/api/settings/global");
+  assert.deepEqual(Object.keys(sent[0].body).sort(),["alertmanager_url","prometheus_url"]);
   assert.equal(sent[0].body.prometheus_url,"http://127.0.0.1:9191");assert.equal(env.run("settingsState.dirty"),false);
 });
 
-test("notification save hooks prevent concurrent submits and preserve unsaved monitor fields", async () => {
+test("testing saved monitoring addresses does not silently discard an unsaved address", async () => {
   const env=environment();await env.run("openSettings('connections')");
-  const details=env.node("settings-content").querySelectorAll("details").find(node=>node.querySelector("summary")?.textContent==="通知渠道");
-  details.open=true;await details.dispatch("toggle");await env.input("notify-name","channel");await env.input("settings-prometheus-url","http://127.0.0.1:9191");
+  await env.input("settings-prometheus-url","http://127.0.0.1:9191");
+  const before=env.calls.length;await env.button("检测已保存地址","settings-actions").click();
+  assert.equal(env.calls.length,before);assert.equal(env.node("modal").classList.contains("hidden"),false);
+  await env.button("继续编辑","modal-actions").click();
+  assert.equal(env.node("settings-prometheus-url").value,"http://127.0.0.1:9191");assert.equal(env.run("settingsState.dirty"),true);
+});
+
+test("notification save hooks prevent concurrent submits and settle only the notification draft", async () => {
+  const env=environment();await env.run("openSettings('notifications')");await env.input("notify-name","channel");
   assert.equal(env.run("settingsNotificationSaving(true)"),true);assert.equal(env.run("settingsState.busy"),true);
   assert.equal(env.run("settingsNotificationSaving(true)"),false);
+  await env.run("renderSettingsSection('connections')");assert.equal(env.run("settingsState.page"),"notifications");
   env.run("settingsNotificationSaved();settingsNotificationSaving(false)");
-  assert.equal(env.run("settingsState.busy"),false);assert.equal(env.run("settingsState.dirty"),true);
-  assert.equal(env.node("settings-prometheus-url").value,"http://127.0.0.1:9191");
+  assert.equal(env.run("settingsState.busy"),false);assert.equal(env.run("settingsState.dirty"),false);
   assert.equal(env.calls.filter(call=>call.method!=="GET").length,0);
 });
+
+test("late notification save completion cannot clear a monitoring draft", async () => {
+  const env=environment();await env.run("openSettings('notifications')");env.run("var previousNotificationScope=settingsState.notificationScope;");
+  await env.run("renderSettingsSection('connections')");await env.input("settings-prometheus-url","http://127.0.0.1:9191");
+  env.run("previousNotificationScope.saved();previousNotificationScope.busy(false);");
+  assert.equal(env.run("settingsState.dirty"),true);assert.equal(env.node("settings-prometheus-url").value,"http://127.0.0.1:9191");
+});
+
+test("a stale notification setup response cannot load channels into another settings section", async () => {
+  const pending=deferred(),env=environment();env.context.__pendingNotify=pending;
+  env.run("var notifyStages=[];loadNotifyKinds=()=>__pendingNotify.promise;fillNotifyMethods=()=>notifyStages.push('methods');loadNotifyChannels=async()=>notifyStages.push('channels');");
+  const opening=env.run("openSettings('notifications')");await flush();
+  assert.equal(env.node("settings-notification-content").parentElement,env.node("settings-storage"));
+  assert.ok(env.node("settings-content").textContent.includes("正在加载通知渠道"));
+  await env.run("renderSettingsSection('about')");pending.resolve();await opening;
+  assert.equal(env.run("settingsState.page"),"about");assert.equal(env.run("notifyStages.length"),0);
+  assert.equal(env.node("settings-notification-content").parentElement,env.node("settings-storage"));
+  assert.ok(!env.node("settings-content").textContent.includes("通知渠道暂时无法加载"));
+});
+
+test("notification channel refresh receives the section lifetime and never sends a test message", async () => {
+  const env=environment();env.run("var channelLifetime;loadNotifyChannels=async(options)=>{channelLifetime=options.active;};");
+  await env.run("openSettings('notifications')");assert.equal(env.run("channelLifetime()"),true);
+  await env.button("刷新渠道","settings-actions").click();assert.equal(env.run("channelLifetime()"),true);
+  await env.run("renderSettingsSection('about')");assert.equal(env.run("channelLifetime()"),false);
+  assert.equal(env.calls.filter(call=>call.method!=="GET").length,0);
+});
+
+test("monitoring save freezes its address fields, rejects duplicate clicks and preserves a failed draft", async () => {
+  const pending=deferred(),env=environment(call=>call.url==="/api/settings/global" && call.method==="POST"?pending.promise:undefined);
+  await env.run("openSettings('connections')");await env.input("settings-prometheus-url","http://127.0.0.1:9191");
+  const prom=env.node("settings-prometheus-url"),am=env.node("settings-alertmanager-url"),button=env.button("保存监控接入","settings-actions");
+  const saving=button.click();await flush();assert.equal(prom.disabled,true);assert.equal(am.disabled,true);
+  await button.click();assert.equal(env.calls.filter(call=>call.method==="POST").length,1);
+  pending.resolve({ok:false,message:"连接无法保存"});await saving;
+  assert.equal(prom.disabled,false);assert.equal(am.disabled,false);assert.equal(prom.value,"http://127.0.0.1:9191");
+  assert.equal(env.run("settingsState.dirty"),true);assert.ok(env.node("settings-feedback").textContent.includes("连接无法保存"));
+});
+
+test("a failed notification metadata load reports failure and a direct refresh can retry", async () => {
+  const env=environment();env.run("loadNotifyKinds=async()=>{throw new Error('offline');};");
+  await env.run("openSettings('notifications')");
+  assert.ok(env.node("settings-content").textContent.includes("通知渠道暂时无法加载"));
+  assert.ok(!env.node("settings-content").textContent.includes("正在加载通知渠道"));
+  assert.equal(env.node("settings-notification-content").parentElement,env.node("settings-storage"));
+  env.run("loadNotifyKinds=async()=>{};");await env.button("刷新渠道","settings-actions").click();
+  assert.ok(env.node("settings-content").contains(env.node("settings-notification-content")));
+});
+
+test("a late monitoring refresh cannot put save feedback on another settings page", async () => {
+  const pending=deferred();let reads=0;
+  const env=environment(call=>call.url==="/api/settings/global" && call.method==="GET" && ++reads===2?pending.promise:undefined);
+  await env.run("openSettings('connections')");await env.input("settings-prometheus-url","http://127.0.0.1:9191");
+  const saving=env.button("保存监控接入","settings-actions").click();await flush();
+  await env.run("renderSettingsSection('about')");pending.resolve({ok:true,prometheus_ok:true});await saving;
+  assert.equal(env.run("settingsState.page"),"about");
+  assert.ok(!env.node("settings-feedback").textContent.includes("监控接入已保存"));
+});
+
 
 (async()=>{
   let passed=0;
