@@ -14,10 +14,23 @@
   "alertmanager_webhook_path": "/hooks/alertmanager",
   "admin_qq": "",
   "admin_wecom_users": [],
+  "mimo_bin": "/usr/local/bin/mimo",
+  "mimo_workdir": "/var/lib/ayana/agent-workspace",
+  "agent_runtime_home": "/var/lib/ayana",
+  "agent_runtime_state_dir": "/var/lib/ayana/agent-runtime",
+  "mimo_serve_external": true,
+  "mimo_serve_port": 6290,
+  "agent_tui_enabled": true,
+  "agent_tui_proxy_port": 6291,
+  "auto_investigate": {
+    "enabled": true,
+    "max_concurrent": 2,
+    "timeout_sec": 300,
+    "max_rounds": 3,
+    "cooldown_sec": 60
+  },
   "verify_window_sec": 90,
   "verify_timeout_sec": 300,
-  "required_checks": {},
-  "runbook_rules": [],
   "prometheus_config": {},
   "node_watch": {
     "send": {

@@ -1,10 +1,8 @@
 # Ayana MCP 操作接口（MiMoCode）
 
-最终决议：删除独立智能填表层。MiMoCode 通过下列 MCP 工具直接完成监控配置；
-Web 手动表单仍保留，校验规则与 MCP 一致。
+MiMoCode 在当前原生会话中通过 MCP 调查、执行、验证和维护监控配置。本文说明当前接口的用途与约束，具体字段以运行时发现的工具定义为准。Web 手工表单与 MCP 共享监控配置校验。
 
-权限说明：`host.exec` 与 `config.*` 的实际能力范围由目标机 SSH 账号决定。
-Ayana 不做命令级读写授权；账号组名称只是标签。
+`host.exec` 的主机权限来自所选 SSH 账号及其 sudo 配置。配置工具还会校验参数、可信会话和目标配置权限；Prometheus 文件变更包含校验、备份与失败回滚。账号组名称只是标签。
 
 ## 账号组（SSH 凭据选择）
 
@@ -26,24 +24,27 @@ Ayana 不做命令级读写授权；账号组名称只是标签。
 | `knowledge.query` / `knowledge.get` / `knowledge.upsert` | 知识库 |
 | `asset.list` | 资产列表 |
 | `session.get` / `session.write_ops` / `session.claim` | 会话与写事实 |
-| `ops.constraints` / `ops.loop_status` | 软约束与闭环状态 |
+| `ops.constraints` / `ops.loop_status` | 当前约束、工单事实与明确标记的历史状态 |
 | `config.prom_target_add` / `_update` / `_delete` | Prometheus 采集目标 |
 | `config.check_list` / `_add` / `_update` / `_delete` | SSH 业务检查 |
 
 ## host.exec
 
-```
-host.exec({
-  "asset_id": "nerv",
-  "incident_id": "inc_example",  // 可选；仅接受当前会话已关联、主机和代次匹配的工单
-  "command": "systemctl status frps",
-  "channel": "read" | "write",   // 默认 write；标记调查/执行用途，两者使用同一当前有效账号组
+调用参数示例：
+
+```json
+{
+  "asset_id": "demo-web",
+  "command": "systemctl is-active nginx",
+  "channel": "read",
   "timeout_sec": 12
-})
+}
 ```
 
+`channel` 可选 `read` 或 `write`，默认 `write`。`read` 用于符合只读语法的调查命令；变更使用 `write`，两者使用同一有效账号组。工单处置可增加 `incident_id`，仅接受当前会话已关联、主机和代次匹配的未关闭工单。
+
 返回：`ok`、`output`、`returncode`、`exec_state`（success|failure|unknown）、`action_key`，以及实际使用的 SSH 账号组和账号。
-结果不明必须为 `unknown`，Ayana 如实记录，不假装成功或失败。是否重试由 MiMoCode 自行判断。
+结果不明为 `unknown`，Ayana 如实记录并保留防重复保护。先通过只读检查核对目标，需澄清原始结果时使用写结果核销入口；不能把 unknown 当作已失败后盲目重放。
 
 写操作省略 `incident_id` 时，仅将同一主机仍未关闭的关联工单作为候选。唯一候选自动绑定，多个候选必须明确指定；未关闭工单的关联代次过期时明确拒绝，需先 `session.claim` 刷新关联。
 
@@ -53,9 +54,11 @@ host.exec({
 
 工单写事实和审计包含真实工单、当前代次、会话、账号组及执行结果；同工单同代次的相同操作跨会话共享防重复键。历史 `unknown` 不会因换代、换会话或归档原会话而解除，必须先核对或人工核销。
 
-`ops.loop_status` 展示当前工单事实和明确标为退役的旧调度快照。查询不创建或重置旧记录；旧 `need_human` 不代表当前原生任务状态，也不控制 `host.exec`。执行任务与故障是否恢复分别核对。
+独立操作也有会话台账和审计。`session.write_ops` 按工单查询；独立操作可在 Web 审计按会话查询，不应以某个工单列表为空来推断没有执行记录。
 
-## config.check_add（替代智能填表）
+`ops.loop_status` 分别返回当前工单事实和只读历史快照。历史快照带 `retired=true`、`active=false`，不代表当前原生任务状态。当前执行任务与故障是否恢复分别核对。
+
+## config.check_add
 
 校验与 Web 表单同一契约（`formspec.validate_check_payload`）：
 
@@ -69,34 +72,34 @@ host.exec({
 
 示例——添加 Nginx 服务检查：
 
-```
-config.check_add({
-  "asset_id": "nerv",
+```json
+{
+  "asset_id": "demo-web",
   "kind": "service",
-  "name": "Nerv nginx 服务检查",
+  "name": "Web nginx 服务检查",
   "params": {"unit": "nginx.service"},
   "interval_sec": 60,
   "fail_threshold": 2,
   "severity": "warning"
-})
+}
 ```
 
 校验失败时返回 `issues`（字段级错误）与 `missing`（缺字段），据此修正后重试。
 
-`config.check_update`：传 `id` + 要改的字段。仅 `enabled:false` 可停用旧检查。
+`config.check_update`：传 `id` 和要改的字段；`enabled:false` 停用检查。
 `config.check_delete`：传 `id`。
 
 ## config.prom_target_add
 
-```
-config.prom_target_add({
-  "address": "10.0.0.2:9100",          // 或 "http://host/healthz"
-  "labels": {"instance": "nerv"},
-  "probe": {"exporter": "127.0.0.1:9115", "module": "http_2xx"}  // 仅 HTTP 探测需要
-})
+```json
+{
+  "address": "http://192.0.2.10/healthz",
+  "labels": {"instance": "demo-web"},
+  "probe": {"exporter": "127.0.0.1:9115", "module": "http_2xx"}
+}
 ```
 
-校验+备份+回滚由 Ayana 处理；无需手写 relabel。
+这是 HTTP 探测示例，需准备 Blackbox Exporter。普通采集目标可使用 `192.0.2.10:9100` 并省略 `probe`。校验、备份、失败回滚由 Ayana 处理。
 
 ## 审计
 

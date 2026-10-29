@@ -9,6 +9,8 @@ ayana.out
 ayana-start*.log
 bootstrap-admin.password
 *.egg-info/
+build/
+dist/
 .venv/
 __pycache__/
 *.pyc

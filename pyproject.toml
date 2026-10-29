@@ -1,7 +1,7 @@
 [project]
 name = "ayana"
-version = "0.8.0"
-description = "Ayana — ops closed loop (OneBot v11 reverse WS + Web console)"
+version = "0.8.1"
+description = "Ayana — native agent operations, monitoring and evidence-backed recovery"
 requires-python = ">=3.11"
 dependencies = ["aiohttp>=3.9", "cryptography>=42", "paramiko>=3.4"]
 
@@ -16,4 +16,4 @@ build-backend = "setuptools.build_meta"
 include = ["ayana*"]
 
 [tool.setuptools.package-data]
-ayana = ["static/*"]
+ayana = ["static/*", "static/**/*"]

@@ -1,364 +1,190 @@
-# Ayana 安装手册
+# 安装、升级与回滚
 
-适用于 **Ayana v0.7.4**。本文只描述安装与运维，不含任何真实凭据。
+适用于 **Ayana v0.8.1**。这是项目的安装手册，命令以 Linux 系统安装的默认路径为例。
 
----
+## 1. 准备运行环境
 
-## 1. 环境要求
+| 项目 | 要求 |
+| --- | --- |
+| 操作系统 | 支持 systemd 的 Linux；用户模式可不使用 systemd |
+| Python | 3.11 或更新版本，包含 venv 和 pip |
+| 系统工具 | Bash、tmux、OpenSSH 客户端中的 ssh / ssh-keyscan |
+| MiMoCode | 可运行的兼容 CLI，支持原生会话、回执、恢复和终端接口 |
+| 网络 | 能访问模型接口、受管主机 SSH，以及选择接入的监控或通知服务 |
 
-| 项 | 要求 |
-|----|------|
-| 操作系统 | Linux（推荐）；macOS 可开发用 |
-| Python | 3.11+（推荐 3.12） |
-| 磁盘 | ≥ 1 GB（含日志与 SQLite） |
-| 网络 | 出站 SSH（受管主机）、可访问 Prometheus / Alertmanager（可选） |
-| 权限 | 专用系统用户 `ayana`；**不要**用 root 长期跑应用 |
+例如，Debian / Ubuntu 可以先安装基础工具：
 
-依赖见仓库 `requirements.txt`：`aiohttp`（Web）、`cryptography`（凭据/TOTP 加密，强烈建议）、`paramiko`（Web 终端）。目标机需要 `ssh` / `ssh-keyscan`。
+```bash
+sudo apt-get update
+sudo apt-get install -y python3 python3-venv python3-pip tmux openssh-client curl
+python3 --version
+tmux -V
+ssh -V
+```
 
----
+按 MiMoCode 发行方说明安装兼容 CLI，完整保留其运行依赖。可将可执行入口放在 `/usr/local/bin/mimo`，然后确认：
 
-## 2. 获取代码
+```bash
+/usr/local/bin/mimo --version
+```
+
+系统服务以专用用户 `ayana` 运行。CLI 及其依赖必须对该用户可用；个人用户主目录中的安装通常不适合作为系统服务入口。安装器检查 CLI，但不会替你选择或下载来源不明的 MiMoCode 版本。
+
+Prometheus、Alertmanager 和机器人渠道均按需接入，不是打开 Web 的前提。
+
+## 2. 安装最新正式版本
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wwqjss/Ayana/main/deploy/bootstrap.sh -o ayana-bootstrap.sh
+sudo bash ayana-bootstrap.sh --system --mimo-bin /usr/local/bin/mimo
+```
+
+引导脚本从 GitHub Release 下载安装包，要求存在匹配的 SHA256 校验文件，校验通过后才调用安装器。它不从工作分支拼装生产代码。
+
+需要固定本次版本时：
+
+```bash
+sudo env AYANA_VERSION=v0.8.1 bash ayana-bootstrap.sh --system --mimo-bin /usr/local/bin/mimo
+```
+
+也可在 Release 页面下载版本安装包及同名 `.sha256`，校验并解压，然后从解压目录运行 `deploy/install.sh`。依赖由 `pyproject.toml` 声明，安装器创建独立虚拟环境并执行项目安装；安装包包含完整 Web 静态资源。
+
+安装器保留已有数据和秘密。只有首次安装才生成初始配置和随机秘密。
+
+## 3. 路径和服务
+
+| 内容 | 系统安装默认路径 |
+| --- | --- |
+| 程序与虚拟环境 | `/opt/ayana`、`/opt/ayana/.venv` |
+| 配置与秘密 | `/etc/ayana/config.json`、`/etc/ayana/secrets.json` |
+| 数据库与运行数据 | `/var/lib/ayana` |
+| 原生工作目录 | `/var/lib/ayana/agent-workspace` |
+| 原生运行时状态 | `/var/lib/ayana/agent-runtime` |
+
+安装器生成两个服务：
+
+- `ayana.service`：Web、告警接入和业务后台。
+- `ayana-agent-runtime.service`：MiMoCode 服务和原生会话的独立运行时。
+
+```bash
+sudo systemctl status ayana ayana-agent-runtime --no-pager
+curl --fail http://127.0.0.1:6200/health
+```
+
+`/health` 检查 Web 进程是否正常响应。模型可用性、SSH 连接和业务恢复需要在相应页面分别核对。尚未配置模型时，原生运行时等待配置是正常现象；先登录 Web 完成设置。
+
+## 4. 首次注册与设置
+
+读取一次性注册令牌：
+
+```bash
+sudo cat /var/lib/ayana/setup-admin.token
+```
+
+打开 `http://127.0.0.1:6200`，在注册页面填写令牌，并自行设置管理员用户名和密码。用户名支持 2–32 位字母、数字、点、下划线或连字符；密码至少 10 位。注册成功后令牌失效，可以删除令牌文件：
+
+```bash
+sudo rm -- /var/lib/ayana/setup-admin.token
+```
+
+远程首次设置可先使用 SSH 转发，而不改变默认监听地址：
+
+```bash
+ssh -L 6200:127.0.0.1:6200 your-user@ayana-server
+```
+
+随后在本机浏览器打开上述 Web 地址，依次完成：
+
+1. 用户菜单 → 设置 → 模型：填写 Base URL、模型 ID 和 API Key，执行“保存并验证”。这会发起真实模型请求。
+2. 连接：登记主机、配置凭据、核对指纹并建立账号组。
+3. Agent 设置：选择全局默认账号组。
+4. Agent → 新建会话 → 连接会话：进入原生输入框，开始一个明确的任务。
+5. 按需配置监控地址和通知渠道；账号安全设置中可启用 TOTP。
+
+完整配置说明见 [CONFIGURATION.md](CONFIGURATION.md)。
+
+## 5. 安装选项
+
+在已解压的安装包或源码根目录中使用：
+
+```bash
+bash deploy/install.sh --help
+sudo bash deploy/install.sh --system --check --mimo-bin /usr/local/bin/mimo
+```
+
+`--check` 检查环境和已安装状态，不安装依赖或变更服务。引导脚本的检查模式只调用已安装的本地检查器，不下载文件；尚未安装时会明确报告本地检查器不存在。检查已解压的安装包时直接调用 `deploy/install.sh`。
+
+| 参数 | 用途 |
+| --- | --- |
+| `--system` | 系统安装，要求 root，生成两个 systemd 服务 |
+| `--user` | 当前用户安装，默认模式，不安装系统服务 |
+| `--prefix PATH` | 程序目录 |
+| `--data PATH` | 数据目录 |
+| `--conf-dir PATH` | 配置和秘密目录 |
+| `--http-host HOST` / `--http-port PORT` | 初始 Web 监听设置 |
+| `--mimo-bin PATH` | MiMoCode 可执行文件 |
+| `--no-start` | 只准备安装文件，不建立系统账号或启动服务；正式启用时再次正常安装 |
+| `--force` | 更新已安装程序和服务定义 |
+| `--backup-dir PATH` | 备份父目录，系统默认 `/opt/ayana-backups` |
+| `--skip-pip` | 跳过依赖安装，仅适用于已准备好匹配依赖的环境 |
+
+可通过 `PYTHON_BIN` 选择 Python，例如 `PYTHON_BIN=python3.12 bash deploy/install.sh --check`。
+
+用户安装默认位置为 `~/.local/share/ayana`、`~/.local/share/ayana-data` 和 `~/.config/ayana`。按安装器输出的命令分别启动 Web 与原生运行时；需要长期运行时请由自己的进程管理器托管。
+
+用户模式更新前，先结束任务、释放会话接管，再正常停止自己启动的 Web 与原生运行时两个进程。安装器不会替用户模式调用 systemd；任一进程仍在线或状态无法确认时会拒绝更新。
+
+## 6. 更新现有安装
+
+先在 Agent 页面核对原生任务、队列和待核对写结果，并释放会话接管。等待当前工作结束，再进入维护窗口；不要为了验证升级主动停止受管主机业务。
+
+1. 下载新版本安装包并核对校验值。
+2. 确认两个服务都可安全停止，记录当前版本和备份位置。
+3. 备份代码、配置、秘密、数据库及运行数据，见[备份与恢复](OPERATIONS.md#备份与恢复)。
+   安装器保留现有配置；核对其中 `mimo_serve_external=true`、`agent_tui_enabled=true`，并为 `mimo_bin` 和原生运行目录填写实际路径。字段说明见[配置手册](CONFIGURATION.md)。
+4. 从新包目录运行安装器，沿用原来的路径参数：
+
+```bash
+sudo bash deploy/install.sh --system --force --mimo-bin /usr/local/bin/mimo
+```
+
+5. 查看安装器报告和两个服务状态，确认 `/health`、登录、模型已保存配置、账号组和现有业务检查均可正常读取。
+6. 在浏览器刷新页面，再由使用者选择业务验收任务。
+
+已安装实例也可使用同一生命周期入口更新到明确版本：
+
+```bash
+sudo bash /opt/ayana/deploy/ayana-setup.sh update --system --ref v0.8.1 \
+  --mimo-bin /usr/local/bin/mimo
+```
+
+该方式从项目仓库获取指定版本；默认引用为当前 `main`。生产更新建议指定发布 tag，或通过引导脚本使用正式 Release。
+
+Web 重启和完整升级具有不同范围。只重启 Web 可保留独立运行时中的任务；更新运行时、核心代码或数据库时，应先等待任务结束，再按完整升级流程执行。
+
+## 7. 回滚
+
+优先使用安装器为该次操作记录的完整备份，恢复与旧程序匹配的配置、数据和服务定义。数据库升级后的回滚必须配套恢复对应备份，不能只替换程序文件。
+
+安装器快照可通过统一入口回滚，使用明确选定的时间戳目录：
+
+```bash
+sudo bash /opt/ayana/deploy/ayana-setup.sh rollback --system \
+  --backup /opt/ayana-backups/CHOSEN-TIMESTAMP
+```
+
+自定义安装路径时，沿用相同的 `--prefix`、`--data`、`--conf-dir` 和 `--backup-dir`。回滚也要求当前工作已结束、没有待核对的写结果。
+
+如果新版本已经接入新告警或执行过操作，先保留当前状态和台账，再决定是否回退数据，防止覆盖新事实。具体备份内容和恢复命令见[运维手册](OPERATIONS.md#备份与恢复)。
+
+## 8. 从源码开发
 
 ```bash
 git clone https://github.com/wwqjss/Ayana.git
 cd Ayana
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install .
 ```
 
-本地若另有 `ayana-v0.7.4-install.tar.gz` 发布包，可解压后同样进入目录安装；**以 GitHub 仓库为准**。
-
----
-
-## 3. 一键安装（推荐）
-
-### 3.1 一条命令（脚本自己拉包）
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/wwqjss/Ayana/main/deploy/bootstrap.sh -o bootstrap.sh
-bash bootstrap.sh --system          # root + systemd；缺啥装啥，全齐则跳过
-# bash bootstrap.sh --user           # 无 systemd
-# bash bootstrap.sh --system --check # 只检查
-```
-
-脚本会自动：
-
-1. 拉取 **最新 Release** 安装包（`ayana-install.tar.gz`，不必改文档里的版本号）
-2. 校验 SHA256（Release 上的 `.sha256`；也可用环境变量钉死）
-3. 调用包内 `deploy/install.sh` 做预检与幂等安装
-
-固定版本 / 钉死哈希（需要可复现时）：
-
-```bash
-AYANA_VERSION=v0.7.4 AYANA_SHA256=<hash> bash bootstrap.sh --system
-```
-
-### 3.2 已有源码/解压包
-
-**先检查（不改动系统）**
-
-```bash
-bash deploy/install.sh --check              # 用户模式
-sudo bash deploy/install.sh --system --check
-```
-
-**系统级（root + systemd）**
-
-```bash
-sudo bash deploy/install.sh --system
-```
-
-**当前用户（无 systemd）**
-
-```bash
-bash deploy/install.sh --user
-```
-
-脚本会：
-
-1. **环境预检**：Python ≥ 3.11、包完整、磁盘、权限/systemd
-2. **检查通过且已装完整 → 跳过安装**（不重复写盘、不覆盖配置）
-3. **有缺失才装对应项**（代码 / venv / deps / secrets / config / unit）
-4. **生成** `secrets.json`（0600，不覆盖已有文件）— 无需手填密钥
-5. 写 `config.json`：`db_path` / `log_file` 指向**数据目录**（默认 `/var/lib/ayana` 或 `~/.local/share/ayana-data`）
-6. `--system` 时创建 `ayana` 用户、安装并启动 `ayana.service`
-
-需要强制重装代码或单元时加 `--force`（才会 `rsync --delete`）。
-
-完成后按脚本输出：查日志中的 bootstrap 口令文件 → 浏览器改密 → 删口令文件。  
-NapCat / 企微**可选**，不影响 Web 登录。
-
-常用参数：`--prefix` `--data` `--conf-dir` `--http-host` `--http-port` `--skip-pip`。
-
-也可单独生成秘密：
-
-```bash
-python3 scripts/gen-secrets.py -o /etc/ayana/secrets.json
-```
-
----
-
-## 4. 目录与用户（生产）
-
-```bash
-sudo useradd --system --home /var/lib/ayana --shell /usr/sbin/nologin ayana
-sudo install -d -o root -g ayana -m 750 /opt/ayana
-sudo install -d -o ayana -g ayana -m 750 /var/lib/ayana /var/log/ayana
-sudo install -d -o root -g ayana -m 640 /etc/ayana
-```
-
-| 路径 | 属主 | 权限 | 说明 |
-|------|------|------|------|
-| `/opt/ayana/` | `root:ayana` | `750` | 代码与 venv，应用只读 |
-| `/etc/ayana/config.json` | `root:ayana` | `640` | 配置 |
-| `/etc/ayana/secrets.json` | `root:ayana` | `600` | 秘密 |
-| `/var/lib/ayana/` | `ayana:ayana` | `750` | DB、锁、**bootstrap 口令文件** |
-| `/var/log/ayana/` | `ayana:ayana` | `750` | 日志 |
-
----
-
-## 5. 安装依赖
-
-```bash
-cd /opt/ayana
-sudo python3 -m venv .venv
-sudo .venv/bin/pip install -U pip
-sudo .venv/bin/pip install -r requirements.txt
-# 生产建议显式安装：
-sudo .venv/bin/pip install aiohttp cryptography paramiko
-```
-
-将源码放到 `/opt/ayana`（保持 `ayana/` 包目录与 `knowledge/`）。
-
----
-
-## 6. 配置
-
-```bash
-sudo cp /opt/ayana/config.example.json /etc/ayana/config.json
-sudo chmod 640 /etc/ayana/config.json
-```
-
-编辑 `config.json`（示例字段）：
-
-```json
-{
-  "ws_host": "127.0.0.1",
-  "ws_port": 6199,
-  "http_host": "127.0.0.1",
-  "http_port": 6200,
-  "db_path": "/var/lib/ayana/ayana.db",
-  "knowledge_dir": "/var/lib/ayana/knowledge",
-  "log_file": "/var/log/ayana/ayana.log",
-  "prometheus_url": "http://127.0.0.1:9090",
-  "alertmanager_url": "http://127.0.0.1:9093",
-  "auto_remediation_enabled": false
-}
-```
-
-**不要**把 `http_host` 设成 `0.0.0.0`，除非前面有反向代理与 TLS。
-
-知识正文是可写的运行数据。生产配置的 `knowledge_dir` 应指向
-`/var/lib/ayana/knowledge`（或 `--data` 下的 `knowledge`），保持
-`ProtectSystem=strict` 和代码目录只读。新安装会把发行版 Markdown 复制到该目录，
-遇到同名文件则保留原内容；开发配置留空时继续使用仓库的 `knowledge/`。
-相对路径按配置文件所在目录解析，Web 与 MCP 使用同一个目录。
-
-已有安装升级时先备份原知识目录和配置，再把 `/opt/ayana/knowledge` 中的现有正文
-复制到数据目录，保留已存在的同名正文，并设置目录属主为 `ayana:ayana`。
-随后在 `/etc/ayana/config.json` 设置上述 `knowledge_dir`，在空闲时重启
-`ayana-agent-runtime.service` 与 `ayana.service`。安装脚本不会覆盖已有配置，
-因此已有安装须显式完成这一步；不需要放开 `/opt/ayana` 的写权限。
-
-若使用本地 Prometheus 配置管理，`prometheus_config.local_dir` 也必须在
-**Web 服务和 Agent runtime 服务两者**的 `ReadWritePaths` 内。原生 MCP 由
-`ayana-agent-runtime.service` 启动，仅给 `ayana.service` 授权不会让 MCP 可写。
-例如配置目录为 `/data/prometheus/config` 时，分别执行
-`sudo systemctl edit ayana.service` 和
-`sudo systemctl edit ayana-agent-runtime.service`，各加入：
-
-```ini
-[Service]
-ReadWritePaths=/data/prometheus/config
-```
-
-保留原有的数据目录授权和 `ProtectSystem=strict`，仅加入实际使用的配置目录。
-执行 `sudo systemctl daemon-reload`，在任务空闲时重启这两个服务后再验证配置写入。
-
-### 秘密（secrets.json）
-
-```bash
-sudo install -o root -g ayana -m 600 /dev/null /etc/ayana/secrets.json
-sudo -u root tee /etc/ayana/secrets.json >/dev/null <<'EOF'
-{
-  "onewbot_token": "<随机长令牌，可选 IM>",
-  "webhook_token": "<Alertmanager webhook Bearer>",
-  "web_auth_pepper": "<独立随机串，勿与 onewbot_token 相同>",
-  "totp_encrypt_key": "<独立随机串>",
-  "ssh_credential_key": "<独立随机串>",
-  "notify_channel_key": "<独立随机串>"
-}
-EOF
-```
-
-生成示例：
-
-```bash
-python3 -c "import secrets; print(secrets.token_urlsafe(32))"
-```
-
-也可用环境变量 `AYANA_*` 覆盖（见 `ayana/config.py` 的 `SECRET_KEYS`）。
-
-**配置来源 2 层优先级**：
-
-| 层 | 来源 | 覆盖顺序 | 可写时机 |
-|---|---|---|---|
-| 启动态 | `DEFAULTS` → `config.json` → `secrets.json` → `AYANA_*` 环境变量 | 后者覆盖前者 | 部署时改文件 |
-| 运行态 | DB `meta` 表（Web 控制台「设置」页） | 启动后覆盖启动态同名键 | 运行时 UI |
-
-启动态由 `ayana/config.py:load_config` 合并；运行态 meta 键（如 `prometheus_url` / `alertmanager_url` / `llm_*`）在启动时回填并即时生效。秘密（token/密钥）只进 `secrets.json` 或 `AYANA_*` env，不进 DB meta。
-
-**注意**：
-
-- `web_auth_pepper` 用于口令哈希；**与 `onewbot_token` 隔离**。若历史库用旧 pepper，设置新 pepper 后旧口令仍可登录，并在登录成功后自动迁移到新 pepper。
-- `totp_encrypt_key` 缺失时 TOTP 秘密可能明文入库——生产必须配置。
-- **禁止**把真实 token 写进聊天、截图或仓库。
-
----
-
-## 7. 首次启动与管理员
-
-```bash
-sudo -u ayana /opt/ayana/.venv/bin/python -m ayana.main /etc/ayana/config.json
-```
-
-1. 观察日志：出现 `BOOTSTRAP admin created` 与口令文件路径（通常在 DB 目录）。
-2. **取默认口令**：
-
-   ```bash
-   # system 安装
-   sudo cat /var/lib/ayana/bootstrap-admin.password
-   # 或 journalctl -u ayana -n 50 | grep BOOTSTRAP
-
-   # user 安装（默认数据目录）
-   cat ~/.local/share/ayana-data/bootstrap-admin.password
-   ```
-
-3. 打开 `http://<主机>:6200`，用户 `admin`，粘贴临时口令。
-4. 界面会要求**修改密码**（至少 10 位）。
-5. 删除口令文件：`sudo rm -f /var/lib/ayana/bootstrap-admin.password`。
-5. 建议启用 **2FA**（控制台 → 2FA）。
-
-口令文件权限 0600；**不会**写入应用日志。若文件丢失，用运维流程重置（停机改库或重装空库），不要在日志里找口令。
-
----
-
-## 8. systemd
-
-```bash
-sudo cp /opt/ayana/deploy/ayana.service /etc/systemd/system/ayana.service
-# 按实际路径调整 ExecStart / ReadWritePaths
-sudo systemctl daemon-reload
-sudo systemctl enable --now ayana
-sudo systemctl status ayana
-```
-
-`deploy/ayana.service` 要点：
-
-- `User=ayana`，非 root
-- `ProtectSystem=strict`，仅 `/var/lib/ayana`、`/var/log/ayana` 可写
-- 单实例由应用 `flock` + systemd 保证
-
-反向代理（Nginx 示例）终止 TLS 后转 `127.0.0.1:6200`；应用侧 Cookie 已 `HttpOnly` + `SameSite=Lax`。
-
----
-
-## 9. 验收清单
-
-- [ ] `GET /health` 返回 `ok: true`
-- [ ] 未登录 `GET /ready` 仅返回 `ok/version`（无内部明细）
-- [ ] 能用 bootstrap 口令登录并强制改密
-- [ ] 改密后旧会话失效
-- [ ] 非 admin 无法自批写操作（若建了运维账号）
-- [ ] 自定义检查拒绝 `cat /etc/passwd`、`curl file://...`
-- [ ] Webhook 渠道拒绝环回 / 元数据地址
-- [ ] `systemctl restart ayana` 后 `/health` 正常
-
-测试：
-
-```bash
-cd /opt/ayana && .venv/bin/python -m unittest discover tests -q
-```
-
----
-
-## 10. 备份与升级
-
-**备份**（SQLite 在线备份，勿直接拷 WAL 未 checkpoint 文件）：
-
-```bash
-sudo -u ayana sqlite3 /var/lib/ayana/ayana.db ".backup '/var/lib/ayana/backup-$(date +%F).db'"
-sudo tar -C /var/lib/ayana -czf /var/backups/ayana-state.tgz backup-*.db bootstrap-admin.password 2>/dev/null || true
-```
-
-**升级**：
-
-1. 备份 DB 与 `/etc/ayana`
-2. 停服务 → 替换 `/opt/ayana` 代码与依赖（保留 venv 或重建）
-3. 启动；schema 自动迁移（失败则回滚备份）
-4. 跑验收清单
-
-**回退**：恢复 DB 备份 + 旧代码 + 旧 secrets。
-
----
-
-## 11. 与监控栈对接
-
-### Alertmanager
-
-```yaml
-receivers:
-  - name: ayana
-    webhook_configs:
-      - url: "http://127.0.0.1:6200/hooks/alertmanager"
-        http_config:
-          authorization:
-            type: Bearer
-            credentials: "<与 secrets.json 的 webhook_token 相同>"
-```
-
-### Prometheus
-
-在控制台配置探测目标，或使用 Prometheus `probe_success`；应用只读查询 Prom API。
-
-### IM（可选）
-
-- QQ：NapCat 反向 WS 到 `ws://127.0.0.1:6199/ws`，Token 与 `onewbot_token` 一致
-- 企业微信：在控制台配置机器人 Webhook / 智能机器人，凭据只进 `secrets`
-
----
-
-## 12. 故障排查
-
-| 现象 | 处理 |
-|------|------|
-| 启动即退 | 看日志；检查 `db_path` 目录可写、端口占用、`flock` |
-| 登录 401 | 确认用户名；连续失败会锁定（默认 8 次 / 15 分钟） |
-| 登录后提示改密 | 正常：bootstrap 或重置账号，按提示改密 |
-| 403 `password_change_required` | 先调 `/api/password` 或走 UI 改密 |
-| 改 pepper 后无法登录 | 确认旧 pepper 在 `legacy` 迁移路径；或用恢复码 / 重置 |
-| SSH 主机密钥未信任 | 在「连接」页确认指纹后再测连接 |
-| Webhook 401 | Bearer 与 `webhook_token` 不一致 |
-| 依赖缺失 | 生产安装 `aiohttp`、`cryptography` |
-
----
-
-## 13. 安全建议摘要
-
-1. 仅监听本机 + 反代 TLS；不要裸奔公网 6200。  
-2. 每个秘密独立随机；权限 600/640。  
-3. 启用 2FA；管理员口令强度足够。  
-4. 写能力最小化授权；非必要不开 `auto_remediation`。  
-5. 受管主机侧仍限制 sudo / forced-command。  
-6. 定期备份 DB 与 secrets（分开存放）。
-
-更细的威胁模型与加固项见仓库变更说明；本手册不替代你的安全评审。
+需要固定发布源码时检出对应 tag。完整原生会话运行仍需要前述 Linux 工具、兼容 MiMoCode CLI 和可用模型配置。开发测试见[测试说明](TESTING.md)。

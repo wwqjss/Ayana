@@ -1,10 +1,9 @@
-# 参考单元模板；生产请用 deploy/install.sh --system 生成并写入真实路径。
-# 数据目录必须在 ReadWritePaths 内（DB、secrets 只读配置、日志、bootstrap 口令）。
+# Rendered by the unified installer; restarting Web does not restart native tasks.
 
 [Unit]
 Description=Ayana ops agent (non-root)
-After=network-online.target
-Wants=network-online.target
+After=network-online.target ayana-agent-runtime.service
+Wants=network-online.target ayana-agent-runtime.service
 
 [Service]
 Type=simple
@@ -18,6 +17,13 @@ KillMode=mixed
 TimeoutStopSec=20
 
 Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/var/lib/ayana
+Environment=XDG_CONFIG_HOME=/var/lib/ayana/.config
+Environment=XDG_DATA_HOME=/var/lib/ayana/.local/share
+Environment=XDG_STATE_HOME=/var/lib/ayana/.local/state
+Environment=XDG_CACHE_HOME=/var/lib/ayana/.cache
+Environment=LANG=C.UTF-8
+UnsetEnvironment=MIMOCODE_HOME
 # Environment=AYANA_* 可覆盖非秘密项
 
 NoNewPrivileges=true

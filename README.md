@@ -1,133 +1,80 @@
 # Ayana
 
-**运维闭环平台**：在同一个 MiMoCode 会话中调查、执行和验证故障处置，保留可核对的执行事实与恢复证据。
+Ayana 是一个以事件为中心的运维工作台。接入告警后，MiMoCode 在同一个原生会话内调查、执行主机命令、核对恢复证据；你可以在 Web 中观察过程、接管会话，并追溯每次操作。
+
+当前发布版本：**v0.8.1**。
 
 ```text
-Alertmanager → Event → Incident → MiMoCode 会话 → host.exec / 验证 → Web / IM / 审计
+告警 / 业务检查 → 工单与故障代次 → MiMoCode 原生会话
+                                  ↓
+                         MCP 查询与 host.exec
+                                  ↓
+                   执行台账 / 恢复证据 / 通知与审计
 ```
 
-| 能力 | 说明 |
-|------|------|
-| 告警接入 | Alertmanager webhook，归并 Event / Incident |
-| 调查与处置 | 同一 MiMoCode 会话通过 MCP 查询证据、执行命令和维护监控配置 |
-| 账号组 | 一个全局默认组；会话可单独选择，实际权限由目标机 SSH 账号决定 |
-| 结果与审计 | 写操作台账、未知结果保护、恢复证据和完整审计 |
-| 入口 | Web 控制台；可选 QQ / 企业微信机器人 |
-| 安全 | 本地账号 + TOTP、会话加固、命令白名单、SSRF 边界 |
+| 功能 | 你可以做什么 |
+| --- | --- |
+| 事件与工单 | 接入 Alertmanager 或原生业务检查，追踪故障、复发代次与恢复依据 |
+| 原生 Agent 工作台 | 观察、接管、暂停、恢复任务，查看执行记录和待核对结果 |
+| SSH 账号组 | 设置全局默认组，按会话覆盖；实际权限由目标服务器账号和 sudo 决定 |
+| 主机与监控 | 管理连接、主机指纹、凭据、端口检查、服务检查和受限命令检查 |
+| 资源状态 | 查看原生检查与 Prometheus 指标，区分异常、未观测和数据不足 |
+| 通知与知识 | 配置通知渠道、检索运维知识、记录处置结论 |
+| 节点守望 | 可选配对实例心跳，观察对端在线情况 |
 
-适合：少量关键主机，需要自动处置并保留执行过程、验证依据的运维场景。
+命令执行成功和故障恢复分别记录。恢复结论需要匹配目标、故障类型和当前代次的证据；结果未知的写操作会保留台账，防止盲目重复执行。
 
-当前版本：**v0.8.0**（见 `ayana/__init__.py` / `pyproject.toml`）。
+## 安装
 
----
-
-## 快速开始
-
-完整步骤见 **[安装手册](docs/INSTALL.md)**。
-
-**一键（脚本自己拉包，跟随最新 Release）：**
+生产部署使用 Linux、Python 3.11+、tmux、OpenSSH 客户端，以及已准备好的兼容 MiMoCode CLI。安装器会检查这些条件；MiMoCode CLI 需要你按其发行方说明安装。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/wwqjss/Ayana/main/deploy/bootstrap.sh -o bootstrap.sh
-bash bootstrap.sh --system              # 缺啥装啥；已装完整则跳过
+curl -fsSL https://raw.githubusercontent.com/wwqjss/Ayana/main/deploy/bootstrap.sh -o ayana-bootstrap.sh
+sudo bash ayana-bootstrap.sh --system --mimo-bin /absolute/path/to/mimo
 ```
 
-从源码最短路径：
+引导脚本下载最新正式 Release 并校验 SHA256。系统安装默认使用：
 
-```bash
-git clone https://github.com/wwqjss/Ayana.git
-cd Ayana
+- 程序：`/opt/ayana`
+- 配置：`/etc/ayana`
+- 数据与运行时：`/var/lib/ayana`
+- Web：`http://127.0.0.1:6200`
+- 服务：`ayana`、`ayana-agent-runtime`
 
-# 1. 依赖：Python 3.11+，建议 venv
-python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
+完整安装、固定版本、用户模式和升级步骤见 [安装手册](docs/INSTALL.md)。
 
-# 2. 配置
-cp config.example.json config.json
-# 编辑 config.json；秘密可用 scripts/gen-secrets.py 生成 secrets.json（600）
-# 或使用 AYANA_* 环境变量
-python -m ayana.main config.json
-```
+## 第一次使用
 
-也可使用 `deploy/install.sh`（`--user` / `--system`）完成目录、依赖、秘密与可选 systemd 安装。
+1. 读取数据目录中的 `setup-admin.token`，在首次注册页面填写令牌，自行设置管理员用户名和密码。
+2. 在用户菜单的设置中填写模型接口、模型 ID 和 API Key，执行“保存并验证”。
+3. 在“连接”中登记主机、确认 SSH 指纹并配置账号组；在 Agent 设置中选定默认账号组。
+4. 点击“新建会话 → 连接会话”，在原生输入框中提出任务。
+5. 按需接入 Prometheus、Alertmanager 和通知渠道。没有 Prometheus 时也可以使用原生业务检查。
 
-首次启动会在**数据库同目录**生成 `bootstrap-admin.password`（0600）。用该口令登录 Web（默认 `http://127.0.0.1:6200`），**立即改密**并删除该文件。
-
-```bash
-# 取默认口令（system 安装；用户安装把路径换成数据目录）
-sudo cat /var/lib/ayana/bootstrap-admin.password
-
-# 也可从日志确认路径
-journalctl -u ayana -n 50 | grep BOOTSTRAP
-
-# 登录改密后删除
-sudo rm -f /var/lib/ayana/bootstrap-admin.password
-```
-
----
-
-## 架构一览
-
-```text
-Prometheus / Alertmanager
-        │
-        ▼
-   接入层（webhook · Prom API · SSH）
-        │
-        ▼
- Asset → Event → Incident → MiMoCode 会话
-        │
-        ▼
- MCP 查询 / host.exec / config.* → 执行事实 / 恢复证据
-        │
-        ▼
-   Web 控制台 · 通知 · 审计
-```
-
-- **平台**：asyncio + aiohttp；SQLite（WAL）；独立 MiMoCode 原生运行时。
-- **账号选择**：未覆盖的会话和后台检查使用全局默认组；会话覆盖只影响后续操作。缺少指定组时明确报错，不换用另一组。
-- **主机侧上限**：目标机 SSH 账号和 sudoers 决定命令权限；账号组名称不代表权限档位。
-- **恢复判定**：命令成功不等于故障恢复，结案需要匹配故障和代次的新鲜证据。
-
----
-
-## 配置与秘密
-
-| 文件 | 是否入库 | 内容 |
-|------|----------|------|
-| `config.json` | 否 | 端口、DB 路径、Prometheus/AM 地址等 |
-| `secrets.json` | 否（600） | token / pepper / 加密密钥等 |
-| `config.example.json` | 是 | 模板，无真实秘密 |
-
-秘密键可用环境变量覆盖：`AYANA_ONEWBOT_TOKEN`、`AYANA_WEBHOOK_TOKEN`、`AYANA_WEB_AUTH_PEPPER`、`AYANA_TOTP_ENCRYPT_KEY`、`AYANA_SSH_CREDENTIAL_KEY` 等（见 `ayana/config.py`）。
-
-**安全基线（v0.7.3+）**：
-
-- 登录：PBKDF2、失败锁定、TOTP 2FA、恢复码、会话绑定
-- 首登强制改密；bootstrap 口令不写日志
-- 自定义检查命令白名单；禁止任意文件读与输出内容 oracle
-- Webhook / WebSocket 目标 SSRF 黑名单；Origin 精确校验
-- 写操作留痕；未知结果保留并阻止盲目重复执行；旧逐动作审批已退役
-
----
-
-## 开发与测试
-
-```bash
-python -m unittest discover tests -q
-```
-
-无网络依赖的单测可在无 aiohttp 环境运行核心逻辑；含 Web 集成的用例需要 `pip install aiohttp`。
-
----
+会话未单独选择账号组时继承全局默认。所选组缺少目标主机账号时会明确报错，不会借用其他组。
 
 ## 文档
 
-- [安装手册](docs/INSTALL.md) — 部署、systemd、备份、升级
-- [MCP 操作接口](docs/mcp-operations.md) — MiMoCode 操作、账号组和监控配置
+- [文档导航](docs/README.md)
+- [安装与升级](docs/INSTALL.md)
+- [配置说明](docs/CONFIGURATION.md)
+- [日常运维与故障排查](docs/OPERATIONS.md)
+- [MCP 操作接口](docs/mcp-operations.md)
+- [版本说明](CHANGELOG.md)
+
+## 开发
+
+依赖和静态资源打包规则由 `pyproject.toml` 统一声明。
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install .
+python -m unittest discover -s tests -q
+```
+
+测试范围与运行方式见 [测试说明](docs/TESTING.md)。
 
 ## 许可证
 
-本项目采用 **MIT License**，详见 [LICENSE](LICENSE)。
-
-Copyright (c) 2026 wwqjss
+[MIT License](LICENSE)
