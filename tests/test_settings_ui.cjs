@@ -174,7 +174,7 @@ function environment(reply, options = {}) {
   vm.runInContext(app.slice(elStart,elEnd),context);
   const modalStart=app.indexOf("function showModal("),modalEnd=app.indexOf('on("modal-close"',modalStart);
   vm.runInContext(app.slice(modalStart,modalEnd),context);
-  const modelStart=app.indexOf("async function openMimoAdmin("),modelEnd=app.indexOf("/* ---- 旧自治历史",modelStart);
+  const modelStart=app.indexOf("async function openMimoAdmin("),modelEnd=app.indexOf("/* ---- 全局设置",modelStart);
   vm.runInContext(app.slice(modelStart,modelEnd),context);
   vm.runInContext("const realMimoAdmin=openMimoAdmin;openMimoAdmin=async(...args)=>{__modelCall(...args);return realMimoAdmin(...args);};",context);
   vm.runInContext(source,context);
@@ -458,20 +458,20 @@ test("failed prompt saves keep the draft and selected version visible", async ()
   assert.equal(env.run("settingsState.busy"),false);assert.ok(env.node("settings-feedback").textContent.includes("保存失败"));
 });
 
-test("saving the auxiliary model does not discard an unsaved autonomous-model draft", async () => {
+test("the model page has no retired form assistant configuration or legacy usage request", async () => {
   const env=environment();await env.run("openSettings('model')");
-  await env.input("mimo-model","unsaved-autonomous-model");await env.input("settings-assist-model","new-helper-model");
-  await env.button("保存辅助配置").click();
+  await env.input("mimo-model","unsaved-autonomous-model");
   assert.equal(env.run("settingsState.dirty"),true);assert.equal(env.node("mimo-model").value,"unsaved-autonomous-model");
+  assert.equal(env.node("settings-assist-model"),null);
   assert.equal(env.calls.filter(call=>call.url==="/api/mimo/provider" && call.body).length,0);
-  const sent=env.calls.find(call=>call.url==="/api/settings/global" && call.body);assert.equal(sent.body.llm_model,"new-helper-model");
+  assert.equal(env.calls.some(call=>call.url==="/api/settings/global" || call.url.startsWith("/api/autonomy/")),false);
 });
 
-test("saving the autonomous model does not discard an unsaved auxiliary-model draft", async () => {
+test("saving the autonomous model retains the supported save and verification flow", async () => {
   const env=environment(call=>call.url==="/api/mimo/provider" && call.body?{ok:true,saved:true,verified:true}:undefined);await env.run("openSettings('model')");
-  await env.input("mimo-model","new-autonomous-model");await env.input("settings-assist-model","unsaved-helper-model");
+  await env.input("mimo-model","new-autonomous-model");
   await env.button("保存并验证","settings-actions").click();
-  assert.equal(env.run("settingsState.dirty"),true);assert.equal(env.node("settings-assist-model").value,"unsaved-helper-model");
+  assert.equal(env.run("settingsState.dirty"),false);assert.equal(env.node("mimo-model").value,"new-autonomous-model");
   assert.equal(env.calls.filter(call=>call.url==="/api/settings/global" && call.body).length,0);
   const sent=env.calls.find(call=>call.url==="/api/mimo/provider" && call.body);assert.equal(sent.body.model,"new-autonomous-model");assert.equal(sent.body.test,true);
 });

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import posixpath
 import re
@@ -292,9 +293,10 @@ def evaluate(kind: str, outputs: list[dict[str, Any]], expect: dict) -> tuple[bo
         ok = bool(lines) and any("LISTEN" in ln.upper() or re.search(r":\d+", ln) for ln in lines)
         return ok, ("ok" if ok else "fail"), (text[:200] if text else "port_not_listening")
     if kind == "service":
-        text = (outputs[0].get("output") or "").strip()
+        out = outputs[0]
+        text = (out.get("output") or "").strip()
         want = (expect.get("active_state") or "active").strip()
-        ok = text == want
+        ok = out.get("ok") is True and out.get("returncode") == 0 and text == want
         return ok, ("ok" if ok else "fail"), f"state={text or 'unknown'} want={want}"
     if kind == "command":
         raw_rc = outputs[0].get("returncode")
@@ -307,6 +309,59 @@ def evaluate(kind: str, outputs: list[dict[str, Any]], expect: dict) -> tuple[bo
         ok = rc == 0
         return ok, ("ok" if ok else "fail"), f"exit={rc}"
     return False, "unknown", f"bad_kind:{kind}"
+
+
+def check_contract_digest(check: dict[str, Any]) -> str:
+    """Bind a result to the actual check target and expectation, not its label."""
+    definition = {
+        "asset_id": check.get("asset_id"), "kind": check.get("kind"),
+        "params": check.get("params") if "params" in check else json.loads(check.get("params_json") or "{}"),
+        "expect": check.get("expect") if "expect" in check else json.loads(check.get("expect_json") or "{}"),
+    }
+    return hashlib.sha256(json.dumps(definition, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def check_recovery_evidence(db: Database, episode: dict, generation: int) -> dict[str, Any]:
+    """Use only the latest fresh result of this exact source check and generation."""
+    try:
+        annotations = json.loads(episode.get("annotations_json") or "{}")
+        check_id = annotations.get("check_id")
+        row = db.query_one("SELECT * FROM checks WHERE id=?", (check_id,))
+        if not row:
+            return {"verdict": "none", "reason": "check_missing"}
+        check = dict(row)
+        kind = check["kind"]
+        if kind not in ("service", "port"):
+            return {"verdict": "no_contract", "contract": ""}
+        base = {"contract": f"check.{kind}", "check_id": check_id}
+        proof = annotations.get("check_recovery") or {}
+        if (episode.get("source_id") != "ayana_check"
+                or episode.get("alertname") != f"CheckFailed_{kind}"
+                or check["asset_id"] != episode.get("asset_id") or not check["enabled"]
+                or proof.get("episode_id") != episode.get("id")
+                or proof.get("incident_id") != episode.get("incident_id")
+                or proof.get("generation") != generation
+                or proof.get("check_id") != check_id
+                or proof.get("contract_digest") != check_contract_digest(check)):
+            return {"verdict": "none", "reason": "check_contract_mismatch", **base}
+        incident = db.query_one("SELECT generation FROM incidents WHERE id=?", (episode.get("incident_id"),))
+        if not incident or int(incident["generation"] or 1) != generation:
+            return {"verdict": "none", "reason": "stale_generation", **base}
+        result = db.query_one(
+            "SELECT * FROM check_results WHERE check_id=? ORDER BY at DESC,id DESC LIMIT 1", (check_id,)
+        )
+        t = now()
+        if (not result or not 0 <= t - float(result["at"]) <= 120
+                or float(result["at"]) < float(episode.get("first_seen") or 0)
+                or float(check["last_at"] or 0) != float(result["at"])):
+            return {"verdict": "none", "reason": "check_result_stale", **base}
+        green = bool(result["ok"] and result["state"] == "ok" and check["last_ok"] and check["last_state"] == "ok")
+        return {"verdict": "green" if green else "red", "source": "check_result",
+                "result_id": result["id"], "sample_at": result["at"],
+                "asset": check["asset_id"], "generation": generation,
+                "contract_digest": proof["contract_digest"], **base}
+    except (TypeError, ValueError, KeyError, AttributeError, OverflowError):
+        return {"verdict": "none", "reason": "invalid_check_evidence"}
 
 
 class CheckService:
@@ -525,7 +580,9 @@ class CheckService:
         thr = int(check.get("fail_threshold") or 2)
         if streak == thr or (not ok and streak == 1 and thr == 1):
             await self._raise_alert(check, detail=detail, streak=streak)
-        if ok and streak == 0 and check.get("was_failing"):
+        if ok:
+            # Also repair an earlier missed source transition on subsequent
+            # successes; _resolve_alert emits nothing when there is no episode.
             await self._resolve_alert(check)
 
     async def _raise_alert(self, check: dict[str, Any], *, detail: str, streak: int) -> None:
@@ -549,7 +606,8 @@ class CheckService:
                 source_id="ayana_check",
                 fingerprint=fp,
                 labels=labels,
-                annotations={"detail": detail, "check_id": check.get("id")},
+                annotations={"detail": detail, "check_id": check.get("id"),
+                             "check_contract": check_contract_digest(check)},
                 status="firing",
                 source_state="firing",
                 t=t,
@@ -578,17 +636,80 @@ class CheckService:
             pass
 
     async def _resolve_alert(self, check: dict[str, Any]) -> None:
-        try:
+        """Resolve only this check's current episode using persisted source evidence."""
+        current = self.get_check(check["id"])
+        if (not current or not current["enabled"]
+                or check_contract_digest(current) != check_contract_digest(check)):
+            return
+        latest = self.db.query_one(
+            "SELECT * FROM check_results WHERE check_id=? ORDER BY at DESC,id DESC LIMIT 1", (check["id"],)
+        )
+        if (not latest or not latest["ok"] or latest["state"] != "ok"
+                or not 0 <= now() - float(latest["at"]) <= 120):
+            return
+        for row in self.db.query(
+            "SELECT * FROM alert_episodes WHERE source_id='ayana_check' AND status='firing'"
+            " AND asset_id=? AND alertname=? AND json_valid(annotations_json)"
+            " AND json_extract(annotations_json,'$.check_id')=?",
+            (check["asset_id"], f"CheckFailed_{check['kind']}", check["id"]),
+        ):
+            episode = dict(row)
+            incident_id = episode["incident_id"] or ""
+            if (not self.incidents or not incident_id
+                    or not self.incidents.episode_is_current(incident_id, episode)):
+                continue
+            incident = self.db.query_one("SELECT generation,status FROM incidents WHERE id=?", (incident_id,))
+            if not incident or incident["status"] != "open":
+                continue
+            generation = int(incident["generation"] or 1)
+            annotations = json.loads(episode["annotations_json"] or "{}")
+            digest = check_contract_digest(current)
+            if annotations.get("check_contract") not in (None, digest):
+                continue
+            # Older episodes did not save the check contract. Do not let a
+            # later edit of that check certify the earlier target's recovery.
+            if not annotations.get("check_contract") and self.db.query_one(
+                "SELECT 1 FROM audit_log WHERE entry='check_update' AND at>?"
+                " AND json_valid(detail_json) AND json_extract(detail_json,'$.id')=? LIMIT 1",
+                (episode["first_seen"], check["id"]),
+            ):
+                continue
+            annotations["check_recovery"] = {
+                "episode_id": episode["id"], "incident_id": incident_id,
+                "generation": generation, "check_id": check["id"],
+                "contract_digest": digest,
+            }
+            episode["annotations_json"] = json.dumps(annotations, ensure_ascii=False)
+            evidence = check_recovery_evidence(self.db, episode, generation)
+            if evidence.get("verdict") not in ("green", "no_contract"):
+                continue
+            with self.db.tx() as conn:
+                # Generation and source status are checked again under the
+                # same write transaction as the lifecycle transition.
+                live = conn.execute("SELECT generation,status FROM incidents WHERE id=?", (incident_id,)).fetchone()
+                if not live or live["status"] != "open" or int(live["generation"] or 1) != generation:
+                    continue
+                evidence = check_recovery_evidence(self.db, episode, generation)
+                if evidence.get("verdict") not in ("green", "no_contract"):
+                    continue
+                cur = conn.execute(
+                    "UPDATE alert_episodes SET status='resolved',source_state='resolved',last_seen=?,"
+                    " last_reconciled_at=?,annotations_json=? WHERE id=? AND status='firing'",
+                    (latest["at"], latest["at"], episode["annotations_json"], episode["id"]),
+                )
+                if cur.rowcount != 1:
+                    continue
+                self.incidents.on_episode_resolved(episode["id"])
             body = f"[恢复] 检查通过 {check.get('asset_id')}/{check.get('name')}"
             ev_id = self.db.event(
                 "check_recovered",
                 f"检查恢复 {check.get('asset_id')}/{check.get('name')}",
-                payload={"check_id": check.get("id"), "body": body},
+                incident_id=incident_id, episode_id=episode["id"],
+                payload={"check_id": check.get("id"), "body": body, "evidence": evidence,
+                         "generation": generation},
             )
             if self.notifier and ev_id:
                 self.notifier.enqueue_for_event(ev_id, body=body, typ="check_recovered")
-        except Exception:
-            pass
 
     async def run_due(self, *, now_ts: float | None = None) -> int:
         """跑到期的启用检查。"""

@@ -120,7 +120,7 @@ _session_ssh_scope: ContextVar[tuple[Any, str] | None] = ContextVar("ayana_sessi
 
 @contextmanager
 def session_ssh_scope(db: Any, session_id: str) -> Iterator[None]:
-    """Use configured investigation/execution roles only for managed sessions."""
+    """Use the session's account group, inheriting the global default when empty."""
     token = _session_ssh_scope.set((db, session_id) if session_id else None)
     try:
         yield
@@ -138,6 +138,8 @@ def check_dispatch_authority() -> None:
 def session_dispatch_guard(
     db: Any, session_id: str, *, require_automatic: bool = False,
     asset_id: str = "", object_id: str = "", incident_id: str = "",
+    incident_generation: int = 0,
+    write_scope: str = "",
 ) -> Iterator[None]:
     """An invocation-local guard; an empty scope preserves legacy callers."""
     if not session_id:
@@ -151,13 +153,17 @@ def session_dispatch_guard(
             authority = resolve_authority(db, session_id)
             if authority.get("lifecycle_block"):
                 raise TransportError(authority["lifecycle_block"], session_id)
-            if authority["access_mode"] != "readwrite":
-                raise TransportError("readonly_mode_rejects_write", session_id)
-            if require_automatic and authority["approval_mode"] != "automatic":
-                raise TransportError("approval_required", session_id)
+            # PERM-03：能力=SSH 账号组；不再做会话级只读/审批拦截
             if asset_id:
-                from .agent_work_scope import WorkScopeError, claim_target
+                from .agent_work_scope import WorkScopeError, claim_target, resolve_incident_write_scope
                 try:
+                    if incident_generation or write_scope:
+                        scope = resolve_incident_write_scope(db, session_id, asset_id, incident_id=incident_id)
+                        if scope["generation"] != incident_generation:
+                            raise WorkScopeError("incident_generation_changed")
+                        if write_scope and (scope["scope"] != write_scope or scope["incident_id"] != incident_id):
+                            raise WorkScopeError("incident_scope_changed", {
+                                "message": "派发前关联工单范围已变化，本次未执行；请重新核对工单后提交。"})
                     claim_target(db,session_id,asset_id=asset_id,object_id=object_id,incident_id=incident_id)
                 except WorkScopeError as exc:
                     error = TransportError(exc.code,str(exc))
@@ -298,64 +304,114 @@ class SSHEndpoint:
 
 
 class SSHAssetStore:
-    """SSH 端点登记与 host key 信任。角色可自定义，kind 决定读/写通道。"""
+    """SSH 端点登记与 host key 信任。
+
+    账号组（原「角色」）名称与描述完全由用户定义；组名只是标签，不代表权限档位。
+    调查/执行各选一组作为凭据选择规则；可只配一组，可设默认组。
+    """
 
     DEFAULT_ROLES = [
-        {"name": "write", "kind": "write", "label": "可执行"},
-        {"name": "read", "kind": "read", "label": "只读"},
+        {"name": "default", "kind": "execute", "label": "默认", "description": ""},
     ]
 
     def __init__(self, db: Database):
         self.db = db
 
     def list_roles(self) -> list[dict[str, Any]]:
-        row = self.db.query_one("SELECT value FROM meta WHERE key='ssh_roles'")
-        if not row:
-            return list(self.DEFAULT_ROLES)
-        try:
-            data = json.loads(row["value"])
-            return data if isinstance(data, list) else list(self.DEFAULT_ROLES)
-        except Exception:
-            return list(self.DEFAULT_ROLES)
+        rows = self.db.query(
+            "SELECT name,label,description FROM ssh_account_groups ORDER BY name"
+        )
+        if rows:
+            return [
+                {"name": r["name"], "label": r["label"] or r["name"],
+                 "description": r["description"] or "", "kind": "custom"}
+                for r in rows
+            ]
+        # 迁移前兜底
+        return list(self.DEFAULT_ROLES)
 
-    def add_role(self, *, name: str, kind: str, label: str = "", actor: str = "web") -> dict[str, Any]:
+    def add_role(self, *, name: str, kind: str = "", label: str = "", description: str = "",
+                 actor: str = "web") -> dict[str, Any]:
+        """新增账号组。name/description 由用户自定义；组名不代表权限档位。"""
         name = (name or "").strip()
         if not name or not name.replace("_", "-").replace(".", "").isalnum() or len(name) > 32:
             raise TransportError("bad_role_name", name)
-        if kind not in ("read", "write"):
-            raise TransportError("bad_role_kind", kind)
-        roles = self.list_roles()
-        if any(r.get("name") == name for r in roles):
-            raise TransportError("role_exists", name)
-        item = {"name": name, "kind": kind, "label": label or name}
-        roles.append(item)
+        item = {
+            "name": name,
+            "kind": kind or "custom",
+            "label": label or name,
+            "description": description or "",
+        }
+        t = now()
         with self.db.tx() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM ssh_account_groups WHERE name=?", (name,)
+            ).fetchone()
+            if exists:
+                raise TransportError("role_exists", name)
             conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES('ssh_roles', ?)",
-                (json.dumps(roles, ensure_ascii=False),),
+                "INSERT INTO ssh_account_groups(name,label,description,created_at,updated_at,created_by)"
+                " VALUES(?,?,?,?,?,?)",
+                (name, item["label"], item["description"], t, t, actor),
             )
             conn.execute(
                 "INSERT INTO audit_log(at, actor_type, actor_id, entry, detail_json, channel)"
                 " VALUES(?,?,?,?,?,?)",
-                (
-                    now(),
-                    "web_user",
-                    actor,
-                    "ssh_role_added",
-                    json.dumps(item, ensure_ascii=False),
-                    "web",
-                ),
+                (t, "web_user", actor, "ssh_role_added",
+                 json.dumps(item, ensure_ascii=False), "web"),
             )
         return item
 
+    def delete_role(self, name: str, *, actor: str = "web") -> None:
+        """删除账号组；同时解绑该组下的主机端点（端点记录保留主机连接信息可复用）。"""
+        name = (name or "").strip()
+        if not name:
+            raise TransportError("bad_role_name", name)
+        with self.db.tx() as conn:
+            row = conn.execute(
+                "SELECT name FROM ssh_account_groups WHERE name=?", (name,)
+            ).fetchone()
+            if not row:
+                raise TransportError("role_not_found", name)
+            conn.execute("DELETE FROM ssh_account_groups WHERE name=?", (name,))
+            conn.execute("DELETE FROM ssh_endpoints WHERE role=?", (name,))
+            conn.execute(
+                "INSERT INTO audit_log(at, actor_type, actor_id, entry, detail_json, channel)"
+                " VALUES(?,?,?,?,?,?)",
+                (now(), "web_user", actor, "ssh_role_deleted",
+                 json.dumps({"name": name}, ensure_ascii=False), "web"),
+            )
+
+    def unassign_account(self, *, asset_id: str, role: str, actor: str = "web") -> None:
+        """把主机账号从组里摘掉（删除该主机在该组下的端点）。"""
+        with self.db.tx() as conn:
+            conn.execute(
+                "DELETE FROM ssh_endpoints WHERE asset_id=? AND role=?",
+                (asset_id, role),
+            )
+            conn.execute(
+                "INSERT INTO audit_log(at, actor_type, actor_id, entry, detail_json, channel)"
+                " VALUES(?,?,?,?,?,?)",
+                (now(), "web_user", actor, "ssh_account_unassigned",
+                 json.dumps({"asset_id": asset_id, "role": role}, ensure_ascii=False), "web"),
+            )
+
     def role_kind(self, role: str) -> str:
-        """角色名 → 读/写通道。未知角色按 write 收紧前先拒绝。"""
+        """兼容读取 kind；组名本身不限制读写。未知组名按 custom。"""
         for r in self.list_roles():
             if r.get("name") == role:
-                return r.get("kind") or "read"
-        if role in ("read", "write"):
-            return role
-        raise TransportError("unknown_role", role)
+                return r.get("kind") or "custom"
+        return "custom"
+
+    def default_role_name(self) -> str:
+        """默认账号组：有 default 则用它，否则唯一组，否则 default。"""
+        roles = self.list_roles()
+        if any(r.get("name") == "default" for r in roles):
+            return "default"
+        if len(roles) == 1:
+            return str(roles[0].get("name") or "default")
+        return "default"
+
 
     def upsert_endpoint(
         self,
@@ -365,7 +421,7 @@ class SSHAssetStore:
         host: str,
         port: int = 22,
         username: str,
-        credential_id: str = "",
+        credential_id: str | None = None,
         actor: str = "web",
     ) -> dict[str, Any]:
         if not host or not username:
@@ -379,14 +435,28 @@ class SSHAssetStore:
         t = now()
         eid = new_id("ssh")
         with self.db.tx() as conn:
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+            previous = conn.execute(
+                "SELECT * FROM ssh_endpoints WHERE asset_id=? AND role=?", (asset_id, role)
+            ).fetchone()
+            saved_credential = (previous["credential_id"] if previous and credential_id is None
+                                else credential_id or "")
+            same_host = bool(previous and previous["host"] == host and int(previous["port"]) == int(port))
+            fingerprint = previous["host_key_sha256"] if same_host else ""
+            key_line = previous["host_key_line"] if same_host else ""
+            trusted_at = previous["host_key_trusted_at"] if same_host else None
             conn.execute(
                 "INSERT INTO ssh_endpoints(id, asset_id, role, host, port, username,"
-                " credential_id, enabled, created_at, updated_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?)"
+                " credential_id, host_key_sha256, host_key_line, host_key_trusted_at, enabled, created_at, updated_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(asset_id, role) DO UPDATE SET"
                 " host=excluded.host, port=excluded.port, username=excluded.username,"
-                " credential_id=excluded.credential_id, updated_at=excluded.updated_at",
-                (eid, asset_id, role, host, int(port), username, credential_id or "", 1, t, t),
+                " credential_id=excluded.credential_id, host_key_sha256=excluded.host_key_sha256,"
+                " host_key_line=excluded.host_key_line, host_key_trusted_at=excluded.host_key_trusted_at,"
+                " updated_at=excluded.updated_at",
+                (eid, asset_id, role, host, int(port), username, saved_credential,
+                 fingerprint, key_line, trusted_at, 1, t, t),
             )
             conn.execute(
                 "INSERT INTO audit_log(at, actor_type, actor_id, entry, asset_id, detail_json, channel)"
@@ -403,7 +473,7 @@ class SSHAssetStore:
                             "host": host,
                             "port": int(port),
                             "username": username,
-                            "credential_id": credential_id or "",
+                            "credential_id": saved_credential,
                         },
                         ensure_ascii=False,
                     ),
@@ -524,46 +594,35 @@ class SSHTransport:
         )
 
     def _endpoint_for_channel(self, asset_id: str, kind: str) -> SSHEndpoint:
-        """按读/写通道找端点：优先精确角色名，再按角色 kind 匹配。
-
-        只读探测在缺少 read 端点时，回落到同资产 write 端点（只读命令仍走 probe）。
-        """
+        """所有用途共用会话选择或全局默认账号组；缺少端点时不回退。"""
         scope = _session_ssh_scope.get()
+        session_id = ""
         if scope:
             database, session_id = scope
-            setting = "ssh_execute_role" if kind == "write" else "ssh_investigate_role"
-            selected = database.query_one("SELECT value FROM agent_settings WHERE key=?",(setting,))
-            role = str(selected["value"] or kind) if selected else kind
-            row = self.store.get_endpoint(asset_id,role)
-            if row and row.get("enabled"):
-                return self._endpoint(asset_id,role)
-            # Keep the legacy default read/write fallback, but an explicitly
-            # selected alternate account must never silently become root.
-            if role != kind or role not in ("read","write"):
-                raise TransportError("configured_ssh_endpoint_missing",f"{asset_id}/{role}; setting={setting}; session_id={session_id}")
-        if kind == "write":
-            row = self.store.get_endpoint(asset_id, "write")
-            if row and row.get("enabled"):
-                return self._endpoint(asset_id, "write")
-            for r in self.store.list_roles():
-                if r.get("kind") == "write":
-                    row = self.store.get_endpoint(asset_id, r["name"])
-                    if row and row.get("enabled"):
-                        return self._endpoint(asset_id, r["name"])
-            raise TransportError("endpoint_missing", f"{asset_id}/write")
-        row = self.store.get_endpoint(asset_id, "read")
+            from .agent_authority import resolve_authority
+            role = resolve_authority(database, session_id)["ssh_account_group"]
+        else:
+            selected = self.store.db.query_one("SELECT value FROM agent_settings WHERE key='ssh_default_group'")
+            role = str(selected["value"] or "default") if selected else "default"
+        row = self.store.get_endpoint(asset_id, role)
         if row and row.get("enabled"):
-            return self._endpoint(asset_id, "read")
-        for r in self.store.list_roles():
-            if r.get("kind") == "read":
-                row = self.store.get_endpoint(asset_id, r["name"])
-                if row and row.get("enabled"):
-                    return self._endpoint(asset_id, r["name"])
-        # 同资产 write 端点可做只读探测（避免「只有 write 就完全不能查状态」）
-        wrow = self.store.get_endpoint(asset_id, "write")
-        if wrow and wrow.get("enabled"):
-            return self._endpoint(asset_id, "write")
-        raise TransportError("endpoint_missing", f"{asset_id}/read")
+            return self._endpoint(asset_id, role)
+        raise TransportError(
+            "configured_ssh_endpoint_missing",
+            f"{asset_id}/{role}; setting=ssh_default_group; session_id={session_id}",
+        )
+
+    def _check_endpoint_selection(self, asset_id: str, kind: str, expected: SSHEndpoint,
+                                  *, explicit_group: str | None = None) -> None:
+        """A group/binding change while preparing SSH must take effect before dispatch."""
+        try:
+            current = (self._endpoint(asset_id, explicit_group) if explicit_group is not None
+                       else self._endpoint_for_channel(asset_id, kind))
+            if current != expected:
+                raise TransportError("ssh_account_group_changed", f"{asset_id}/{expected.role}")
+        except Exception as exc:
+            exc.dispatch_not_started = True
+            raise
 
     async def probe(self, asset_id: str, cmd_tokens: list[str], timeout: float | None = None) -> NTResult:
         return await self._run(asset_id, "read", cmd_tokens, timeout)
@@ -582,14 +641,25 @@ class SSHTransport:
         """通用 shell 入口：绕过 cmd_tokens 元字符检查，其余校验照旧。
 
         权限半径 = 目标机 SSH 账户。host key / 用户校验 / 超时 / 输出截断与 probe/exec 一致。
-        channel: write（默认）| read，决定走写/读端点。
+        channel: write（默认）| read，仅标注命令用途；两者使用同一账号组。
         """
         if not isinstance(command, str) or not command.strip():
             raise TransportError("bad_command")
         if "\x00" in command:
             raise TransportError("unsafe_command", "null byte")
         kind = "read" if channel == "read" else "write"
-        return await self._run_command(asset_id, kind, command, timeout)
+        try:
+            return await self._run_command(asset_id, kind, command, timeout)
+        except TransportError as exc:
+            # These checks all precede process creation. A missing account
+            # group or an untrusted key must not become an unknown execution.
+            if exc.code in {
+                "configured_ssh_endpoint_missing", "endpoint_missing",
+                "host_key_untrusted", "host_key_changed", "host_key_line_missing",
+                "bad_username", "bad_host", "bad_identity",
+            }:
+                exc.dispatch_not_started = True
+            raise
 
     async def _run(
         self, asset_id: str, kind: str, cmd_tokens: list[str], timeout: float | None = None
@@ -603,9 +673,11 @@ class SSHTransport:
         return await self._run_command(asset_id, kind, remote, timeout)
 
     async def _run_command(
-        self, asset_id: str, kind: str, remote: str, timeout: float | None = None
+        self, asset_id: str, kind: str, remote: str, timeout: float | None = None,
+        *, explicit_group: str | None = None,
     ) -> NTResult:
-        ep = self._endpoint_for_channel(asset_id, "write" if kind == "write" else "read")
+        ep = (self._endpoint(asset_id, explicit_group) if explicit_group is not None
+              else self._endpoint_for_channel(asset_id, "write" if kind == "write" else "read"))
         # 首次未信任：不要求用户手工粘贴；由上层 fetch_host_key + 信任后再连
         if not ep.host_key_sha256 or not ep.host_key_trusted_at:
             raise TransportError("host_key_untrusted", f"{asset_id}/{ep.role}")
@@ -699,6 +771,7 @@ class SSHTransport:
             argv += ["-l", ep.username, "--", ep.host, remote]
 
             check_dispatch_authority()
+            self._check_endpoint_selection(asset_id, kind, ep, explicit_group=explicit_group)
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdout=asyncio.subprocess.PIPE,
@@ -713,7 +786,8 @@ class SSHTransport:
                     await asyncio.wait_for(proc.wait(), timeout=2)
                 except Exception:
                     pass
-                return NTResult(ok=False, output="timeout", timed_out=True, returncode=-1)
+                return NTResult(ok=False, output="timeout", timed_out=True, returncode=-1,
+                                account=ep.username, account_group=ep.role)
             out = (out_b or b"").decode("utf-8", errors="replace")
             err = (err_b or b"").decode("utf-8", errors="replace")
             text = out if proc.returncode == 0 else (err or out or f"exit={proc.returncode}")
@@ -723,6 +797,7 @@ class SSHTransport:
                 returncode=proc.returncode,
                 mode="exec" if kind == "write" else "probe",
                 account=ep.username,
+                account_group=ep.role,
             )
         finally:
             # 凭据与临时文件立即清理
@@ -792,6 +867,7 @@ class SSHTransport:
 
             async def _run_cat(cmd_line: str, data: bytes) -> NTResult:
                 check_dispatch_authority()
+                self._check_endpoint_selection(asset_id, "write", ep)
                 proc = await asyncio.create_subprocess_exec(
                     *argv[:-1],
                     cmd_line,
@@ -807,9 +883,11 @@ class SSHTransport:
                         proc.kill()
                     except Exception:
                         pass
-                    return NTResult(ok=False, output="timeout", returncode=-1)
+                    return NTResult(ok=False, output="timeout", returncode=-1, timed_out=True,
+                                    account=ep.username, account_group=ep.role)
                 text = ((out_b or b"") + (err_b or b"")).decode("utf-8", "replace")
-                return NTResult(ok=proc.returncode == 0, output=text[:500], returncode=proc.returncode)
+                return NTResult(ok=proc.returncode == 0, output=text[:500], returncode=proc.returncode,
+                                account=ep.username, account_group=ep.role)
 
             # 大文件分块写入，避免单次 stdin 过大被 sshd 重置
             size = lp.stat().st_size
@@ -844,19 +922,16 @@ class SSHTransport:
                 pass
             secret = ""
 
-    async def test_connection(self, asset_id: str, role: str = "read") -> dict[str, Any]:
-        kind = "write" if role == "write" else "read"
-        try:
-            self.store.role_kind(role) if role not in ("read", "write") else None
-            kind = self.store.role_kind(role) if role not in ("read", "write") else role
-        except Exception:
-            pass
-        res = await self._run(asset_id, "write" if kind == "write" else "read", ["true"], timeout=8.0)
+    async def test_connection(self, asset_id: str, role: str | None = None) -> dict[str, Any]:
+        """Test the explicitly selected group, or the effective default if omitted."""
+        res = await self._run_command(asset_id, "read", "true", timeout=8.0, explicit_group=role)
         return {
             "ok": res.ok,
             "output": res.output[:500],
             "returncode": res.returncode,
             "timed_out": res.timed_out,
+            "account_group": res.account_group,
+            "account": res.account,
         }
 
 
@@ -879,19 +954,27 @@ def resolve_exec_channel(
     """统一执行通道解析：有 SSH 端点用 SSH；仅本机登记资产才允许 LocalExec。
 
     合并自 main._checks_transport 与 web._ne_transport 两处重复回落逻辑。
-    SSH 失败不得静默跨主机回退；找不到通道抛 ChannelUnavailable。
+    role 是调查/执行用途，实际账号组由 SSHTransport 统一选择。
+    已配置 SSH 的资产缺少指定组时直接报错，不跨组或跨主机回退。
     """
     local_assets = local_assets or set()
     store = getattr(ssh_transport, "store", None) if ssh_transport is not None else None
     if store is not None:
-        try:
-            ep = store.get_endpoint(asset_id, role) or store.get_endpoint(
-                asset_id, "write" if role == "read" else "read"
-            )
-        except Exception:
-            ep = None
-        if ep and ep.get("enabled") and ssh_transport is not None:
-            return ssh_transport
+        select = getattr(ssh_transport, "_endpoint_for_channel", None)
+        if select is not None:
+            # Use the same selector as the eventual probe/exec, including the
+            # session override or the global default account group.
+            try:
+                select(asset_id, "write" if role == "write" else "read")
+            except TransportError:
+                if store.list_endpoints(asset_id) or asset_id not in local_assets:
+                    raise
+            else:
+                return ssh_transport
+        else:
+            ep = store.get_endpoint(asset_id, role)
+            if ep and ep.get("enabled"):
+                return ssh_transport
     if asset_id in local_assets:
         from .promconfig import LocalExecTransport
 

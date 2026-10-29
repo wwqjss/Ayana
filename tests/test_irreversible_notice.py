@@ -1,4 +1,4 @@
-﻿"""不可逆操作提前通知：只通知不审批、不阻断、不作安全保证。"""
+"""不可逆操作提前通知：只通知不审批、不阻断、不作安全保证。"""
 from __future__ import annotations
 
 import asyncio
@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from ayana.actions import ActionService, looks_irreversible, announce_irreversible
+from ayana.exec_facts import looks_irreversible, announce_irreversible
 from ayana.db import Database, now
 from ayana.ntsafe import NTError, NTResult
 
@@ -68,13 +68,7 @@ class NoticeTests(unittest.TestCase):
             " VALUES('admin','x',0,1,?,?)",
             (t, t),
         )
-        from ayana.policy import Policy
-
         self.nt = FakeNT()
-        self.actions = ActionService(
-            self.db, self.nt, FakeGate(), Policy(self.db), FakeProm(),
-            action_ttl=1800, verify_window=5, verify_timeout=1,
-        )
 
     def tearDown(self):
         self.db.close()

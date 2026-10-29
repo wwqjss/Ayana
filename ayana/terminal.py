@@ -241,7 +241,7 @@ class TerminalService:
         self,
         *,
         asset_id: str,
-        role: str = "write",
+        role: str | None = None,
         username: str,
         cols: int = 80,
         rows: int = 24,
@@ -257,11 +257,12 @@ class TerminalService:
                 raise TerminalError("too_many_sessions", "user")
 
             eps = self.ssh_store.list_endpoints(asset_id) if self.ssh_store else []
+            if role is None:
+                selected = self.db.query_one("SELECT value FROM agent_settings WHERE key='ssh_default_group'")
+                role = str(selected["value"] or "default") if selected else "default"
             ep = next((e for e in eps if e.get("role") == role and e.get("enabled")), None)
             if not ep:
-                ep = next((e for e in eps if e.get("enabled")), None)
-            if not ep:
-                raise TerminalError("no_ssh_endpoint", "请先配置 SSH 连接")
+                raise TerminalError("no_ssh_endpoint", f"请先配置 SSH 账号组 {role} 的连接")
             if not ep.get("credential_id"):
                 raise TerminalError("no_credential", "未配置密码或密钥")
 

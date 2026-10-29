@@ -295,7 +295,7 @@ main { padding: 20px 22px 40px; max-width: 1100px; margin: 0 auto; }
   border-radius: 0 8px 8px 0;
   font-size: 13px; line-height: 1.6; color: var(--ink);
 }
-#chk-assist-msg div { line-height: 1.55; }
+#chk-form-msg div { line-height: 1.55; }
 .assist-followup:empty { display: none; }
 .assist-question { margin: 12px 0; padding-top: 10px; border-top: 1px solid var(--line); }
 .assist-question label { display: block; color: var(--ink); margin-bottom: 6px; }
@@ -308,8 +308,8 @@ main { padding: 20px 22px 40px; max-width: 1100px; margin: 0 auto; }
 .assist-choice-help { margin: 5px 0; color: var(--dim); font-size: 12px; }
 .assist-debug { margin-top: 12px; }
 .assist-debug summary { cursor: pointer; color: var(--dim); font-size: 12px; }
-.assist-field-source { display: inline-block; margin-left: 6px; color: var(--dim); font-size: 11px; }
-.assist-field-source.inferred { color: var(--warn); }
+.check-field-source { display: inline-block; margin-left: 6px; color: var(--dim); font-size: 11px; }
+.check-field-source.inferred { color: var(--warn); }
 .check-form-title { font-size: 13px; margin: 16px 0 8px; }
 .btn:disabled { opacity: .55; cursor: wait; }
 
@@ -905,6 +905,20 @@ body.settings-open, body.settings-page-open { overflow: hidden; }
 .workspace-inset-disclosure { margin-top: 20px; border-top: 1px solid var(--line); padding-top: 17px; }
 .workspace-inset-disclosure > summary, .workspace-diagnostics > summary { color: #a9b3c1; font-size: 12px; cursor: pointer; line-height: 1.7; }
 .workspace-inset-body { padding-top: 20px; }
+
+/* 账号组管理 */
+.account-group-row { border: 1px solid var(--line); border-radius: 10px; margin: 10px 0; background: #141920; }
+.account-group-row > summary { list-style: none; cursor: pointer; padding: 12px 14px; }
+.account-group-row > summary::-webkit-details-marker { display: none; }
+.account-group-row > summary::before { content: "▸"; display: inline-block; width: 1em; color: #8a93a0; margin-right: 6px; transition: transform .15s; }
+.account-group-row[open] > summary::before { transform: rotate(90deg); }
+.account-group-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.account-group-head code { color: #8ec7ff; }
+.account-group-body { padding: 0 14px 12px 30px; }
+.account-group-members { margin-top: 4px; display: grid; gap: 4px; }
+.account-group-member { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; font-size: 12px; color: #c3ccd8; }
+.account-group-member code { color: #9fd0ff; }
+.btn.link { background: transparent; border: none; color: #6eb6ff; text-decoration: underline; padding: 0; height: auto; }
 .workspace-diagnostics { margin-top: 21px; padding-top: 15px; border-top: 1px solid var(--line); }
 .workspace-diagnostics pre { margin-top: 12px; max-height: 280px; white-space: pre-wrap; overflow-wrap: anywhere; color: #9aa4b2; background: #151920; }
 .connection-row, .credential-row { margin-bottom: 10px; border: 1px solid rgba(255,255,255,.075); border-radius: 11px; background: rgba(255,255,255,.012); overflow: hidden; }

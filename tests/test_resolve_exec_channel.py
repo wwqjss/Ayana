@@ -59,12 +59,12 @@ class ResolveExecChannelTest(unittest.TestCase):
         with self.assertRaises(ChannelUnavailable):
             resolve_exec_channel("remote", None, local_assets=set(), role="write")
 
-    def test_role_fallback_to_other_role(self):
-        # 只读通道在缺 read 端点时可回落 write 端点（只读命令仍走 probe）
+    def test_missing_selected_group_never_falls_back_to_other_role(self):
+        # 账号组由用户指定；缺少指定组不能改用另一个组的账号。
         store = FakeStore({"web-01/write": {"enabled": True}})
         ssh = FakeSSH(store)
-        ch = resolve_exec_channel("web-01", ssh, local_assets=set(), role="read")
-        self.assertIs(ch, ssh)
+        with self.assertRaises(ChannelUnavailable):
+            resolve_exec_channel("web-01", ssh, local_assets=set(), role="read")
 
     def test_disabled_endpoint_not_used(self):
         store = FakeStore({"web-01/read": {"enabled": False}})

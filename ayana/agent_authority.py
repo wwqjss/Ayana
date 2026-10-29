@@ -20,6 +20,10 @@ def _one(db, conn, sql, params=()):
 
 
 def resolve_authority(db: Any, session_id: str, *, conn=None) -> dict:
+    """会话权威：生命周期 + 接管租约。三档只读/审批权限已删除（PERM-03）。
+
+    能力范围由当前会话选择的 SSH 账号组决定，不由会话 access_mode 决定。
+    """
     if conn is None:
         with db.tx() as snapshot:
             if not snapshot.in_transaction: snapshot.execute("BEGIN")
@@ -28,28 +32,22 @@ def resolve_authority(db: Any, session_id: str, *, conn=None) -> dict:
     if session is None:
         raise AuthorityError("authority_session_unknown")
     session = dict(session)
-    settings = dict((r["key"], r["value"]) for r in
-        (conn.execute("SELECT key,value FROM agent_settings") if conn is not None else db.query("SELECT key,value FROM agent_settings")))
-    approval = settings.get("auto_approval_mode", "automatic")
-    if session["origin"] == "auto":
-        access, source = settings.get("auto_access_mode", "readwrite"), "auto_global"
-    else:
-        access, approval, source = session["access_mode"], session["approval_mode"], "manual_session"
+    global_group = _one(db, conn, "SELECT value FROM agent_settings WHERE key='ssh_default_group'")
+    selected_group = str(session.get("ssh_account_group") or "").strip()
+    account_group = selected_group or str(global_group["value"] if global_group else "default").strip() or "default"
     binding = _one(db, conn, "SELECT * FROM agent_runtime_bindings WHERE session_id=?", (session_id,))
     binding = dict(binding) if binding is not None else {}
     active = bool(session["status"] == "open" and binding.get("controller") and binding.get("controller_connection_id")
         and float(binding.get("control_expires_at") or 0) > time.time())
-    if active:
-        access, approval, source = binding.get("override_access_mode"), binding.get("override_approval_mode"), "takeover"
-    if access not in ("readonly", "readwrite") or approval not in ("manual", "automatic"):
-        raise AuthorityError("authority_state_invalid")
+    source = "takeover" if active else ("auto_global" if session["origin"] == "auto" else "manual_session")
     global_rev = _one(db, conn, "SELECT value FROM meta WHERE key='agent_authority_revision'")
     revision = int(global_rev["value"] if global_rev else 0) * 1000000000 + int(session["authority_revision"]) * 2 + (0 if active else 1)
     lifecycle_block = ("session_deleted" if session.get("deleted_at") else "session_deleting" if session.get("delete_requested_at")
                        else "session_paused" if session.get("paused_at") else "")
-    return {"session_id": session_id, "access_mode": access, "approval_mode": approval,
+    return {"session_id": session_id, "access_mode": "readwrite", "approval_mode": "automatic",
+        "ssh_account_group": account_group, "ssh_account_group_source": "session" if selected_group else "global",
         "source": source, "revision": revision, "controller_active": active,
-        "lifecycle_block": lifecycle_block, "write_allowed": not lifecycle_block and access == "readwrite",
+        "lifecycle_block": lifecycle_block, "write_allowed": not lifecycle_block,
         "lease_expires_at": float(binding.get("control_expires_at") or 0) if active else 0}
 
 

@@ -24,6 +24,7 @@ from typing import Any
 
 from .db import new_id, now
 from .duty_session import DutySessionManager
+from .agent_work_scope import WorkScopeError
 
 
 class SessionBridge:
@@ -509,6 +510,7 @@ class SessionBridge:
         claimed_by: str = "",
         retry_safe: bool = False,
         authority_session_id: str = "",
+        incident_generation: int = 0,
     ) -> dict[str, Any]:
         if not incident_id or not action_key:
             raise ValueError("incident_id and action_key required")
@@ -518,8 +520,6 @@ class SessionBridge:
             authority = resolve_authority(self.db, authority_session_id)
             if authority.get("lifecycle_block"):
                 return {"ok":False,"claimed":False,"error":authority["lifecycle_block"]}
-            if authority["access_mode"] != "readwrite":
-                return {"ok": False, "claimed": False, "error": "readonly_mode_rejects_write"}
         t = now()
         lease = t + self._lease_seconds()
         params_hash = ""
@@ -532,6 +532,30 @@ class SessionBridge:
 
         try:
             with self.db.tx() as conn:
+                if not conn.in_transaction:
+                    conn.execute("BEGIN IMMEDIATE")
+                if authority_session_id and target:
+                    from .agent_work_scope import claim_target, resolve_incident_write_scope
+                    if incident_generation:
+                        scope = resolve_incident_write_scope(self.db, authority_session_id, target,
+                                                             incident_id=incident_id, conn=conn)
+                        if scope["generation"] != incident_generation:
+                            raise WorkScopeError("incident_generation_changed")
+                    claim_target(self.db, authority_session_id, asset_id=target, object_id="*",
+                                 incident_id=incident_id if incident_generation else "", conn=conn)
+                    unresolved = conn.execute(
+                        "SELECT id,incident_id,session_id,action_key,status,lease_expires_at FROM session_write_ops "
+                        "WHERE target=? AND status IN ('claimed','unknown') ORDER BY created_at LIMIT 1",
+                        (target,)).fetchone()
+                    if unresolved:
+                        unresolved = dict(unresolved)
+                        if unresolved["status"] == "claimed" and float(unresolved["lease_expires_at"] or 0) < t:
+                            conn.execute("UPDATE session_write_ops SET status='unknown',result='lease_expired',updated_at=? "
+                                         "WHERE id=? AND status='claimed'", (t, unresolved["id"]))
+                            unresolved["status"] = "unknown"
+                        return {"ok": False, "claimed": False, "error": "unresolved_target_write",
+                                "unknown": unresolved["status"] == "unknown",
+                                "in_flight": unresolved["status"] == "claimed", **unresolved}
                 conn.execute(
                     "INSERT INTO session_write_ops("
                     " id, incident_id, session_id, action_key, status, result,"
@@ -553,6 +577,8 @@ class SessionBridge:
                     ),
                 )
             return {"ok": True, "claimed": True, "action_key": action_key, "already_done": False}
+        except WorkScopeError:
+            raise
         except Exception:
             pass
 
@@ -619,9 +645,9 @@ class SessionBridge:
         with self.db.tx() as conn:
             cur = conn.execute(
                 "UPDATE session_write_ops SET status='claimed', updated_at=?, lease_expires_at=?,"
-                " claimed_by=? WHERE incident_id=? AND action_key=?"
+                " claimed_by=?,session_id=? WHERE incident_id=? AND action_key=?"
                 " AND status IN ('released','failed')",
-                (now(), lease, (claimed_by or "")[:64], incident_id, action_key),
+                (now(), lease, (claimed_by or "")[:64], sid, incident_id, action_key),
             )
             changed = cur.rowcount == 1
         if changed:
@@ -825,8 +851,6 @@ class SessionBridge:
             authority = resolve_authority(self.db, authority_session_id)
             if authority.get("lifecycle_block"):
                 return {"ok":False,"error":authority["lifecycle_block"]}
-            if authority["access_mode"] != "readwrite":
-                return {"ok": False, "error": "readonly_mode_rejects_write"}
             params = {**(params or {}), "_ayana_session_id": authority_session_id}
         t = now()
         with self.db.tx() as conn:
@@ -888,8 +912,6 @@ class SessionBridge:
                     authority = resolve_authority(self.db, authority_sid, conn=conn)
                 except AuthorityError as exc:
                     return {"ok": False, "error": exc.code}
-                if authority["access_mode"] != "readwrite":
-                    return {"ok": False, "error": "readonly_mode_rejects_write"}
                 if authority.get("lifecycle_block"):
                     return {"ok":False,"error":authority["lifecycle_block"]}
             t=now()

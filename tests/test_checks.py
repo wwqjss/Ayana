@@ -98,9 +98,9 @@ class TestTokens(unittest.TestCase):
                 self.assertEqual(validate_argv(argv), argv)
 
     def test_evaluate(self):
-        ok, state, _ = evaluate("service", [{"output": "active", "returncode": 0}], {})
+        ok, state, _ = evaluate("service", [{"output": "active", "returncode": 0, "ok": True}], {})
         self.assertTrue(ok)
-        ok, state, _ = evaluate("service", [{"output": "inactive", "returncode": 0}], {})
+        ok, state, _ = evaluate("service", [{"output": "inactive", "returncode": 0, "ok": True}], {})
         self.assertFalse(ok)
         ok, _, _ = evaluate("port", [{"output": "LISTEN 0 128 *:8080", "returncode": 0, "ok": True}], {})
         self.assertTrue(ok)

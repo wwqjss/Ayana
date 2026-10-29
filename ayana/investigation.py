@@ -28,8 +28,8 @@ from .capabilities import (
 )
 from .db import Database, new_id, now
 from .knowledge import KnowledgeBase
-from .ntsafe import IdentityGate, NTClient, NTResult
-from .policy import Policy
+from .exec_facts import NTResult
+from .access import AccessControl as Policy
 from .prom import PromClient, summarize_probe
 
 # 停止条件（禁止“模型觉得差不多了”作为唯一条件）
@@ -252,8 +252,8 @@ class InvestigationService:
     def __init__(
         self,
         db: Database,
-        nt: NTClient,
-        gate: IdentityGate,
+        nt: Any,
+        gate: Any,
         prom: PromClient,
         policy: Policy,
         knowledge: KnowledgeBase | None = None,
@@ -693,8 +693,8 @@ class InvestigationService:
         inv_id: str,
         round_no: int,
     ) -> list[dict[str, Any]]:
-        binding = self.gate.get(asset_id)
         out: list[dict[str, Any]] = []
+        identity = asset_id
 
         if capability == "probe.status":
             service = (object_id or "").split(":")[-1] or object_id
@@ -711,7 +711,7 @@ class InvestigationService:
                     "source": "prometheus",
                     "observed_at": now(),
                     "classification": EV_OBSERVED,
-                    "transport": {"ok": True, "returncode": 0, "timed_out": False, "error": "", "identity": binding.read_alias},
+                    "transport": {"ok": True, "returncode": 0, "timed_out": False, "error": "", "identity": identity},
                     "observed": {
                         "kind": "probe",
                         "summary": summary,
@@ -727,7 +727,7 @@ class InvestigationService:
             res: NTResult = await self._probe_channel(asset_id, tokens, timeout=10.0)
             classified = classify_evidence(capability, tokens, res)
             transport = dict(classified.get("transport") or {})
-            transport["identity"] = binding.read_alias
+            transport["identity"] = identity
             ev = {
                 "evidence_id": new_id("ev"),
                 "round": round_no,
@@ -776,44 +776,14 @@ class InvestigationService:
                 "stop_reason": "",
             }
         try:
-            # 过滤 output 防注入：只给结构化摘要 + 截断 raw
-            ev_brief = []
-            for e in evidence[-12:]:
-                obs = e.get("observed") or {}
-                ev_brief.append(
-                    {
-                        "id": e.get("evidence_id"),
-                        "tool": e.get("tool"),
-                        "class": e.get("classification"),
-                        "object": e.get("object_id"),
-                        "state": obs.get("service_state") or obs.get("listening") or obs.get("kind"),
-                        "ts": e.get("observed_at"),
-                    }
-                )
-            allowed = [
-                c
-                for c in CAPABILITIES
-                if CAPABILITIES[c].kind == "read"
-            ]
-            text = await self.llm.propose_next_tools(
-                asset_id=asset_id,
-                object_id=object_id,
-                evidence_brief=ev_brief,
-                hypotheses=hypotheses,
-                missing=missing,
-                knowledge_text=(knol.get("context_text") or "")[:1500],
-                extra_failures=extra_failures,
-                allowed_capabilities=allowed,
-            )
-            if not text:
-                return {
-                    "hypotheses": hypotheses,
-                    "missing_evidence": missing,
-                    "next_tools": [],
-                    "stop": False,
-                    "stop_reason": "",
-                }
-            return self._parse_llm_proposal(text, hypotheses=hypotheses, missing=missing)
+            # 旧第二套 AI 调查已退役：MiMoCode 是唯一 AI 大脑（core-012/013）
+            return {
+                "hypotheses": hypotheses,
+                "missing_evidence": missing,
+                "next_tools": [],
+                "stop": True,
+                "stop_reason": "need_human",
+            }
         except Exception:
             return {
                 "hypotheses": hypotheses,

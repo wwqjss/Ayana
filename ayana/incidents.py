@@ -22,6 +22,7 @@ class IncidentService:
         self.db = db
         self.session_bridge = None  # P2 薄桥，可选注入；不引入新自治
         self.auto_investigator = None  # P4.3 只读调查，可选注入
+        self.prom = None  # 恢复证据评估（可选注入）；缺失时视为证据不足
 
     def _touch_session(self, inc_id: str, generation: int | None = None) -> None:
         """挂上调查 Session（P2）。桥缺失/失败不影响事件主流程。"""
@@ -210,8 +211,9 @@ class IncidentService:
             # 同事件还有别的问题在响，先别闭环。
             # 不要把 stage 打成 watching：那会把事件踢出 Agent 捞取窗口。
             return
-        # 目标已恢复：直接闭环，理由=目标已恢复（不再被 need_human / 缺验证卡住）
-        self._force_recovered(inc_id, episode_id=episode_id)
+        # 告警消失 ≠ 恢复（软约束第 4 条对状态机同样生效）：
+        # 恢复结论必须有按故障类型匹配契约的、新鲜有效的证据。
+        self._claim_recovery_with_evidence(inc_id, episode_id=episode_id)
 
     def episode_is_current(self, inc_id: str, episode: dict) -> bool:
         """旧代恢复补偿不能清理当前故障；首条 episode 由代次事件明确绑定。"""
@@ -240,7 +242,8 @@ class IncidentService:
                 return True
         return float(episode["first_seen"] or 0) >= float(generation["at"])
 
-    def ensure_recovery_event(self, inc_id: str, *, episode_id: str = "") -> int | None:
+    def ensure_recovery_event(self, inc_id: str, *, episode_id: str = "",
+                              evidence: dict | None = None) -> int | None:
         """已确认的恢复每代只记录一次；状态与事件应在同一外层事务提交。"""
         with self.db.tx() as conn:
             row = conn.execute("SELECT * FROM incidents WHERE id=?", (inc_id,)).fetchone()
@@ -267,20 +270,192 @@ class IncidentService:
                 "incident_resolved", "目标已恢复", incident_id=inc_id, episode_id=episode_id,
                 payload={"episode_id": episode_id, "generation": int(row["generation"] or 1),
                          "reason": "目标已恢复", "resolution_basis": row["resolution_basis"],
-                         "body": fmt_incident_resolved(snapshot)},
+                         "evidence": evidence, "body": fmt_incident_resolved(snapshot)},
             )
 
-    def _force_recovered(self, inc_id: str, *, episode_id: str = "") -> dict[str, Any]:
-        """目标已恢复即闭环：outcome=recovered，理由=目标已恢复。"""
+    def _recovery_evidence(self, ep: dict) -> dict[str, Any]:
+        """按故障类型匹配验证契约，评估新鲜恢复证据。"""
+        from .verify_profiles import recovery_evidence_contract
+
+        if ep.get("source_id") == "ayana_check":
+            from .checks import check_recovery_evidence
+            incident = self.db.query_one("SELECT generation FROM incidents WHERE id=?", (ep.get("incident_id"),))
+            if not incident:
+                return {"verdict": "none", "reason": "incident_missing"}
+            return check_recovery_evidence(self.db, ep, int(incident["generation"] or 1))
+        contract = recovery_evidence_contract(
+            alertname=ep.get("alertname") or "",
+            problem_family=ep.get("problem_family") or "",
+        )
+        if contract is None:
+            return {"verdict": "no_contract", "contract": ""}
+        prom = getattr(self, "prom", None)
+        if prom is None:
+            return {"verdict": "none", "contract": getattr(contract, "id", "")}
+        try:
+            out = prom.evaluate_recovery_evidence_sync(
+                contract,
+                asset_id=ep.get("asset_id") or "",
+                service=ep.get("object_id") or "",
+            )
+            return dict(out)
+        except Exception as exc:  # noqa: BLE001 — 证据源故障视为证据不足
+            return {"verdict": "none", "contract": getattr(contract, "id", ""),
+                    "error": str(exc)[:120]}
+
+    def _claim_recovery_with_evidence(self, inc_id: str, *, episode_id: str = "") -> None:
+        """恢复声明必须有新鲜有效证据；无证据/证据否决都不得 recovered。"""
+        row = self.db.query_one("SELECT * FROM incidents WHERE id=?", (inc_id,))
+        if not row or row["status"] != "open":
+            return
+        gen = int(row["generation"] or 1)
+        ev = self._incident_recovery_evidence(inc_id, gen)
+        verdict = ev.get("verdict")
+        if verdict == "green":
+            self._force_recovered(inc_id, episode_id=episode_id, evidence=ev, generation=gen)
+        elif verdict == "red":
+            self.db.event(
+                "recovery_claim_rejected",
+                "恢复声明被新近证据否决，故障仍未恢复",
+                incident_id=inc_id, episode_id=episode_id,
+                payload={"evidence": ev},
+            )
+        elif verdict == "no_contract":
+            self._close_unverified(inc_id, episode_id=episode_id, reason="no_recovery_contract", generation=gen)
+        else:
+            self.db.event(
+                "recovery_claim_awaiting_evidence",
+                "告警已恢复但缺少新鲜恢复证据，等待确认",
+                incident_id=inc_id, episode_id=episode_id,
+                payload={"evidence": ev},
+            )
+
+    def _recorded_recovery_evidence(self, inc_id: str, gen: int, ep: dict, contract: Any) -> dict:
+        """A passed action is evidence only for its exact recovery contract and target."""
+        from .actions import action_generation_block
+        from .prom import evaluate_recovery_samples
+
+        evaluated_at = now()
+        for verification in self.db.query(
+            "SELECT * FROM verifications WHERE incident_id=? AND status='passed'"
+            " AND generation=? AND profile_id=? AND finished_at>=? ORDER BY finished_at DESC",
+            (inc_id, gen, contract.id, evaluated_at - 120),
+        ):
+            try:
+                evidence = json.loads(verification["evidence_json"] or "{}")
+                action = self.db.query_one("SELECT * FROM actions WHERE id=?", (verification["action_id"],))
+                if (not action or action["state"] != "success" or action["incident_id"] != inc_id
+                        or action_generation_block(self.db, action) is not None
+                        or evidence.get("profile_id") != contract.id
+                        or evidence.get("generation") != gen
+                        or evidence.get("asset") != ep["asset_id"]
+                        or evidence.get("service") != ep["object_id"]
+                        or evidence.get("action_id") != action["id"]
+                        or float(verification["finished_at"]) > evaluated_at + 1):
+                    continue
+                checks = []
+                for check in contract.checks:
+                    if check.get("optional"):
+                        continue
+                    selector = dict(check.get("selector") or {})
+                    selector.update(asset=ep["asset_id"], service=ep["object_id"])
+                    samples = evidence.get("samples") or []
+                    # Existing service verifications use the dedicated probe source.
+                    # Multi-metric contracts additionally require the metric identity.
+                    if contract.id != "svc.recover":
+                        samples = [s for s in samples if (s.get("metric") or {}).get("__name__") == check["metric"]]
+                    start = float(evidence.get("baseline") or 0) + float(contract.warmup_sec)
+                    samples = [s for s in samples if float(s.get("sample_at") or 0) >= start]
+                    checks.append(evaluate_recovery_samples(
+                        samples, selector=selector, success_value=float(check.get("success_value", 1)),
+                        evaluated_at=evaluated_at, continuous_success_sec=contract.continuous_success_sec,
+                        max_sample_gap_sec=contract.max_sample_gap_sec,
+                    ))
+                if checks and all(check["verdict"] == "green" for check in checks):
+                    return {"verdict": "green", "contract": contract.id,
+                            "source": "verification_passed", "verification_id": verification["id"],
+                            "generation": gen, "asset": ep["asset_id"], "service": ep["object_id"],
+                            "checks": checks}
+            except (TypeError, ValueError, KeyError, AttributeError, OverflowError):
+                continue
+        return {"verdict": "none", "contract": contract.id}
+
+    def _incident_recovery_evidence(self, inc_id: str, gen: int) -> dict:
+        """All current failure contracts must have evidence; one healthy sibling is insufficient."""
+        from .verify_profiles import recovery_evidence_contract
+
+        checks = []
+        seen = set()
+        for row in self.db.query("SELECT * FROM alert_episodes WHERE incident_id=?", (inc_id,)):
+            ep = dict(row)
+            if not self.episode_is_current(inc_id, ep):
+                continue
+            contract = recovery_evidence_contract(alertname=ep["alertname"] or "", problem_family=ep["problem_family"] or "")
+            source_check = ep.get("source_id") == "ayana_check"
+            key = (("ayana_check", ep["id"]) if source_check else
+                   (contract.id if contract else "", ep["asset_id"], ep["object_id"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            evidence = (self._recovery_evidence(ep) if ep["asset_id"] and (ep["object_id"] or source_check)
+                        else {"verdict": "none", "reason": "unbound_target"})
+            # Fresh negative observations override a previously passed verification.
+            if contract is not None and evidence.get("verdict") == "none":
+                evidence = self._recorded_recovery_evidence(inc_id, gen, ep, contract)
+            checks.append({"episode_id": ep["id"], **evidence})
+        verdicts = [check.get("verdict") for check in checks]
+        verdict = ("red" if "red" in verdicts else "no_contract" if "no_contract" in verdicts
+                   else "green" if verdicts and all(v == "green" for v in verdicts) else "none")
+        return {"verdict": verdict, "generation": gen, "checks": checks}
+
+    def _close_unverified(self, inc_id: str, *, episode_id: str = "", reason: str = "",
+                          generation: int | None = None) -> None:
+        """无恢复证据也不得谎称 recovered：诚实关闭为未证实恢复。"""
+        t = now()
+        with self.db.tx() as conn:
+            cur = conn.execute(
+                "UPDATE incidents SET status='closed', stage='done', outcome='closed_unverified',"
+                " resolution_basis=?, close_reason='目标已恢复但无恢复验证契约', updated_at=?,"
+                " need_human=0, need_human_reason=''"
+                " WHERE id=? AND status='open' AND (? IS NULL OR generation=?)",
+                (reason or "no_recovery_contract", t, inc_id, generation, generation),
+            )
+            if cur.rowcount != 1:
+                return
+            conn.execute(
+                "INSERT INTO events(incident_id, at, type, title, payload_json) VALUES(?,?,?,?,?)",
+                (inc_id, t, "incident_closed",
+                 "已关闭（未证实恢复）",
+                 json.dumps({"reason": reason or "no_recovery_contract",
+                             "episode_id": episode_id,
+                             "note": "no evidence, never claimed recovered"},
+                            ensure_ascii=False)),
+            )
+        self.db.audit("system", "incident", "incident_closed_unverified",
+                      asset_id="", object_id=inc_id,
+                      detail={"reason": reason or "no_recovery_contract"},
+                      incident_id=inc_id, channel="system")
+
+    def _force_recovered(
+        self, inc_id: str, *, episode_id: str = "", evidence: dict | None = None,
+        generation: int | None = None,
+    ) -> dict[str, Any]:
+        """证据充分的目标恢复即闭环：outcome=recovered，理由=目标已恢复。"""
         t = now()
         gen = 1
         with self.db.tx() as conn:
             row = conn.execute("SELECT * FROM incidents WHERE id=?", (inc_id,)).fetchone()
             if not row:
                 return {"ok": False, "error": "not_found"}
+            if generation is not None and int(row["generation"] or 1) != generation:
+                return {"ok": False, "error": "stale_generation"}
+            if generation is not None and conn.execute(
+                "SELECT 1 FROM alert_episodes WHERE incident_id=? AND status='firing' LIMIT 1", (inc_id,)
+            ).fetchone():
+                return {"ok": False, "error": "still_firing"}
             if row["status"] in ("resolved", "closed"):
                 if row["status"] == "resolved":
-                    self.ensure_recovery_event(inc_id, episode_id=episode_id)
+                    self.ensure_recovery_event(inc_id, episode_id=episode_id, evidence=evidence)
                 return {"ok": True, "status": row["status"], "outcome": row["outcome"] or ""}
             gen = int(row["generation"] or 1)
             conn.execute(
@@ -290,7 +465,11 @@ class IncidentService:
                 " WHERE id=?",
                 (t, t, inc_id),
             )
-            self.ensure_recovery_event(inc_id, episode_id=episode_id)
+            self.ensure_recovery_event(inc_id, episode_id=episode_id, evidence=evidence)
+            # The incident, evidence event and current loop close commit together.
+            from .ops_loop import close_recovered as loop_close_recovered
+            loop_close_recovered(self.db, inc_id, generation=gen,
+                                 result="recovered", evidence=evidence)
         self._cancel_pending_proposals(inc_id, "target_recovered")
         return {"ok": True, "status": "resolved", "outcome": "recovered", "generation": gen}
 
@@ -678,26 +857,13 @@ class IncidentService:
         resolved_at = inc.get("resolved_at")
         basis = resolution_basis or inc.get("resolution_basis") or ""
 
-        can_recover = (
-            not blocked
-            and n_passed > 0
-            and n_firing == 0
-            and n_unknown == 0
-            and n_pending == 0
-            and not need
-        )
-        # 有 passed 证据且无阻塞 → recovered
-        if can_recover and already == "open":
-            status = "resolved"
-            outcome = "recovered"
-            stage = "done"
-            resolved_at = resolved_at or now()
-            if not basis:
-                basis = "verification_passed"
-            # 自然恢复：取消过时 proposal
-            self._cancel_pending_proposals(inc_id, "verification_recovered")
-        elif already == "open" and not blocked and n_passed == 0 and n_firing == 0:
-            # 无阻塞也无恢复证据：保持 open/watching，outcome unknown
+        if already == "open" and not blocked and n_firing == 0:
+            # A status='passed' row alone cannot bypass the recovery evidence gate.
+            ev = self._incident_recovery_evidence(inc_id, gen)
+            if ev.get("verdict") == "green":
+                self._force_recovered(inc_id, evidence=ev, generation=gen)
+                return self.reconcile(inc_id, resolution_basis="target_recovered")
+            # 证据不足/被否决：保持 open/watching，outcome unknown
             outcome = "unknown"
             stage = "watching" if stage in ("pending", "verifying", "executing") else stage
         elif already == "open":

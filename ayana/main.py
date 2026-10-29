@@ -14,12 +14,10 @@ from pathlib import Path
 from aiohttp import web
 
 from . import VERSION
-from .actions import ActionService
 from .agent_query import AgentQueryService
 from .alertmanager import AlertIngest
 from .auth import AuthService
 from .config import load_config
-from .controlled import ControlledExecutor
 from .db import Database, now
 from .incidents import IncidentService
 from .auto_investigate import AutoInvestigator, InvestConfig
@@ -28,7 +26,6 @@ from .investigation import InvestigationService
 from .instance import acquire_single_instance_lock
 from .knowledge import KnowledgeBase, knowledge_root
 from .llm import make_llm
-from .ntsafe import AssetBinding, IdentityGate, NTClient
 from .notify import Notifier
 from .notify_channels import ChannelStore
 from .monitor import HostMonitor
@@ -135,29 +132,6 @@ def seed_assets(db: Database) -> None:
     # 知识正文在 knowledge/*.md；此处仅建索引可重建，不再写 object_knowledge 正文
 
 
-def ensure_checks_admin_perms(db: Database) -> None:
-    """Compatibility hook: account roles no longer need capability seeds."""
-
-
-def ensure_promconfig_admin_perms(db: Database) -> None:
-    """Compatibility hook: never recreate retired permission rules."""
-
-
-def load_bindings(db: Database) -> list[AssetBinding]:
-    out = []
-    for r in db.query("SELECT * FROM assets WHERE enabled=1"):
-        out.append(
-            AssetBinding(
-                asset_id=r["id"],
-                read_alias=r["read_alias"],
-                write_alias=r["write_alias"],
-                expected_host_id=r["expected_host_id"] or "",
-                host_id_verified_at=r["host_id_verified_at"],
-            )
-        )
-    return out
-
-
 class App:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -189,8 +163,8 @@ class App:
         )
         self.policy = AccessControl(self.db, admin_qq=str(cfg.get("admin_qq") or ""),
                                     admin_wecom_users=cfg.get("admin_wecom_users") or [])
-        self.nt = NTClient(privilege_mode="restricted_dispatcher")
-        self.gate = IdentityGate(self.nt, load_bindings(self.db))
+        self.nt = None  # 旧 NT dispatcher 已退役（PERM-17）；现役 SSH 走 transport
+        self.gate = None
         self.knowledge = KnowledgeBase(self.db, root=knowledge_root(cfg))
         self.prom = PromClient(cfg.get("prometheus_url", "http://127.0.0.1:9090"))
         # 首登/设置页写入的运行时覆盖（DB meta），优先于 config.json
@@ -277,6 +251,7 @@ class App:
             row = self.db.query_one("SELECT id FROM duty_sessions WHERE remote_session_id=?", (rid,))
             if row:
                 self.duty.record_receipt(row["id"], rid, receipt_id, origin="automatic")
+                self.duty.record_native_turn(row["id"], rid, message_id, "accepted", receipt_id=receipt_id)
                 self.duty.set_runtime_state(row["id"], "running", receipt_id=receipt_id, receipt_status="accepted")
 
         def _native_state(rid, state, detail):
@@ -284,8 +259,26 @@ class App:
             if not row:
                 return
             receipt_id = detail.get("receipt_id") or ""
+            message_id = detail.get("message_id") or ""
+            if message_id:
+                engine = self.agent_tui.engine_signature() if state == "running" and self.agent_tui else None
+                self.duty.record_native_turn(row["id"], rid, message_id,
+                                            "submitting" if state == "running" else state,
+                                            receipt_id=receipt_id, engine=engine)
             if receipt_id:
-                self.db.execute("UPDATE agent_runtime_receipts SET status=?,updated_at=? WHERE receipt_id=?", (state, time.time(), receipt_id))
+                changed = self.db.execute(
+                    "UPDATE agent_runtime_receipts SET status=?,updated_at=? WHERE receipt_id=?"
+                    " AND session_id=? AND remote_session_id=?"
+                    " AND status IN ('accepted','pending','queued','running','unknown')",
+                    (state, time.time(), receipt_id, row["id"], rid))
+                if not changed.rowcount:
+                    # A durable observer may have proved this turn interrupted or
+                    # finished while the waiting client was timing out.
+                    terminal = self.db.query_one(
+                        "SELECT status FROM agent_runtime_receipts WHERE receipt_id=? AND session_id=?",
+                        (receipt_id, row["id"]))
+                    if terminal and terminal["status"] in ("completed", "failed", "cancelled"):
+                        return
             if state == "unknown":
                 self.duty.set_runtime_state(row["id"], "unknown", receipt_id=receipt_id, receipt_status="unknown")
             elif state in ("completed", "failed", "cancelled") and receipt_id:
@@ -370,19 +363,7 @@ class App:
             knowledge=self.knowledge,
             transport=self.transport,
         )
-        self.actions = ActionService(
-            self.db,
-            self.nt,
-            self.gate,
-            self.policy,
-            self.prom,
-            transport=self.transport,
-            action_ttl=int(cfg.get("action_ttl_sec", 1800)),
-            verify_window=int(cfg.get("verify_window_sec", 90)),
-            verify_timeout=int(cfg.get("verify_timeout_sec", 300)),
-        )
-        # P4.2：ActionService 与 Session 桥共用写幂等台账
-        self.actions.write_ops = self.session_bridge
+        self.actions = None  # ActionService 已退役：写入口为 host.exec + 统一审计
         from .ops_constraints import OpsConstraints
         from .ops_loop import OpsLoop, ensure_ops_loop_schema
 
@@ -390,7 +371,7 @@ class App:
         self.ops_constraints = OpsConstraints(self.db)
         self.ops_loop = OpsLoop(
             self.db,
-            actions=self.actions,
+            actions=None,
             incidents=self.incidents,
             bridge=self.session_bridge,
             constraints=self.ops_constraints,
@@ -398,11 +379,12 @@ class App:
         # P6.1：把闭环依赖注入自动调查器
         if self.auto_investigator is not None:
             self.auto_investigator.ops_loop = self.ops_loop
-            self.auto_investigator.actions = self.actions
+            self.auto_investigator.actions = None
             self.auto_investigator.incidents = self.incidents
+        self.incidents.prom = self.prom
         self.notifier = Notifier(self.db, default_target="")
         self.ops_loop.notifier = self.notifier
-        self.actions.notifier = self.notifier
+
         self.alert_ingest = AlertIngest(self.db, incidents=self.incidents, notifier=self.notifier)
         self.notifier.set_default_target(
             f"user:{cfg['admin_qq']}" if cfg.get("admin_qq") else ""
@@ -479,7 +461,7 @@ class App:
             self.ob,
             self.incidents,
             self.investigation,
-            self.actions,
+            None,
             self.policy,
             self.notifier,
             admin_qq=str(cfg.get("admin_qq") or ""),
@@ -487,20 +469,16 @@ class App:
             channel_store=self.channel_store,
             version=VERSION,
         )
-        # 统一消息入口：Agent 查询 + 受控命令
+        # 统一消息入口：Agent 查询（受控 -c 命令入口已退役）
         self.agent_query = AgentQueryService(self.host_monitor, self.db)
-        self.controlled = ControlledExecutor(
-            self.db, self.transport, self.policy, self.actions
-        )
         self.qq.agent_query = self.agent_query
-        self.qq.controlled = self.controlled
         self.webapp = WebApp(
             self.db,
             self.auth,
             self.policy,
             self.incidents,
             self.investigation,
-            self.actions,
+            None,
             self.prom,
             static_dir=Path(__file__).resolve().parent / "static",
             version=VERSION,
@@ -651,16 +629,7 @@ class App:
             return None
 
     async def start(self) -> None:
-        # 启动安全检查
-        unknown = self.actions.mark_unknown_unfinished()
-        if unknown:
-            log.warning("marked %d dispatched actions as unknown after restart", unknown)
-        backfilled = self.actions.backfill_missing_verifications()
-        if backfilled:
-            log.info("backfilled %d verification obligations", backfilled)
-        resumed = self.actions.resume_pending_verifications()
-        if resumed:
-            log.info("resumed %d pending verifications", resumed)
+        # 启动安全检查：ActionService 补验已退役；任务恢复归 core-007 会话队列
         # 一次性 Token 注册门闩：不单凭用户数=0 开放
         try:
             setup = self.auth.ensure_setup_initialized()
@@ -882,36 +851,32 @@ class App:
                 t = translate_event(ev)
                 if not t:
                     return
+                # 环形缓冲供前端即时轮询；完整原生内容由 MiMoCode 自存，
+                # Ayana 不再把 text/tool/delta 逐条复制进 session_events（core-033）。
                 self.mimo_live_events.append({"at": time.time(), **t})
                 if len(self.mimo_live_events) > 400:
                     self.mimo_live_events = self.mimo_live_events[-250:]
                 sid = t.get("session_id") or ""
-                # 关联 duty session（remote_session_id）
+                # 关联 duty session（remote_session_id）——只落任务级事件
                 if sid:
                     row = self.db.query_one(
                         "SELECT id FROM duty_sessions WHERE remote_session_id=?", (sid,)
                     )
                     if row:
                         duty_sid = row["id"]
-                        if t.get("kind") == "part" and t.get("part_type") in (
-                            "text", "tool", "tool-call", "tool_use", "step-start", "step-finish", "reasoning",
-                        ):
-                            self.duty.record_event(
-                                duty_sid,
-                                type=t.get("part_type") or "part",
-                                title=(t.get("tool") or t.get("part_type") or "")[:80],
-                                payload={"part_id": t.get("part_id"), "text": (t.get("text") or "")[:500]},
-                            )
-                        elif t.get("kind") == "delta" and t.get("field") == "text":
-                            self.duty.record_event(
-                                duty_sid,
-                                type="delta",
-                                title="",
-                                payload={"part_id": t.get("part_id"), "delta": (t.get("delta") or "")[:200]},
-                            )
-                        elif t.get("kind") == "session_updated" and t.get("title"):
+                        if t.get("kind") == "session_updated" and t.get("title"):
                             try:
                                 self.duty.update_title(duty_sid, t["title"])
+                            except Exception:
+                                pass
+                        elif t.get("kind") in ("session_completed", "session_error", "turn_completed"):
+                            try:
+                                self.duty.record_event(
+                                    duty_sid,
+                                    type=str(t.get("kind")),
+                                    title=(t.get("title") or t.get("kind") or "")[:80],
+                                    payload={"status": t.get("status") or ""},
+                                )
                             except Exception:
                                 pass
             except Exception as e:  # noqa: BLE001
@@ -936,9 +901,6 @@ class App:
     async def _reconcile_native_receipts_once(self) -> None:
         """Observe durable turns, including timed-out ones; never submit/replay."""
         from .mimo_serve import normalize_receipt_status
-        if getattr(self,"agent_tui",None):
-            from .native_turns import NativeTurns
-            await NativeTurns(self.db).reconcile(self.agent_tui)
         rows = self.db.query(
             "SELECT * FROM agent_runtime_receipts WHERE status IN ('accepted','pending','queued','running','unknown') ORDER BY updated_at LIMIT 40"
         )
@@ -946,6 +908,18 @@ class App:
         for row in rows:
             try:
                 receipt = await self.mimo_serve.client().receipt(row["remote_session_id"], row["receipt_id"])
+                message_id = receipt.get("inputMessageID")
+                if (row["origin"] in ("auto", "automatic") and isinstance(message_id, str)
+                        and message_id and getattr(self, "agent_tui", None)):
+                    # The native receipt binds an old automatic turn even when the
+                    # previous Web owner did not persist its input message ID.
+                    from .mimo_serve import native_id
+                    native_id(message_id)
+                    session = self.duty.get(row["session_id"]) or {}
+                    if session.get("remote_session_id") == row["remote_session_id"]:
+                        self.duty.record_native_turn(
+                            row["session_id"], row["remote_session_id"], message_id, "accepted",
+                            receipt_id=row["receipt_id"], engine=self.agent_tui.engine_signature())
                 status = normalize_receipt_status(receipt)
                 if status in ("completed", "failed", "cancelled"):
                     self.db.execute(
@@ -957,6 +931,9 @@ class App:
             except Exception:
                 # Even a missing receipt is uncertainty, never evidence of failure.
                 self.db.execute("UPDATE agent_runtime_receipts SET status='unknown',updated_at=? WHERE receipt_id=? AND status IN ('accepted','pending','queued','running','unknown')", (time.time(), row["receipt_id"]))
+        if getattr(self,"agent_tui",None):
+            from .native_turns import NativeTurns
+            await NativeTurns(self.db).reconcile(self.agent_tui)
         # A prior callback can finish the receipt before this observer sees it.
         candidates.update(row["session_id"] for row in self.db.query(
             "SELECT session_id FROM agent_runtime_bindings WHERE state IN ('running','busy','unknown') AND receipt_id<>''"
@@ -1035,15 +1012,8 @@ class App:
                 pass
 
     async def _bg_maintenance(self) -> None:
-        """Expire human proposals without recreating retired permission grants."""
+        """周期维护：写台账 unknown 收尾由 bridge 承担，不再过期旧提案。"""
         while not self._stop.is_set():
-            for name, expire in (
-                ("proposals", self.actions.expire_stale_proposals),
-            ):
-                try:
-                    expire()
-                except Exception:
-                    log.exception("expire %s failed", name)
             try:
                 self.db.execute(
                     "INSERT OR REPLACE INTO meta(key,value) VALUES('worker_maintenance_last_ok',?)",
@@ -1092,9 +1062,8 @@ class App:
             await asyncio.sleep(60)
 
     def reload_gate(self) -> None:
-        self.gate = IdentityGate(self.nt, load_bindings(self.db))
-        self.investigation.gate = self.gate
-        self.actions.gate = self.gate
+        self.gate = None
+        self.investigation.gate = None
 
 
 async def amain(config_path: str) -> None:

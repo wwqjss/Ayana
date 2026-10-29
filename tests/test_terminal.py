@@ -1,4 +1,4 @@
-"""Web 终端 MVP：权限隔离、host key、会话限制。"""
+﻿"""Web 终端 MVP：权限隔离、host key、会话限制。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ayana.db import Database, now
-from ayana.policy import Policy
+from ayana.access import AccessControl as Policy
 from ayana.terminal import TerminalError, TerminalService
 from ayana.transport import SSHAssetStore
 
@@ -109,7 +109,7 @@ class TestTerminalSessionGuard(unittest.TestCase):
 
     def test_untrusted_host_key_blocks(self):
         self.store.upsert_endpoint(
-            asset_id="romi", role="write", host="127.0.0.1", port=22,
+            asset_id="romi", role="default", host="127.0.0.1", port=22,
             username="root", credential_id="c1", actor="admin",
         )
         svc = TerminalService(self.db, self.store, None)

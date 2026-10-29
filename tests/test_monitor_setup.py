@@ -15,7 +15,7 @@ from ayana.db import Database, now
 from ayana.health import host_health
 from ayana.main import seed_assets
 from ayana.monitor import PromError
-from ayana.policy import Policy
+from ayana.access import AccessControl as Policy
 from ayana.web import SESSION_COOKIE, WebApp
 
 
@@ -58,8 +58,13 @@ class AdminMonitorPermTests(unittest.TestCase):
             self.assertTrue(d["allowed"], f"{cap} should be allowed for admin, got {d}")
 
     def test_seed_assets_does_not_create_permission_rules(self):
-        self.assertEqual(self.db.query_one("SELECT COUNT(*) n FROM permissions")["n"], 0)
-        self.assertEqual(self.db.query_one("SELECT COUNT(*) n FROM agent_ceiling")["n"], 0)
+        # 旧 permissions/agent_ceiling 表已删除；注册/播种不再写授权规则
+        self.assertIsNone(self.db.query_one(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='permissions'"
+        ))
+        self.assertIsNone(self.db.query_one(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_ceiling'"
+        ))
 
     def test_viewer_can_read_monitor_but_cannot_manage_it(self):
         args = dict(subject_type="web_user", subject_id="viewer", asset_id="demo-web")

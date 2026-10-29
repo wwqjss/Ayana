@@ -10,9 +10,9 @@
 
 <title>Ayana</title>
 
-<link rel="stylesheet" href="/static/app.css?v=20261028-unified-authority1">
+<link rel="stylesheet" href="/static/app.css?v=20261029-execution-scope1">
 
-<link rel="stylesheet" href="/static/workbench.css?v=20261027-lifecycle2">
+<link rel="stylesheet" href="/static/workbench.css?v=20261029-execution-scope1">
 
 <link rel="stylesheet" href="/static/xterm/xterm.css">
 
@@ -338,17 +338,8 @@
             <p class="muted small">
               在已登记主机上创建端口监听、服务状态或只读探测检查。结果统一显示在「资源状态」。
               异常进入事件与通知，原生检查可以独立于 Prometheus 使用。
+              自然语言配置请直接对 MiMoCode 说（MCP <code>config.check_add</code>），下面是手动表单。
             </p>
-            <div class="assist-box" id="chk-assist-box">
-              <div class="assist-title">描述需求，准备检查</div>
-              <div class="form-row">
-                <input id="chk-assist-input" placeholder="例如：给主机的 8080 端口做一个检查，每 60 秒一次，连续 2 次失败就严重告警" style="flex:1;min-width:280px">
-                <button class="btn primary" id="chk-assist-go" type="button">帮我填表</button>
-              </div>
-              <div id="chk-assist-msg" class="muted small" aria-live="polite"></div>
-              <div id="chk-assist-followup" class="assist-followup"></div>
-              <details id="chk-assist-debug" class="assist-debug hidden"><summary>高级：识别与校验详情</summary><pre class="code-block"></pre></details>
-            </div>
             <h3 class="check-form-title">基本配置</h3>
             <div class="form-row">
               <label>所属主机
@@ -394,6 +385,7 @@
             </div>
             <div id="chk-list"></div>
             <div id="chk-summary" class="live-summary"></div>
+            <div id="chk-form-msg" role="status" aria-live="polite"></div>
           </div>
           <div class="card">
             <h2>执行动态</h2>
@@ -479,8 +471,7 @@
                   <button type="button" class="btn primary small hidden" id="aw-term-reconnect">连接会话</button>
                   <button type="button" class="btn primary small hidden" id="aw-term-acquire">接管控制</button>
                   <button type="button" class="btn ghost small hidden" id="aw-term-release">释放控制</button>
-                  <button type="button" class="btn ghost small aw-access-switch" id="aw-access-mode" role="switch" aria-label="会话读写权限" title="接管后可临时切换权限，释放后恢复" aria-checked="false" disabled>只读</button>
-                  <select id="aw-approval-mode" aria-label="当前会话审批模式" title="接管期间的临时审批模式" disabled><option value="manual">人工审批</option><option value="automatic">自动执行</option></select>
+                  <label class="aw-account-picker"><span>账号组</span><select id="aw-account-group" aria-label="当前会话账号组" title="仅改变当前会话，下次执行生效" disabled><option value="">跟随默认</option></select></label>
                   <details class="aw-session-menu">
                     <summary class="btn ghost small" aria-label="会话操作">···</summary>
                     <div class="aw-menu-items">
@@ -519,11 +510,7 @@
               <div id="aw-incidents"></div>
             </div>
             <div class="aw-section">
-              <h4>待审批</h4>
-              <div id="aw-pending"></div>
-            </div>
-            <div class="aw-section">
-              <h4>执行与验证</h4>
+              <h4>执行记录与待核对结果</h4>
               <div id="aw-results"></div>
             </div>
           </aside>
@@ -542,6 +529,26 @@
         </nav>
         <div id="connections-sub-hosts" class="subpanel">
           <p id="connections-load-error" class="workspace-feedback" role="alert" aria-live="polite"></p>
+          <details open id="account-groups-panel" class="workspace-disclosure">
+            <summary><span class="workspace-summary-text"><span class="workspace-summary-title">账号组</span><span class="workspace-summary-note">建组、挂已有 SSH 账号；Agent 默认账号组与会话账号组均从这里选择</span></span></summary>
+            <div class="workspace-disclosure-body">
+              <div id="account-groups-list"></div>
+              <div class="form-row workspace-form" id="account-group-create">
+                <label>账号组名称<input id="ag-name" placeholder="你自定义，如 ops / monitor / default" autocomplete="off"></label>
+                <label>显示名<input id="ag-label" placeholder="例如 运维账号"></label>
+                <label class="workspace-field-wide">描述<input id="ag-desc" placeholder="可选。组名只是标签，不代表权限"></label>
+                <div class="workspace-actions"><button class="btn primary" id="ag-create-btn" type="button">创建账号组</button></div>
+              </div>
+              <div class="form-row workspace-form workspace-inset" id="ag-assign-form">
+                <label>账号组<select id="ag-assign-group"></select></label>
+                <label>主机<select id="ag-assign-asset"></select></label>
+                <label>已有凭据<select id="ag-assign-cred"><option value="">沿用已有账号凭据</option></select></label>
+                <label>登录用户<input id="ag-assign-user" placeholder="root" autocomplete="off"></label>
+                <div class="workspace-actions"><button class="btn primary" id="ag-assign-btn" type="button">把账号挂进组</button></div>
+                <p class="workspace-feedback" id="ag-msg" aria-live="polite"></p>
+              </div>
+            </div>
+          </details>
           <details id="hosts-panel" class="workspace-disclosure">
             <summary><span class="workspace-summary-text"><span class="workspace-summary-title">主机列表</span><span class="workspace-summary-note">展开查看主机状态、连接账户与操作</span></span><span id="host-list-count" class="workspace-count" aria-live="polite">—</span></summary>
             <div class="workspace-disclosure-body"><div id="host-list"></div></div>
@@ -573,7 +580,7 @@
                 <label>地址<input id="host-addr" placeholder="IP 地址或域名" autocomplete="off"></label>
                 <label>端口<input id="host-port" type="number" value="22" min="1" max="65535"></label>
                 <label>用户<input id="host-user" placeholder="root" autocomplete="off"></label>
-                <label>角色<span class="workspace-inline"><select id="host-role"></select><button class="btn" id="role-add-btn" type="button">添加角色</button></span></label>
+                <label>账号组<span class="workspace-inline"><select id="host-role"></select><button class="btn" id="role-add-btn" type="button">管理账号组</button></span></label>
                 <label>认证方式<select id="host-auth"><option value="password">密码</option><option value="key">私钥</option><option value="cred">已有凭据</option><option value="none">暂不配置</option></select></label>
                 <label id="host-auth-password-wrap">密码<input id="host-password" type="password" placeholder="SSH 密码" autocomplete="new-password"></label>
                 <label id="host-auth-key-wrap" class="workspace-field-wide hidden">私钥<textarea id="host-private-key" class="secret-editor" rows="4" placeholder="粘贴完整 PEM 私钥，保留换行" autocomplete="off" spellcheck="false"></textarea></label>
@@ -581,20 +588,20 @@
                 <div class="workspace-actions workspace-field-wide"><button class="btn primary" id="host-add-btn" type="button">添加主机</button></div>
               </div>
               <div id="role-add-form" class="form-row workspace-form workspace-inset hidden">
-                <label>角色名<input id="role-name" placeholder="例如 deploy / monitor"></label>
-                <label>显示名<input id="role-label" placeholder="例如 发布账号"></label>
-                <label>用途<select id="role-kind"><option value="write">执行</option><option value="read">调查</option></select></label>
-                <div class="workspace-actions"><button class="btn primary" id="role-save-btn" type="button">保存角色</button><button class="btn" id="role-cancel-btn" type="button">取消</button></div>
+                <label>账号组名称<input id="role-name" placeholder="你自定义的组名，如 ops / monitor / default"></label>
+                <label>显示名<input id="role-label" placeholder="例如 运维账号"></label>
+                <label class="workspace-field-wide">描述<input id="role-desc" placeholder="可选。组名只是标签，不代表权限；实际权限由服务器账号决定"></label>
+                <div class="workspace-actions"><button class="btn primary" id="role-save-btn" type="button">保存账号组</button><button class="btn" id="role-cancel-btn" type="button">取消</button></div>
               </div>
               <p class="workspace-feedback" id="host-add-msg" aria-live="polite"></p>
             </div>
           </details>
           <details id="connection-test-panel" class="workspace-disclosure">
-            <summary><span class="workspace-summary-text"><span class="workspace-summary-title">连接测试</span><span class="workspace-summary-note">选择主机和角色，验证已保存的连接</span></span></summary>
+            <summary><span class="workspace-summary-text"><span class="workspace-summary-title">连接测试</span><span class="workspace-summary-note">选择主机和账号组，验证已保存的连接</span></span></summary>
             <div class="workspace-disclosure-body">
               <div class="form-row workspace-form">
                 <label>主机<select id="ssh-test-asset"></select></label>
-                <label>角色<select id="ssh-test-role"><option value="read">只读</option><option value="write">可执行</option></select></label>
+                <label>账号组<select id="ssh-test-role"></select></label>
               </div>
               <div class="workspace-actions"><button class="btn primary" id="ssh-test-btn" type="button">测试连接</button></div>
               <p id="ssh-test-summary" class="workspace-feedback" aria-live="polite"></p>
@@ -1091,9 +1098,9 @@
 <script src="/static/xterm/xterm-addon-fit.js"></script>
 <script src="/static/terminal_clipboard.js?v=20261027-lifecycle2"></script>
 
-<script src="/static/app.js?v=20261028-unified-authority1"></script>
-<script src="/static/settings.js?v=20261028-workspace1"></script>
-<script src="/static/workbench.js?v=20261028-unified-authority1"></script>
+<script src="/static/app.js?v=20261029-execution-scope1"></script>
+<script src="/static/settings.js?v=20261029-execution-scope1"></script>
+<script src="/static/workbench.js?v=20261029-execution-scope1"></script>
 
 </body>
 

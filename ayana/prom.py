@@ -225,6 +225,87 @@ class PromClient:
         )
         return {"result": samples, "evaluated_at": end}
 
+    def _range_sync(self, expr: str, *, window_sec: float) -> list[dict[str, Any]]:
+        """同步 range 查询（供同步状态机做恢复证据判定）。"""
+        import urllib.parse
+        import urllib.request
+
+        end = time.time()
+        params = urllib.parse.urlencode({
+            "query": f"{expr}[{int(math.ceil(window_sec))}s]", "time": end,
+        })
+        # Instant range-vector queries retain scrape timestamps. query_range
+        # supplies evaluation timestamps and can make a stale sample look fresh.
+        url = self.base_url.rstrip("/") + "/api/v1/query?" + params
+        with urllib.request.urlopen(url, timeout=self.timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if data.get("status") != "success" or data.get("data", {}).get("resultType") != "matrix":
+            raise PromError("expected raw matrix recovery evidence")
+        out = []
+        for r in (data.get("data", {}).get("result") or []):
+            metric = r.get("metric") or {}
+            for ts, val in r.get("values") or []:
+                try:
+                    out.append({"metric": metric, "sample_at": float(ts),
+                                "value": float(val)})
+                except (TypeError, ValueError):
+                    continue
+        return out
+
+    def evaluate_recovery_evidence_sync(
+        self,
+        profile: Any,
+        *,
+        asset_id: str,
+        service: str,
+        max_age_sec: float = 120.0,
+    ) -> dict[str, Any]:
+        """按验证契约同步评估恢复证据（软约束第 4 条对状态机生效）。
+
+        verdict:
+        - green: 契约检查均有新鲜样本且达到 success_value（新鲜有效）
+        - red:   有新鲜样本但未达 success_value（证据否决恢复）
+        - none:  无新鲜样本或查询失败（证据不足，不得 recovered）
+        """
+        checks = [c for c in getattr(profile, "checks", ()) if not c.get("optional")]
+        if not checks:
+            return {"verdict": "none", "contract": getattr(profile, "id", ""), "checks": []}
+        window = float(profile.continuous_success_sec)
+        max_gap = float(profile.max_sample_gap_sec)
+        evaluated_at = time.time()
+        details = []
+        verdicts = []
+        for check in checks:
+            metric = str(check.get("metric") or "")
+            selector = dict(check.get("selector") or {})
+            selector.update(asset=asset_id, service=service)
+            if not asset_id or not service:
+                return {"verdict": "none", "contract": profile.id, "reason": "unbound_target"}
+            sel = ",".join(f'{k}="{quote(str(v))}"' for k, v in selector.items() if v)
+            want = float(check.get("success_value", 1))
+            try:
+                samples = self._range_sync(f"{metric}{{{sel}}}", window_sec=max(window + max_gap, max_age_sec))
+            except Exception as exc:  # noqa: BLE001
+                details.append({"metric": metric, "error": str(exc)[:120]})
+                verdicts.append("none")
+                continue
+            detail = evaluate_recovery_samples(
+                samples, selector=selector, success_value=want, evaluated_at=evaluated_at,
+                continuous_success_sec=window, max_sample_gap_sec=max_gap,
+                max_age_sec=max_age_sec,
+            )
+            details.append({"metric": metric, **detail})
+            verdicts.append(detail["verdict"])
+        if any(v == "red" for v in verdicts):
+            verdict = "red"
+        elif verdicts and all(v == "green" for v in verdicts):
+            verdict = "green"
+        else:
+            verdict = "none"
+        return {"verdict": verdict, "contract": getattr(profile, "id", ""),
+                "checks": details, "window_sec": window, "evaluated_at": evaluated_at,
+                "asset": asset_id, "service": service}
+
     async def up_metric(self, asset: str) -> dict[str, Any]:
         end = time.time()
         samples = await self.query_range_vector(
@@ -283,6 +364,58 @@ def summarize_probe(data: dict[str, Any]) -> dict[str, Any]:
         "age_sec": age,
         "labels": s.get("metric") or {},
     }
+
+
+def evaluate_recovery_samples(
+    samples: list[dict], *, selector: dict, success_value: float, evaluated_at: float,
+    continuous_success_sec: float, max_sample_gap_sec: float, max_age_sec: float = 120,
+) -> dict[str, Any]:
+    """Require one exact series, raw fresh timestamps and a sustained success span."""
+    matched = []
+    for sample in samples:
+        labels = sample.get("metric") or {}
+        if any(labels.get(k) != v for k, v in selector.items()):
+            continue
+        try:
+            stamp, value = float(sample["sample_at"]), float(sample["value"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(stamp) or not math.isfinite(value) or stamp > evaluated_at + 1:
+            continue
+        if stamp >= evaluated_at - max(max_age_sec, continuous_success_sec + max_sample_gap_sec):
+            matched.append({"metric": labels, "sample_at": stamp, "value": value})
+    groups = group_by_series(matched)
+    if len(groups) != 1:
+        return {"verdict": "none", "reason": "ambiguous_series" if groups else "no_samples"}
+    timeline = next(iter(groups.values()))
+    # Equal timestamps cannot increase the successful span or hide conflicts.
+    points = {}
+    for sample in timeline:
+        stamp = sample["sample_at"]
+        if stamp in points and points[stamp]["value"] != sample["value"]:
+            return {"verdict": "none", "reason": "conflicting_samples"}
+        points[stamp] = sample
+    timeline = [points[stamp] for stamp in sorted(points)]
+    latest = timeline[-1]
+    age = evaluated_at - latest["sample_at"]
+    if age > min(max_age_sec, max_sample_gap_sec):
+        return {"verdict": "none", "reason": "stale_samples", "latest_at": latest["sample_at"]}
+    recent = [s for s in timeline if s["sample_at"] >= evaluated_at - continuous_success_sec]
+    if any(abs(s["value"] - success_value) >= 1e-9 for s in recent):
+        return {"verdict": "red", "reason": "failure_sample", "latest_at": latest["sample_at"]}
+    trailing = []
+    for sample in reversed(timeline):
+        if abs(sample["value"] - success_value) >= 1e-9:
+            break
+        if trailing and trailing[-1]["sample_at"] - sample["sample_at"] > max_sample_gap_sec:
+            break
+        trailing.append(sample)
+    span = trailing[0]["sample_at"] - trailing[-1]["sample_at"] if trailing else 0
+    detail = {"samples": len(trailing), "span_sec": span, "latest_at": latest["sample_at"],
+              "latest": latest["value"], "want": success_value}
+    if len(trailing) < 2 or span < continuous_success_sec:
+        return {"verdict": "none", "reason": "stability_not_reached", **detail}
+    return {"verdict": "green", **detail}
 
 
 def series_key(metric: dict) -> str:

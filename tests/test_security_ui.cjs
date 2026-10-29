@@ -83,14 +83,14 @@ function environment(reply = () => ({ ok: true })) {
     ["function el(", "async function api("],
     ["/* ---- Web SSH Terminal (xterm.js) ---- */", "/* ---- modal ---- */"],
     ["async function openIncidentDetail(", "function openActionDetail("],
-    ["async function renderConnections(", 'on("host-auth", "change"'],
+    ["function renderAccountGroups(", 'on("host-auth", "change"'],
   ]) vm.runInContext(cut(start, end), context);
   return { nodes, calls, sockets, terminals, dialogs, actions, promptReplies, run: (code) => vm.runInContext(code, context) };
 }
 const tests = [];
 const test = (name, run) => tests.push({ name, run });
-const checkSuccess = { ok: true };
-const keyCheck = { ok: false, detail: "host_key_untrusted", host_key_info: { host: "control", fingerprint: "SHA256:test", key_line: "ssh-ed25519 test" } };
+const checkSuccess = { ok: true, account_group: "default" };
+const keyCheck = { ok: false, account_group: "ops", detail: "host_key_untrusted", host_key_info: { host: "control", fingerprint: "SHA256:test", key_line: "ssh-ed25519 test" } };
 const socketAsset = (socket) => new URL(socket.url).searchParams.get("asset_id");
 
 test("closing and reopening for another host ignores the old connection check", async () => {
@@ -187,19 +187,24 @@ test("a trust dialog from another host cannot submit trust or reconnect", async 
 });
 
 const proposalReply = { ok: true, incident: {}, summary: {}, disposition: { proposals: [{ action_id: "act1", capability: "service.restart", asset_id: "control", object_id: "nginx" }] } };
-for (const label of ["批准并执行", "拒绝"]) {
-  test(`canceling ${label} submits no approval decision`, async () => {
-    const env = environment(() => proposalReply); await env.run('openIncidentDetail("inc1")');
-    env.promptReplies.push(null);
-    await env.nodes.get("modal-body").querySelectorAll("button").find((n) => n.textContent === label).click();
-    assert.equal(env.calls.length, 1); assert.equal(env.nodes.get("modal").classList.contains("hidden"), false);
-  });
-}
-test("confirming an empty approval reason still approves exactly once", async () => {
-  const env = environment(({ body }) => body ? { ok: true } : proposalReply); await env.run('openIncidentDetail("inc1")');
-  env.promptReplies.push("");
-  await env.nodes.get("modal-body").querySelectorAll("button").find((n) => n.textContent === "批准并执行").click(); await flush();
-  assert.deepEqual(env.calls.filter((call) => call.body).map((call) => call.body), [{ execute: true, reason: "" }]);
+test("historical proposals remain readable without retired approval or execution controls", async () => {
+  const env = environment(() => proposalReply); await env.run('openIncidentDetail("inc1")');
+  assert.ok(env.nodes.get("modal-body").textContent.includes("service.restart"));
+  assert.deepEqual(env.nodes.get("modal-body").querySelectorAll("button").map(button=>button.textContent),["原始数据"]);
+  assert.equal(env.calls.length,1); assert.equal(env.calls[0].body,null);
+});
+test("an explicit terminal group is bound to the same connection check and websocket", async () => {
+  const env = environment(() => ({ok:true,account_group:"ops"}));
+  await env.run('openTerminal("control",{role:"ops",username:"operator"})');
+  assert.equal(new URL(env.calls[0].url,"https://ayana.test").searchParams.get("role"),"ops");
+  assert.equal(new URL(env.sockets[0].url).searchParams.get("role"),"ops");
+});
+test("host trust uses the checked account group without a write-group fallback", async () => {
+  const env = environment(({url}) => url.startsWith("/api/terminal/check") ? keyCheck : {ok:true});
+  await env.run('openTerminal("control")');
+  await env.actions.querySelectorAll("button").find(n=>n.textContent==="信任并连接").click();
+  assert.equal(env.calls.find(call=>call.url==="/api/ssh/endpoints/trust").body.role,"ops");
+  assert.equal(env.calls.some(call=>call.body?.role==="write"),false);
 });
 
 test("private-key rotation lets the server derive the new public key", async () => {

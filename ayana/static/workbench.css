@@ -114,13 +114,9 @@ main:has(#tab-agent.tab-panel:not(.hidden)) { max-width: none !important; paddin
   .aw-session-list { padding: 4px; }
   .aw-chat-title { font-size: 13px; }
 }
-/* Session controls stay adjacent to takeover; the native terminal stays central. */
-.aw-access-switch[aria-checked="true"] { color:var(--accent,#ff8547); border-color:currentColor; }
-.aw-access-switch { position:relative; padding-left:43px!important; min-height:28px; }
-.aw-access-switch::before { content:""; position:absolute; left:7px; top:calc(50% - 7px); width:28px; height:14px; border-radius:8px; background:#555; }
-.aw-access-switch::after { content:""; position:absolute; left:9px; top:calc(50% - 5px); width:10px; height:10px; border-radius:50%; background:#eee; transition:transform .15s; }
-.aw-access-switch[aria-checked="true"]::before { background:var(--accent,#ff8547); }
-.aw-access-switch[aria-checked="true"]::after { transform:translateX(14px); }
+/* The account-group choice applies to this session's next dispatch. */
+.aw-account-picker { display:flex; align-items:center; gap:7px; color:#aeb6c3; font-size:11px; white-space:nowrap; }
+.aw-account-picker select { min-width:140px; max-width:230px; min-height:32px; }
 .aw-term-actions select { background:var(--bg,#151515); color:inherit; border:1px solid var(--border,#444); border-radius:6px; padding:5px; font-size:12px; }
 .aw-term-actions :disabled { opacity:.55; cursor:default; }
 .aw-task-state { color:#9aa9bb; font-size:11px; padding:3px 7px; border:1px solid #ffffff15; border-radius:5px; white-space:nowrap; }
@@ -139,12 +135,6 @@ main:has(#tab-agent.tab-panel:not(.hidden)) { max-width: none !important; paddin
 .aw-agent-settings .settings-description { font-size:12px; margin:0 0 16px; }
 .aw-agent-settings select, .aw-agent-settings input { display:block; width:100%; padding:10px 12px; border:1px solid #ffffff1a; border-radius:8px; background:#222731; color:var(--ink); font:inherit; font-size:13px; }
 .aw-agent-settings select:focus, .aw-agent-settings input:focus { outline:2px solid #6cb6ff40; border-color:#6cb6ff80; }
-.aw-segmented { display:flex; gap:4px; padding:3px; border:1px solid #ffffff15; border-radius:10px; background:#151a22; }
-.aw-segmented .btn { flex:1; padding:9px 12px; border:1px solid transparent; background:transparent; color:#99a5b5; border-radius:7px; }
-.aw-segmented .btn.selected { background:#6cb6ff20; border-color:#6cb6ff40; color:#d9eeff; }
-.aw-role-accounts { margin:-9px 0 20px; max-height:110px; overflow-y:auto; color:#96a5b6; font-size:11px; line-height:1.7; }
-.aw-role-account { display:grid; grid-template-columns:minmax(65px,.6fr) minmax(0,1.8fr); gap:10px; padding:3px 0; }
-.aw-role-account code { color:#c1ccd8; overflow-wrap:anywhere; white-space:normal; font-size:11px; }
 .aw-settings-actions { position:sticky; bottom:0; padding:13px 4px; min-height:65px; background:#1b1f27; }
 .aw-settings-actions .error { color:#e5b988; }
 @media (max-width:600px) { .aw-copy-actions { flex-wrap:wrap; } .aw-agent-settings .settings-card { padding:15px; } .aw-settings-actions { flex-wrap:wrap; } }
@@ -164,11 +154,11 @@ main:has(#tab-agent.tab-panel:not(.hidden)) { max-width: none !important; paddin
 .aw-agent-settings .settings-field > span { margin:0; }
 .aw-agent-settings .settings-field > small { grid-column:2; color:#8e9bab; line-height:1.6; font-size:11px; }
 .aw-agent-settings select,.aw-agent-settings input { width:100%; padding:10px 12px; border:1px solid #3a4350; border-radius:8px; background:#222731; color:#dce3ed; font:inherit; box-sizing:border-box; }
-.aw-segmented { display:flex; padding:3px; gap:3px; background:#121820; border:1px solid #34404d; border-radius:9px; }
-.aw-segmented .btn { flex:1; border:0; background:transparent; color:#9da9b8; font-size:12px; padding:9px 10px; }
-.aw-segmented .btn.selected { color:#d8ecff; background:#263c52; box-shadow:inset 0 0 0 1px #496985; }
-.aw-role-accounts { display:grid; grid-template-columns:1fr 1fr; gap:5px 16px; margin:0 0 18px 151px; font-size:11px; }
-.aw-role-account { display:flex; justify-content:space-between; gap:8px; color:#8f9dad; overflow-wrap:anywhere; }
-.aw-role-account code { color:#c0ccdb; }
+.aw-account-list { display:flex; flex-direction:column; gap:0; margin:2px 0 16px; max-height:220px; overflow-y:auto; }
+.aw-account-row { display:grid; grid-template-columns:minmax(80px,.35fr) minmax(0,1fr); gap:12px; align-items:center; padding:8px 0; border-bottom:1px solid #ffffff0b; color:#9ca8b7; font-size:12px; line-height:1.5; }
+.aw-account-row:last-child { border-bottom:0; }
+.aw-account-asset,.aw-account-address,.aw-account-missing { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.aw-account-address { color:#c9d4e3; font-size:12px; }
+.aw-account-missing { color:#8290a2; }
 .aw-settings-actions { padding:14px 0 0; min-height:54px; background:transparent; position:sticky; bottom:-24px; padding-bottom:14px; background:#1b1f27; }
-@media(max-width:600px) { .aw-agent-settings .settings-field { grid-template-columns:1fr; } .aw-agent-settings .settings-field > small { grid-column:1; } .aw-role-accounts { margin-left:0; grid-template-columns:1fr; } .modal-card:has(.aw-agent-settings) { padding:18px; } }
+@media(max-width:600px) { .aw-agent-settings .settings-field { grid-template-columns:1fr; } .aw-agent-settings .settings-field > small { grid-column:1; } .aw-account-row { grid-template-columns:90px minmax(0,1fr); } .modal-card:has(.aw-agent-settings) { padding:18px; } .aw-account-picker select { min-width:120px; max-width:190px; } }

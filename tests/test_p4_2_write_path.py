@@ -240,8 +240,8 @@ class TestMcpControlledWrite(unittest.TestCase):
         self.assertTrue(a["ok"] and b["ok"])
         self.assertNotEqual(a["action_key"], b["action_key"])
 
-    def test_human_approval_blocks_write_until_approved(self):
-        # 人工审批拦截属于会话 manual 档语义（不再依赖全局审批开关）
+    def test_per_action_approval_is_retired(self):
+        # PERM-06：逐动作人工审批已删除；写直接走审计+unknown
         from ayana.duty_session import DutySessionManager
 
         duty = DutySessionManager(self.db)
@@ -258,28 +258,9 @@ class TestMcpControlledWrite(unittest.TestCase):
                 {"asset_id": "nerv", "command": "systemctl restart frps", "channel": "write"},
             )
         )
-        self.assertFalse(out["ok"])
-        self.assertEqual(out.get("error"), "approval_required")
-        self.assertTrue(out.get("pending"))
-        self.assertEqual(self.transport.calls, [])
-        key = out.get("action_key")
-        self.assertTrue(key)
-        scope = f"_session:{sid}"
-        approved = self.bridge.approve_pending_write(scope, key, approved_by="alice")
-        self.assertTrue(approved["ok"])
-        # 批准后执行
-        self.bridge.complete_write(scope, key, ok=True, result="ok")
-        self.assertTrue(self.bridge.is_write_done(scope, key))
-
-
-class TestActionServiceWriteOps(unittest.TestCase):
-    def test_write_ops_hook_present(self):
-        from ayana.actions import ActionService
-
-        self.assertTrue(hasattr(ActionService, "execute"))
-        src = Path("ayana/actions.py").read_text(encoding="utf-8")
-        self.assertIn("self.write_ops", src)
-        self.assertIn("mark_unknown", src)
+        self.assertNotEqual(out.get("error"), "approval_required")
+        self.assertTrue(self.transport.calls)
+        self.assertTrue(out.get("action_key"))
 
 
 if __name__ == "__main__":

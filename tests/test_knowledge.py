@@ -1,4 +1,4 @@
-"""MD 知识库：front matter、多对象关联、共同命中、状态语义、不授予执行权。"""
+﻿"""MD 知识库：front matter、多对象关联、共同命中、状态语义、不授予执行权。"""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from ayana.db import Database
 from ayana.investigation import InvestigationService
 from ayana.knowledge import KnowledgeBase, parse_front_matter
 from ayana.ntsafe import NTResult
-from ayana.policy import Policy
+from ayana.access import AccessControl as Policy
 
 ROOT = Path(__file__).resolve().parents[1] / "knowledge"
 
@@ -171,6 +171,8 @@ class TestMarkdownKnowledge(unittest.TestCase):
 
 
 class TestInvestigationUsesMarkdown(unittest.TestCase):
+    """知识正文注入：MiMoCode 经 knowledge.query/get 获取 Markdown 正文。"""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.db = Database(Path(self.tmp.name) / "t.db")
@@ -181,23 +183,14 @@ class TestInvestigationUsesMarkdown(unittest.TestCase):
             " VALUES(?,?,?,?,?,?,1,'',?,?)",
             ("demo", "Demo", "demo", "demo-exec", "demo", "demo", t, t),
         )
-        self.policy = Policy(self.db)
-        self.policy.upsert_permission(
-            subject_type="auto_rule", subject_id="agent", capability="asset.summary",
-            asset_id="demo", object_id="*", allow=True, require_approval=False,
-            auto_allowed=False, actor="test",
-        )
         self.kb = KnowledgeBase(self.db, root=ROOT)
-        self.inv = InvestigationService(
-            self.db, FakeNT(), FakeGate(), FakeProm(), self.policy, knowledge=self.kb
-        )
 
     def tearDown(self):
         self.db.close()
         self.tmp.cleanup()
 
-    def test_investigation_injects_md_body(self):
-        """注入与对象匹配的知识正文。"""
+    def test_knowledge_injects_md_body(self):
+        """命中对象的知识文档返回 Markdown 正文。"""
         tmp = self.kb.root / "_tmp_inv.md"
         tmp.write_text(
             "---\nid: inv-test\ntitle: inv\ntype: issue\nstatus: active\nobjects:\n"
@@ -206,47 +199,13 @@ class TestInvestigationUsesMarkdown(unittest.TestCase):
         )
         try:
             self.kb.reload()
-            res = asyncio.run(
-                self.inv.run(
-                    asset_id="demo",
-                    object_id="svc-a",
-                    capability="asset.summary",
-                    actor_type="auto_rule",
-                    actor_id="agent",
-                )
-            )
-            self.assertTrue(res.get("ok"))
-            knol = res.get("knowledge") or {}
+            knol = self.kb.investigation_context("demo", "svc-a")
             self.assertTrue(knol.get("docs"))
             self.assertIn("INJECTED_MARKER", knol.get("context_text", ""))
             self.assertIn("inv-test", knol.get("context_text", ""))
         finally:
             tmp.unlink(missing_ok=True)
             self.kb.reload()
-
-    def test_knowledge_does_not_grant_write(self):
-        d = self.policy.check(
-            subject_type="auto_rule",
-            subject_id="agent",
-            capability="service.restart",
-            asset_id="demo",
-            object_id="demo:service:svc-a",
-            auto=True,
-        )
-        self.assertFalse(d["allowed"])
-
-    def test_without_permission_denied(self):
-        self.db.execute("DELETE FROM permissions")
-        res = asyncio.run(
-            self.inv.run(
-                asset_id="demo",
-                object_id="svc-a",
-                capability="asset.summary",
-                actor_type="auto_rule",
-                actor_id="agent",
-            )
-        )
-        self.assertFalse(res.get("ok"))
 
 
 if __name__ == "__main__":

@@ -75,7 +75,9 @@ class NativeTurns:
         queued=status.get("type") in ("busy","retry")
         binding=manager._binding(sid) or {}
         if binding.get("state")=="unknown" or binding.get("receipt_status")=="unknown":raise NativeAdmissionError("native_turn_unknown")
-        message_id=body.get("messageID")
+        body = dict(body)
+        message_id=body.get("messageID") or "msg_" + uuid.uuid4().hex
+        body["messageID"] = message_id
         if message_id:
             old=self.db.query_one("SELECT state,receipt_id FROM agent_native_submissions WHERE session_id=? AND kind='prompt' AND json_extract(payload_json,'$.messageID')=? ORDER BY created_at DESC LIMIT 1",(sid,message_id))
             if old:
@@ -160,28 +162,52 @@ class NativeTurns:
             raise
 
     async def reconcile(self,manager):
-        rows=self.db.query("SELECT * FROM agent_native_submissions WHERE state IN ('recovering','unknown') OR (state='submitting' AND updated_at<?) ORDER BY updated_at LIMIT 20",(time.time()-30,))
+        rows=self.db.query(
+            "SELECT * FROM agent_native_submissions s WHERE state IN ('recovering','unknown')"
+            " OR (state='submitting' AND updated_at<?) OR (state='accepted' AND EXISTS"
+            " (SELECT 1 FROM agent_runtime_receipts r WHERE r.receipt_id=s.receipt_id"
+            " AND r.session_id=s.session_id AND r.status IN ('accepted','pending','queued','running','unknown')))"
+            " ORDER BY updated_at LIMIT 20",(time.time()-30,))
         for raw in rows:
             row=dict(raw);sid=row["session_id"]
             try:
                 context=json.loads(row["payload_json"]);client=manager.serve_client_factory()
                 client._admit()
+                session = self.duty.get(sid) or {}
+                if session.get("remote_session_id") != row["remote_session_id"]:
+                    continue
                 if manager.engine_signature()!=context.get("engine"):
                     self.finish(sid,row["submission_id"],"unknown");continue
                 status=await client.session_status(row["remote_session_id"])
                 messages=await client.messages(row["remote_session_id"],limit=200)
-                if row["kind"]=="prompt":
+                if row["kind"] in ("prompt", "automatic"):
                     user_id=context.get("messageID")
                     linked=[m for m in messages if (m.get("info") or {}).get("role")=="assistant" and m["info"].get("parentID")==user_id]
                     if status.get("type")=="idle" and user_id and linked:
                         last=max(linked,key=lambda m:(m["info"].get("time") or {}).get("created",0))
+                        outcome = ""
                         if _assistant_finished(last["info"]):
                             outcome="failed" if last["info"].get("error") else "completed"
+                        else:
+                            recovery = await client._request("GET", "/session/" + row["remote_session_id"] + "/recovery")
+                            options = recovery.get("candidates", []) if isinstance(recovery, dict) else recovery if isinstance(recovery, list) else []
+                            if any(isinstance(candidate, dict)
+                                   and candidate.get("kind") == "assistant"
+                                   and candidate.get("assistantMessageID") == last["info"].get("id")
+                                   and candidate.get("parentMessageID") == user_id for candidate in options):
+                                outcome = "cancelled"
+                        if outcome:
                             self.finish(sid,row["submission_id"],outcome)
+                            if row["receipt_id"]:
+                                self.db.execute(
+                                    "UPDATE agent_runtime_receipts SET status=?,updated_at=?"
+                                    " WHERE receipt_id=? AND session_id=? AND remote_session_id=?"
+                                    " AND status IN ('accepted','pending','queued','running','unknown')",
+                                    (outcome,time.time(),row["receipt_id"],sid,row["remote_session_id"]))
                             remaining=self.db.query_one("SELECT 1 FROM agent_native_submissions WHERE session_id=? AND state IN ('submitting','recovering','unknown')",(sid,))
                             if not remaining and not self.db.query_one("SELECT 1 FROM agent_runtime_receipts WHERE session_id=? AND status IN ('accepted','pending','queued','running','unknown')",(sid,)):
-                                self.duty.set_runtime_state(sid,"idle",receipt_status=outcome)
-                            self.ack(sid,state=self.duty.task_info(sid)["task_state"],message="已核对原生任务结果，未重发原消息。")
+                                self.duty.set_runtime_state(sid,"idle",receipt_id=row["receipt_id"],receipt_status=outcome)
+                            self.ack(sid,state=self.duty.task_info(sid)["task_state"],message="已核对原生任务已中断，可在原会话恢复；未重发原消息。" if outcome == "cancelled" else "已核对原生任务结果，未重发原消息。")
                     continue
                 parent_id=context.get("parent_id") or context["candidate"].get("parentMessageID")
                 new=[m for m in messages if (m.get("info") or {}).get("role")=="assistant" and m["info"].get("parentID")==parent_id and m["info"].get("id") not in context["before_ids"]]

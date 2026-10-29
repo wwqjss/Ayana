@@ -56,7 +56,7 @@ const flush = async () => { for (let index = 0; index < 8; index++) await Promis
 function environment(customReply) {
   const nodes = new Map(), calls = [];
   const create = (id, tag = "div") => { const node = new Element(tag); node.id = id; nodes.set(id, node); return node; };
-  for (const id of ["monitor-body", "monitor-hosts-strip", "monitor-business", "monitor-onboard", "monitor-install-box", "promconfig-ne", "chk-list", "chk-activity", "chk-assist-msg", "modal", "modal-title", "modal-body", "monitor-sub-metrics", "monitor-sub-checks", "monitor-sub-prom"]) create(id);
+  for (const id of ["monitor-body", "monitor-hosts-strip", "monitor-business", "monitor-onboard", "monitor-install-box", "promconfig-ne", "chk-list", "chk-activity", "chk-form-msg", "modal", "modal-title", "modal-body", "monitor-sub-metrics", "monitor-sub-checks", "monitor-sub-prom"]) create(id);
   for (const id of ["monitor-detect", "monitor-configure", "monitor-refresh", "monitor-auto", "chk-refresh", "chk-add"]) create(id, "button");
   for (const id of ["monitor-host", "pc-ne-asset", "monitor-range", "chk-asset"]) create(id, "select");
   create("pc-ne-register", "input");
@@ -71,6 +71,7 @@ function environment(customReply) {
     if (url.startsWith("/api/monitor/business/")) return businessFor(url.split("/").at(-1));
     if (url.startsWith("/api/checks?")) return { ok: true, checks: [native] };
     if (url === "/api/checks/activity") return { ok: true, activity: [] };
+    if (url === "/api/assist/form?domain=checks") return {ok:true,form};
     if (["/api/checks/run", "/api/checks/update", "/api/checks/delete"].includes(url)) return { ok: true };
     if (url === "/api/setup/monitor") return { ok: true, prometheus_ok: true };
     if (url === "/api/promconfig/node-exporter/detect") return { ok: true, running: true, binary: "/usr/bin/node_exporter", port_9100: true };
@@ -84,8 +85,8 @@ function environment(customReply) {
     api: async (url, options = {}) => { const request = { url, body: options.body ? JSON.parse(options.body) : null }; calls.push(request); const result = customReply && customReply(request, defaultReply); return result === undefined ? defaultReply(url) : await result; },
     badge: (label, cls) => { const node = new Element("span"); node.className = "badge " + cls; node.textContent = label; return node; },
     pcBadge: (label, cls) => { const node = new Element("span"); node.className = "badge " + cls; node.textContent = label; return node; },
-    assistForms: { checks: form }, ensureAssistForm: async () => form, chkKindChanged: () => {},
-    assistNote: (id, lines) => { if (nodes.get(id)) nodes.get(id).textContent = lines.join("\n"); },
+    checkForms: { checks: form }, ensureCheckForm: async () => form, chkKindChanged: () => {},
+    checkFormNote: (id, lines) => { if (nodes.get(id)) nodes.get(id).textContent = lines.join("\n"); },
     getSchemaDefault: (_, name) => form.fields.find((field) => field.name === name)?.default,
     fmtTime: (value) => "最近 " + value,
     showModal: (title, children) => { nodes.get("modal-title").textContent = title; nodes.get("modal-body").innerHTML = ""; children.forEach((child) => nodes.get("modal-body").appendChild(child)); nodes.get("modal").classList.remove("hidden"); },
@@ -96,9 +97,17 @@ function environment(customReply) {
     ["function setMonitorSub(", "function setNotifySub("], ["function syncChecksAsset(", "/* ---- 统一健康状态"],
     ["const pcProgressByHost", "function showModal("], ["const monitorState", "/* ---- 通知渠道"],
     ["function pcFillRegisterAddr(", "async function renderPcNodeExporter("],
-    ["function checkHostLabel(", "function chkKindChanged("], ["function humanFormError(", "async function assistConfigure("],
+    ["function checkHostLabel(", "function chkKindChanged("], ["function humanFormError(", "function checkFormNote("],
   ]) vm.runInContext(cut(start, end), context);
-  return { nodes, calls, state, run: (code) => vm.runInContext(code, context) };
+  return { nodes, calls, state, run: (code) => vm.runInContext(code, context), installCheckForm: async () => {
+    for (const field of form.fields) if (!nodes.has(field.control || field.control_id)) create(field.control || field.control_id, Array.isArray(field.values) ? "select" : "input");
+    create("chk-summary");
+    vm.runInContext(cut("function confirmFormAction(", 'on("kb-search"'),context);
+    vm.runInContext(cut("const checkFormState", 'on("monitor-detect"'),context);
+    vm.runInContext(cut("function checkPayloadSummary(", "/* ---- 节点守望配对 ---- */"),context);
+    await vm.runInContext('ensureCheckForm("checks")',context);
+    nodes.get("chk-asset").value="control"; nodes.get("chk-kind").value="service";nodes.get("chk-name").value="Service health";nodes.get("chk-unit").value="containerd";
+  } };
 }
 
 const tests = [];
@@ -341,6 +350,29 @@ test("unavailable Prometheus stops onboarding before detection or changes and pe
   await env.run("pcRunAdoptFlow('control')");
   assert.equal(env.run("pcProgressByHost.control[3].status"), "ok");
   assert.equal(env.calls.filter((call) => call.url === "/api/promconfig/node-exporter/detect").length, 1);
+});
+
+test("manual check submission validates before confirmation and sends no retired assistant request", async () => {
+  const env=environment(({url})=>url==="/api/checks/validate"?{ok:true,payload:{asset_id:"control",kind:"service",name:"Service health",params:{unit:"containerd"},interval_sec:60,fail_threshold:2,severity:"warning"}}:undefined);
+  await env.installCheckForm();await env.nodes.get("chk-add").click();
+  assert.equal(env.nodes.get("modal-title").textContent,"确认创建业务检查");
+  assert.equal(env.calls.filter(call=>call.url==="/api/checks/validate").length,1);
+  assert.equal(env.calls.some(call=>call.url==="/api/checks" || call.url==="/api/assist/configure"),false);
+  assert.ok(env.nodes.get("modal-body").textContent.includes("containerd"));
+});
+test("editing a manual check during validation rejects the stale result without opening confirmation", async () => {
+  const pending=deferred();const env=environment(({url})=>url==="/api/checks/validate"?pending.promise:undefined);
+  await env.installCheckForm();const operation=env.nodes.get("chk-add").click();await flush();
+  env.nodes.get("chk-unit").value="nginx";await env.nodes.get("chk-unit").dispatch("input");
+  pending.resolve({ok:true,payload:{asset_id:"control",kind:"service",params:{unit:"containerd"}}});await operation;
+  assert.ok(env.nodes.get("chk-form-msg").textContent.includes("表单已修改"));
+  assert.equal(env.nodes.get("modal-title").textContent,"");assert.equal(env.nodes.get("chk-add").disabled,false);
+});
+test("manual check validation failure remains visible and preserves the user's values", async () => {
+  const env=environment(({url})=>url==="/api/checks/validate"?{ok:false,issues:[{label:"服务名称",message:"请核对服务名称"}]}:undefined);
+  await env.installCheckForm();await env.nodes.get("chk-add").click();
+  assert.ok(env.nodes.get("chk-form-msg").textContent.includes("请核对服务名称"));
+  assert.equal(env.nodes.get("chk-unit").value,"containerd");assert.equal(env.nodes.get("chk-add").disabled,false);
 });
 
 (async () => {

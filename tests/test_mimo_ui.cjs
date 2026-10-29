@@ -6,7 +6,7 @@ const vm = require("node:vm");
 const harness = fs.readFileSync(path.join(__dirname, "test_security_ui.cjs"), "utf8").split("const tests = [];")[0];
 const environment = vm.runInNewContext(harness + "\nenvironment;", {require, __dirname, console, URL, TextEncoder, Uint8Array});
 const source = fs.readFileSync(path.join(__dirname, "../ayana/static/app.js"), "utf8");
-const start = source.indexOf("async function openMimoAdmin("), end = source.indexOf("/* ---- 旧自治历史", start);
+const start = source.indexOf("async function openMimoAdmin("), end = source.indexOf("/* ---- 全局设置", start);
 const cli = {ok:true,exists:true,version:"test"};
 const config = (available = false, model = "owner/model-a") => ({
   ok:true,available,model:"selected/" + model,

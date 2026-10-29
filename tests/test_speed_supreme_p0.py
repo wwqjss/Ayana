@@ -53,7 +53,8 @@ class TestExecShell(unittest.TestCase):
         with self.assertRaises(TransportError) as cm:
             asyncio.run(self.tr.exec_shell("nerv", "journalctl -u frps | tail -5"))
         self.assertNotEqual(cm.exception.code, "unsafe_token")
-        self.assertIn(cm.exception.code, ("endpoint_missing", "host_key_untrusted"))
+        self.assertIn(cm.exception.code, ("configured_ssh_endpoint_missing", "endpoint_missing", "host_key_untrusted"))
+        self.assertTrue(cm.exception.dispatch_not_started)
 
     def test_token_path_still_blocks_metachar(self):
         with self.assertRaises(TransportError) as cm:
@@ -115,12 +116,15 @@ class TestMcpTools(unittest.TestCase):
                 "session.write_ops",
                 "session.claim",
                 "session.remote",
-                "action.execute",
                 "ops.constraints",
                 "ops.loop_status",
                 "config.prom_target_add",
                 "config.prom_target_update",
                 "config.prom_target_delete",
+                "config.check_list",
+                "config.check_add",
+                "config.check_update",
+                "config.check_delete",
             },
         )
 
@@ -222,12 +226,13 @@ class TestMcpServer(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(init["result"]["serverInfo"]["name"], "ayana-mcp")
         lst = await srv.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-        self.assertEqual(len(lst["result"]["tools"]), 20)
+        self.assertEqual(len(lst["result"]["tools"]), 23)
         self.assertEqual({tool["name"] for tool in lst["result"]["tools"]}, {
             "host.exec", "metrics.query", "incident.list", "incident.get", "incident.note", "incident.close",
             "knowledge.query", "knowledge.get", "knowledge.upsert", "asset.list", "session.get",
-            "session.write_ops", "session.claim", "session.remote", "action.execute", "ops.constraints",
+            "session.write_ops", "session.claim", "session.remote", "ops.constraints",
             "ops.loop_status", "config.prom_target_add", "config.prom_target_update", "config.prom_target_delete",
+            "config.check_list", "config.check_add", "config.check_update", "config.check_delete",
         })
         call = await srv.handle(
             {

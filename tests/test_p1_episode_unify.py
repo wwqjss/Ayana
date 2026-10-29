@@ -22,6 +22,14 @@ from ayana.db import Database, new_id, now
 from ayana.incidents import IncidentService
 
 
+class RecoveryProm:
+    """Supply fresh, target-matched recovery evidence for recovery debounce."""
+
+    def evaluate_recovery_evidence_sync(self, profile, *, asset_id, service):
+        return {"verdict": "green", "contract": profile.id,
+                "asset": asset_id, "service": service}
+
+
 def make_db():
     tmp = tempfile.TemporaryDirectory()
     db = Database(str(Path(tmp.name) / "t.db"))
@@ -382,6 +390,7 @@ class TestRecoveryDebounce(unittest.TestCase):
         self.tmp, self.db = make_db()
         self.addCleanup(close, self.tmp, self.db)
         self.inc = IncidentService(self.db)
+        self.inc.prom = RecoveryProm()
         self.db.execute(
             "INSERT INTO incidents(id, title, asset_id, object_id, status, stage,"
             " need_human, generation, created_at, updated_at)"
@@ -391,13 +400,13 @@ class TestRecoveryDebounce(unittest.TestCase):
         self.db.execute(
             "INSERT INTO alert_episodes(id, source_id, fingerprint, starts_at_norm,"
             " alertname, status, asset_id, object_id, incident_id, first_seen, last_seen,"
-            " receive_count) VALUES('ep1','am','fp1','s1','TestAlert','resolved',"
-            " 'host1','obj1','inc1',?,?,1)",
+            " receive_count,problem_family) VALUES('ep1','am','fp1','s1','TargetDown','resolved',"
+            " 'host1','obj1','inc1',?,?,1,'availability')",
             (now(), now()),
         )
 
     def test_resolved_with_no_obligations_recovers(self):
-        # reconcile 要求 n_passed>0 才能 recovered
+        # 告警恢复须有当前目标的新鲜契约证据，passed 状态本身不足以证明恢复。
         self.db.execute(
             "INSERT INTO actions(id, incident_id, asset_id, object_id, capability,"
             " state, mode, created_at) VALUES('act1','inc1','host1','obj1',"

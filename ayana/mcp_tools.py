@@ -37,6 +37,7 @@ def _result_payload(res: NTResult) -> dict[str, Any]:
         "timed_out": res.timed_out,
         "mode": res.mode,
         "account": res.account,
+        "account_group": getattr(res, "account_group", ""),
     }
 
 
@@ -58,6 +59,7 @@ class OpsContext:
     promconfig: Any = None
     ops_loop: Any = None
     constraints: Any = None
+    checks: Any = None
     managed_context: bool = False
 
 
@@ -66,18 +68,20 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "name": "host.exec",
         "description": (
             "在资产上执行通用 shell 命令（调查与变更统一入口）。"
-            "权限=目标机 SSH 账户。channel=write(默认)|read 决定读/写端点。"
+            "权限=目标机 SSH 账户。所有用途使用会话选定账号组，未指定时继承全局默认。"
+            "channel=write(默认)|read 仅标注用途，不切换账号组。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "asset_id": {"type": "string", "description": "资产 ID"},
                 "command": {"type": "string", "description": "远端 shell 命令行"},
+                "incident_id": {"type": "string", "description": "本次写操作所属未关闭工单；多个未关闭关联时必须指定，唯一时自动绑定。手动会话仅有关联的已关闭历史工单时，省略此字段可执行独立任务"},
                 "timeout_sec": {"type": "number", "description": "超时秒，默认 12"},
                 "channel": {
                     "type": "string",
                     "enum": ["write", "read"],
-                    "description": "写或读通道，默认 write",
+                    "description": "变更或调查用途，默认 write；使用相同的会话账号组",
                 },
             },
             "required": ["asset_id", "command"],
@@ -256,31 +260,13 @@ TOOL_SPECS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "action.execute",
-        "description": (
-            "自主执行已登记对象上的受控写能力（service.restart 等），"
-            "退役 Ceiling/三态后系统自动批准；仍受能力目录/对象绑定/host key/幂等/unknown 保护。"
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "asset_id": {"type": "string"},
-                "object_id": {"type": "string"},
-                "capability": {"type": "string"},
-                "incident_id": {"type": "string"},
-                "reason": {"type": "string"},
-            },
-            "required": ["incident_id", "asset_id", "object_id", "capability"],
-        },
-    },
-    {
         "name": "ops.constraints",
         "description": "读取当前生效的 MiMoCode 运维软约束文本（无进展/同方案失败/转人工）。",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "ops.loop_status",
-        "description": "查询工单闭环软约束状态（轮次/无进展/停止原因）。",
+        "description": "读取当前工单状态和已退役调度器的历史快照；旧停止原因不代表当前会话控制状态，恢复须另看真实验证证据。",
         "inputSchema": {
             "type": "object",
             "properties": {"incident_id": {"type": "string"}},
@@ -335,12 +321,71 @@ TOOL_SPECS: list[dict[str, Any]] = [
             "required": ["address"],
         },
     },
+    {
+        "name": "config.check_list",
+        "description": "列出现有 SSH 业务检查。可按 asset_id 过滤。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"asset_id": {"type": "string"}},
+        },
+    },
+    {
+        "name": "config.check_add",
+        "description": (
+            "新增轻量 SSH 业务检查（service|port|command）。"
+            "校验规则与 Web 表单一致：kind=service 需 params.unit；"
+            "kind=port 需 params.proto/port；kind=command 需 params.cmd（仅允许安全程序白名单）。"
+            "返回校验通过后的 check；校验失败时给出 issues/missing。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "asset_id": {"type": "string"},
+                "kind": {"type": "string", "enum": ["service", "port", "command"]},
+                "name": {"type": "string"},
+                "params": {"type": "object"},
+                "expect": {"type": "object"},
+                "interval_sec": {"type": "integer", "minimum": 15, "maximum": 3600},
+                "fail_threshold": {"type": "integer", "minimum": 1, "maximum": 20},
+                "severity": {"type": "string", "enum": ["info", "warning", "critical"]},
+            },
+            "required": ["asset_id", "kind", "name", "params"],
+        },
+    },
+    {
+        "name": "config.check_update",
+        "description": "更新现有检查。可改 name/params/expect/interval_sec/fail_threshold/severity/enabled。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "name": {"type": "string"},
+                "params": {"type": "object"},
+                "expect": {"type": "object"},
+                "interval_sec": {"type": "integer"},
+                "fail_threshold": {"type": "integer"},
+                "severity": {"type": "string"},
+                "enabled": {"type": "boolean"},
+            },
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "config.check_delete",
+        "description": "删除检查。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+        },
+    },
 ]
 
 
 _MANAGED_MUTATIONS = frozenset({
     "incident.note", "incident.close", "knowledge.upsert", "session.remote",
     "config.prom_target_add", "config.prom_target_update", "config.prom_target_delete",
+    "config.check_add", "config.check_update", "config.check_delete",
 })
 
 
@@ -422,6 +467,8 @@ class OpsTools:
 
     async def _call(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         args = arguments or {}
+        if name == "action.execute":
+            raise McpToolError("tool_retired", "action.execute is retired; use host.exec for session execution.")
         handlers: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = {
             "host.exec": self.host_exec,
             "metrics.query": self.metrics_query,
@@ -437,12 +484,15 @@ class OpsTools:
             "session.write_ops": self.session_write_ops,
             "session.remote": self.session_remote,
             "session.claim": self.session_claim,
-            "action.execute": self.action_execute,
             "ops.constraints": self.ops_constraints,
             "ops.loop_status": self.ops_loop_status,
             "config.prom_target_add": self.config_prom_target_add,
             "config.prom_target_update": self.config_prom_target_update,
             "config.prom_target_delete": self.config_prom_target_delete,
+            "config.check_list": self.config_check_list,
+            "config.check_add": self.config_check_add,
+            "config.check_update": self.config_check_update,
+            "config.check_delete": self.config_check_delete,
         }
         fn = handlers.get(name)
         if not fn:
@@ -454,9 +504,6 @@ class OpsTools:
                 self._require_write_mode(name)
                 self._validate_incident_scope(args)
                 return await self._managed_mutation(name, args, fn)
-            if name == "action.execute":
-                self._require_write_mode(name)
-                self._validate_incident_scope(args)
             return await fn(args)
         except McpToolError:
             raise
@@ -468,37 +515,26 @@ class OpsTools:
     async def _managed_mutation(self, name: str, args: dict[str, Any], fn: Any) -> dict[str, Any]:
         self._require_write_mode(name)
         sid = self.ctx.authority_session_id
-        approved = bool(getattr(self.ctx, "approved_write", False))
         br = self._bridge()
         incident_id = self.ctx.mcp_incident_scope
         action_key = br.make_action_key(sid, name, args, context="mcp-tool-write")
         payload = {"_ayana_session_id": sid, "_ayana_tool": name, "_ayana_arguments": args}
-        if not approved:
-            if self.ctx.authority_approval_mode == "manual":
-                pending = br.pending_write(incident_id, action_key, target=str(args.get("asset_id") or ""),
-                                           params=payload, claimed_by="mcp_agent", authority_session_id=sid)
-                if not pending.get("ok"):
-                    return {"ok": False, "error": "idempotent_block", "detail": pending, "action_key": action_key}
-                self._audit_write("", name, "awaiting_approval", sid)
-                return {"ok": False, "error": "approval_required", "pending": True,
-                        "action_key": action_key, "incident_id": incident_id}
-            claim = br.claim_write(incident_id, action_key, params=payload, claimed_by="mcp_agent", authority_session_id=sid)
-            if not claim.get("claimed"):
-                return {"ok": False, "error": "idempotent_block", "detail": claim, "action_key": action_key}
+        # 逐动作审批已删除：直接 claim → 执行 → 审计/unknown
+        claim = br.claim_write(incident_id, action_key, params=payload, claimed_by="mcp_agent", authority_session_id=sid)
+        if not claim.get("claimed"):
+            return {"ok": False, "error": "idempotent_block", "detail": claim, "action_key": action_key}
         try:
-            with session_dispatch_guard(self.ctx.db, sid, require_automatic=not approved,
+            with session_dispatch_guard(self.ctx.db, sid, require_automatic=False,
                     asset_id=str(args.get("asset_id") or ""),object_id=str(args.get("object_id") or ""),
                     incident_id=str(args.get("incident_id") or args.get("source_incident") or "")):
                 out = await fn(args)
         except Exception as exc:
-            if not approved:
-                if getattr(exc, "dispatch_not_started", False):
-                    br.release_write(incident_id, action_key, confirmed_safe=True, reason=exc.code)
-                else:
-                    br.mark_unknown(incident_id, action_key, reason=type(exc).__name__)
+            if getattr(exc, "dispatch_not_started", False):
+                br.release_write(incident_id, action_key, confirmed_safe=True, reason=getattr(exc, "code", "failed"))
+            else:
+                br.mark_unknown(incident_id, action_key, reason=type(exc).__name__)
             raise
-        if not approved:
-            br.complete_write(incident_id, action_key, ok=out.get("ok", True), result=json.dumps(out, default=str))
+        br.complete_write(incident_id, action_key, ok=out.get("ok", True), result=json.dumps(out, default=str))
         self._audit_write("", name, "success" if out.get("ok", True) else "failed", sid)
         return out
 
@@ -560,6 +596,7 @@ class OpsTools:
                 timeout=timeout_f,
                 channel=channel,
                 classified=cls,
+                requested_incident=args.get("incident_id"),
             )
         res = await self.ctx.transport.exec_shell(
             asset_id, command, timeout_f, channel="read"
@@ -574,27 +611,30 @@ class OpsTools:
         timeout: float | None,
         channel: str,
         classified: str,
+        requested_incident: str | None = None,
     ) -> dict[str, Any]:
-        """统一受控写：审批门 → claim → 执行 → 确定结果/unknown → 审计。"""
-        from .actions import classify_exec_result
+        """统一受控写：claim → 执行 → 结果/unknown → 审计（无逐动作审批）。"""
+        from .exec_facts import announce_irreversible, classify_exec_result, looks_irreversible
+        from .agent_work_scope import WorkScopeError, claim_target, resolve_incident_write_scope
 
         self._require_write_mode("host.exec")
-        authority_sid = getattr(self.ctx,"authority_session_id","")
+        authority_sid = getattr(self.ctx, "authority_session_id", "")
+        if requested_incident is not None and (not isinstance(requested_incident, str) or not requested_incident.strip()):
+            raise McpToolError("bad_request", "incident_id must be a non-empty string")
+        scope = {"incident_id": "", "generation": 0, "scope": "session"}
         if authority_sid:
-            from .agent_work_scope import WorkScopeError,claim_target
             try:
-                claim_target(self.ctx.db,authority_sid,asset_id=asset_id)
+                scope = resolve_incident_write_scope(self.ctx.db, authority_sid, asset_id,
+                                                     incident_id=(requested_incident or "").strip())
+                claim_target(self.ctx.db, authority_sid, asset_id=asset_id, object_id="*",
+                             incident_id=scope["incident_id"])
             except WorkScopeError as exc:
-                raise McpToolError(exc.code,str(exc),exc.detail) from exc
+                raise McpToolError(exc.code, str(exc), exc.detail) from exc
+        elif requested_incident:
+            raise McpToolError("trusted_session_context_required")
 
         br = getattr(self.ctx, "session_bridge", None)
-        duty = getattr(self.ctx, "duty", None)
-        # 默认自主执行：审批只由会话权威决定（manual 才挂起），无全局审批开关。
-        authority_sid = getattr(self.ctx, "authority_session_id", "")
-        require_human = bool(
-            authority_sid and getattr(self.ctx, "authority_approval_mode", "") == "manual"
-        )
-        incident_id = str(getattr(self.ctx, "mcp_incident_scope", "") or "_mcp_")
+        incident_id = scope["incident_id"] or str(getattr(self.ctx, "mcp_incident_scope", "") or "_mcp_")
         action_key = ""
         if br is not None:
             try:
@@ -602,34 +642,8 @@ class OpsTools:
                     asset_id,
                     "exec_shell",
                     {"command": command, "channel": channel, "classified": classified},
-                    context="mcp-host-exec",
+                    context=(f"mcp-host-exec:generation:{scope['generation']}" if scope["generation"] else "mcp-host-exec"),
                 )
-                if require_human:
-                    pending = br.pending_write(
-                        incident_id,
-                        action_key,
-                        target=asset_id,
-                        params={"command": command, "channel": channel, "timeout": timeout,
-                                **({"_ayana_session_id": authority_sid} if authority_sid else {})},
-                        claimed_by="mcp_agent",
-                        **({"authority_session_id": authority_sid} if authority_sid else {}),
-                    )
-                    if not pending.get("ok") and pending.get("error") != "already_pending":
-                        return {
-                            "ok": False,
-                            "error": pending.get("error") or "pending_failed",
-                            "detail": pending,
-                            "action_key": action_key,
-                        }
-                    self._audit_write(asset_id, command, "awaiting_approval", "human approval required")
-                    return {
-                        "ok": False,
-                        "error": "approval_required",
-                        "message": "写操作已记录，等待人工批准后执行",
-                        "action_key": action_key,
-                        "pending": True,
-                        "incident_id": incident_id,
-                    }
                 claim = br.claim_write(
                     incident_id,
                     action_key,
@@ -637,18 +651,27 @@ class OpsTools:
                     params={"command": command, "channel": channel,
                             **({"_ayana_session_id": authority_sid} if authority_sid else {})},
                     claimed_by="mcp_agent",
+                    incident_generation=scope["generation"],
                     **({"authority_session_id": authority_sid} if authority_sid else {}),
                 )
+            except WorkScopeError as e:
+                raise McpToolError(e.code, str(e), e.detail) from e
             except Exception as e:  # noqa: BLE001
                 return {"ok": False, "error": "claim_failed", "message": str(e)}
             if not claim.get("claimed"):
                 return {
                     "ok": False,
                     "error": "idempotent_block",
+                    "executed": False,
+                    **({"already_done": True, "exec_state": "already_done", "previous_result": claim.get("result", ""),
+                        "message": "该操作已有成功完成记录，本次没有重复执行。"} if claim.get("already_done") else {}),
                     "detail": claim,
                     "action_key": action_key,
+                    **scope,
+                    "idempotent_incident": incident_id,
                 }
-        from .actions import announce_irreversible, looks_irreversible
+            self._audit_write(asset_id, command, "claimed", "", channel=channel,
+                              incident_id=scope["incident_id"], generation=scope["generation"], action_key=action_key)
 
         if looks_irreversible(command):
             announce_irreversible(
@@ -657,7 +680,9 @@ class OpsTools:
                 action_id=action_key, incident_id=incident_id,
             )
         try:
-            with session_dispatch_guard(self.ctx.db, authority_sid, require_automatic=bool(authority_sid),asset_id=asset_id):
+            with session_dispatch_guard(self.ctx.db, authority_sid, require_automatic=bool(authority_sid),
+                                        asset_id=asset_id, object_id="*", incident_id=scope["incident_id"],
+                                        incident_generation=scope["generation"], write_scope=scope["scope"]):
                 res = await self.ctx.transport.exec_shell(
                     asset_id, command, timeout, channel=channel
                 )
@@ -665,12 +690,17 @@ class OpsTools:
             if getattr(e, "dispatch_not_started", False):
                 if br is not None and action_key:
                     br.release_write(incident_id, action_key, confirmed_safe=True, reason=e.code)
-                self._audit_write(asset_id, command, "rejected_before_dispatch", e.code)
-                return {"ok": False, "error": e.code, "action_key": action_key,**(getattr(e,"detail",{}) if isinstance(getattr(e,"detail",{}),dict) else {})}
+                self._audit_write(asset_id, command, "rejected_before_dispatch", e.code, channel=channel,
+                                  incident_id=scope["incident_id"], generation=scope["generation"], action_key=action_key)
+                return {"ok": False, "error": e.code, "action_key": action_key,
+                        **scope, "idempotent_incident": incident_id,
+                        **(getattr(e, "detail", {}) if isinstance(getattr(e, "detail", {}), dict) else {})}
             if br is not None and action_key:
                 br.mark_unknown(incident_id, action_key, reason=f"exception:{type(e).__name__}")
-            self._audit_write(asset_id, command, "unknown", str(e)[:200])
-            return {"ok": False, "error": "exec_error", "message": str(e), "action_key": action_key}
+            self._audit_write(asset_id, command, "unknown", str(e)[:200], channel=channel,
+                              incident_id=scope["incident_id"], generation=scope["generation"], action_key=action_key)
+            return {"ok": False, "error": "exec_error", "message": str(e), "action_key": action_key,
+                    **scope, "idempotent_incident": incident_id}
 
         state, detail = classify_exec_result(res)
         if br is not None and action_key:
@@ -683,16 +713,25 @@ class OpsTools:
                     ok=(state == "success"),
                     result=(detail or "")[:500],
                 )
-        self._audit_write(asset_id, command, state, (detail or "")[:200])
+        self._audit_write(asset_id, command, state, (detail or "")[:200], channel=channel,
+                          ssh_account=getattr(res, "account", "") or "",
+                          ssh_account_group=getattr(res, "account_group", "") or "",
+                          incident_id=scope["incident_id"], generation=scope["generation"], action_key=action_key,
+                          execution_facts={"ok": bool(res.ok), "returncode": res.returncode,
+                                           "timed_out": bool(res.timed_out)})
         return {
             **_result_payload(res),
             "classified": classified,
             "exec_state": state,
             "action_key": action_key,
             "idempotent_incident": incident_id,
+            **scope,
         }
 
-    def _audit_write(self, asset_id: str, command: str, state: str, result: str) -> None:
+    def _audit_write(self, asset_id: str, command: str, state: str, result: str,
+                     *, channel: str = "write", ssh_account: str = "", ssh_account_group: str = "",
+                     incident_id: str = "", generation: int = 0, action_key: str = "",
+                     execution_facts: dict | None = None) -> None:
         db = getattr(self.ctx, "db", None)
         if db is None:
             return
@@ -702,14 +741,22 @@ class OpsTools:
                 "mcp_agent",
                 "mcp_host_exec_write",
                 asset_id=asset_id,
+                incident_id=incident_id,
+                action_id=action_key,
                 detail={
                     "command": command[:300],
                     "state": state,
                     "result": result[:200],
+                    "purpose": "execute" if channel == "write" else "investigate",
+                    "ssh_account": ssh_account,
+                    "ssh_account_group": ssh_account_group,
+                    "incident_id": incident_id,
+                    "generation": generation,
+                    "session_id": getattr(self.ctx, "authority_session_id", ""),
+                    "action_key": action_key,
+                    **(execution_facts or {}),
                     "authority_session_id": getattr(self.ctx, "authority_session_id", ""),
-                    "authority_approval_mode": getattr(self.ctx, "authority_approval_mode", ""),
                     "authority_revision": getattr(self.ctx, "authority_revision", None),
-                    "approved_write": bool(getattr(self.ctx, "approved_write", False)),
                 },
                 channel="mcp",
             )
@@ -1051,33 +1098,6 @@ class OpsTools:
             self._audit_write("", "", "rejected_readonly", tool)
             raise McpToolError("readonly_mode_rejects_write", f"当前会话为只读，拒绝 {tool}；请核对当前会话权限。",{"effective_permissions":authority})
 
-    async def action_execute(self, args: dict[str, Any]) -> dict[str, Any]:
-        self._require_write_mode("action.execute")
-        loop = getattr(self.ctx, "ops_loop", None)
-        if loop is None:
-            raise McpToolError("unavailable", "OpsLoop not wired")
-        asset_id = str(args.get("asset_id") or "").strip()
-        object_id = str(args.get("object_id") or "").strip()
-        capability = str(args.get("capability") or "").strip()
-        incident_id = str(args.get("incident_id") or "").strip()
-        if not asset_id or not object_id or not capability or not incident_id:
-            raise McpToolError("bad_request", "incident_id, asset_id, object_id, capability required")
-        params = args.get("params") or {}
-        if not isinstance(params, dict):
-            raise McpToolError("bad_request", "params must be an object")
-        # The MCP entry shares the same hard round/stop boundary as the worker.
-        res = await loop.run_action_and_verify(
-            incident_id=incident_id, asset_id=asset_id, object_id=object_id,
-            capability=capability, params=params,
-            reason=str(args.get("reason") or "mcp_action_execute"),
-            plan_sig=str(args.get("plan_sig") or f"{capability}:{object_id}"),
-            **({"authority_session_id": self.ctx.authority_session_id}
-               if getattr(self.ctx, "authority_session_id", "") else {}),
-        )
-        self._audit_write(asset_id, capability, str(res.get("state") or res.get("error") or ""),
-                          str(res.get("detail") or "")[:200])
-        return {**res, "id": res.get("action_id") or ""}
-
     async def ops_constraints(self, args: dict[str, Any]) -> dict[str, Any]:
         c = getattr(self.ctx, "constraints", None)
         if c is None:
@@ -1091,7 +1111,7 @@ class OpsTools:
             raise McpToolError("unavailable", "ops_loop not wired")
         if not inc_id:
             raise McpToolError("bad_request", "incident_id required")
-        return {"ok": True, "loop": loop.status(inc_id)}
+        return {"ok": True, "loop": loop.observed_status(inc_id)}
 
     async def config_prom_target_add(self, args: dict[str, Any]) -> dict[str, Any]:
         self._require_write_mode("config.prom_target_add")
@@ -1136,6 +1156,67 @@ class OpsTools:
             )
         except Exception as e:  # noqa: BLE001
             raise McpToolError(getattr(e, "code", "promconfig_failed"), str(e)[:300]) from e
+
+    def _checks_service(self):
+        svc = getattr(self.ctx, "checks", None)
+        if svc is not None:
+            return svc
+        from .checks import CheckService
+        if self.ctx.db is None:
+            raise McpToolError("unavailable", "checks not wired")
+        return CheckService(self.ctx.db, self.ctx.transport,
+                            notifier=self.ctx.notifier, incidents=self.ctx.incidents)
+
+    async def config_check_list(self, args: dict[str, Any]) -> dict[str, Any]:
+        try:
+            items = self._checks_service().list_checks(str(args.get("asset_id") or ""))
+            return {"ok": True, "checks": items}
+        except Exception as e:  # noqa: BLE001
+            raise McpToolError(getattr(e, "code", "check_failed"), str(e)[:300]) from e
+
+    async def config_check_add(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_write_mode("config.check_add")
+        try:
+            item = self._checks_service().create_check(
+                asset_id=str(args.get("asset_id") or ""),
+                kind=str(args.get("kind") or ""),
+                name=str(args.get("name") or ""),
+                params=args.get("params") or {},
+                expect=args.get("expect"),
+                interval_sec=int(args.get("interval_sec") or 60),
+                fail_threshold=int(args.get("fail_threshold") or 2),
+                severity=str(args.get("severity") or "warning"),
+                actor="mcp_agent",
+            )
+            return {"ok": True, "check": item}
+        except Exception as e:  # noqa: BLE001
+            detail = {
+                "issues": getattr(e, "issues", None),
+                "missing": getattr(e, "missing", None),
+            }
+            raise McpToolError(
+                getattr(e, "code", "check_validation_failed"), str(e)[:300], detail
+            ) from e
+
+    async def config_check_update(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_write_mode("config.check_update")
+        allowed = ("name", "params", "expect", "interval_sec", "fail_threshold", "severity", "enabled")
+        fields = {k: args[k] for k in allowed if k in args}
+        try:
+            item = self._checks_service().update_check(
+                str(args.get("id") or ""), actor="mcp_agent", **fields
+            )
+            return {"ok": True, "check": item}
+        except Exception as e:  # noqa: BLE001
+            raise McpToolError(getattr(e, "code", "check_failed"), str(e)[:300]) from e
+
+    async def config_check_delete(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_write_mode("config.check_delete")
+        try:
+            self._checks_service().delete_check(str(args.get("id") or ""), actor="mcp_agent")
+            return {"ok": True}
+        except Exception as e:  # noqa: BLE001
+            raise McpToolError(getattr(e, "code", "check_failed"), str(e)[:300]) from e
 
 
 def tool_result(ok: bool, data: dict[str, Any] | None = None, error: str = "") -> dict[str, Any]:

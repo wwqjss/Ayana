@@ -413,7 +413,7 @@ on("pw-change-form", "submit", async (e) => {
 
 on("chg-pw-btn", "click", () => openSettings("profile"));
 
-/* ---- Legacy autonomy history: read-only, no provider or execution controls ---- */
+/* ---- MiMoCode model and runtime management ---- */
 /* ---- 运维软约束 / MiMoCode 管理（最终架构） ---- */
 async function openOpsConstraints() { return openSettings("prompts"); }
 
@@ -580,29 +580,8 @@ async function openMimoAdmin(host = null, context = null) {
   present("MiMoCode 管理", [wrap]);
 }
 
-/* ---- 旧自治历史（只读） ---- */
-async function openAutonomySettings() {
-  const [settings, usageReply] = await Promise.all([api("/api/autonomy/providers"), api("/api/autonomy/usage")]);
-  if (!settings.ok) { showModal("旧自治历史与费用", [el("p", { class: "error", text: settings.message || settings.error || "历史加载失败" })]); return; }
-  const wrap = el("div", { class: "form-col" });
-  wrap.appendChild(el("p", { class: "muted small", text: "旧自治流程已退役。本页仅保留历史费用记录；模型配置、账户核验和自动执行入口已关闭。人工审批、手动调查和 Runbook 继续可用。" }));
-  if (!usageReply.ok) {
-    wrap.appendChild(el("p", { class: "error", text: usageReply.message || usageReply.error || "历史费用暂时不可用" }));
-  } else {
-    const usage = usageReply.usage || {};
-    const totals = usage.overall || usage;
-    const budgetView = usage.budget || usage;
-    wrap.appendChild(el("h4", { text: "历史模型费用与预算", style: "margin:16px 0 4px" }));
-    wrap.appendChild(el("p", { class: "muted small", text: `已统计费用：${councilMoney(totals.complete === false ? null : (totals.cost_cny ?? totals.total_cost_cny))} · 历史预算：${councilMoney(budgetView.budget_cny)} · 历史可用预算：${councilMoney(budgetView.remaining_cny)} · 账户余额：${councilMoney(budgetView.account_balance_cny)}` }));
-    Object.entries(usage.by_role || {}).forEach(([role, row]) => wrap.appendChild(el("p", { class: "small", text: `${{planner: "中书省", reviewer_kimi: "Kimi 委员", reviewer_deepseek: "DeepSeek 委员"}[role] || role} · 输入 ${row.input_tokens ?? "未知"} / 输出 ${row.output_tokens ?? "未知"} Token · 费用 ${councilMoney(row.complete === false ? null : row.cost_cny)}` })));
-    if (totals.complete === false) wrap.appendChild(el("p", { class: "muted small", text: `存在未知费用调用；已知部分小计 ${councilMoney(totals.known_cost_cny ?? totals.cost_cny)}，不代表完整费用或实际扣费。` }));
-    wrap.appendChild(councilObjectDetails("历史 Token 与费用明细", usage));
-  }
-  showModal("旧自治历史与费用", [wrap]);
-}
-
 /* ---- 全局设置（用户名旁） ---- */
-/* Unified settings entry; legacy history remains read-only. */
+/* Unified settings entry. */
 on("settings-btn", "click", () => openSettings("model"));
 
 on("login-back-btn", "click", () => {
@@ -900,6 +879,7 @@ function fillSelect(id, opts) {
     const op = document.createElement("option");
     op.value = o.v;
     op.textContent = o.t;
+    if (o.disabled) op.disabled = true;
     s.appendChild(op);
   });
 }
@@ -941,7 +921,7 @@ function syncChecksAsset() {
   const sel = $("chk-asset");
   if (!sel) return;
   // 默认跟随资源页当前主机，无需重复选择
-  if (monitorState.host && !sel.dataset.assistDraft) sel.value = monitorState.host;
+  if (monitorState.host && !sel.dataset.formDraft) sel.value = monitorState.host;
 }
 
 /* ---- 统一健康状态 ---- */
@@ -1378,35 +1358,29 @@ async function renderAssets() {
 
 /** 故障闭环摘要：问题 → 处置 → 验证 → 恢复 */
 function loopOutcome(inc) {
-  const actions = inc.actions || [];
-  const vers = (inc.verifications || []).concat(
-    ...actions.map((a) => a.verifications || [])
-  );
-  const seen = new Set();
-  const allVers = vers.filter((v) => {
-    if (!v || seen.has(v.id)) return false;
-    seen.add(v.id);
-    return true;
-  });
-  const lastVer = allVers[allVers.length - 1];
-  const lastAct = actions[actions.length - 1];
-  // P0-04：outcome 来自服务端；closed ≠ recovered
+  const generation = Number(inc.generation || 1);
+  const recovery = inc.recovery || {};
+  const proof = recovery.evidence || {};
   const outcome = inc.outcome || "";
-  let recovered = outcome === "recovered";
+  const recovered = inc.status === "resolved" && outcome === "recovered" && recovery.confirmed === true
+    && Number(recovery.generation) === generation && Number(proof.generation) === generation && proof.verdict === "green";
+  const operations = ((inc.host_exec || {}).operations || []).filter(op => Number(op.generation) === generation);
+  const needHuman = inc.status === "open" && !!inc.need_human;
   let recoverLabel = "处理中";
   let recoverCls = "warn";
   if (inc.status === "closed") {
-    recovered = false;
     recoverLabel = "已关闭（未证实恢复）";
     recoverCls = "dim";
-  } else if (outcome === "recovered" || inc.status === "resolved") {
-    recovered = true;
+  } else if (recovered) {
     recoverLabel = "已恢复";
     recoverCls = "ok";
+  } else if (inc.status === "resolved" || outcome === "recovered") {
+    recoverLabel = "已解决（恢复证据待核对）";
+    recoverCls = "warn";
   } else if (outcome === "closed_unverified") {
     recoverLabel = "已关闭（未证实恢复）";
     recoverCls = "dim";
-  } else if (inc.need_human) {
+  } else if (needHuman) {
     recoverLabel = "需人工";
     recoverCls = "bad";
   } else if (outcome === "unrecovered") {
@@ -1419,19 +1393,18 @@ function loopOutcome(inc) {
   return {
     problem: inc.title || "",
     assetObject: `${inc.asset_id || "?"}/${inc.object_id || "?"}`,
-    invCount: (inc.investigations || []).length,
-    invLast: (inc.investigations || []).slice(-1)[0] || null,
-    actions,
-    lastAct,
-    verifications: allVers,
-    lastVer,
+    operations,
+    lastExec: operations[0] || null,
+    nativeTask: inc.native_task || null,
+    recovery,
+    legacyLoop: inc.legacy_loop || null,
     recovered,
     recoverLabel,
     recoverCls,
     outcome,
-    generation: inc.generation || 1,
-    needHuman: !!inc.need_human,
-    needReason: inc.need_human_reason || "",
+    generation,
+    needHuman,
+    needReason: needHuman ? inc.need_human_reason || "" : "",
   };
 }
 
@@ -1450,34 +1423,45 @@ function renderLoopSteps(loop, sum) {
     return c;
   };
 
-  const inv = loop.invLast;
-  const act = loop.lastAct;
-  const ver = loop.lastVer;
+  const operation = loop.lastExec;
+  const task = loop.nativeTask;
+  const proof = loop.recovery && loop.recovery.evidence;
+  const checks = proof && Array.isArray(proof.checks) ? proof.checks : [];
   wrap.appendChild(step(
     "出现了什么问题",
     `${loop.problem} · ${loop.assetObject}`,
     null
   ));
   wrap.appendChild(step(
-    "做了什么处置",
-    act
-      ? `${ZH_CAP[act.capability] || act.capability} · ${act.object_id || ""}`
-        + (act.reason ? `\n${act.reason}` : "")
-      : (loop.invCount ? `仅调查 ${loop.invCount} 次，未处置` : "尚未处置"),
-    act ? { label: zh(act.state), cls: act.state === "success" ? "ok" : act.state === "failure" || act.state === "unknown" ? "bad" : "warn" } : null
+    "原生任务",
+    task ? task.task_state_label || task.task_state || "状态待确认" : "未关联本代原生会话",
+    null
+  ));
+  const operationNames = {done:"执行完成",failed:"执行失败",unknown:"结果待核对",claimed:"已派发，结果待确认",released:"已释放"};
+  wrap.appendChild(step(
+    "本代执行记录",
+    operation ? (operation.command || operation.action_key || "主机命令")
+      + (operation.account_group ? ` · 账号组 ${operation.account_group}` : "")
+      + (operation.account ? ` · ${operation.account}` : "") : "暂无本代执行记录",
+    operation ? {label:operationNames[operation.status] || "状态待核对",cls:operation.status === "done" ? "ok" : operation.status === "failed" ? "bad" : "warn"} : null
   ));
   wrap.appendChild(step(
-    "验证结果",
-    ver
-      ? `${zh(ver.status)}${ver.note ? " · " + ver.note : ""}`
-      : (act && act.state === "success" ? "待验证" : "—"),
-    ver ? { label: zh(ver.status === "passed" ? "验证通过" : ver.status === "failed" ? "验证未通过" : ver.status), cls: ver.status === "passed" ? "ok" : ver.status === "failed" ? "bad" : "dim" } : null
+    "恢复证据",
+    loop.recovered ? (checks.map(check => check.check_id || check.contract || "监控观察").join("、") || "监控验证通过")
+      + ` · 第 ${loop.generation} 代 · ${fmtTime(loop.recovery.recorded_at)}` : "尚无本代确认恢复的证据",
+    loop.recovered ? {label:"证据已记录",cls:"ok"} : null
   ));
   wrap.appendChild(step(
     "是否恢复",
-    loop.needHuman ? (loop.needReason || "需人工介入") : (loop.recovered ? "已恢复" : "处理中"),
+    loop.needHuman ? (loop.needReason || "需人工介入") : loop.recoverLabel,
     { label: loop.recoverLabel, cls: loop.recoverCls }
   ));
+  const legacy = loop.legacyLoop && loop.legacyLoop.snapshot;
+  if (legacy) wrap.appendChild(el("details", {style:"grid-column:1/-1",class:"muted small"}, [
+    el("summary", {text:"旧调度记录（已退役，仅供追溯）"}),
+    el("p", {text:`历史状态：${legacy.status || "未知"} · 记录代次：${legacy.generation || "未知"}`
+      + (legacy.stop_reason ? ` · 原因：${legacy.stop_reason}` : "") + "。此记录不参与当前执行或恢复判断。"}),
+  ]));
   return wrap;
 }
 
@@ -1564,7 +1548,7 @@ async function openIncidentDetail(incId) {
     }));
   }
   if ((disp.proposals || []).length || disp.evidence_summary || disp.authority) {
-    body.appendChild(el("h3", { text: "处置上下文", style: "margin:16px 0 8px;font-size:14px" }));
+    body.appendChild(el("h3", { text: "历史处置上下文（只读）", style: "margin:16px 0 8px;font-size:14px" }));
     if (disp.evidence_summary) {
       const evBox = el("div", {
         style: "background:rgba(120,160,255,.08);border-radius:8px;padding:10px;margin:8px 0",
@@ -1589,54 +1573,13 @@ async function openIncidentDetail(incId) {
         `模式: ${p.mode || "manual"} · 提案 ${p.action_id}`,
         p.approval_deadline ? `批准期限: ${fmtTime(p.approval_deadline)}` : "",
       ].filter(Boolean).forEach((t) => box.appendChild(el("div", { class: "muted small", text: t })));
-      box.appendChild(el("div", { class: "row-actions", style: "margin-top:10px" }, [
-        el("button", {
-          class: "btn", text: p.state === "approved" ? "继续执行" : "批准并执行",
-          onclick: async () => {
-            const reason = prompt("批准原因（可空）:", "");
-            if (reason === null) return;
-            // P1-09: 启用 2FA 的用户需要动态码；失败不得静默关窗
-            const totp = prompt("动态验证码（若账号已启用 2FA，否则留空）:", "") || "";
-            const res = await api(`/api/actions/${p.action_id}/${p.state === "approved" ? "execute" : "approve"}`, {
-              method: "POST",
-              body: JSON.stringify({ execute: true, reason, ...(totp ? { totp } : {}) }),
-            });
-            if (!res.ok) {
-              alert(res.message || res.error || "批准失败，请检查动态码或权限");
-              return;
-            }
-            if (res.executed === false) alert("操作已批准，执行尚未完成。请在关联操作中查看状态或继续执行。");
-            $("modal").classList.add("hidden");
-            openIncidentDetail(incId);
-          },
-        }),
-        el("button", {
-          class: "btn danger", text: "拒绝", disabled: p.state === "approved",
-          onclick: async () => {
-            const reason = prompt("拒绝原因:", "");
-            if (reason === null) return;
-            const res = await api(`/api/actions/${p.action_id}/reject`, {
-              method: "POST",
-              body: JSON.stringify({ reason }),
-            });
-            if (!res.ok) {
-              alert(res.message || res.error || "拒绝失败");
-              return;
-            }
-            $("modal").classList.add("hidden");
-            openIncidentDetail(incId);
-          },
-        }),
-      ]));
       body.appendChild(box);
     });
-    if (disp.authority && ["readonly", "readwrite"].includes(disp.authority.access_mode)
-        && ["manual", "automatic"].includes(disp.authority.approval_mode)) {
+    if (disp.authority && disp.authority.ssh_account_group) {
       const authority = disp.authority;
-      const access = authority.access_mode === "readwrite" ? "读写" : "只读";
-      const approval = authority.approval_mode === "automatic" ? "自动执行" : "人工审批";
       body.appendChild(el("div", {
-        class: "muted small", text: `当前 Agent 会话：${access} · ${approval}`
+        class: "muted small", text: `当前 Agent 会话账号组：${authority.ssh_account_group}`
+          + (authority.ssh_account_group_source === "global" ? "（跟随默认）" : "")
           + (authority.lifecycle_block ? " · 当前已暂停或正在关闭，不能修改" : ""),
         style: "margin:6px 0",
       }));
@@ -1644,56 +1587,14 @@ async function openIncidentDetail(incId) {
   }
 
   // 故障闭环：问题 → 处置 → 验证 → 恢复
-  if (d.council) body.appendChild(renderCouncilPanel(d.council, incId));
   const loop = loopOutcome(inc);
   body.appendChild(el("h3", { text: "故障闭环", style: "margin:16px 0 8px;font-size:14px" }));
   body.appendChild(renderLoopSteps(loop, inc));
 
   // 关联操作（含验证）
-  const approvalButtons = (a) => {
-    const controls = el("div", { class: "row-actions", style: "margin-top:8px" });
-    let submitting = false;
-    const choices = a.state === "approved" ? [["resume_execution", "继续执行"]] : [
-      ["execute_once", "执行一次"],
-      ["reject", "不执行"],
-    ];
-    choices.forEach(([decision, label]) => controls.appendChild(el("button", {
-      class: decision === "reject" ? "btn danger" : "btn", text: label,
-      onclick: async (event) => {
-        if (event && event.stopPropagation) event.stopPropagation();
-        if (submitting) return;
-        const reason = prompt(`${label}的原因（可空）:`, "");
-        if (reason === null) return;
-        let totp = "";
-        if (decision !== "reject") {
-          totp = prompt("动态验证码（若账号已启用 2FA，否则留空）:", "");
-          if (totp === null) return;
-        }
-        submitting = true;
-        controls.querySelectorAll("button").forEach((button) => { button.disabled = true; });
-        try {
-          const result = await api(`/api/actions/${encodeURIComponent(a.id)}/${decision === "resume_execution" ? "execute" : "decision"}`, {
-            method: "POST", body: JSON.stringify(decision === "resume_execution" ? { totp } : { decision, reason, totp }),
-          });
-          if (!result.ok) {
-            alert(result.message || "授权未完成，请检查权限或动态验证码");
-            return;
-          }
-          if (result.executed === false) alert("操作已批准，执行尚未完成。请在关联操作中查看状态或继续执行。");
-          await openIncidentDetail(incId);
-        } catch (_) {
-          alert("请求未完成，请刷新事件详情确认操作状态后重试。");
-        } finally {
-          submitting = false;
-          controls.querySelectorAll("button").forEach((button) => { button.disabled = false; });
-        }
-      },
-    })));
-    return controls;
-  };
   const relatedActions = inc.actions || [];
   if (relatedActions.length) {
-    body.appendChild(el("h3", { text: "关联操作", style: "margin:16px 0 8px;font-size:14px" }));
+    body.appendChild(el("h3", { text: "历史结构化操作（只读）", style: "margin:16px 0 8px;font-size:14px" }));
     relatedActions.forEach((a) => {
       const st = a.state;
       const cls = st === "success" ? "ok" : st === "failure" || st === "unknown" ? "bad" : "warn";
@@ -1719,7 +1620,6 @@ async function openIncidentDetail(incId) {
           badge(zh(st), cls),
         ]),
       ]);
-      if ((st === "proposed" || st === "approved") && a.mode !== "reviewed" && !a.council_grant_id) row.appendChild(approvalButtons(a));
       body.appendChild(row);
     });
   }
@@ -1776,74 +1676,6 @@ async function openIncidentDetail(incId) {
 
   showModal("", [body]);
   $("modal-title").textContent = "事件详情";
-}
-
-function councilMoney(value) {
-  return value == null || value === "" || !Number.isFinite(Number(value)) ? "未知" : "¥" + Number(value).toFixed(4);
-}
-
-function councilObjectDetails(title, value) {
-  return el("details", { style: "margin:8px 0" }, [
-    el("summary", { text: title }),
-    el("pre", { text: JSON.stringify(value, null, 2), style: "max-height:280px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere" }),
-  ]);
-}
-
-function renderCouncilPanel(council, incId) {
-  const wrap = el("section", { class: "card", style: "margin:16px 0" });
-  wrap.appendChild(el("h3", { text: "旧自治 · 历史记录" }));
-  wrap.appendChild(el("p", { class: "muted small", text: "旧自治流程已退役，以下仅展示历史记录；不会重新拟案、审批或自动执行。人工审批、手动调查和 Runbook 继续可用。" }));
-  if (council.status === "unavailable" || council.error) {
-    wrap.appendChild(el("p", { class: "error", text: "旧自治历史暂时不可用，告警与现有处置记录仍可查看。" }));
-    return wrap;
-  }
-  const phaseNames = { received: "接奏", investigating: "调查", planning: "拟旨", drafting: "拟旨", reviewing: "会审", approved: "准奏", vetoed: "封驳", rejected: "封驳", executing: "奉旨执行", verifying: "验证", reporting: "回奏", done: "结案", closed: "结案", manual: "等待人工裁决", need_human: "等待人工裁决", waiting: "等待重试", watching: "持续观察", provider_unavailable: "模型暂不可用", budget_blocked: "费用熔断", disabled: "未启用" };
-  const phase = council.phase || council.status || "received";
-  wrap.appendChild(el("p", { class: "muted small", text: "接奏 → 调查 → 拟旨 → 会审 → 准奏/封驳 → 奉旨执行 → 验证 → 回奏 → 结案" }));
-  wrap.appendChild(badge("已退役 · 历史阶段：" + (phaseNames[phase] || phase), "dim"));
-  if (council.last_error) wrap.appendChild(el("p", { class: "error small", text: "历史阻碍：" + (typeof council.last_error === "string" ? council.last_error : JSON.stringify(council.last_error)) }));
-  const evidence = council.evidence || [];
-  if (evidence.length) wrap.appendChild(councilObjectDetails("中书省调查证据 · " + evidence.length + " 项", evidence));
-  if (council.draft) wrap.appendChild(councilObjectDetails("历史拟案 · 不提供执行授权", council.draft));
-  if ((council.feedback || []).length) wrap.appendChild(councilObjectDetails("封驳、执行失败与验证反馈", council.feedback));
-  const plans = council.plans || [];
-  plans.forEach((record) => {
-    const plan = record.plan || {};
-    const card = el("div", { style: "border-top:1px solid var(--line);padding-top:10px;margin-top:10px" });
-    card.appendChild(el("h4", { text: `方案 ${record.version == null ? "" : "v" + record.version} · ${plan.repair_goal || record.repair_goal || record.goal_id || "待补充目标"}` }));
-    card.appendChild(el("p", { class: "muted small", text: `第 ${record.generation || 1} 轮故障 · ${record.asset_id || ""}/${record.object_id || ""} · ${phaseNames[record.state] || record.state || "待审议"}` }));
-    if (plan.rationale) card.appendChild(el("p", { text: plan.rationale }));
-    (plan.steps || []).forEach((step, index) => card.appendChild(el("p", { class: "small", text: `${index + 1}. ${step.capability || "操作"} · ${(step.tokens || []).join(" ") || JSON.stringify(step.params || {})}` })));
-    if (plan.scope) card.appendChild(el("p", { class: "muted small", text: "影响范围：" + (typeof plan.scope === "string" ? plan.scope : JSON.stringify(plan.scope)) }));
-    if (plan.rollback) card.appendChild(councilObjectDetails("恢复手段", plan.rollback));
-    if (plan.verification) card.appendChild(councilObjectDetails("独立验证要求", plan.verification));
-    const reviews = record.reviews || [];
-    ["reviewer_kimi", "reviewer_deepseek"].forEach((role) => {
-      const review = reviews.find((item) => item.role === role);
-      const label = role === "reviewer_kimi" ? "门下省 A · Kimi" : "门下省 B · DeepSeek";
-      const verdict = !review ? "等待审议" : review.approve === true ? "同意" : review.approve === false ? "否决" : "未取得有效意见";
-      card.appendChild(el("p", { class: review && review.approve === false ? "error small" : "small", text: label + "：" + verdict + (review && review.reason ? " · " + review.reason : "") }));
-      if (review && (review.missing_evidence || []).length) card.appendChild(el("p", { class: "muted small", text: "缺失证据：" + review.missing_evidence.join("；") }));
-      if (review && review.suggested_revision) card.appendChild(el("p", { class: "muted small", text: "修改建议：" + review.suggested_revision }));
-    });
-    const ballot = record.ballot;
-    if (ballot) card.appendChild(el("p", { class: "small", text: "投票箱：" + ({ approved: "准奏", vetoed: "封驳", failed: "审议失败", pending: "等待两票", stale: "方案已失效" }[ballot.decision] || ballot.decision) + (ballot.reason ? " · " + ballot.reason : "") }));
-    if (record.grant) card.appendChild(councilObjectDetails("一次性授权与 Action 执行记录 · " + (record.grant.state || ""), record.grant));
-    card.appendChild(councilObjectDetails("不可变方案版本与完整审议记录", record));
-    wrap.appendChild(card);
-  });
-  if ((council.verifications || []).length) wrap.appendChild(councilObjectDetails("Verification 独立验证证据", council.verifications));
-  if ((council.attempts || []).length) wrap.appendChild(councilObjectDetails("调查、执行与验证轮次", council.attempts));
-  const usage = council.usage || {};
-  const totals = usage.overall || usage;
-  wrap.appendChild(el("p", { class: "muted small", text: `本事件模型费用：${councilMoney(totals.complete === false ? null : (totals.cost_cny ?? totals.total_cost_cny))} · 输入 Token：${totals.input_tokens ?? "未知"} · 输出 Token：${totals.output_tokens ?? "未知"}` }));
-  if (Object.keys(usage).length) wrap.appendChild(councilObjectDetails("Token 与费用明细", usage));
-  const goals = (council.goals || []).filter((goal) => goal.manual_required);
-  if (council.manual_required || goals.length) wrap.appendChild(el("p", { class: "muted small", text: "历史记录含人工裁决请求；旧流程已退役，不能重新拟案。" }));
-  goals.forEach((goal) => {
-    wrap.appendChild(el("p", { class: "small", text: `历史修复目标：${goal.repair_goal || goal.id} · 连续封驳 ${goal.consecutive_vetoes || 0} 次${goal.manual_reason ? " · " + goal.manual_reason : ""}` }));
-  });
-  return wrap;
 }
 
 function openActionDetail(a) {
@@ -2134,12 +1966,13 @@ function hostStatusBadge(ep) {
 async function testHostChannel(assetId, role) {
   const out = await api(`/api/assets/${assetId}/test`, {
     method: "POST",
-    body: JSON.stringify({ role: role || "write" }),
+    body: JSON.stringify(role ? { role } : {}),
   });
   return showChannelResult(assetId, out, role);
 }
 
 function showChannelResult(assetId, out, role) {
+  role = out.account_group || role;
   const ch = out.channel === "ssh" ? "原生 SSH" : "无通道";
   const kids = [];
 
@@ -2181,7 +2014,7 @@ function showChannelResult(assetId, out, role) {
           method: "POST",
           body: JSON.stringify({
             asset_id: assetId,
-            role: role || "write",
+            ...(role ? { role } : {}),
             host_key_sha256: info.fingerprint,
             host_key_line: info.key_line || "",
           }),
@@ -2195,7 +2028,7 @@ function showChannelResult(assetId, out, role) {
         trust.textContent = "已信任，继续连接…";
         const again = await api(`/api/assets/${assetId}/test`, {
           method: "POST",
-          body: JSON.stringify({ role: role || "write" }),
+          body: JSON.stringify(role ? { role } : {}),
         });
         actions.querySelectorAll(".btn-trust").forEach((b) => b.remove());
         showChannelResult(assetId, again, role);
@@ -2243,7 +2076,7 @@ function showChannelResult(assetId, out, role) {
           method: "POST",
           body: JSON.stringify({
             asset_id: assetId,
-            role: role || "write",
+            ...(role ? { role } : {}),
             host_key_sha256: info.current_fingerprint || scan.fingerprint,
             host_key_line: scan.key_line || "",
           }),
@@ -2255,7 +2088,7 @@ function showChannelResult(assetId, out, role) {
         }
         const again = await api(`/api/assets/${assetId}/test`, {
           method: "POST",
-          body: JSON.stringify({ role: role || "write" }),
+          body: JSON.stringify(role ? { role } : {}),
         });
         showChannelResult(assetId, again, role);
         renderConnections();
@@ -2315,6 +2148,96 @@ function showChannelResult(assetId, out, role) {
   return out;
 }
 
+function renderAccountGroups(groupRes, { hosts, creds, roles, view }) {
+  const box = $("account-groups-list");
+  if (!box) return;
+  if (groupRes && groupRes.ok) view.groupsSnapshot = groupRes.groups || [];
+  const groups = view.groupsSnapshot || [];
+  if (!groupRes || !groupRes.ok) return;
+  box.innerHTML = "";
+  if (!groups.length) {
+    box.appendChild(el("p", { class: "muted small", text: "还没有账号组。先在下方创建一个。" }));
+  }
+  groups.forEach((g) => {
+    const members = g.members || [];
+    const details = el("details", { class: "account-group-row" });
+    if (groups.length === 1) details.open = true;
+    details.appendChild(el("summary", { class: "account-group-head" }, [
+      el("strong", { text: g.label || g.name }),
+      el("code", { class: "small", text: g.name }),
+      g.description ? el("span", { class: "muted small", text: g.description }) : el("span"),
+      el("span", { class: "workspace-count", text: `${members.length} 个账号` }),
+      el("button", {
+        type: "button", class: "btn small danger", text: "删除组",
+        onclick: async (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          if (!window.confirm(`删除账号组「${g.label || g.name}」？组下 ${members.length} 个账号会被解绑。`)) return;
+          const r = await api("/api/ssh/account-groups?name=" + encodeURIComponent(g.name), { method: "DELETE" });
+          if (!r.ok) showModal("删除失败", [el("pre", { text: r.message || r.error || "" })]);
+          renderConnections();
+        },
+      }),
+    ]));
+    const body = el("div", { class: "account-group-body" });
+    if (members.length) {
+      const list = el("div", { class: "account-group-members" });
+      members.forEach((m) => {
+        const cred = m.credential && m.credential.name ? ` · 凭据 ${m.credential.name}` : (m.credential_id ? " · 已绑凭据" : "");
+        list.appendChild(el("div", { class: "account-group-member" }, [
+          el("span", { text: m.asset_id || "-" }),
+          el("code", { text: `${m.username || "?"}@${m.host || "?"}:${m.port || 22}` }),
+          el("span", { class: "muted small", text: cred }),
+          el("button", {
+            type: "button", class: "btn small", text: "移出",
+            onclick: async () => {
+              const r = await api("/api/ssh/account-groups/member", {
+                method: "DELETE",
+                body: JSON.stringify({ asset_id: m.asset_id, group: g.name }),
+              });
+              if (!r.ok) showModal("移出失败", [el("pre", { text: r.message || r.error || "" })]);
+              renderConnections();
+            },
+          }),
+        ]));
+      });
+      body.appendChild(list);
+    } else {
+      body.appendChild(el("p", { class: "muted small", text: "还没有挂账号。用下方「把账号挂进组」添加。" }));
+    }
+    details.appendChild(body);
+    box.appendChild(details);
+  });
+
+  const groupSel = $("ag-assign-group");
+  const assigned = new Set();
+  groups.forEach((g) => (g.members || []).forEach((m) => assigned.add(g.name + "\0" + m.asset_id)));
+  if (groupSel) {
+    const prev = groupSel.value;
+    fillSelect("ag-assign-group", groups.map((g) => ({ v: g.name, t: `${g.label || g.name} (${g.name})` })));
+    if (prev && groups.some((g) => g.name === prev)) groupSel.value = prev;
+    if (!groupSel.value && groups.length) groupSel.value = groups[0].name;
+  }
+  const currentGroup = groupSel && groupSel.value;
+  if (hosts && hosts.length) {
+    const prev = $("ag-assign-asset") && $("ag-assign-asset").value;
+    fillSelect("ag-assign-asset", hosts.map((a) => {
+      const taken = currentGroup && assigned.has(currentGroup + "\0" + a.id);
+      return { v: a.id, t: `${a.id} / ${a.display_name || ""}` + (taken ? "（已在此组）" : ""), disabled: taken };
+    }));
+    if (prev) $("ag-assign-asset").value = prev;
+  }
+  if (creds) {
+    const prev = $("ag-assign-cred") && $("ag-assign-cred").value;
+    fillSelect("ag-assign-cred", [{ v: "", t: "沿用已有账号凭据" }, ...creds.map((c) => ({ v: c.id, t: credLabel(c) }))]);
+    if (prev) $("ag-assign-cred").value = prev;
+  }
+  if (groupSel && !groupSel.dataset.bound) {
+    groupSel.dataset.bound = "1";
+    groupSel.addEventListener("change", () => renderConnections());
+  }
+}
+
 async function renderConnections() {
   const view = renderConnections.view || (renderConnections.view = { sequence: 0, hosts: new Map(), credentials: new Map() });
   const sequence = ++view.sequence;
@@ -2324,25 +2247,26 @@ async function renderConnections() {
     fillSelect(id, options);
     if (input && options.some((option) => option.v === value)) input.value = value;
   };
-  const [assetRes, credRes, roleRes] = await Promise.all([
+  const [assetRes, credRes, roleRes, groupRes] = await Promise.all([
     api("/api/assets").catch(() => ({ ok: false })),
     api("/api/ssh/credentials").catch(() => ({ ok: false })),
     api("/api/ssh/roles").catch(() => ({ ok: false })),
+    api("/api/ssh/account-groups").catch(() => ({ ok: false })),
   ]);
   if (sequence !== view.sequence) return;
   const errors = [];
   if (!assetRes?.ok) errors.push("主机列表暂时无法加载，已保留当前列表。");
   if (!credRes?.ok) errors.push("凭据库暂时无法加载，已保留当前列表。");
-  if (!roleRes?.ok) errors.push("连接角色暂时无法加载。");
+  if (!roleRes?.ok) errors.push("账号组暂时无法加载。");
+  if (!groupRes?.ok) errors.push("账号组成员暂时无法加载，已保留当前列表。");
   if (feedback) { feedback.textContent = errors.join(" "); feedback.classList.toggle("hidden", !errors.length); }
   const hosts = (assetRes && assetRes.ok && assetRes.assets) || [];
   if (credRes?.ok) view.credentialsSnapshot = credRes.credentials || [];
   const creds = view.credentialsSnapshot || [];
   if (roleRes?.ok) view.rolesSnapshot = roleRes.roles || [];
-  const roles = view.rolesSnapshot || [
-    { name: "write", kind: "write", label: "可执行" },
-    { name: "read", kind: "read", label: "只读" },
-  ];
+  const roles = view.rolesSnapshot || [{ name: "default", label: "默认" }];
+
+  renderAccountGroups(groupRes, { hosts, creds, roles, view });
 
   if (credRes?.ok) preserveSelect("host-cred", [{ v: "", t: "（无）" }, ...creds.map((c) => ({ v: c.id, t: credLabel(c) }))]);
   if (roleRes?.ok) preserveSelect("host-role", roles.map((r) => ({
@@ -2350,7 +2274,7 @@ async function renderConnections() {
     t: `${r.name} · ${r.label || r.kind}`,
   })));
   if (assetRes?.ok) preserveSelect("ssh-test-asset", hosts.map((a) => ({ v: a.id, t: a.id + " / " + (a.display_name || "") })));
-  if (roleRes?.ok) preserveSelect("ssh-test-role", roles.map((r) => ({ v: r.name, t: `${r.name} (${r.kind})` })));
+  if (roleRes?.ok) preserveSelect("ssh-test-role", roles.map((r) => ({ v: r.name, t: `${r.label || r.name}` })));
 
   // ---- host list ----
   const box = $("host-list");
@@ -2367,7 +2291,7 @@ async function renderConnections() {
   } else {
     hosts.forEach((a) => {
       const eps = a.ssh_endpoints || [];
-      const writeEp = eps.find((e) => e.role === "write") || eps[0];
+      const writeEp = eps.find((e) => e.role === "default") || eps[0];
       const card = el("details", { class: "connection-row" });
       card.dataset.assetId = a.id;
       card.open = view.hosts.get(a.id) === true;
@@ -2385,7 +2309,7 @@ async function renderConnections() {
         el("button", {
           class: "btn small", text: "测试",
           onclick: async () => {
-            await testHostChannel(a.id, writeEp ? writeEp.role : "write");
+            await testHostChannel(a.id, writeEp ? writeEp.role : "default");
             renderConnections();
           },
         }),
@@ -2567,7 +2491,7 @@ async function renderConnections() {
                     host: d.host,
                     username: d.username || "root",
                     port: Number(d.port || 22),
-                    role: "write",
+                    role: "default",
                     password: d.password || "",
                     private_key: d.private_key || "",
                   }),
@@ -2577,7 +2501,7 @@ async function renderConnections() {
           }),
           el("button", {
             class: "btn small", text: "测试连接",
-            onclick: () => testHostChannel(a.id, "write"),
+            onclick: () => testHostChannel(a.id, "default"),
           }),
         ]));
       }
@@ -2705,17 +2629,58 @@ on("role-save-btn", "click", async () => {
   const body = {
     name: $("role-name").value.trim(),
     label: $("role-label").value.trim(),
-    kind: $("role-kind").value,
+    description: ($("role-desc") && $("role-desc").value.trim()) || "",
+    kind: "custom",
   };
   if (!body.name) return;
   const r = await api("/api/ssh/roles", { method: "POST", body: JSON.stringify(body) });
   if (!r.ok) {
-    showModal("添加角色失败", [el("pre", { text: JSON.stringify(r, null, 2) })]);
+    showModal("添加账号组失败", [el("pre", { text: JSON.stringify(r, null, 2) })]);
     return;
   }
   $("role-name").value = "";
   $("role-label").value = "";
+  if ($("role-desc")) $("role-desc").value = "";
   $("role-add-form").classList.add("hidden");
+  renderConnections();
+});
+
+on("ag-create-btn", "click", async () => {
+  const msg = $("ag-msg");
+  const body = {
+    name: ($("ag-name").value || "").trim(),
+    label: ($("ag-label").value || "").trim(),
+    description: ($("ag-desc").value || "").trim(),
+    kind: "custom",
+  };
+  if (!body.name) { if (msg) msg.textContent = "请填写账号组名称"; return; }
+  const r = await api("/api/ssh/roles", { method: "POST", body: JSON.stringify(body) });
+  if (!r.ok) {
+    if (msg) { msg.textContent = "创建失败：" + (r.message || r.error || ""); msg.classList.add("error"); }
+    return;
+  }
+  $("ag-name").value = ""; $("ag-label").value = ""; $("ag-desc").value = "";
+  if (msg) { msg.textContent = "账号组已创建，可在 Agent 设置里选用"; msg.classList.remove("error"); }
+  renderConnections();
+});
+
+on("ag-assign-btn", "click", async () => {
+  const msg = $("ag-msg");
+  const group = ($("ag-assign-group").value || "").trim();
+  const asset = ($("ag-assign-asset").value || "").trim();
+  if (!group || !asset) { if (msg) msg.textContent = "请选择账号组和主机"; return; }
+  const body = {
+    group,
+    asset_id: asset,
+    credential_id: ($("ag-assign-cred").value || "").trim(),
+    username: ($("ag-assign-user").value || "root").trim(),
+  };
+  const r = await api("/api/ssh/account-groups/assign", { method: "POST", body: JSON.stringify(body) });
+  if (!r.ok) {
+    if (msg) { msg.textContent = "挂载失败：" + (r.message || r.error || ""); msg.classList.add("error"); }
+    return;
+  }
+  if (msg) { msg.textContent = "已挂进账号组"; msg.classList.remove("error"); }
   renderConnections();
 });
 
@@ -2812,6 +2777,7 @@ const termState = {
   ws: null,
   assetId: "",
   endpoint: null,
+  accountGroup: "",
   generation: 0,
   visible: false,
   open: false,
@@ -2896,6 +2862,7 @@ async function openTerminal(assetId, ep) {
   destroyTerminal();
   termState.assetId = assetId;
   termState.endpoint = ep || null;
+  termState.accountGroup = ep && ep.role || "";
   termState.visible = true;
   const generation = termState.generation;
   const isCurrent = () => currentTerminalRequest(assetId, generation);
@@ -2910,11 +2877,13 @@ async function openTerminal(assetId, ep) {
   // 先检查权限 / host key
   let chk;
   try {
-    chk = await api(`/api/terminal/check?asset_id=${encodeURIComponent(assetId)}`);
+    chk = await api(`/api/terminal/check?asset_id=${encodeURIComponent(assetId)}`
+      + (termState.accountGroup ? "&role=" + encodeURIComponent(termState.accountGroup) : ""));
   } catch (_) {
     chk = { ok: false, hint: "连接检查失败，请检查网络后重新连接。" };
   }
   if (!isCurrent()) return;
+  if (chk.account_group) termState.accountGroup = chk.account_group;
   if (chk.detail === "host_key_untrusted" && chk.host_key_info) {
     setTermStatus("待信任指纹", "warn");
     showHostKeyDialog(assetId, chk, () => openTerminal(assetId, ep), isCurrent);
@@ -2983,7 +2952,7 @@ function showHostKeyDialog(assetId, chk, onDone, isCurrent = () => true) {
         method: "POST",
         body: JSON.stringify({
           asset_id: assetId,
-          role: "write",
+          ...(chk.account_group || termState.accountGroup ? { role: chk.account_group || termState.accountGroup } : {}),
           host_key_sha256: (changed ? info.current_fingerprint : info.fingerprint) || "",
           host_key_line: info.key_line || "",
         }),
@@ -3008,7 +2977,8 @@ function connectTerminal(assetId, generation = termState.generation) {
   if (!term) return;
   setTermStatus("连接中…", "warn");
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const url = `${proto}//${location.host}/ws/terminal?asset_id=${encodeURIComponent(assetId)}&cols=${term.cols}&rows=${term.rows}`;
+  const url = `${proto}//${location.host}/ws/terminal?asset_id=${encodeURIComponent(assetId)}&cols=${term.cols}&rows=${term.rows}`
+    + (termState.accountGroup ? "&role=" + encodeURIComponent(termState.accountGroup) : "");
   const ws = new WebSocket(url);
   ws.binaryType = "arraybuffer";
   termState.ws = ws;
@@ -3839,7 +3809,7 @@ async function renderMonitor() {
     (async () => {
       const [res] = await Promise.all([
         api(`/api/monitor/business/${encodeURIComponent(host)}`).catch(() => ({ ok: false })),
-        ensureAssistForm("checks").catch(() => null),
+        ensureCheckForm("checks").catch(() => null),
       ]);
       if (current()) renderMonitorBusiness(res, host);
     })(),
@@ -4066,7 +4036,7 @@ async function openAibotAdmins(ch) {
   const candidates = [...new Set([...(res.users || []), ...selected])];
   const wrap = el("div");
   wrap.appendChild(el("p", { class: "muted small", text: "可选配置：勾选成员 UserID，或手动填写。名单仅对本消息渠道有效；留空不授予管理员资格。" }));
-  wrap.appendChild(el("p", { class: "muted small", text: "管理员可审批本次处置；后续是否自动执行由 Agent 设置和会话权限决定。请填写成员 UserID，群会话 ID 不能代表成员身份。" }));
+  wrap.appendChild(el("p", { class: "muted small", text: "管理员可管理通知与受控操作，命令执行使用会话选定的 SSH 账号。请填写成员 UserID，群会话 ID 不能代表成员身份。" }));
   const choices = candidates.map((userId) => {
     const check = el("input", { type: "checkbox" });
     check.checked = selected.has(userId);
@@ -5004,7 +4974,7 @@ function checkHostLabel(assetId) {
 }
 
 function checkFieldValueLabel(name, value) {
-  const field = ((assistForms.checks || {}).fields || []).find((item) => item.name === name);
+  const field = ((checkForms.checks || {}).fields || []).find((item) => item.name === name);
   return (field && (field.value_labels || {})[value]) || "未设置";
 }
 
@@ -5083,12 +5053,12 @@ let checksRenderVersion = 0;
 async function renderChecks() {
   const version = ++checksRenderVersion;
   const chosen = (($("chk-asset") || {}).value || "");
-  const hasDraft = !!(($("chk-asset") || {}).dataset || {}).assistDraft;
+  const hasDraft = !!(($("chk-asset") || {}).dataset || {}).formDraft;
   fillSelect("chk-asset", [{ v: "", t: "请选择主机" }, ...(state.assets || []).map((a) => ({ v: a.id, t: a.display_name || a.id }))]);
   if (chosen || hasDraft) setVal("chk-asset", chosen);
   syncChecksAsset();
-  const formLoad = ensureAssistForm("checks").then(() => chkKindChanged()).catch(() => {
-    assistNote("chk-assist-msg", ["无法加载检查表单定义，请刷新后重试。"], "error");
+  const formLoad = ensureCheckForm("checks").then(() => chkKindChanged()).catch(() => {
+    checkFormNote("chk-form-msg", ["无法加载检查表单定义，请刷新后重试。"], "error");
   });
   const list = $("chk-list");
   const act = $("chk-activity");
@@ -5187,27 +5157,26 @@ on("chk-kind", "change", chkKindChanged);
 on("chk-expect", "change", () => resetCheckConditionalFields());
 on("chk-refresh", "click", () => renderChecks());
 on("chk-asset", "change", () => {
-  if ($("chk-asset")) $("chk-asset").dataset.assistDraft = "1";
+  if ($("chk-asset")) $("chk-asset").dataset.formDraft = "1";
   renderChecks();
 });
 
-/* ---- 自然语言辅助配置：真实表单草稿与追问，不保存、不执行 ---- */
-const assistState = {
-  checks: { sequence: 0, revision: 0, pending: false, response: null, originalText: "", answers: [], manualResolved: new Set() },
+/* ---- 业务检查表单：默认值、字段约束与提交校验 ---- */
+const checkFormState = {
+  checks: { revision: 0 },
 };
-const assistForms = {};
-const assistFormLoads = {};
-const assistPrefix = () => "chk";
+const checkForms = {};
+const checkFormLoads = {};
 
-async function ensureAssistForm(domain) {
-  if (assistForms[domain]) return assistForms[domain];
-  if (assistFormLoads[domain]) return assistFormLoads[domain];
-  assistFormLoads[domain] = (async () => {
+async function ensureCheckForm(domain) {
+  if (checkForms[domain]) return checkForms[domain];
+  if (checkFormLoads[domain]) return checkFormLoads[domain];
+  checkFormLoads[domain] = (async () => {
     const res = await api("/api/assist/form?domain=" + encodeURIComponent(domain));
     if (!res.ok || !res.form || !Array.isArray(res.form.fields)) {
       throw new Error("无法读取当前表单定义，请刷新后重试。");
     }
-    assistForms[domain] = res.form;
+    checkForms[domain] = res.form;
     res.form.fields.forEach((field) => {
       const node = $(field.control || field.control_id);
       if (!node) return;
@@ -5219,11 +5188,11 @@ async function ensureAssistForm(domain) {
           value, text: (field.value_labels || {})[value] || value,
         })));
         node.value = previous || (field.default != null ? String(field.default) : "");
-        if (!previous && field.default != null) markAssistField(node, "默认值", "");
+        if (!previous && field.default != null) markCheckField(node, "默认值", "");
       }
       if (node.value === "" && field.default != null) {
         node.value = field.default;
-        markAssistField(node, "默认值", "");
+        markCheckField(node, "默认值", "");
       }
       if (field.minimum != null) node.min = String(field.minimum);
       if (field.maximum != null) node.max = String(field.maximum);
@@ -5231,36 +5200,35 @@ async function ensureAssistForm(domain) {
       if (field.pattern) node.pattern = field.pattern;
       if (field.help) node.title = field.help;
       node.dataset.formField = field.name;
-      if (!node.dataset.assistWatched) {
-        node.dataset.assistWatched = "1";
+      if (!node.dataset.formWatched) {
+        node.dataset.formWatched = "1";
         ["input", "change"].forEach((event) => node.addEventListener(event, () => {
-          const session = assistState[domain];
+          const session = checkFormState[domain];
           session.revision += 1;
-          session.manualResolved.add(field.name);
-          markAssistField(node, "已修改", "edited");
+          markCheckField(node, "已修改", "edited");
         }));
       }
     });
     return res.form;
   })();
-  try { return await assistFormLoads[domain]; }
-  finally { delete assistFormLoads[domain]; }
+  try { return await checkFormLoads[domain]; }
+  finally { delete checkFormLoads[domain]; }
 }
 
-function markAssistField(node, text, source) {
+function markCheckField(node, text, source) {
   const label = node && node.closest("label");
   if (!label) return;
-  let badge = label.querySelector(".assist-field-source");
+  let badge = label.querySelector(".check-field-source");
   if (!badge) {
-    badge = el("span", { class: "assist-field-source" });
+    badge = el("span", { class: "check-field-source" });
     label.appendChild(badge);
   }
   badge.textContent = text;
-  badge.className = "assist-field-source " + (source || "");
+  badge.className = "check-field-source " + (source || "");
 }
 
 function collectCheckFields() {
-  const form = assistForms.checks;
+  const form = checkForms.checks;
   if (!form) throw new Error("检查表单定义尚未加载，请稍后重试。");
   const fields = {};
   form.fields.forEach((field) => {
@@ -5285,7 +5253,7 @@ function fieldApplies(condition, fields) {
 }
 
 function resetCheckConditionalFields() {
-  const form = assistForms.checks;
+  const form = checkForms.checks;
   if (!form) return;
   const values = {};
   form.fields.forEach((field) => { values[field.name] = (($(field.control || field.control_id) || {}).value || ""); });
@@ -5294,17 +5262,17 @@ function resetCheckConditionalFields() {
     if (!node) return;
     if (!fieldApplies(field.applicable_if, values)) {
       node.value = "";
-      markAssistField(node, "", "");
+      markCheckField(node, "", "");
     } else if (field.applicable_if && node.value === "" && field.default != null) {
       node.value = field.default;
-      markAssistField(node, "默认值", "");
+      markCheckField(node, "默认值", "");
     }
   });
   updateCheckSummary();
 }
 
 function getSchemaDefault(domain, name) {
-  const field = ((assistForms[domain] || {}).fields || []).find((item) => item.name === name);
+  const field = ((checkForms[domain] || {}).fields || []).find((item) => item.name === name);
   return field && field.default != null ? field.default : null;
 }
 
@@ -5326,14 +5294,7 @@ function humanFormError(res, fallback) {
   return messages[(res || {}).error] || fallback || "操作未完成，请核对配置后重试。";
 }
 
-async function assistConfigure(domain, text, context) {
-  return api("/api/assist/configure", {
-    method: "POST",
-    body: JSON.stringify({ domain, text, context: context || {} }),
-  });
-}
-
-function assistNote(boxId, lines, cls) {
+function checkFormNote(boxId, lines, cls) {
   const box = $(boxId);
   if (!box) return;
   box.innerHTML = "";
@@ -5346,17 +5307,6 @@ function setVal(id, v) {
   const n = $(id);
   if (!n || v == null) return;
   n.value = v;
-}
-
-function applyCheckFields(fields) {
-  const form = assistForms.checks;
-  if (!fields || !form) return;
-  // 新草稿完整替换，避免上一份服务名、命令或告警值混入。
-  form.fields.forEach((field) => setVal(field.control || field.control_id,
-    Object.prototype.hasOwnProperty.call(fields, field.name) ? fields[field.name] : ""));
-  if ($("chk-asset")) $("chk-asset").dataset.assistDraft = "1";
-  chkKindChanged();
-  updateCheckSummary();
 }
 
 /** 实时人话摘要：前端固定模板，禁止 AI 生成 */
@@ -5384,228 +5334,10 @@ function updateCheckSummary() {
   on(id, "input", updateCheckSummary);
 });
 
-function assistFieldLabel(domain, name) {
-  const field = ((assistForms[domain] || {}).fields || []).find((f) => f.name === name);
+function checkFormFieldLabel(domain, name) {
+  const field = ((checkForms[domain] || {}).fields || []).find((f) => f.name === name);
   return field ? field.label : "配置内容";
 }
-
-function isAssistAnswerQuestion(question) {
-  return question.mode === "answer" || String(question.field || question.key || "").startsWith("clarification.")
-    || (question.options || []).some((choice) => choice && choice.mode === "answer");
-}
-
-function unresolvedAssistQuestions(domain) {
-  const session = assistState[domain];
-  return ((session.response || {}).missing || []).filter((question) =>
-    isAssistAnswerQuestion(question) || !session.manualResolved.has(question.field || question.key));
-}
-
-function assistFailureLines(domain, res) {
-  const lines = [humanFormError(res, "未能可靠理解这次需求，请补充说明后重试，或自行填写表单。").slice(0, 300)];
-  const reasons = new Set();
-  (Array.isArray((res || {}).issues) ? res.issues : []).forEach((issue) => {
-    if (!issue || typeof issue !== "object") return;
-    let label = assistFieldLabel(domain, issue.field);
-    // Only readable labels belong in the ordinary view; unknown internal keys remain in debug.
-    if (label === "配置内容" && typeof issue.label === "string" && /[\u3400-\u9fff]/.test(issue.label)) label = issue.label.trim().slice(0, 40);
-    const message = humanFormError({ message: issue.message, error: issue.code }, "请检查此项的格式和可用选项。").trim().slice(0, 240);
-    reasons.add(label + "：" + message);
-  });
-  lines.push(...[...reasons].slice(0, 5));
-  if (reasons.size > 5) lines.push("还有 " + (reasons.size - 5) + " 项需要核对，可在高级区域查看完整说明。");
-  return lines;
-}
-
-function renderAssistDebug(domain, res) {
-  const details = $(assistPrefix(domain) + "-assist-debug");
-  if (!details) return;
-  details.classList.remove("hidden");
-  const pre = details.querySelector("pre");
-  if (pre) pre.textContent = JSON.stringify(res, null, 2);
-}
-
-function setAssistBusy(domain, busy) {
-  const prefix = assistPrefix(domain);
-  assistState[domain].pending = busy;
-  const go = $(prefix + "-assist-go");
-  if (go) go.disabled = busy;
-  const followup = $(prefix + "-assist-followup");
-  if (followup) ["button", "input", "select"].forEach((type) =>
-    followup.querySelectorAll(type).forEach((control) => { control.disabled = busy; }));
-  if (domain === "checks" && $("chk-add")) $("chk-add").disabled = busy;
-}
-
-function markAssistSources(domain, res) {
-  const defaults = new Set(res.defaulted || []);
-  const inferred = new Set((res.inferred_detail || []).map((item) => item.field));
-  (res.inferred || []).forEach((name) => inferred.add(name));
-  ((assistForms[domain] || {}).fields || []).forEach((field) => {
-    const node = $(field.control || field.control_id);
-    if (!node) return;
-    const present = Object.prototype.hasOwnProperty.call(res.fields || {}, field.name);
-    markAssistField(node, !present ? "待补充" : defaults.has(field.name) ? "默认值" : inferred.has(field.name) ? "待核对" : "已填写",
-      inferred.has(field.name) ? "inferred" : "");
-  });
-}
-
-function renderAssistResult(domain, res) {
-  const prefix = assistPrefix(domain);
-  const lines = [];
-  if (res.status === "unsupported" || res.unsupported) {
-    const unsupported = res.unsupported || {};
-    lines.push(unsupported.reason || "当前系统无法完成这项配置。");
-    (unsupported.alternatives || []).forEach((alternative) => {
-      const text = typeof alternative === "string" ? alternative : alternative.description || alternative.label;
-      if (text) lines.push("可选方式：" + text);
-    });
-  } else if ((res.missing || []).some(isAssistAnswerQuestion)) {
-    lines.push("还需要确认你的意思，尚未完成配置。", "请回答下方问题；可以选择候选，也可以自己说明。");
-  } else {
-    lines.push("已准备可修改的检查草稿，尚未创建。");
-    (res.inferred_detail || []).forEach((item) => {
-      lines.push("请核对「" + (item.label || assistFieldLabel(domain, item.field)) + "」：" + (item.reason || "根据描述推断。"));
-    });
-    const defaultLabels = (res.defaulted || []).map((name) => assistFieldLabel(domain, name));
-    if (defaultLabels.length) lines.push("采用默认设置：" + defaultLabels.join("、") + "，可以直接修改。");
-    if (res.confirm_question) lines.push("需要确认：" + res.confirm_question);
-    if ((res.missing || []).length) lines.push("还有必要信息需要补充，请回答下方问题，或直接修改对应表单字段。");
-    else lines.push("核对摘要并提交后，还会显示最终确认。");
-  }
-  assistNote(prefix + "-assist-msg", lines);
-  renderAssistDebug(domain, res);
-  renderAssistFollowup(domain, res);
-}
-
-function renderAssistFollowup(domain, res) {
-  const box = $(assistPrefix(domain) + "-assist-followup");
-  if (!box) return;
-  box.innerHTML = "";
-  const questions = res.missing || [];
-  const controls = [];
-  questions.forEach((question, index) => {
-    const key = question.field || question.key || "clarification";
-    const row = el("div", { class: "assist-question" });
-    const id = assistPrefix(domain) + "-assist-answer-" + index;
-    row.appendChild(el("label", { for: id, text: question.question || "请补充" + (question.label || "必要信息") }));
-    let input, custom;
-    if (Array.isArray(question.options) && question.options.length) {
-      input = el("select", { id });
-      input.appendChild(el("option", { value: "", text: "请选择" }));
-      question.options.forEach((choice) => {
-        const value = typeof choice === "string" ? choice : choice.value ?? choice.id ?? choice.label;
-        const label = typeof choice === "string" ? choice : choice.label || String(value);
-        input.appendChild(el("option", { value, text: label }));
-        if (choice.description) row.appendChild(el("p", { class: "assist-choice-help", text: label + "：" + choice.description }));
-      });
-    } else input = el("input", { id, maxlength: 1000, placeholder: "填写你的选择或补充说明" });
-    row.appendChild(input);
-    if (input.tagName === "SELECT" && isAssistAnswerQuestion(question)) {
-      const customId = id + "-custom";
-      row.appendChild(el("label", { for: customId, text: "也可以自己说明" }));
-      custom = el("input", { id: customId, maxlength: 1000, placeholder: "候选不适用时，写下你的意思" });
-      custom.addEventListener("input", () => { if (custom.value.trim()) input.value = ""; });
-      input.addEventListener("change", () => { if (input.value) custom.value = ""; });
-      row.appendChild(custom);
-    }
-    controls.push({ key, input, custom });
-    box.appendChild(row);
-  });
-  if (questions.length) box.appendChild(el("button", {
-    type: "button", class: "btn primary", text: "补充后继续填写",
-    onclick: () => {
-      const answers = controls.map(({ key, input, custom }) => ({ field: key, text: (custom && custom.value.trim()) || input.value.trim() }));
-      if (answers.some((answer) => !answer.text)) {
-        assistNote(assistPrefix(domain) + "-assist-msg", ["请先回答每个必要问题。"], "error");
-        return;
-      }
-      return runAssist(domain, { continuation: true, answers });
-    },
-  }));
-  if (res.confirm_question && !questions.some(isAssistAnswerQuestion)) {
-    box.appendChild(el("button", {
-      type: "button", class: "btn", text: "确认这个理解", style: "margin:8px 8px 0 0",
-      onclick: () => runAssist(domain, { continuation: true, answers: [{ field: "confirmation", text: "确认：" + res.confirm_question }] }),
-    }));
-    const correction = el("input", { placeholder: "有差异时，在这里补充你的意思", style: "margin-top:8px;min-width:260px" });
-    box.appendChild(correction);
-    box.appendChild(el("button", {
-      type: "button", class: "btn", text: "修正理解",
-      onclick: () => {
-        if (correction.value.trim()) runAssist(domain, { continuation: true, answers: [{ field: "clarification", text: correction.value.trim() }] });
-      },
-    }));
-  }
-}
-
-async function runAssist(domain, options = {}) {
-  if (domain !== "checks") return;
-  const prefix = assistPrefix(domain);
-  const session = assistState[domain];
-  const text = options.continuation ? session.originalText : (($(prefix + "-assist-input") || {}).value || "").trim();
-  if (!text) {
-    assistNote(prefix + "-assist-msg", ["请先描述希望监控什么。"]);
-    return;
-  }
-  const sequence = ++session.sequence;
-  const revision = session.revision;
-  if (!options.continuation) {
-    session.originalText = text;
-    session.answers = [];
-    session.response = null;
-    session.manualResolved.clear();
-    if ($(prefix + "-assist-followup")) $(prefix + "-assist-followup").innerHTML = "";
-  }
-  const answers = [...session.answers, ...(options.answers || [])];
-  setAssistBusy(domain, true);
-  assistNote(prefix + "-assist-msg", ["正在结合当前表单和已登记资产理解需求…"]);
-  try {
-    await ensureAssistForm(domain);
-    const context = { asset_id: ($("chk-asset") || {}).value || "" };
-    if (options.continuation && session.response) {
-      context.draft = {
-        fields: collectCheckFields(),
-        original_text: session.originalText, confirm_question: session.response.confirm_question || "",
-      };
-      context.answers = answers;
-    }
-    const res = await assistConfigure(domain, text, context);
-    if (sequence !== session.sequence) return;
-    renderAssistDebug(domain, res);
-    if (revision !== session.revision) {
-      assistNote(prefix + "-assist-msg", ["你已修改表单，这次识别结果没有覆盖修改。可再次点击填写继续。"]);
-      return;
-    }
-    if (!res.ok) {
-      assistNote(prefix + "-assist-msg", assistFailureLines(domain, res), "error");
-      return;
-    }
-    session.response = res;
-    session.answers = answers;
-    session.manualResolved.clear();
-    if (res.status !== "unsupported" && !res.unsupported) {
-      applyCheckFields(res.fields || {});
-      if (sequence !== session.sequence || revision !== session.revision) return;
-      markAssistSources(domain, res);
-    } else applyCheckFields({});
-    renderAssistResult(domain, res);
-  } catch (error) {
-    if (sequence === session.sequence) assistNote(prefix + "-assist-msg", ["未完成智能填写，请稍后重试。现有配置未保存。"], "error");
-    renderAssistDebug(domain, { ok: false, message: String(error.message || error) });
-  } finally {
-    if (sequence === session.sequence) setAssistBusy(domain, false);
-  }
-}
-
-["checks"].forEach((domain) => {
-  const prefix = assistPrefix(domain);
-  on(prefix + "-assist-go", "click", () => runAssist(domain));
-  on(prefix + "-assist-input", "input", () => {
-    const session = assistState[domain];
-    session.sequence += 1;
-    if (session.pending) assistNote(prefix + "-assist-msg", ["描述已修改，请重新点击填写。"]);
-    setAssistBusy(domain, false);
-  });
-});
 
 on("monitor-detect", "click", () => {
   const asset = monitorState.host || (($("monitor-host") || {}).value || "") || (($("pc-ne-asset") || {}).value || "");
@@ -5645,55 +5377,41 @@ function checkPayloadSummary(payload) {
 
 async function prepareCheckSubmit() {
   const button = $("chk-add");
-  if (assistState.checks.pending || (button && button.disabled)) return;
+  if (button && button.disabled) return;
   if (button) button.disabled = true;
   try {
-    await ensureAssistForm("checks");
+    await ensureCheckForm("checks");
     const fields = collectCheckFields();
-    const session = assistState.checks;
-    if ((session.response || {}).status === "unsupported" && !session.manualResolved.size) {
-      assistNote("chk-assist-msg", ["当前需求超出系统支持的范围。可补充说明选择可用方式，或自行填写一个新的检查。"], "error");
-      return;
-    }
-    const unresolved = unresolvedAssistQuestions("checks");
-    if (unresolved.length) {
-      assistNote("chk-assist-msg", [unresolved.some(isAssistAnswerQuestion)
-        ? "请先回答下方的需求确认问题，再核对并创建。"
-        : "请先补充必要信息，或直接修改对应字段，再核对并创建。"], "error");
-      return;
-    }
-    const assistSequence = session.sequence;
+    const session = checkFormState.checks;
+    const formRevision = session.revision;
     const snapshot = JSON.stringify(fields);
     const validation = await api("/api/checks/validate", { method: "POST", body: JSON.stringify({ fields }) });
-    renderAssistDebug("checks", { stage: "validation", ...validation });
-    if (assistSequence !== session.sequence || session.pending || snapshot !== JSON.stringify(collectCheckFields())) {
-      assistNote("chk-assist-msg", ["校验期间表单已修改，请重新点击添加以核对最新配置。"], "error");
+    if (formRevision !== session.revision || snapshot !== JSON.stringify(collectCheckFields())) {
+      checkFormNote("chk-form-msg", ["校验期间表单已修改，请重新点击添加以核对最新配置。"], "error");
       return;
     }
     if (!validation.ok || !validation.payload) {
       const issues = (validation.issues || []).map((item) => (item.label || "配置") + "：" + item.message);
-      assistNote("chk-assist-msg", issues.length ? issues : [humanFormError(validation, "检查配置尚不完整，请核对后再提交。")], "error");
+      checkFormNote("chk-form-msg", issues.length ? issues : [humanFormError(validation, "检查配置尚不完整，请核对后再提交。")], "error");
       return;
     }
     const payload = validation.payload;
     const summary = checkPayloadSummary(payload);
-    if (session.response && session.response.confirm_question) summary.push("本次理解：" + session.response.confirm_question);
-    const defaulted = (validation.defaulted || []).map((name) => assistFieldLabel("checks", name));
+    const defaulted = (validation.defaulted || []).map((name) => checkFormFieldLabel("checks", name));
     if (defaulted.length) summary.push("未指定的设置采用默认值：" + defaulted.join("、") + "。");
     summary.push("确认后才会保存并启用此检查。取消不会创建。" );
     confirmFormAction("确认创建业务检查", summary, async () => {
       const res = await api("/api/checks", { method: "POST", body: JSON.stringify(payload) });
       if (res.ok) {
-        assistNote("chk-assist-msg", ["检查已创建，已更新这台主机的资源与业务状态。"]);
+        checkFormNote("chk-form-msg", ["检查已创建，已更新这台主机的资源与业务状态。"]);
         await refreshResourceAfterCheck(payload.asset_id, true);
-      } else renderAssistDebug("checks", { stage: "create", ...res });
+      } else checkFormNote("chk-form-msg", [humanFormError(res, "检查未能创建，请核对后重试。")], "error");
       return res;
-    }, () => !assistState.checks.pending && assistSequence === assistState.checks.sequence
-      && !unresolvedAssistQuestions("checks").length && snapshot === JSON.stringify(collectCheckFields()));
+    }, () => formRevision === checkFormState.checks.revision && snapshot === JSON.stringify(collectCheckFields()));
   } catch (_) {
-    assistNote("chk-assist-msg", ["未能完成提交前校验，请刷新后重试。检查尚未创建。"], "error");
+    checkFormNote("chk-form-msg", ["未能完成提交前校验，请刷新后重试。检查尚未创建。"], "error");
   } finally {
-    if (button) button.disabled = assistState.checks.pending;
+    if (button) button.disabled = false;
   }
 }
 on("chk-add", "click", prepareCheckSubmit);

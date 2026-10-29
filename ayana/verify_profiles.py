@@ -143,6 +143,20 @@ def bound_contract(profile: VerificationProfile, *, asset_id: str, service: str)
     return result
 
 
+def recovery_evidence_contract(*, alertname: str, problem_family: str = "") -> VerificationProfile | None:
+    """按故障类型匹配恢复证据契约；无契约则无法验证恢复（不得 recovered）。"""
+    a = (alertname or "").lower().replace(" ", "").replace("_", "")
+    if a in {"mysqlreplicationiorunning", "mysqlreplicationsqlrunning",
+             "mysqlslaveiorunning", "mysqlslavesqlrunning"}:
+        return PROFILES.get("mysql.replica.recover")
+    if "mysqlreplication" in a or "mysqlslave" in a:
+        # Running threads do not prove that lag or another replication fault cleared.
+        return None
+    if a in {"targetdown", "servicedown", "probefailed"}:
+        return PROFILES.get("svc.recover")
+    return None
+
+
 def profile_for_action(*, capability: str, asset_id: str = "", object_id: str = "") -> VerificationProfile | None:
     """按 capability 解析通用 profile；未知返回 None（阻止自动）。"""
     if capability in CAP_PROFILE:

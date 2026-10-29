@@ -278,19 +278,6 @@ class NativeLifecycleTests(Fixture,unittest.IsolatedAsyncioTestCase):
 
 
 class WorkerInterventionTests(Fixture,unittest.IsolatedAsyncioTestCase):
-    async def test_guidance_during_decision_prevents_stale_action(self):
-        from ayana.auto_investigate import AutoInvestigator,InvestConfig
-        bridge=SimpleNamespace(duty=self.duty,get_mapping=lambda iid:{"session_id":self.auto})
-        worker=AutoInvestigator(self.db,bridge=bridge,config=InvestConfig(enabled=True,closed_loop=True),ops_loop=SimpleNamespace())
-        worker._runtime_ready=lambda:True
-        async def decision(*args,**kwargs):
-            self.db.execute("UPDATE duty_sessions SET human_message_revision=human_message_revision+1 WHERE id=?",(self.auto,))
-            return {"decision":"execute","capability":"service.restart","object_id":"service"}
-        worker._decide_remediation=decision
-        result=await worker._close_loop("inc1",{},generation=1)
-        self.assertEqual(result["skipped"],"human_guidance")
-        self.assertEqual(self.db.query_one("SELECT count(*) FROM actions")[0],0)
-
     async def test_pause_cancels_old_business_owner_even_when_abort_unconfirmed(self):
         from ayana.web import WebApp
         self.db.execute("INSERT INTO investigation_jobs(incident_id,generation,status,updated_at,created_at) VALUES('inc1',1,'running',?,?)",(time.time(),time.time()))

@@ -1,23 +1,23 @@
 # Ayana
 
-**运维闭环平台**：把告警变成**可调查、可审批、可执行、可验证**的处置流程，而不是只丢一条群消息。
+**运维闭环平台**：在同一个 MiMoCode 会话中调查、执行和验证故障处置，保留可核对的执行事实与恢复证据。
 
 ```text
-Alertmanager → Event → Incident → 调查 → 权限 → 受控处置 → 独立验证 → Web / IM → 审计
+Alertmanager → Event → Incident → MiMoCode 会话 → host.exec / 验证 → Web / IM / 审计
 ```
 
 | 能力 | 说明 |
 |------|------|
 | 告警接入 | Alertmanager webhook，归并 Event / Incident |
-| 只读调查 | 受限 SSH / Prometheus 证据采集，有预算与截止时间 |
-| 受控执行 | 能力目录固定 argv；提案 → 批准 → 执行 → 验证 |
-| 权限与审计 | Policy 三态（禁止 / 人工确认 / 自动）+ 完整审计 |
+| 调查与处置 | 同一 MiMoCode 会话通过 MCP 查询证据、执行命令和维护监控配置 |
+| 账号组 | 一个全局默认组；会话可单独选择，实际权限由目标机 SSH 账号决定 |
+| 结果与审计 | 写操作台账、未知结果保护、恢复证据和完整审计 |
 | 入口 | Web 控制台；可选 QQ / 企业微信机器人 |
 | 安全 | 本地账号 + TOTP、会话加固、命令白名单、SSRF 边界 |
 
-适合：少量关键主机，需要「半夜自动处置也要留痕、可拒、可验」的运维场景。
+适合：少量关键主机，需要自动处置并保留执行过程、验证依据的运维场景。
 
-当前版本：**v0.7.4**（见 `ayana/__init__.py` / `pyproject.toml`）。
+当前版本：**v0.8.0**（见 `ayana/__init__.py` / `pyproject.toml`）。
 
 ---
 
@@ -75,18 +75,19 @@ Prometheus / Alertmanager
    接入层（webhook · Prom API · SSH）
         │
         ▼
- Asset → Event → Incident → Investigation
+ Asset → Event → Incident → MiMoCode 会话
         │
         ▼
- Capability / Policy → Action → Verification
+ MCP 查询 / host.exec / config.* → 执行事实 / 恢复证据
         │
         ▼
    Web 控制台 · 通知 · 审计
 ```
 
-- **运行时**：单进程 asyncio + aiohttp；SQLite（WAL）
-- **执行零自由度**：LLM 只分析；动手只能命中能力目录 / runbook 固定动作
-- **主机侧上限**：业务权限在 Ayana；目标机 sudoers / forced-command 仍是最终边界
+- **平台**：asyncio + aiohttp；SQLite（WAL）；独立 MiMoCode 原生运行时。
+- **账号选择**：未覆盖的会话和后台检查使用全局默认组；会话覆盖只影响后续操作。缺少指定组时明确报错，不换用另一组。
+- **主机侧上限**：目标机 SSH 账号和 sudoers 决定命令权限；账号组名称不代表权限档位。
+- **恢复判定**：命令成功不等于故障恢复，结案需要匹配故障和代次的新鲜证据。
 
 ---
 
@@ -106,7 +107,7 @@ Prometheus / Alertmanager
 - 首登强制改密；bootstrap 口令不写日志
 - 自定义检查命令白名单；禁止任意文件读与输出内容 oracle
 - Webhook / WebSocket 目标 SSRF 黑名单；Origin 精确校验
-- 写操作职责分离（非 admin 不可自批）
+- 写操作留痕；未知结果保留并阻止盲目重复执行；旧逐动作审批已退役
 
 ---
 
@@ -123,7 +124,7 @@ python -m unittest discover tests -q
 ## 文档
 
 - [安装手册](docs/INSTALL.md) — 部署、systemd、备份、升级
-- [智能填表说明](docs/assist-configuration.md) — 可选 LLM 填表
+- [MCP 操作接口](docs/mcp-operations.md) — MiMoCode 操作、账号组和监控配置
 
 ## 许可证
 

@@ -2,7 +2,7 @@
 
 路由：
 - `@Ayana /help` 等斜杠命令 → 现有业务分发
-- `@Ayana -c <host> <cmd...>` → 受控命令执行（跳过 Agent，禁止改写）
+- `@Ayana -c <host> <cmd...>` → 兼容识别旧语法，由渠道返回退役提示
 - `@Ayana 查询 demo-01 状态` → Agent 自然语言理解并调用工具
 
 错误引导：
@@ -128,7 +128,7 @@ _READ_PROGRAMS = frozenset(
 class ParsedEntry:
     """解析结果。"""
 
-    kind: str  # slash | controlled | nl | approval | empty | unknown | urgent | settings | watch_ping
+    kind: str  # slash | controlled | nl | empty | unknown | urgent | settings | watch_ping
     text: str = ""
     slash_cmd: str = ""
     slash_args: list[str] = field(default_factory=list)
@@ -139,7 +139,6 @@ class ParsedEntry:
     error: str = ""
     error_hint: str = ""
     request_id: str = ""
-    approval_decision: str = ""
 
 
 def parse_entry(raw: str) -> ParsedEntry:
@@ -171,12 +170,6 @@ def parse_entry(raw: str) -> ParsedEntry:
         text = m.group(1).strip()
     if not text:
         return ParsedEntry(kind="empty")
-
-    # 授权答复必须整句匹配，不能把引用、否定或讨论文字误当指令。
-    from .approval import parse_approval_reply
-    decision = parse_approval_reply(text)
-    if decision:
-        return ParsedEntry(kind="approval", text=text, approval_decision=decision)
 
     # 斜杠命令
     if text.startswith("/"):
@@ -308,10 +301,8 @@ def error_reply(code: str, hint: str = "") -> str:
 def usage_hint_for_controlled() -> str:
     """受控命令通用用法（占位符）。"""
     return (
-        f"受控命令用法: -c {PH_HOST} {PH_CMD}\n"
-        f"读示例: -c {PH_HOST} systemctl status {PH_CMD}\n"
-        f"写示例: -c {PH_HOST} systemctl restart {PH_CMD}\n"
-        f"写操作需审批。"
+        f"旧受控命令语法: -c {PH_HOST} {PH_CMD}\n"
+        "此入口已退役，请通过 MiMoCode 会话操作。"
     )
 
 

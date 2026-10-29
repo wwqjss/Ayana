@@ -7,7 +7,7 @@ import unittest
 from ayana.checks import CheckError, build_tokens
 from ayana.formspec import (
     check_payload, condition_applicability, condition_dependencies, condition_matches,
-    field_applicability, form_prompt_payload, get_form, payload_to_fields,
+    field_applicability, get_form, payload_to_fields,
     validate_check_payload, validate_fields,
 )
 
@@ -166,13 +166,10 @@ class TestFormContract(unittest.TestCase):
         self.assertEqual(fields["params.cmd"]["control_id"], "chk-cmd")
         self.assertNotIn("default", fields["kind"])
         self.assertNotIn("pattern", fields["name"])
-        prompt = form_prompt_payload("checks", assets=ASSETS)
-        prompt_fields = {f["name"]: f for f in prompt["form"]["fields"]}
-        self.assertEqual(prompt_fields["params.unit"]["pattern"], fields["params.unit"]["pattern"])
-        self.assertIn("curl", prompt_fields["params.cmd"]["allowed_programs"])
-        self.assertIn("不支持 Docker", prompt["form"]["capability_boundary"]["service"])
-        self.assertIn("GET/HEAD", prompt["form"]["command_boundary"]["curl"])
-        self.assertIn("-O -", prompt["form"]["command_boundary"]["wget"])
+        self.assertIn("curl", fields["params.cmd"]["allowed_programs"])
+        self.assertIn("不支持 Docker", form["capability_boundary"]["service"])
+        self.assertIn("GET/HEAD", form["command_boundary"]["curl"])
+        self.assertIn("-O -", form["command_boundary"]["wget"])
 
     def test_applicability_is_structured_and_matches_actual_required_fields(self):
         fields = {f["name"]: f for f in get_form("checks")["fields"]}
@@ -186,37 +183,6 @@ class TestFormContract(unittest.TestCase):
             check_payload(self.service(interval_sec=5), assets=ASSETS)
         self.assertIn("15 到 3600", raised.exception.detail)
         self.assertEqual(raised.exception.issues[0]["field"], "interval_sec")
-
-    def test_prompt_routes_and_metadata_fields_are_limited_to_actual_domain(self):
-        for domain, routes in (("checks", {"checks_form"}),):
-            with self.subTest(domain=domain):
-                prompt = form_prompt_payload(domain, assets=ASSETS)
-                schema = prompt["output_schema"]
-                names = [field["name"] for field in get_form(domain)["fields"]]
-                self.assertEqual(set(schema["route"].split(" | ")), routes)
-                self.assertEqual(schema["field_names"], names)
-                for metadata in ("missing", "inferred"):
-                    self.assertEqual(schema[metadata][0]["field"].split(" | "), names)
-                self.assertNotIn("clarification", names)
-                self.assertNotIn("component", names)
-
-    def test_prompt_distinguishes_conversation_answers_from_assignable_values(self):
-        prompt = form_prompt_payload("checks", assets=ASSETS)
-        schema = prompt["output_schema"]
-        option = schema["missing"][0]["options"][0]
-        self.assertIn("field_value", option["mode"])
-        self.assertIn("answer", option["mode"])
-        self.assertIn("默认为 field_value", option["mode"])
-        clarification = schema["clarifications"][0]
-        self.assertEqual(set(clarification), {"id", "label", "question", "options"})
-        self.assertIn("^[A-Za-z][A-Za-z0-9_-]{0,63}$", clarification["id"])
-        self.assertIn("非空", clarification["options"][0]["value"])
-        self.assertIn("不直接", clarification["options"][0]["value"])
-        rules = "\n".join(prompt["interpretation_rules"])
-        self.assertIn("背景", rules)
-        self.assertIn("名称前缀", rules)
-        self.assertIn("先询问", rules)
-        self.assertIn("不等于完整技术名称", rules)
 
     def test_clarification_applicability_preserves_unknown_selectors(self):
         self.assertIsNone(field_applicability("checks", "params.unit", {}))

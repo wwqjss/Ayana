@@ -14,13 +14,12 @@ from urllib.parse import urlsplit
 
 from aiohttp import web
 
-from .actions import ActionError, ActionService
-from .approval import ApprovalService
+from .exec_facts import ActionError, classify_exec_result
 from .auth import AuthError, AuthService
 from .db import Database, now
 from .incidents import IncidentService
 from .investigation import InvestigationService
-from .policy import Policy
+from .access import AccessControl as Policy
 from .prom import PromClient, summarize_probe
 from .agent_authority import resolve_authority
 
@@ -102,7 +101,7 @@ class WebApp:
         policy: Policy,
         incidents: IncidentService,
         investigation: InvestigationService,
-        actions: ActionService,
+        actions: Any,
         prom: PromClient,
         *,
         static_dir: Path,
@@ -171,12 +170,10 @@ class WebApp:
         self.mimo_serve = mimo_serve
         self.agent_tui = agent_tui
         self.mimo_events = mimo_events
-        # Legacy kwargs remain accepted for older callers, but no live service is retained.
-        from .legacy_history import LegacyHistory
-
+        # 旧自治历史浏览已退役；必要历史数据走离线归档
         self.autonomy = None
         self.providers = None
-        self.legacy_history = LegacyHistory(db)
+        self.legacy_history = None
         # P2-4: 死键修复 — 路由读取 config.alertmanager_webhook_path
         self.alertmanager_webhook_path = alertmanager_webhook_path or "/hooks/alertmanager"
 
@@ -249,6 +246,7 @@ class WebApp:
         app.router.add_post("/api/agent/sessions/{sid}/resume-duty", self.api_agent_session_resume_duty)
         app.router.add_post("/api/agent/sessions/{sid}/recover", self.api_agent_session_recover)
         app.router.add_post("/api/agent/sessions/{sid}/permissions", self.api_agent_session_permissions)
+        app.router.add_post("/api/agent/sessions/{sid}/account-group", self.api_agent_session_account_group)
         app.router.add_post("/api/agent/sessions/{sid}/prompt", self.api_agent_session_prompt)
         app.router.add_post("/api/agent/sessions/{sid}/abort", self.api_agent_session_abort)
         app.router.add_get("/api/agent/events", self.api_agent_events)
@@ -311,6 +309,10 @@ class WebApp:
         app.router.add_delete("/api/ssh/endpoints", self.api_ssh_endpoint_delete)
         app.router.add_get("/api/ssh/roles", self.api_ssh_roles)
         app.router.add_post("/api/ssh/roles", self.api_ssh_role_add)
+        app.router.add_get("/api/ssh/account-groups", self.api_ssh_account_groups)
+        app.router.add_post("/api/ssh/account-groups/assign", self.api_ssh_account_add)
+        app.router.add_delete("/api/ssh/account-groups", self.api_ssh_account_group_delete)
+        app.router.add_delete("/api/ssh/account-groups/member", self.api_ssh_account_unassign)
         app.router.add_get("/api/ssh/credentials", self.api_ssh_credentials)
         app.router.add_post("/api/ssh/credentials", self.api_ssh_credential_create)
         app.router.add_post("/api/ssh/credentials/generate", self.api_ssh_credential_generate)
@@ -444,60 +446,11 @@ class WebApp:
         return assets
 
     async def api_assist_configure(self, request: web.Request) -> web.Response:
-        """自然语言 → 填表意图。只读查询 + 字段草稿；不保存。"""
-        sess = self._require_auth(request)
-        self._check_csrf(request, sess)
-        try:
-            body = await request.json()
-        except Exception:
-            return _json({"ok": False, "error": "bad_json", "message": "提交内容无法读取，请重新填写。"}, 400)
-        if not isinstance(body, dict) or not isinstance(body.get("text"), str):
-            return _json({"ok": False, "error": "bad_input", "message": "请用文字描述要配置什么。"}, 400)
-        domain = body.get("domain")
-        text = body["text"].strip()
-        ctx = body.get("context", {})
-        if not isinstance(ctx, dict) or len(json.dumps(ctx, ensure_ascii=False)) > 20000:
-            return _json({"ok": False, "error": "bad_context", "message": "补充内容格式不正确或过长，请重新填写。"}, 400)
-        if domain == "permissions":
-            return _json({"ok": False, "error": "legacy_permissions_retired", "retired": True,
-                          "message": "旧权限策略已停用，请在 Agent 设置或会话顶部调整权限。"}, 410)
-        if domain != "checks":
-            return _json({"ok": False, "error": "bad_domain", "message": "当前页面尚不支持智能填表。"}, 400)
-        if not text or len(text) > 4000:
-            return _json({"ok": False, "error": "bad_text", "message": "请输入不超过 4000 字的配置描述。"}, 400)
-        if domain == "checks":
-            self._check_read(request)
-
-        assets = self._assist_assets(sess)
-        caps = []
-        names: list[str] = []
-        if domain == "checks":
-            visible_ids = {a["id"] for a in assets}
-            names = [c["name"] for c in self._checks().list_checks("") if c["asset_id"] in visible_ids]
-
-        from . import assist
-
-        res = await assist.configure(
-            domain=domain,
-            text=text,
-            context=ctx,
-            llm=self.llm,
-            assets=assets,
-            capabilities=caps,
-            existing_names=names,
-        )
-        try:
-            self.db.audit(
-                "web_user",
-                sess.get("username") or "",
-                "assist_configure",
-                detail={"domain": domain, "source": res.get("source"), "route": res.get("route"),
-                        "status": res.get("status"), "error": res.get("error"),
-                        "trace_id": (res.get("diagnostics") or {}).get("trace_id")},
-            )
-        except Exception:
-            pass
-        return _json(res)
+        """The retired natural-language form filler has no execution path."""
+        user = self._require_auth(request)
+        self._check_csrf(request, user)
+        return _json({"ok": False, "error": "assist_configure_retired", "retired": True,
+                      "message": "智能填表已停用，请使用检查设置表单。"}, 410)
 
     # ---- auth helpers ----
 
@@ -1355,22 +1308,20 @@ class WebApp:
     async def api_ops_loop_status(self, request: web.Request) -> web.Response:
         sess = self._require_auth(request)
         inc_id = request.match_info["inc_id"]
+        inc = self.incidents.get_incident(inc_id)
+        if not inc:
+            return _json({"ok": False, "error": "not_found"}, 404)
+        if inc.get("asset_id") not in self._visible_asset_ids(sess):
+            return _json({"ok": False, "error": "permission_denied"}, 403)
         if not self.ops_loop:
             return _json({"ok": False, "error": "unavailable"}, 503)
-        loop = self.ops_loop.status(inc_id)
-        job = self.db.query_one(
-            "SELECT status, rounds, last_result_status, last_error, generation, updated_at"
-            " FROM investigation_jobs WHERE incident_id=?",
-            (inc_id,),
-        )
-        ai = getattr(self, "auto_investigator", None)
-        cfg = getattr(ai, "config", None) if ai else None
+        current = self._incident_execution_view(inc)
         return _json({
             "ok": True,
-            "loop": loop,
-            "investigation": dict(job) if job else None,
-            "closed_loop_enabled": bool(getattr(cfg, "closed_loop", False)) if cfg else False,
-            "auto_investigate_enabled": bool(getattr(cfg, "enabled", False)) if cfg else False,
+            "loop": self.ops_loop.observed_status(inc_id),
+            "native_task": current["native_task"],
+            "host_exec": current["host_exec"],
+            "recovery": current["recovery"],
         })
 
     def _mimo(self):
@@ -1804,37 +1755,31 @@ class WebApp:
         except Exception:
             return _json({"ok":False,"error":"copy_unavailable","message":"暂时无法读取回复，可选择终端文字复制。"},502)
 
-    async def api_agent_session_permissions(self, request: web.Request) -> web.Response:
+    async def api_agent_session_account_group(self, request: web.Request) -> web.Response:
         user = self._require_admin(request)
         self._check_csrf(request, user)
         sid = request.match_info.get("sid") or ""
         session = self._agent_session_require(user, sid, control=True)
         if session.get("status") != "open":
-            return _json({"ok": False, "error": "session_archived"}, 409)
+            return _json({"ok": False, "error": "session_not_open"}, 409)
         try:
             body = await request.json()
         except (ValueError, TypeError):
             body = None
-        if (not isinstance(body, dict) or not isinstance(body.get("connection_id"), str)
-                or type(body.get("revision")) is not int
-                or not any(key in body for key in ("access_mode", "approval_mode"))
-                or any(key not in ("connection_id", "revision", "access_mode", "approval_mode") for key in body)
-                or ("access_mode" in body and body["access_mode"] not in ("readonly", "readwrite"))
-                or ("approval_mode" in body and body["approval_mode"] not in ("manual", "automatic"))):
-            return _json({"ok": False, "error": "invalid_permissions"}, 400)
-        manager = getattr(self, "agent_tui", None)
-        if manager is None:
-            return self._agent_runtime_failure()
+        if (not isinstance(body, dict) or set(body) != {"group"}
+                or not isinstance(body["group"], str) or len(body["group"]) > 32):
+            return _json({"ok": False, "error": "invalid_ssh_account_group"}, 400)
         try:
-            result = manager.change_permissions(sid, user["username"], body["connection_id"],
-                access_mode=body.get("access_mode"), approval_mode=body.get("approval_mode"),
-                expected_revision=body["revision"])
-            return _json(result)
-        except Exception as error:
-            from .agent_authority import resolve_authority
-            return _json({"ok": False, "error": getattr(error, "code", "permissions_unavailable"),
-                "message": "权限切换未生效，请确认当前窗口仍持有控制权后重试。",
-                "effective_permissions": resolve_authority(self.db, sid)}, 409)
+            result = self._duty().set_session_account_group(sid, body["group"], actor=user["username"])
+        except ValueError as exc:
+            code = str(exc)
+            return _json({"ok": False, "error": code}, 409 if code.startswith("session_") else 400)
+        return _json({**result, "group": body["group"], "effective_permissions": resolve_authority(self.db, sid)})
+
+    async def api_agent_session_permissions(self, request: web.Request) -> web.Response:
+        user = self._require_admin(request)
+        self._check_csrf(request, user)
+        return _json({"ok": False, "error": "session_permissions_retired", "retired": True}, 410)
 
     async def ws_agent_terminal(self, request: web.Request) -> web.StreamResponse:
         # Upgrade only after authentication, Origin and complete session ACL.
@@ -2147,35 +2092,30 @@ class WebApp:
         if not isinstance(body, dict):
             return _json({"ok": False, "error": "bad_json"}, 400)
         allowed = {
-            "auto_access_mode",
-            "auto_approval_mode",
             "archive_delay_sec",
-            "ssh_investigate_role",
-            "ssh_execute_role",
+            "ssh_default_group",
         }
         changed = {}
         actor = sess.get("username") or "web"
         for key, value in body.items():
             if key not in allowed:
                 continue
-            if key in ("auto_access_mode", "auto_approval_mode"):
-                options = ("readonly", "readwrite") if key == "auto_access_mode" else ("manual", "automatic")
-                if value not in options:
-                    return _json({"ok": False, "error": "invalid_permission_mode", "field": key}, 400)
-                val = value
-            elif key == "archive_delay_sec":
+            if key == "archive_delay_sec":
                 if type(value) is not int or not 30 <= value <= 3600:
                     return _json({"ok": False, "error": "invalid_archive_delay", "field": key}, 400)
                 val = str(value)
             else:
-                if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value):
-                    return _json({"ok": False, "error": "invalid_credential_role", "field": key}, 400)
+                if not isinstance(value, str) or not value or len(value) > 32:
+                    return _json({"ok": False, "error": "invalid_ssh_account_group", "field": key}, 400)
                 store=getattr(self,"ssh_store",None)
                 if store is not None and value not in {role["name"] for role in store.list_roles()}:
-                    return _json({"ok":False,"error":"ssh_role_not_found","field":key,"message":"请选择已配置的 SSH 角色。"},400)
+                    return _json({"ok":False,"error":"ssh_account_group_not_found","field":key,"message":"请选择已配置的 SSH 账号组（组名由你自定义，不代表权限）。"},400)
                 val = str(value)
             changed[key] = val
-        duty.set_settings(changed, actor=actor)
+        try:
+            duty.set_settings(changed, actor=actor)
+        except ValueError as exc:
+            return _json({"ok": False, "error": str(exc)}, 400)
         self.db.audit("web_user", actor, "agent_settings_saved",
                       detail={"changed": changed}, channel="web")
         return _json({"ok": True, "changed": changed, "settings": duty.settings()})
@@ -2191,100 +2131,14 @@ class WebApp:
         return _json({"ok": True, "pending": pending})
 
     async def api_agent_pending_approve(self, request: web.Request) -> web.Response:
-        sess = self._require_admin(request)
-        self._check_csrf(request, sess)
-        bridge = self._bridge()
-        if not bridge:
-            return _json({"ok": False, "error": "bridge_unavailable"}, 503)
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        inc_id = str((body or {}).get("incident_id") or "").strip()
-        action_key = str((body or {}).get("action_key") or "").strip()
-        if not inc_id or not action_key:
-            return _json({"ok": False, "error": "incident_id_and_action_key_required"}, 400)
-        approved = bridge.approve_pending_write(inc_id, action_key, approved_by=sess.get("username") or "web")
-        if not approved.get("ok"):
-            return _json(approved, 400)
-        params = approved.get("params") or {}
-        command = str(params.get("command") or "")
-        channel = str(params.get("channel") or "write")
-        timeout = params.get("timeout")
-        try:
-            timeout_f = float(timeout) if timeout is not None else None
-        except (TypeError, ValueError):
-            timeout_f = None
-        result: dict[str, Any] = {"approved": True}
-        row = self.db.query_one(
-            "SELECT target, result FROM session_write_ops WHERE incident_id=? AND action_key=?",
-            (inc_id, action_key),
-        )
-        asset_id = (row["target"] if row else "") or ""
-        authority_sid = str(params.get("_ayana_session_id") or "")
-        if params.get("_ayana_tool"):
-            try:
-                from .mcp_tools import OpsContext, OpsTools
-                from .transport import session_dispatch_guard
-                context = OpsContext(db=self.db, transport=self.transport, prom=self.prom,
-                    incidents=self.incidents, knowledge=bridge.knowledge, session_bridge=bridge,
-                    actions=self.actions, promconfig=getattr(self,"promconfig",None),
-                    ops_loop=getattr(self,"ops_loop",None), constraints=getattr(self,"ops_constraints",None))
-                with session_dispatch_guard(self.db, authority_sid):
-                    out = await OpsTools(context).call_approved(str(params["_ayana_tool"]),
-                        params.get("_ayana_arguments") or {}, authority_session_id=authority_sid)
-                bridge.complete_write(inc_id,action_key,ok=out.get("ok",True),result=json.dumps(out,default=str))
-                result.update({"exec_state":"success" if out.get("ok",True) else "failed","tool_result":out})
-            except Exception as error:
-                if getattr(error,"dispatch_not_started",False):
-                    bridge.release_write(inc_id,action_key,confirmed_safe=True,reason=error.code)
-                else:
-                    bridge.mark_unknown(inc_id,action_key,reason=type(error).__name__)
-                result.update({"exec_state":"rejected" if getattr(error,"dispatch_not_started",False) else "unknown", "exec_error":getattr(error,"code","tool_failed")})
-        elif command and asset_id and self.transport is not None:
-            try:
-                from .actions import classify_exec_result
-                from .transport import session_dispatch_guard
-                with session_dispatch_guard(self.db, authority_sid,asset_id=asset_id):
-                    res = await self.transport.exec_shell(asset_id, command, timeout_f, channel=channel)
-                state, detail = classify_exec_result(res)
-                if state == "unknown":
-                    bridge.mark_unknown(inc_id, action_key, reason=detail or "unknown")
-                else:
-                    bridge.complete_write(inc_id, action_key, ok=(state == "success"), result=(detail or "")[:500])
-                result.update({"exec_state": state, "detail": (detail or "")[:300]})
-            except Exception as e:  # noqa: BLE001
-                if getattr(e,"dispatch_not_started",False):
-                    bridge.release_write(inc_id,action_key,confirmed_safe=True,reason=e.code)
-                else:
-                    bridge.mark_unknown(inc_id, action_key, reason=str(e)[:120])
-                result["exec_error"] = str(e)[:200]
-        else:
-            # 无命令参数：仅批准状态，调用方稍后执行
-            result["note"] = "approved_without_inline_exec"
-        self.db.audit("web_user", sess["username"], "pending_write_approved",
-                      detail={"incident_id": inc_id, "action_key": action_key, "result": result}, channel="web")
-        return _json({"ok": True, **result})
+        user = self._require_admin(request)
+        self._check_csrf(request, user)
+        return _json({"ok": False, "error": "action_approval_retired", "retired": True}, 410)
 
     async def api_agent_pending_reject(self, request: web.Request) -> web.Response:
-        sess = self._require_admin(request)
-        self._check_csrf(request, sess)
-        bridge = self._bridge()
-        if not bridge:
-            return _json({"ok": False, "error": "bridge_unavailable"}, 503)
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        inc_id = str((body or {}).get("incident_id") or "").strip()
-        action_key = str((body or {}).get("action_key") or "").strip()
-        reason = str((body or {}).get("reason") or "human_rejected")
-        if not inc_id or not action_key:
-            return _json({"ok": False, "error": "incident_id_and_action_key_required"}, 400)
-        res = bridge.reject_pending_write(inc_id, action_key, reason=reason)
-        self.db.audit("web_user", sess["username"], "pending_write_rejected",
-                      detail={"incident_id": inc_id, "action_key": action_key}, channel="web")
-        return _json(res)
+        user = self._require_admin(request)
+        self._check_csrf(request, user)
+        return _json({"ok": False, "error": "action_approval_retired", "retired": True}, 410)
 
     async def api_agent_pending_actions(self, request: web.Request) -> web.Response:
         user = self._require_auth(request)
@@ -2381,10 +2235,9 @@ class WebApp:
             d["probe"] = {"state": view["health"].get("state", "unknown")}
             assets.append(d)
         need = [i for i in open_inc if i.get("need_human")]
-        actions = [action for action in self.actions.list_actions(limit=50)
-                   if action.get("asset_id") in visible][:10]
-        pending_actions = [x for x in actions if x.get("state") in ("proposed", "approved", "dispatched")]
-        unknown_actions = [x for x in actions if x.get("state") == "unknown"]
+        actions: list = []
+        pending_actions = []
+        unknown_actions = []
         sources = {}
         try:
             targets = await self.prom.targets()
@@ -2538,6 +2391,10 @@ class WebApp:
             out.append(d)
         return _json({"ok": True, "assets": out})
 
+    def _default_ssh_group(self) -> str:
+        selected = self.db.query_one("SELECT value FROM agent_settings WHERE key='ssh_default_group'")
+        return str(selected["value"] or "default") if selected else "default"
+
     def _asset_payload(self, body: dict) -> dict:
         aid = str(body.get("id") or "").strip()
         if not aid or not aid.replace("_", "").replace("-", "").isalnum() or len(aid) > 32:
@@ -2553,7 +2410,7 @@ class WebApp:
             "host": host,
             "port": port,
             "username": user,
-            "role": str(body.get("role") or "write").strip(),
+            "role": str(body.get("role") or self._default_ssh_group()).strip(),
             "credential_id": body.get("credential_id") or "",
             "prom_asset": str(body.get("prom_asset") or aid).strip(),
             "notes": str(body.get("notes") or "").strip(),
@@ -2605,7 +2462,7 @@ class WebApp:
             try:
                 kind = "private_key" if "BEGIN" in secret else "password"
                 meta = self._cred_store().create(
-                    name=f"{p['id']}-{p.get('role') or 'write'}",
+                    name=f"{p['id']}-{p['role']}",
                     kind=kind,
                     secret=secret,
                     actor=sess["username"],
@@ -2617,7 +2474,7 @@ class WebApp:
             try:
                 ssh_ep = self.ssh_store.upsert_endpoint(
                     asset_id=p["id"],
-                    role=p["role"] or "write",
+                    role=p["role"],
                     host=p["host"],
                     port=p["port"],
                     username=p["username"],
@@ -2647,16 +2504,14 @@ class WebApp:
             (display, notes, enabled, t, aid),
         )
         ssh_ep = None
-        role = str(body.get("role") or "write")
+        role = str(body.get("role") or self._default_ssh_group())
         # 凭据策略：空=保留原凭据；clear_credential=显式清空；新密文=rotate 或 create
         clear_cred = bool(body.get("clear_credential"))
         secret = str(body.get("password") or body.get("private_key") or "").strip()
         existing_ep = None
         if self.ssh_store:
             try:
-                existing_ep = self.ssh_store.get_endpoint(aid, role) or (
-                    self.ssh_store.list_endpoints(aid) or [None]
-                )[0]
+                existing_ep = self.ssh_store.get_endpoint(aid, role)
             except Exception:
                 existing_ep = None
         cred_id = body.get("credential_id")
@@ -2787,13 +2642,69 @@ class WebApp:
         filtered = [i for i in all_incs if i.get("asset_id") in visible] if visible else []
         return _json({"ok": True, "incidents": filtered})
 
+    def _incident_execution_view(self, incident: dict) -> dict:
+        """Read recorded execution and recovery facts without reviving the old dispatcher."""
+        data = dict(incident)
+        inc_id = str(data["id"])
+        generation = int(data.get("generation") or 1)
+        operations = []
+        for row in self.db.query(
+            "WITH latest AS (SELECT action_id,MAX(id) AS id FROM audit_log"
+            " WHERE incident_id=? AND entry='mcp_host_exec_write' AND json_valid(detail_json)"
+            " AND json_extract(detail_json,'$.generation')=? GROUP BY action_id)"
+            " SELECT w.id,w.session_id,w.action_key,w.status,w.target,w.created_at,w.updated_at,w.adjudication,"
+            " a.at AS audit_at,a.detail_json FROM latest JOIN audit_log a ON a.id=latest.id"
+            " JOIN session_write_ops w ON a.incident_id=w.incident_id AND a.action_id=w.action_key"
+            " WHERE w.incident_id=?"
+            " AND json_extract(a.detail_json,'$.session_id')=w.session_id"
+            " ORDER BY a.id DESC LIMIT 20", (inc_id, generation, inc_id),
+        ):
+            item = dict(row)
+            detail = json.loads(item.pop("detail_json"))
+            item.update({"generation": generation, "command": str(detail.get("command") or "")[:300],
+                         "exec_state": detail.get("state") or "", "account_group": detail.get("ssh_account_group") or "",
+                         "account": detail.get("ssh_account") or "", "returncode": detail.get("returncode"),
+                         "timed_out": detail.get("timed_out"), "purpose": detail.get("purpose") or ""})
+            operations.append(item)
+        recovery = {"confirmed": False, "generation": generation, "recorded_at": None,
+                    "resolution_basis": data.get("resolution_basis") or "", "evidence": None}
+        for row in self.db.query(
+            "SELECT id,at,payload_json FROM events WHERE incident_id=? AND type='incident_resolved' ORDER BY id DESC",
+            (inc_id,),
+        ):
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+                evidence = payload.get("evidence")
+                if (int(payload.get("generation") or 0) != generation or not isinstance(evidence, dict)
+                        or int(evidence.get("generation") or 0) != generation or evidence.get("verdict") != "green"):
+                    continue
+            except (ValueError, TypeError, AttributeError):
+                continue
+            recovery.update({"confirmed": data.get("status") == "resolved" and data.get("outcome") == "recovered",
+                             "recorded_at": row["at"], "event_id": row["id"], "evidence": evidence})
+            break
+        legacy = self.db.query_one("SELECT * FROM ops_loop_state WHERE incident_id=?", (inc_id,))
+        data.update({"execution_mode": "session_host_exec", "host_exec": {"generation": generation, "operations": operations},
+                     "recovery": recovery, "native_task": None,
+                     "legacy_loop": {"retired": True, "active": False, "snapshot": dict(legacy) if legacy else None,
+                                     "same_generation": bool(legacy and int(legacy["generation"] or 1) == generation)}})
+        duty = self._duty()
+        if duty:
+            session = self.db.query_one(
+                "SELECT d.id FROM session_incidents si JOIN duty_sessions d ON d.id=si.session_id"
+                " WHERE si.incident_id=? AND si.generation=?"
+                " ORDER BY (d.deleted_at>0),(d.status='open') DESC,d.updated_at DESC LIMIT 1", (inc_id, generation))
+            if session:
+                data["native_task"] = {"session_id": session["id"], **duty.task_info(session["id"])}
+        return data
+
     async def api_loops(self, request: web.Request) -> web.Response:
-        """故障闭环：Incident 关联 Investigation / Action / Verification。"""
+        """Current incident evidence and session execution, with retired records marked as history."""
         sess = self._require_auth(request)
         limit = int(request.rel_url.query.get("limit", "50"))
         loops = self.incidents.list_closed_loops(limit=limit)
         visible = self._visible_asset_ids(sess)
-        loops = [loop for loop in loops if loop.get("asset_id") in visible]
+        loops = [self._incident_execution_view(loop) for loop in loops if loop.get("asset_id") in visible]
         return _json({"ok": True, "loops": loops})
 
     async def api_incident_detail(self, request: web.Request) -> web.Response:
@@ -2804,12 +2715,18 @@ class WebApp:
             return _json({"ok": False, "error": "not_found"}, 404)
         if inc.get("asset_id") not in self._visible_asset_ids(sess):
             return _json({"ok": False, "error": "permission_denied"}, 403)
+        inc = self._incident_execution_view(inc)
         # 附加人话摘要
         from .fmt import alert_name
 
         actions_list = inc.get("actions") or []
         last_action = actions_list[-1] if actions_list else None
         summary = self._incident_human_summary(inc, last_action)
+        if inc.get("status") != "open":
+            summary["why_human"] = ""
+            summary["suggestion"] = ("恢复证据已记录，可查看原生任务与执行记录。" if inc["recovery"]["confirmed"]
+                                     else "事件已关闭，未证实恢复。" if inc.get("status") == "closed"
+                                     else "事件已解决，请核对恢复证据与原生任务状态。")
         disposition = self._incident_disposition(inc)
         return _json({
             "ok": True,
@@ -2820,17 +2737,7 @@ class WebApp:
         })
 
     async def _council_snapshot(self, inc_id: str) -> dict:
-        try:
-            snapshot = self.legacy_history.snapshot(inc_id)
-            if not isinstance(snapshot, dict):
-                raise ValueError("invalid history snapshot")
-            return snapshot
-        except Exception:
-            log.warning("legacy autonomy history unavailable for incident %s", inc_id)
-            return {
-                "enabled": False, "retired": True, "read_only": True,
-                "status": "unavailable", "error": "legacy_history_unavailable",
-            }
+        return {"enabled": False, "retired": True, "read_only": True, "status": "retired"}
 
     def _council_visible_incident(self, request: web.Request, sess: dict) -> dict | web.Response:
         inc = self.incidents.get_incident(request.match_info["inc_id"])
@@ -2841,42 +2748,22 @@ class WebApp:
         return inc
 
     async def api_incident_council(self, request: web.Request) -> web.Response:
-        sess = self._require_auth(request)
-        inc = self._council_visible_incident(request, sess)
-        if isinstance(inc, web.Response):
-            return inc
-        return _json({"ok": True, "council": await self._council_snapshot(inc["id"])})
+        return _json({"ok": False, "error": "legacy_autonomy_retired", "retired": True,
+                      "message": "旧会审历史浏览已退役；必要历史数据可离线归档"}, 410)
 
     async def api_autonomy_providers(self, request: web.Request) -> web.Response:
-        self._require_admin(request)
-        return _json({
-            "ok": True, "config": self.legacy_history.public_config(),
-            "available": False, "retired": True, "read_only": True,
-        })
+        return _json({"ok": False, "error": "legacy_autonomy_retired", "retired": True}, 410)
 
     async def api_autonomy_providers_save(self, request: web.Request) -> web.Response:
-        sess = self._require_admin(request)
-        self._check_csrf(request, sess)
         return _legacy_autonomy_retired()
 
     async def api_autonomy_usage(self, request: web.Request) -> web.Response:
-        self._require_admin(request)
-        return _json({
-            "ok": True, "usage": self.legacy_history.usage_summary(),
-            "retired": True, "read_only": True,
-        })
+        return _json({"ok": False, "error": "legacy_autonomy_retired", "retired": True}, 410)
 
     async def api_autonomy_provider_verify(self, request: web.Request) -> web.Response:
-        sess = self._require_admin(request)
-        self._check_csrf(request, sess)
         return _legacy_autonomy_retired()
 
     async def api_council_manual_review(self, request: web.Request) -> web.Response:
-        sess = self._require_admin(request)
-        self._check_csrf(request, sess)
-        inc = self._council_visible_incident(request, sess)
-        if isinstance(inc, web.Response):
-            return inc
         return _legacy_autonomy_retired()
 
     def _incident_disposition(self, inc: dict) -> dict:
@@ -2947,7 +2834,7 @@ class WebApp:
         authority = None
         ref = pending[0] if pending else (actions_list[-1] if actions_list else None)
         if ref:
-            session_id = ActionService._action_session_id(ref)
+            session_id = str(ref.get("session_id") or ref.get("authority_session_id") or "")
             if session_id:
                 try:
                     authority = resolve_authority(self.db, session_id)
@@ -3083,45 +2970,17 @@ class WebApp:
         return _json({"ok": True, "outcome": res.get("outcome")})
 
     async def api_actions(self, request: web.Request) -> web.Response:
-        sess = self._require_auth(request)
-        q = request.rel_url.query
-        manual_only = q.get("manual", "") in ("1", "true", "yes")
-        visible = self._visible_asset_ids(sess)
-        all_actions = self.actions.list_actions(manual_only=manual_only)
-        # S10: 只返回调用者有权资产关联的操作
-        filtered = [a for a in all_actions if a.get("asset_id") in visible] if visible else []
-        return _json({
-            "ok": True,
-            "actions": filtered,
-        })
+        """旧结构化动作列表已退役；写入口为 host.exec + 统一审计。"""
+        self._require_auth(request)
+        return _json({"ok": True, "actions": [], "retired": True})
 
     async def api_action_detail(self, request: web.Request) -> web.Response:
-        sess = self._require_auth(request)
-        data = self.actions.get_action(request.match_info["aid"])
-        if not data:
-            return _json({"ok": False, "error": "not_found"}, 404)
-        if data.get("asset_id") not in self._visible_asset_ids(sess):
-            return _json({"ok": False, "error": "permission_denied"}, 403)
-        return _json({"ok": True, "action": data})
+        self._require_auth(request)
+        return _json({"ok": False, "error": "action_service_retired", "retired": True}, 410)
 
     async def api_action_propose(self, request: web.Request) -> web.Response:
-        sess = self._require_admin(request)
-        self._check_csrf(request, sess)
-        body = await request.json()
-        try:
-            res = self.actions.propose(
-                asset_id=body["asset_id"],
-                object_id=body["object_id"],
-                capability=body["capability"],
-                params=body.get("params") or {},
-                reason=body.get("reason", ""),
-                incident_id=body.get("incident_id", ""),
-                proposer_type="web_user",
-                proposer_id=sess["username"],
-            )
-        except (ActionError, KeyError, ValueError) as e:
-            return _json({"ok": False, "error": str(e)}, 400)
-        return _json({"ok": True, **res})
+        return _json({"ok": False, "error": "action_service_retired", "retired": True,
+                      "message": "结构化动作执行已退役；请通过 MiMoCode + host.exec 处置"}, 410)
 
     def _sensitive_totp(self, sess: dict, body: dict) -> dict[str, Any] | None:
         """敏感操作二次确认：已启用 TOTP 的用户必须提供有效验证码。
@@ -3149,141 +3008,24 @@ class WebApp:
         return None
 
     async def api_action_decision(self, request: web.Request) -> web.Response:
-        """Approve or reject one operation; persistent rule grants are retired."""
-        from .fmt import approval_error
-        sess = self._require_admin(request)
-        self._check_csrf(request, sess)
-        try:
-            body = await request.json()
-        except (ValueError, TypeError):
-            return _json({"ok": False, "error": "invalid_json", "message": "请求格式错误"}, 400)
-        if not isinstance(body, dict):
-            return _json({"ok": False, "error": "invalid_json", "message": "请求格式错误"}, 400)
-        decision = body.get("decision")
-        if decision == "allow_always":
-            return _json({"ok": False, "error": "legacy_permissions_retired", "retired": True,
-                          "message": "永久授权已停用，请在 Agent 设置或会话顶部调整审批模式。"}, 410)
-        if decision not in ("execute_once", "reject"):
-            return _json({"ok": False, "error": "invalid_decision", "message": "请选择执行一次或不执行"}, 400)
-        if decision != "reject":
-            mfa_err = self._sensitive_totp(sess, body)
-            if mfa_err:
-                return _json(mfa_err, 401)
-        try:
-            result = await ApprovalService(self.actions).decide(
-                decision, action_id=request.match_info["aid"],
-                actor_type="web_user", actor_id=sess["username"], channel="web",
-                is_admin=bool(sess.get("is_admin")), reason=str(body.get("reason") or ""),
-            )
-        except ActionError as e:
-            return _json({"ok": False, "error": e.code, "message": approval_error(e.code)}, 400)
-        return _json({"ok": True, **result})
+        return _json({"ok": False, "error": "action_service_retired", "retired": True,
+                      "message": "逐动作人工审批已删除"}, 410)
 
     async def api_action_approve(self, request: web.Request) -> web.Response:
-        sess = self._require_admin(request)
-        self._check_csrf(request, sess)
-        body = {}
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        mfa_err = self._sensitive_totp(sess, body)
-        if mfa_err:
-            return _json(mfa_err, 401)
-        execute = bool(body.get("execute", True))
-        reason = body.get("reason", "") or ""
-        try:
-            if execute:
-                res = await ApprovalService(self.actions).decide(
-                    "execute_once", action_id=request.match_info["aid"],
-                    actor_type="web_user",
-                    actor_id=sess["username"],
-                    channel="web",
-                    reason=reason,
-                    is_admin=bool(sess.get("is_admin")),
-                )
-            else:
-                res = self.actions.approve(
-                    request.match_info["aid"],
-                    approver_type="web_user",
-                    approver_id=sess["username"],
-                    channel="web",
-                    reason=reason,
-                )
-        except ActionError as e:
-            return _json({"ok": False, "error": str(e)}, 400)
-        return _json({"ok": True, **res})
+        return _json({"ok": False, "error": "action_service_retired", "retired": True}, 410)
 
     async def api_action_reject(self, request: web.Request) -> web.Response:
-        sess = self._require_admin(request)
-        self._check_csrf(request, sess)
-        body = {}
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        reason = body.get("reason", "") or ""
-        try:
-            res = await ApprovalService(self.actions).decide(
-                "reject", action_id=request.match_info["aid"],
-                actor_type="web_user",
-                actor_id=sess["username"],
-                channel="web",
-                reason=reason,
-            )
-        except ActionError as e:
-            return _json({"ok": False, "error": e.code, "message": str(e)}, 400)
-        return _json({"ok": True, **res})
+        return _json({"ok": False, "error": "action_service_retired", "retired": True}, 410)
 
     async def api_action_cancel(self, request: web.Request) -> web.Response:
-        sess = self._require_admin(request)
-        self._check_csrf(request, sess)
-        try:
-            self.actions.cancel(
-                request.match_info["aid"],
-                actor_type="web_user",
-                actor_id=sess["username"],
-                is_admin=bool(sess.get("is_admin")),
-            )
-        except ActionError as e:
-            return _json({"ok": False, "error": e.code, "message": str(e)}, 400)
-        return _json({"ok": True})
+        return _json({"ok": False, "error": "action_service_retired", "retired": True}, 410)
 
     async def api_action_execute(self, request: web.Request) -> web.Response:
-        sess = self._require_admin(request)
-        self._check_csrf(request, sess)
-        body = {}
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        mfa_err = self._sensitive_totp(sess, body)
-        if mfa_err:
-            return _json(mfa_err, 401)
-        try:
-            res = await self.actions.execute(
-                request.match_info["aid"],
-                actor_type="web_user",
-                actor_id=sess["username"],
-                is_admin=bool(sess.get("is_admin")),
-            )
-        except ActionError as e:
-            return _json({"ok": False, "error": e.code, "message": str(e)}, 400)
-        return _json({"ok": True, **res})
+        return _json({"ok": False, "error": "action_service_retired", "retired": True}, 410)
 
     async def api_action_verify(self, request: web.Request) -> web.Response:
-        sess = self._require_auth(request)
-        self._check_csrf(request, sess)
-        action = self.actions.get_action(request.match_info["aid"])
-        if not action:
-            return _json({"ok": False, "error": "not_found"}, 404)
-        if action.get("asset_id") not in self._visible_asset_ids(sess):
-            return _json({"ok": False, "error": "permission_denied"}, 403)
-        try:
-            res = await self.actions.verify(request.match_info["aid"])
-        except ActionError as e:
-            return _json({"ok": False, "error": str(e)}, 400)
-        return _json({"ok": True, **res})
+        return _json({"ok": False, "error": "action_service_retired", "retired": True,
+                      "message": "独立动作验证器已删除；恢复判断见 Incident 监控证据"}, 410)
 
     async def api_legacy_permissions_retired(self, request: web.Request) -> web.Response:
         """Old rule APIs cannot create grants after session authority migration."""
@@ -3935,6 +3677,53 @@ class WebApp:
         self._require_auth(request)
         return _json({"ok": True, "roles": self._require_ssh_store().list_roles()})
 
+    async def api_ssh_account_groups(self, request: web.Request) -> web.Response:
+        """账号组列表 + 各组已挂的 SSH 账号（端点）。"""
+        sess = self._require_auth(request)
+        store = self._require_ssh_store()
+        visible = self._visible_asset_ids(sess)
+        roles = store.list_roles()
+        endpoints = [ep for ep in store.list_endpoints() if ep.get("asset_id") in visible]
+        creds = {}
+        try:
+            for c in (self.cred_store.list_meta() if self.cred_store else []):
+                creds[str(c.get("id") or "")] = {
+                    "id": c.get("id"), "name": c.get("name"), "kind": c.get("kind"),
+                }
+        except Exception:
+            pass
+        groups = []
+        for r in roles:
+            name = str(r.get("name") or "")
+            members = []
+            for ep in endpoints:
+                if ep.get("role") != name:
+                    continue
+                members.append({
+                    "asset_id": ep.get("asset_id"),
+                    "host": ep.get("host"),
+                    "port": ep.get("port"),
+                    "username": ep.get("username"),
+                    "credential_id": ep.get("credential_id") or "",
+                    "credential": creds.get(str(ep.get("credential_id") or "")),
+                    "enabled": bool(ep.get("enabled")),
+                })
+            groups.append({
+                "name": name,
+                "label": r.get("label") or name,
+                "description": r.get("description") or "",
+                "kind": r.get("kind") or "custom",
+                "members": members,
+            })
+        return _json({
+            "ok": True,
+            "groups": groups,
+            "credentials": list(creds.values()),
+            "assets": [{"id": r["id"], "display_name": r["display_name"] or r["id"]}
+                       for r in self.db.query("SELECT id, display_name FROM assets WHERE enabled=1")],
+        })
+
+
     async def api_ssh_role_add(self, request: web.Request) -> web.Response:
         sess = self._require_admin(request)
         self._check_csrf(request, sess)
@@ -3942,13 +3731,106 @@ class WebApp:
         try:
             role = self._require_ssh_store().add_role(
                 name=body["name"],
-                kind=body.get("kind") or "read",
+                kind=body.get("kind") or "custom",
                 label=body.get("label") or "",
+                description=body.get("description") or "",
                 actor=sess["username"],
             )
         except Exception as e:
             return _json({"ok": False, "error": str(e)}, 400)
         return _json({"ok": True, "role": role})
+
+    async def api_ssh_account_add(self, request: web.Request) -> web.Response:
+        """把已有 SSH 账号（凭据）挂到账号组。
+
+        地址/端口沿用该主机已配置的 SSH 连接，不在此重复填写。
+        """
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        store = self._require_ssh_store()
+        asset_id = str(body.get("asset_id") or "")
+        group = str(body.get("group") or body.get("role") or "")
+        try:
+            with self.db.tx() as conn:
+                if not conn.in_transaction:
+                    conn.execute("BEGIN IMMEDIATE")
+                endpoints = [item for item in store.list_endpoints(asset_id) if item.get("enabled")]
+                existing = store.get_endpoint(asset_id, group)
+                address_source = existing or next(iter(endpoints), None)
+                host = str(body.get("host") or "").strip()
+                port = int(body.get("port") or 0)
+                if not host and address_source:
+                    host = str(address_source["host"])
+                    port = port or int(address_source.get("port") or 22)
+                if not host:
+                    row = conn.execute("SELECT host FROM assets WHERE id=?", (asset_id,)).fetchone()
+                    host = str(row["host"] or "") if row else ""
+                port = port or 22
+                if not host:
+                    return _json({"ok": False, "error": "host_unbound",
+                                  "message": "该主机还没有可用的 SSH 地址，请先在主机上配置连接"}, 400)
+                username = str(body.get("username") or (address_source or {}).get("username") or "root")
+                candidates = endpoints + ([existing] if existing and not existing.get("enabled") else [])
+                matches = [item for item in candidates if item["host"] == host
+                           and int(item["port"]) == port and item["username"] == username]
+                credential = str(body.get("credential_id") or "").strip()
+                if body.get("clear_credential"):
+                    credential = ""
+                    matches = []
+                elif not credential:
+                    # The group form's unchanged blank selection means reuse
+                    # the existing account, rather than erase its credential.
+                    credentials = {item["credential_id"] for item in matches if item["credential_id"]}
+                    if existing and existing in matches and existing.get("credential_id"):
+                        credential = existing["credential_id"]
+                    elif len(credentials) > 1:
+                        return _json({"ok": False, "error": "account_ambiguous",
+                                      "message": "此账号有多个凭据，请明确选择要挂入组的凭据。"}, 400)
+                    else:
+                        credential = next(iter(credentials), "")
+                matches = [item for item in matches if (item.get("credential_id") or "") == credential]
+                trusted = [item for item in matches if item.get("host_key_sha256")
+                           and item.get("host_key_trusted_at") and item.get("host_key_line")]
+                pins = {item["host_key_sha256"] for item in trusted}
+                ep = store.upsert_endpoint(
+                    asset_id=asset_id, role=group, host=host, port=port, username=username,
+                    credential_id=credential, actor=sess["username"],
+                )
+                if len(pins) == 1 and not ep.get("host_key_trusted_at"):
+                    source = trusted[0]
+                    ep = store.trust_host_key(asset_id, group, source["host_key_sha256"],
+                                              actor=sess["username"], key_line=source["host_key_line"])
+        except Exception as e:
+            return _json({"ok": False, "error": getattr(e, "code", "error"), "message": str(e)[:200]}, 400)
+        return _json({"ok": True, "endpoint": ep})
+
+    async def api_ssh_account_group_delete(self, request: web.Request) -> web.Response:
+        """删除账号组；组下主机账号会被解绑（端点记录删除）。"""
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        name = request.rel_url.query.get("name", "")
+        try:
+            self._require_ssh_store().delete_role(name, actor=sess["username"])
+        except Exception as e:
+            return _json({"ok": False, "error": getattr(e, "code", "error"), "message": str(e)[:200]}, 400)
+        return _json({"ok": True})
+
+    async def api_ssh_account_unassign(self, request: web.Request) -> web.Response:
+        """把主机账号从组里摘掉。"""
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await request.json()
+        try:
+            self._require_ssh_store().unassign_account(
+                asset_id=str(body.get("asset_id") or ""),
+                role=str(body.get("group") or body.get("role") or ""),
+                actor=sess["username"],
+            )
+        except Exception as e:
+            return _json({"ok": False, "error": getattr(e, "code", "error"), "message": str(e)[:200]}, 400)
+        return _json({"ok": True})
+
 
     async def api_ssh_endpoints(self, request: web.Request) -> web.Response:
         sess = self._require_auth(request)
@@ -3967,11 +3849,11 @@ class WebApp:
         try:
             ep = self._require_ssh_store().upsert_endpoint(
                 asset_id=body["asset_id"],
-                role=body.get("role") or "read",
+                role=body.get("role") or self._default_ssh_group(),
                 host=body["host"],
                 port=int(body.get("port") or 22),
                 username=body["username"],
-                credential_id=body.get("credential_id") or "",
+                credential_id=body.get("credential_id"),
                 actor=sess["username"],
             )
         except Exception as e:
@@ -4000,7 +3882,7 @@ class WebApp:
         try:
             ep = self._require_ssh_store().trust_host_key(
                 body["asset_id"],
-                body.get("role") or "read",
+                body.get("role") or self._default_ssh_group(),
                 body["host_key_sha256"],
                 actor=sess["username"],
                 key_line=body.get("host_key_line") or "",
@@ -4015,7 +3897,7 @@ class WebApp:
         body = await request.json()
         try:
             self._require_ssh_store().delete_endpoint(
-                body["asset_id"], body.get("role") or "read", actor=sess["username"]
+                body["asset_id"], body.get("role") or self._default_ssh_group(), actor=sess["username"]
             )
         except Exception as e:
             return _json({"ok": False, "error": str(e)}, 400)
@@ -4117,7 +3999,7 @@ class WebApp:
         return _json({"ok": True, **res})
 
     async def api_asset_channel_test(self, request: web.Request) -> web.Response:
-        """测当前实际使用的通道：SSH 或 NT，并明确通/不通与原因。"""
+        """测试指定账号组的 SSH 连接，缺少端点时不回退。"""
         sess = self._require_admin(request)
         self._check_csrf(request, sess)
         asset_id = request.match_info["asset_id"]
@@ -4126,8 +4008,7 @@ class WebApp:
             body = await request.json()
         except Exception:
             body = {}
-        role = str(body.get("role") or "write")
-        want_write = role not in ("read",)
+        role = str(body.get("role") or self._default_ssh_group())
 
         eps = []
         if self.ssh_store:
@@ -4135,16 +4016,7 @@ class WebApp:
                 eps = [e for e in self.ssh_store.list_endpoints(asset_id) if e.get("enabled")]
             except Exception:
                 eps = []
-        ssh_ep = None
-        for e in eps:
-            if want_write and e.get("role") not in ("read",):
-                ssh_ep = e
-                break
-            if not want_write:
-                ssh_ep = e
-                break
-        if not ssh_ep and eps:
-            ssh_ep = eps[0]
+        ssh_ep = next((ep for ep in eps if ep.get("role") == role), None)
 
         has_credential = bool(ssh_ep and ssh_ep.get("credential_id"))
         auth_method = "none"
@@ -4156,6 +4028,7 @@ class WebApp:
                 auth_method = "unknown"
         result: dict[str, Any] = {
             "asset_id": asset_id,
+            "account_group": role,
             "channel": "none",
             "ok": False,
             "ssh_configured": bool(ssh_ep),
@@ -4283,7 +4156,7 @@ class WebApp:
         self._check_csrf(request, sess)
         body = await request.json()
         asset_id = str(body.get("asset_id") or "").strip()
-        role = str(body.get("role") or "write")
+        role = str(body.get("role") or self._default_ssh_group())
         delete_password = bool(body.get("delete_password", True))
         # 明确「信任并更换」：未信任也可一步完成；未勾选则仍拒绝（安全边界）
         trust_and_rotate = bool(body.get("trust_host_key", False))
@@ -4296,8 +4169,6 @@ class WebApp:
         except Exception as e:
             return _json({"ok": False, "error": f"endpoints: {e}"}, 400)
         ep = next((e for e in eps if e.get("role") == role and e.get("enabled")), None)
-        if not ep and eps:
-            ep = next((e for e in eps if e.get("enabled")), None)
         if not ep:
             return _json({
                 "ok": False,
@@ -4419,7 +4290,7 @@ class WebApp:
             )
             try:
                 tr = SSHTransport(self._require_ssh_store(), self._cred_store())
-                verify = await tr.test_connection(ep["asset_id"], "write")
+                verify = await tr.test_connection(ep["asset_id"], ep["role"])
             except Exception as e:
                 verify = {"ok": False, "error": str(e)[:300]}
             if not verify.get("ok"):
@@ -4526,11 +4397,13 @@ class WebApp:
             return _json({"ok": False, "error": "terminal_unavailable"}, 503)
 
         eps = self.ssh_store.list_endpoints(asset_id) if self.ssh_store else []
-        ep = next((e for e in eps if e.get("enabled")), None)
+        group = request.rel_url.query.get("role") or self._default_ssh_group()
+        ep = next((e for e in eps if e.get("role") == group and e.get("enabled")), None)
         if not ep:
             return _json({
                 "ok": False,
                 "can_open": False,
+                "account_group": group,
                 "detail": "no_ssh_endpoint",
                 "hint": "未配置 SSH，请先在连接页配置地址与密码/密钥。",
             })
@@ -4538,6 +4411,7 @@ class WebApp:
             return _json({
                 "ok": False,
                 "can_open": False,
+                "account_group": group,
                 "detail": "no_credential",
                 "hint": "未配置密码或密钥，无法打开终端。",
             })
@@ -4556,6 +4430,7 @@ class WebApp:
 
         base = {
             "asset_id": asset_id,
+            "account_group": group,
             "host": ep.get("host"),
             "port": ep.get("port"),
             "remote_user": ep.get("username"),
@@ -4633,7 +4508,7 @@ class WebApp:
         try:
             tsess, info = await self.terminal.create(
                 asset_id=asset_id,
-                role=request.rel_url.query.get("role") or "write",
+                role=request.rel_url.query.get("role") or None,
                 username=username,
                 cols=cols,
                 rows=rows,
@@ -4748,13 +4623,13 @@ class WebApp:
         body = await request.json()
         try:
             tr = SSHTransport(self._ssh_store(), self._cred_store())
-            res = await tr.test_connection(body["asset_id"], body.get("role") or "read")
+            res = await tr.test_connection(body["asset_id"], body.get("role") or None)
             self.db.audit(
                 "web_user",
                 sess["username"],
                 "ssh_test",
                 asset_id=body.get("asset_id") or "",
-                detail={"ok": res.get("ok"), "role": body.get("role") or "read"},
+                detail={"ok": res.get("ok"), "role": body.get("role") or self._default_ssh_group()},
             )
         except Exception as e:
             return _json({"ok": False, "error": str(e)}, 400)
@@ -5100,7 +4975,7 @@ class WebApp:
 
     def _ne_transport(self, asset_id: str):
         """Node Exporter 通道：有 SSH 端点用 SSH；仅本机资产才允许 LocalExec。SSH 失败不得回退。"""
-        from .promconfig import LocalExecTransport
+        from .transport import ChannelUnavailable, TransportError, resolve_exec_channel
 
         local_assets = set(
             str(x).strip()
@@ -5109,22 +4984,12 @@ class WebApp:
             )
             if str(x).strip()
         )
-        # 也允许 config 显式登记的本机资产
-        ssh = self.transport
-        store = self._ssh_store() if ssh is not None else None
-        ep = None
-        if store is not None:
-            try:
-                ep = store.get_endpoint(asset_id, "read") or store.get_endpoint(asset_id, "write")
-            except Exception:
-                ep = None
-        if ep:
-            return ssh
-        if asset_id in local_assets:
-            return LocalExecTransport()
-        raise web.HTTPForbidden(
-            text=json.dumps({"error": "asset_channel_unavailable", "asset_id": asset_id})
-        )
+        try:
+            return resolve_exec_channel(asset_id, self.transport, local_assets=local_assets)
+        except (ChannelUnavailable, TransportError) as exc:
+            raise web.HTTPForbidden(text=json.dumps({
+                "error": getattr(exc, "code", "asset_channel_unavailable"), "asset_id": asset_id,
+            })) from exc
 
     def _json_bool(self, body: dict, key: str, default: bool = False) -> bool:
         v = body.get(key, default)

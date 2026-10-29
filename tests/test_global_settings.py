@@ -1,4 +1,4 @@
-"""全局设置与一键接入 Prometheus 前置检查。"""
+﻿"""全局设置与一键接入 Prometheus 前置检查。"""
 from __future__ import annotations
 
 import json
@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ayana.auth import AuthService
 from ayana.db import Database
-from ayana.policy import Policy
+from ayana.access import AccessControl as Policy
 from ayana.web import SESSION_COOKIE, WebApp
 
 

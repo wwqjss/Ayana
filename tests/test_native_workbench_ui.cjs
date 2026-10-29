@@ -90,10 +90,11 @@ function environment(reply) {
   let nextTimer = 0;
   const defaultReply = call => {
     if (call.url.includes("/sessions?")) return { ok: true, sessions };
+    if (call.url === "/api/agent/settings") return {ok:true,settings:{ssh_default_group:"default",archive_delay_sec:300},ssh_roles:[{name:"default",label:"默认"},{name:"ops",label:"运维"}],ssh_endpoints:[]};
     if (call.url.endsWith("/terminal/control")) return { ok: true };
     if (call.url.endsWith("/terminal")) return call.method === "POST" ? { ok: true, binding: {} } : { ok: true, attached: false, binding: null, released_at: 0, last_capture: "" };
     const sid = call.url.split("/").pop();
-    return { ok: true, session: { ...sessions.find(s => s.id === sid), remote_session_id: "ses_" + sid }, effective_permissions:{session_id:sid,access_mode:"readwrite",approval_mode:"manual",revision:1}, incidents: [], can_control: true, can_prepare: true };
+    return { ok: true, session: { ...sessions.find(s => s.id === sid), remote_session_id: "ses_" + sid }, effective_permissions:{session_id:sid,ssh_account_group:"default",ssh_account_group_source:"global",revision:1}, incidents: [], can_control: true, can_prepare: true };
   };
   const window = {
     isSecureContext: false, atob: text => Buffer.from(text, "base64").toString("binary"),
@@ -167,7 +168,7 @@ test("transport-ready waits for real native bytes before claiming a rendered con
   assert.equal(env.nodes.get("aw-term-status").textContent, "等待原生画面");
   assert.equal(env.nodes.get("aw-term-status").classList.contains("ready"), false);
   env.paint();
-  assert.equal(env.nodes.get("aw-term-status").textContent, "观察·读写");
+  assert.equal(env.nodes.get("aw-term-status").textContent, "观察 · 默认");
   assert.equal(env.nodes.get("aw-term-notice").classList.contains("hidden"), true);
   assert.equal(env.terminals[0].output.length, 1);
 });
@@ -187,7 +188,7 @@ test("native screen becomes ready only after the terminal parser commits visible
   assert.equal(env.nodes.get("aw-term-status").textContent, "等待原生画面");
   assert.equal(env.nodes.get("aw-term-notice").classList.contains("hidden"), false);
   terminal.completeWrites();
-  assert.equal(env.nodes.get("aw-term-status").textContent, "观察·读写");
+  assert.equal(env.nodes.get("aw-term-status").textContent, "观察 · 默认");
   assert.equal(env.nodes.get("aw-term-notice").classList.contains("hidden"), true);
   assert.equal(env.timeouts.size, 0);
 });
@@ -199,7 +200,7 @@ test("a pending parser callback from the old terminal cannot mark a new selectio
   assert.equal(env.nodes.get("aw-term-status").textContent, "等待原生画面");
   assert.equal(env.nodes.get("aw-term-notice").classList.contains("hidden"), false);
   env.paint();
-  assert.equal(env.nodes.get("aw-term-status").textContent, "观察·读写");
+  assert.equal(env.nodes.get("aw-term-status").textContent, "观察 · 默认");
 });
 test("fit, onResize and host observation send each distinct geometry once", async () => {
   const env = environment(); await env.window.renderAgentWorkbench(); await env.attach(); env.ready();
@@ -260,7 +261,7 @@ test("old socket output and keyboard callbacks cannot cross into another session
   handlers.message({ data: new Uint8Array([65]).buffer }); handlers.close({ code: 4403 }); handlers.error();
   assert.equal(terminal.disposed, true);
   assert.equal(env.terminals[1].output.length, 1);
-  assert.equal(env.nodes.get("aw-term-status").textContent, "观察·读写");
+  assert.equal(env.nodes.get("aw-term-status").textContent, "观察 · 默认");
   assert.equal(old.sent.map(JSON.parse).filter(v => v.type === "input").length, 0);
 });
 test("late session details never overwrite a more recent selection", async () => {
@@ -308,7 +309,7 @@ test("late control grant after switching cannot enable keyboard in the new sessi
   pending.resolve({ ok: true }); await grant;
   env.terminals[1].data("blocked-after-stale-grant\r");
   assert.equal(env.sockets[1].sent.map(JSON.parse).filter(item => item.type === "input").length, 0);
-  assert.equal(env.nodes.get("aw-term-status").textContent, "观察·读写");
+  assert.equal(env.nodes.get("aw-term-status").textContent, "观察 · 默认");
 });
 test("archived history attaches read-only without silently reopening a session", async () => {
   const env = environment((call, normal) => {
@@ -359,38 +360,51 @@ test("new manual sessions collect only a title and start tasks inside the native
   await env.attach();
   assert.equal(new URL(env.sockets.at(-1).url).searchParams.get("session_id"), "sess_b");
 });
-test("approval retains the exact action and OTP while duplicate clicks submit once", async () => {
+test("unknown write adjudication retains the exact operation and evidence while duplicate clicks submit once", async () => {
   const pending = deferred();
   const env = environment((call, normal) => {
-    if (call.url === "/api/actions/action-a/decision") return pending.promise;
+    if (call.url === "/api/agent/write-ops/write-a/adjudicate") return pending.promise;
     const result = normal(call);
-    if (call.url === "/api/agent/sessions/sess_a") result.pending_actions = [{ id: "action-a", capability: "service.restart", object_id: "mysql" }];
+    if (call.url === "/api/agent/sessions/sess_a") result.pending_write_results = [{ id: "write-a", target: "mysql", status: "unknown" }];
     return result;
   });
   await env.window.renderAgentWorkbench(); await env.attach();
-  const approve = env.nodes.get("aw-pending").querySelectorAll("button").find(b => b.textContent === "批准并执行");
-  env.prompts.push("123456");
-  const first = approve.click(); await approve.click();
-  const requests = env.calls.filter(c => c.url === "/api/actions/action-a/decision");
+  const adjudicate = env.nodes.get("aw-results").querySelectorAll("button").find(b => b.textContent === "已执行");
+  env.prompts.push("已核对目标主机日志");
+  const first = adjudicate.click(); await adjudicate.click();
+  const requests = env.calls.filter(c => c.url === "/api/agent/write-ops/write-a/adjudicate");
   assert.equal(requests.length, 1);
-  assert.deepEqual(requests[0].body, { decision: "execute_once", totp: "123456" });
+  assert.deepEqual(requests[0].body, { outcome: "executed", reason: "已核对目标主机日志" });
   pending.resolve({ ok: true }); await first;
 });
-test("read-only viewers can inspect pending approvals without action buttons becoming active", async () => {
+test("read-only viewers can inspect unknown writes without adjudication buttons becoming active", async () => {
   const env = environment((call, normal) => {
     const result = normal(call);
     if (call.url === "/api/agent/sessions/sess_a") {
       result.can_prepare = result.can_control = false;
-      result.pending_actions = [{ id: "action-a", capability: "service.restart" }];
+      result.pending_write_results = [{ id: "write-a", status: "unknown" }];
     }
     return result;
   });
   await env.window.renderAgentWorkbench(); await env.attach();
-  const buttons = env.nodes.get("aw-pending").querySelectorAll("button");
-  assert.equal(buttons.length, 2);
+  const buttons = env.nodes.get("aw-results").querySelectorAll("button");
+  assert.equal(buttons.length, 3);
   assert.ok(buttons.every(b => b.disabled));
   await buttons[0].click();
-  assert.equal(env.calls.some(c => c.url.includes("/api/actions/")), false);
+  assert.equal(env.calls.some(c => c.url.includes("/adjudicate")), false);
+});
+test("retired approval data cannot recreate action or write approval controls", async () => {
+  const env = environment((call, normal) => {
+    const result = normal(call);
+    if (call.url === "/api/agent/sessions/sess_a") {
+      result.pending_actions = [{id:"action-a"}]; result.pending_writes = [{action_key:"old-write"}];
+    }
+    return result;
+  });
+  await env.window.renderAgentWorkbench();
+  assert.equal(html.includes('id="aw-pending"'),false);
+  assert.equal(env.nodes.get("aw-results").querySelectorAll("button").length,0);
+  assert.equal(env.calls.some(call => call.url.includes("/api/actions/") || call.url.includes("pending-writes")),false);
 });
 test("control revocation immediately disables the original native keyboard", async () => {
   const env = environment(); await env.window.renderAgentWorkbench(); await env.attach(); env.ready(); env.paint();
@@ -423,46 +437,59 @@ test("observers return only the native queried DECRPM modes and valid status val
   assert.deepEqual(socket.sent.map(JSON.parse), reports);
   assert.equal(env.calls.some(call => call.url.endsWith("/terminal/control")), false);
 });
-test("observer shows actual access with both permission controls disabled", async () => {
-  const env=environment();await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();
-  assert.equal(env.nodes.get("aw-term-status").textContent,"观察·读写");
-  assert.equal(env.nodes.get("aw-access-mode").disabled,true);
-  assert.equal(env.nodes.get("aw-approval-mode").disabled,true);
-  const before=env.calls.length;await env.nodes.get("aw-access-mode").click();assert.equal(env.calls.length,before);
+test("observers can choose the session account group without starting or taking over a native task", async () => {
+  let env;env=environment(call=>call.url.endsWith("/account-group") ? {ok:true,group:"ops",effective_permissions:{session_id:"sess_a",ssh_account_group:"ops",ssh_account_group_source:"session",revision:2}} : env.defaultReply(call));
+  await env.window.renderAgentWorkbench();
+  const select=env.nodes.get("aw-account-group");
+  assert.equal(select.disabled,false);
+  assert.ok(select.children.some(option=>option.value==="" && option.textContent==="跟随默认（默认）"));
+  assert.ok(select.children.some(option=>option.value==="ops" && option.textContent==="运维"));
+  select.value="ops";await select.onchange();
+  assert.deepEqual(env.calls.find(call=>call.url.endsWith("/account-group")).body,{group:"ops"});
+  assert.equal(select.value,"ops");
+  assert.equal(env.sockets.length,0);
+  assert.equal(env.calls.some(call=>call.url.endsWith("/terminal/control") || call.url.endsWith("/prompt") || call.url.endsWith("/recover")),false);
+  assert.equal(html.includes('id="aw-access-mode"'),false);assert.equal(html.includes('id="aw-approval-mode"'),false);
 });
-test("takeover inherits and permission toggle waits for confirmed response", async () => {
+test("account group changes wait for confirmation and leave native control untouched", async () => {
   const pending=deferred();let env;
-  env=environment(call=>call.url.endsWith("/permissions") ? pending.promise : env.defaultReply(call));
-  await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();await env.nodes.get("aw-term-acquire").click();
-  assert.equal(env.nodes.get("aw-term-status").textContent,"控制中·读写");
-  const operation=env.nodes.get("aw-access-mode").click();await flush();
-  assert.equal(env.nodes.get("aw-access-mode").textContent,"读写");
-  assert.equal(env.nodes.get("aw-access-mode").disabled,true);
-  const call=env.calls.find(c=>c.url.endsWith("/permissions"));
-  assert.equal(call.body.access_mode,"readonly");
-  pending.resolve({ok:true,effective_permissions:{session_id:"sess_a",access_mode:"readonly",approval_mode:"manual",revision:2}});await operation;
-  assert.equal(env.nodes.get("aw-term-status").textContent,"控制中·只读");
+  env=environment(call=>call.url.endsWith("/account-group") ? pending.promise : env.defaultReply(call));
+  await env.window.renderAgentWorkbench();await env.attach();env.ready();env.paint();
+  const select=env.nodes.get("aw-account-group");select.value="ops";const operation=select.onchange();await flush();
+  assert.equal(select.value,"");assert.equal(select.disabled,true);
+  pending.resolve({ok:true,group:"ops",effective_permissions:{session_id:"sess_a",ssh_account_group:"ops",ssh_account_group_source:"session",revision:2}});await operation;
+  assert.equal(env.nodes.get("aw-term-status").textContent,"观察 · 运维");assert.equal(select.value,"ops");
+  assert.equal(env.calls.some(call=>call.url.endsWith("/permissions") || call.url.endsWith("/terminal/control")),false);
 });
-test("permission failure keeps backend mode and exposes reason", async () => {
-  let env;env=environment(call=>call.url.endsWith("/permissions") ? {ok:false,message:"控制权已过期",effective_permissions:{session_id:"sess_a",access_mode:"readwrite",approval_mode:"manual",revision:2}} : env.defaultReply(call));
-  await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();await env.nodes.get("aw-term-acquire").click();await env.nodes.get("aw-access-mode").click();
-  assert.equal(env.nodes.get("aw-access-mode").textContent,"读写");
-  assert.equal(env.nodes.get("aw-task-feedback").textContent,"控制权已过期");
-  assert.equal(env.nodes.get("aw-term-notice").classList.contains("hidden"),true);
+test("an account-group rejection keeps the confirmed group and exposes its reason", async () => {
+  let env;env=environment(call=>call.url.endsWith("/account-group") ? {ok:false,message:"该账号组不存在"} : env.defaultReply(call));
+  await env.window.renderAgentWorkbench();await env.attach();env.ready();env.paint();
+  const select=env.nodes.get("aw-account-group");select.value="ops";await select.onchange();
+  assert.equal(select.value,"");assert.equal(env.nodes.get("aw-task-feedback").textContent,"该账号组不存在");
+  assert.equal(env.nodes.get("aw-term-status").textContent,"观察 · 默认");
 });
-test("late permission response cannot change another session", async () => {
-  const pending=deferred();let env;env=environment(call=>call.url.endsWith("/permissions") ? pending.promise : env.defaultReply(call));
-  await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();await env.nodes.get("aw-term-acquire").click();
-  const operation=env.nodes.get("aw-access-mode").click();await flush();await env.select("sess_b"); await env.attach();env.ready();env.paint();
-  pending.resolve({ok:true,effective_permissions:{session_id:"sess_a",access_mode:"readonly",approval_mode:"automatic",revision:99}});await operation;
-  assert.equal(env.nodes.get("aw-term-status").textContent,"观察·读写");assert.equal(env.nodes.get("aw-access-mode").disabled,true);
+test("a late account-group response cannot change another selected session", async () => {
+  const pending=deferred();let env;env=environment(call=>call.url.endsWith("/account-group") ? pending.promise : env.defaultReply(call));
+  await env.window.renderAgentWorkbench();const select=env.nodes.get("aw-account-group");select.value="ops";
+  const operation=select.onchange();await flush();await env.select("sess_b");await env.attach();env.ready();env.paint();
+  pending.resolve({ok:true,group:"ops",effective_permissions:{session_id:"sess_a",ssh_account_group:"ops",ssh_account_group_source:"session",revision:99}});await operation;
+  assert.equal(env.nodes.get("aw-term-status").textContent,"观察 · 默认");assert.equal(select.value,"");assert.equal(select.disabled,false);
 });
-test("release and heartbeat adopt restored backend permissions", async () => {
-  let env;env=environment(call=>call.url.endsWith("/terminal/control") && call.body.action==="release" ? {ok:true,effective_permissions:{session_id:"sess_a",access_mode:"readonly",approval_mode:"manual",revision:3}} : env.defaultReply(call));
-  await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();await env.nodes.get("aw-term-acquire").click();await env.nodes.get("aw-term-release").click();
-  assert.equal(env.nodes.get("aw-term-status").textContent,"观察·只读");assert.equal(env.nodes.get("aw-access-mode").disabled,true);
-  env.sockets[0].onmessage({data:JSON.stringify({type:"control",control:false,effective_permissions:{session_id:"sess_a",access_mode:"readwrite",approval_mode:"automatic",revision:4}})});
-  assert.equal(env.nodes.get("aw-term-status").textContent,"观察·读写");assert.equal(env.nodes.get("aw-approval-mode").value,"automatic");
+test("release and heartbeat show the account group without reintroducing old permission tiers", async () => {
+  let env;env=environment(call=>call.url.endsWith("/terminal/control") && call.body.action==="release" ? {ok:true,effective_permissions:{session_id:"sess_a",ssh_account_group:"ops",ssh_account_group_source:"session",revision:3}} : env.defaultReply(call));
+  await env.window.renderAgentWorkbench();await env.attach();env.ready();env.paint();await env.nodes.get("aw-term-acquire").click();await env.nodes.get("aw-term-release").click();
+  assert.equal(env.nodes.get("aw-term-status").textContent,"观察 · 运维");assert.equal(env.nodes.get("aw-account-group").value,"ops");
+  env.sockets[0].onmessage({data:JSON.stringify({type:"control",control:false,effective_permissions:{session_id:"sess_a",ssh_account_group:"ops",ssh_account_group_source:"global",revision:4}})});
+  assert.equal(env.nodes.get("aw-account-group").value,"");
+  assert.equal(env.nodes.get("aw-account-group").children[0].textContent,"跟随默认（运维）");
+});
+test("a detail request started before a group change cannot restore the old selection", async () => {
+  const pending=deferred();let hold=false,env;
+  env=environment(call=>call.url.endsWith("/account-group") ? {ok:true,group:"ops",effective_permissions:{session_id:"sess_a",ssh_account_group:"ops",ssh_account_group_source:"session",revision:2}} : hold && call.url==="/api/agent/sessions/sess_a" ? pending.promise : env.defaultReply(call));
+  await env.window.renderAgentWorkbench();hold=true;
+  const request=pollCallback(env)();await flush();const select=env.nodes.get("aw-account-group");select.value="ops";await select.onchange();
+  pending.resolve(env.defaultReply({url:"/api/agent/sessions/sess_a"}));await request;
+  assert.equal(select.value,"ops");assert.equal(env.window.agentWorkbenchState.permissions.ssh_account_group,"ops");
 });
 test("backend task state is separate from open session and heartbeat does not erase a queue acknowledgment", async () => {
   const env=environment();await env.window.renderAgentWorkbench(); await env.attach();env.ready();env.paint();
@@ -564,26 +591,24 @@ test("lifecycle rejection keeps the selected session and makes the backend reaso
   assert.equal(env.nodes.get("aw-task-feedback").textContent,"结果待核对，未暂停任务");
   assert.equal(env.nodes.get("aw-pause-duty").disabled,false);
 });
-test("Agent settings separates permission and approval and shows actual role fallback accounts", async () => {
+test("Agent settings has one global group and compact per-host account rows", async () => {
   let env;env=environment(call=>{
     if(call.url==="/api/agent/settings"){
       if(call.method==="POST")return {ok:true,settings:call.body};
-      return {ok:true,settings:{auto_access_mode:"readonly",auto_approval_mode:"automatic",ssh_investigate_role:"read",ssh_execute_role:"write",archive_delay_sec:300},ssh_roles:[{name:"read",kind:"read"},{name:"write",kind:"write"},{name:"root-ops",kind:"write"}],ssh_endpoints:[{asset_id:"host",role:"write",username:"root",host:"host.example",enabled:true},{asset_id:"host",role:"root-ops",username:"operator",host:"host.example",enabled:true}]};
+      return {ok:true,settings:{ssh_default_group:"default",archive_delay_sec:300},ssh_roles:[{name:"default",label:"默认"},{name:"ops",label:"运维"}],ssh_endpoints:[{asset_id:"host",role:"default",username:"root",host:"host.example",enabled:true},{asset_id:"host",role:"ops",username:"operator",host:"host.example",enabled:true},{asset_id:"another",role:"default",username:"root",host:"other.example",enabled:true}]};
     }
     return env.defaultReply(call);
   });
-  await env.window.renderAgentWorkbench(); await env.attach();await env.nodes.get("aw-settings-btn").click();
-  const wrap=env.modals.at(-1).children[0],access=modalNode(env,"agent-auto-access"),approval=modalNode(env,"agent-auto-approval");
-  assert.equal(access.value,"readonly");assert.equal(approval.value,"automatic");
-  assert.ok(wrap.textContent.includes("root@host.example · 回退至 write"));
-  for(const id of ["agent-ssh-investigate","agent-ssh-execute"])assert.ok(modalNode(env,id).children.some(option=>option.value==="root-ops"));
-  await access.children[1].click();await approval.children[0].click();
-  modalNode(env,"agent-ssh-investigate").value="root-ops";modalNode(env,"agent-ssh-investigate").onchange();
-  modalNode(env,"agent-ssh-execute").value="read";
+  await env.window.renderAgentWorkbench();await env.nodes.get("aw-settings-btn").click();
+  const wrap=env.modals.at(-1).children[0],group=modalNode(env,"agent-ssh-default");
+  assert.equal(group.value,"default");assert.equal(modalNode(env,"agent-ssh-investigate"),null);assert.equal(modalNode(env,"agent-ssh-execute"),null);
+  assert.ok(group.children.some(option=>option.value==="ops"));group.value="ops";group.onchange();
+  assert.ok(wrap.textContent.includes("operator@host.example"));assert.ok(wrap.textContent.includes("未加入此账号组"));
+  const list=nested(wrap,node=>node.className==="aw-account-list");assert.equal(list.children.length,2);assert.ok(list.children.every(row=>row.className==="aw-account-row"));
   const preset=modalNode(env,"agent-archive-preset");preset.value="custom";preset.onchange();modalNode(env,"agent-archive-custom").value="217";
   await modalButton(env,"保存设置").click();
   const saved=env.calls.find(call=>call.url==="/api/agent/settings"&&call.method==="POST");
-  assert.deepEqual(saved.body,{auto_access_mode:"readwrite",auto_approval_mode:"manual",archive_delay_sec:217,ssh_investigate_role:"root-ops",ssh_execute_role:"read"});
+  assert.deepEqual(saved.body,{archive_delay_sec:217,ssh_default_group:"ops"});
   assert.ok(wrap.textContent.includes("已保存并生效"));
 });
 test("settings cancellation does not save and invalid custom delay stays inline", async () => {
@@ -598,7 +623,7 @@ test("settings prevents edits and duplicate saves while awaiting the backend and
   const pending=deferred();let env;env=environment(call=>call.url==="/api/agent/settings"?(call.method==="POST"?pending.promise:{ok:true,settings:{archive_delay_sec:300},ssh_roles:[{name:"read"},{name:"write"}]}):env.defaultReply(call));
   await env.window.renderAgentWorkbench(); await env.attach();await env.nodes.get("aw-settings-btn").click();
   const save=modalButton(env,"保存设置"),operation=save.click();await flush();
-  assert.equal(modalNode(env,"agent-ssh-investigate").disabled,true);assert.equal(modalNode(env,"agent-auto-access").children[0].disabled,true);
+  assert.equal(modalNode(env,"agent-ssh-default").disabled,true);
   await save.click();assert.equal(env.calls.filter(call=>call.url==="/api/agent/settings"&&call.method==="POST").length,1);
   pending.resolve({ok:false,error:"configured_ssh_endpoint_missing",message:"该角色端点尚未配置"});await operation;
   assert.ok(env.modals.at(-1).children[0].textContent.includes("该角色端点尚未配置"));assert.equal(save.disabled,false);

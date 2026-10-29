@@ -38,6 +38,63 @@ def normalise_object(conn, asset_id: str, object_id: str) -> str:
     return str(row["id"]) if row else object_id
 
 
+def resolve_incident_write_scope(db: Any, session_id: str, asset_id: str, *,
+                                 incident_id: str = "", conn=None) -> dict:
+    """Bind a write to trusted participation, never to an arbitrary model ID."""
+    with _snapshot(db, conn) as current:
+        session = current.execute("SELECT origin FROM duty_sessions WHERE id=?", (session_id,)).fetchone()
+        if session is None:
+            raise WorkScopeError("session_unavailable")
+        manual = session["origin"] == "manual"
+        rows = [dict(row) for row in current.execute(
+            "SELECT i.id AS incident_id,i.asset_id,i.status,i.generation,si.generation AS joined_generation "
+            "FROM session_incidents si JOIN incidents i ON i.id=si.incident_id WHERE si.session_id=?",
+            (session_id,)).fetchall()]
+        related = [row for row in rows if row["asset_id"] == asset_id]
+        open_related = [row for row in related if row["status"] == "open"]
+        if incident_id:
+            selected = next((row for row in rows if row["incident_id"] == incident_id), None)
+            if selected is None:
+                raise WorkScopeError("incident_session_mismatch", {
+                    "incident_id": incident_id, "session_id": session_id,
+                    "next_tool": "ayana_session_claim", "message": "请先在当前会话关联该工单。"})
+            if selected["asset_id"] != asset_id:
+                raise WorkScopeError("incident_asset_mismatch", {"incident_id": incident_id, "asset_id": asset_id})
+            if selected["status"] != "open":
+                standalone = manual and not open_related
+                raise WorkScopeError("incident_not_open", {
+                    "incident_id": incident_id, "status": selected["status"],
+                    "can_run_standalone": standalone,
+                    "next_action": "omit_incident_id" if standalone else "select_open_incident" if open_related else "use_manual_session",
+                    "message": ("该工单已关闭；省略 incident_id 可在当前手动会话执行独立任务，历史记录和幂等保护继续保留。"
+                                if standalone else "该工单已关闭，请选择仍未关闭的关联工单。" if open_related
+                                else "该工单已关闭，自动会话不能转为独立写任务；请使用手动会话处理后续任务。")})
+            candidates = [selected]
+        else:
+            candidates = open_related
+            if not candidates and related and not manual:
+                raise WorkScopeError("incident_not_open", {
+                    "incident_ids": [row["incident_id"] for row in related], "can_run_standalone": False,
+                    "next_action": "use_manual_session",
+                    "message": "关联工单已关闭，自动会话不能转为独立写任务；请使用手动会话处理后续任务。"})
+        stale = [row for row in candidates if int(row["generation"] or 1) != int(row["joined_generation"] or 1)]
+        if stale:
+            raise WorkScopeError("incident_generation_stale", {
+                "incident_ids": [row["incident_id"] for row in stale], "next_tool": "ayana_session_claim",
+                "associations": [{"incident_id": row["incident_id"], "status": row["status"],
+                                  "association_generation": int(row["joined_generation"] or 1),
+                                  "current_generation": int(row["generation"] or 1)} for row in stale],
+                "message": "未关闭工单的关联代次已过期，请先调用 session.claim 刷新关联，再继续处置。"})
+        if len(candidates) > 1:
+            raise WorkScopeError("incident_scope_required", {
+                "candidate_incident_ids": sorted(row["incident_id"] for row in candidates),
+                "message": "当前主机关联多个工单，请用 incident_id 明确本次写操作所属工单。"})
+        if candidates:
+            return {"incident_id": candidates[0]["incident_id"],
+                    "generation": int(candidates[0]["generation"] or 1), "scope": "incident"}
+        return {"incident_id": "", "generation": 0, "scope": "session"}
+
+
 def session_has_work(db: Any, session_id: str, *, conn=None) -> bool:
     """Native uncertainty and dispatched writes remain owners until reconciled."""
     with _snapshot(db, conn) as current:

@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ayana.auth import AuthError, AuthService
 from ayana.db import Database
-from ayana.policy import Policy
+from ayana.access import AccessControl as Policy
 from ayana.web import SESSION_COOKIE, WebApp
 
 
@@ -191,11 +191,10 @@ class SetupRegisterApiTests(unittest.IsolatedAsyncioTestCase):
                 }
             )
         )
-        row = self.db.query_one(
-            "SELECT allow FROM permissions WHERE subject_type='web_user'"
-            " AND subject_id='opsroot' AND capability='asset.summary'"
-        )
-        self.assertIsNone(row)
+        # 旧 permissions 表已删除；注册只建账号角色，不写授权规则
+        self.assertIsNone(self.db.query_one(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='permissions'"
+        ))
         user = self.db.query_one("SELECT is_admin FROM users WHERE username='opsroot'")
         self.assertTrue(user["is_admin"])
 

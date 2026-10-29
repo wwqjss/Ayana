@@ -42,43 +42,30 @@ class AuthorityTests(unittest.TestCase):
     def switch(self, sid, **kw):
         return self.manager.change_permissions(sid,"admin",sid,expected_revision=resolve_authority(self.db,sid)["revision"],**kw)
 
-    def test_all_auto_modes_independent(self):
-        for access in ("readonly","readwrite"):
-            for approval in ("manual","automatic"):
-                self.duty.set_settings({"auto_access_mode":access,"auto_approval_mode":approval})
-                a=resolve_authority(self.db,self.auto)
-                self.assertEqual((a["access_mode"],a["approval_mode"]),(access,approval))
+    def test_write_allowed_unless_lifecycle_block(self):
+        # PERM-03：三档只读/审批已删除；未阻塞会话可写，由 SSH 账号组决定能力
+        a=resolve_authority(self.db,self.auto)
+        self.assertTrue(a["write_allowed"])
+        self.duty.pause_session(self.auto, actor="admin")
+        a=resolve_authority(self.db,self.auto)
+        self.assertFalse(a["write_allowed"])
+        self.assertEqual(a["lifecycle_block"],"session_paused")
 
-    def test_manual_owns_state(self):
-        before=resolve_authority(self.db,self.manual)
-        self.duty.set_settings({"auto_access_mode":"readonly","auto_approval_mode":"automatic"})
-        after=resolve_authority(self.db,self.manual)
-        self.assertEqual((after["access_mode"],after["approval_mode"]),(before["access_mode"],before["approval_mode"]))
-        self.assertEqual(after["access_mode"],"readwrite")
+    def test_manual_and_auto_share_authority_shape(self):
+        for sid in (self.auto, self.manual):
+            a=resolve_authority(self.db,sid)
+            self.assertTrue(a["write_allowed"])
+            self.assertEqual(a["access_mode"],"readwrite")
 
-    def test_takeover_inherits_all_four_combinations(self):
-        for access in ("readonly","readwrite"):
-            for approval in ("manual","automatic"):
-                self.duty.set_settings({"auto_access_mode":access,"auto_approval_mode":approval})
-                a=self.manager.acquire_control(self.auto,"admin",self.auto)["effective_permissions"]
-                self.assertEqual((a["access_mode"],a["approval_mode"]),(access,approval))
-                self.manager.release_control(self.auto,"admin",self.auto)
-
-    def test_switch_does_not_mutate_global_and_release_restores_latest(self):
-        self.duty.set_settings({"auto_access_mode":"readonly","auto_approval_mode":"manual"})
+    def test_takeover_sets_source_and_survives_release(self):
         self.manager.acquire_control(self.auto,"admin",self.auto)
-        self.switch(self.auto,access_mode="readwrite",approval_mode="automatic")
-        self.assertEqual(self.duty.settings()["auto_access_mode"],"readonly")
-        self.duty.set_settings({"auto_access_mode":"readwrite","auto_approval_mode":"manual"})
-        self.assertEqual(resolve_authority(self.db,self.auto)["approval_mode"],"automatic")
-        a=self.manager.release_control(self.auto,"admin",self.auto)["effective_permissions"]
-        self.assertEqual((a["access_mode"],a["approval_mode"],a["source"]),("readwrite","manual","auto_global"))
-
-    def test_manual_release_restores_own_base(self):
-        self.manager.acquire_control(self.manual,"admin",self.manual)
-        self.switch(self.manual,access_mode="readonly",approval_mode="automatic")
-        a=self.manager.release_control(self.manual,"admin",self.manual)["effective_permissions"]
-        self.assertEqual((a["access_mode"],a["approval_mode"]),("readwrite","manual"))
+        a=resolve_authority(self.db,self.auto)
+        self.assertTrue(a["controller_active"])
+        self.assertEqual(a["source"],"takeover")
+        self.manager.release_control(self.auto,"admin",self.auto)
+        a=resolve_authority(self.db,self.auto)
+        self.assertFalse(a["controller_active"])
+        self.assertEqual(a["source"],"auto_global")
 
     def test_observer_cannot_switch(self):
         with self.assertRaises(AgentTuiError): self.switch(self.auto,access_mode="readonly")
@@ -86,7 +73,7 @@ class AuthorityTests(unittest.TestCase):
     def test_connection_competition_and_stale_revision(self):
         self.manager.acquire_control(self.auto,"admin",self.auto)
         old=resolve_authority(self.db,self.auto)["revision"]
-        self.switch(self.auto,access_mode="readonly")
+        self.switch(self.auto,access_mode="readwrite",approval_mode="automatic")
         with self.assertRaises(AgentTuiError):
             self.manager.change_permissions(self.auto,"admin",self.auto,access_mode="readwrite",expected_revision=old)
         self.manager._connections["other"]={"session_id":self.auto,"username":"admin"}
@@ -95,18 +82,14 @@ class AuthorityTests(unittest.TestCase):
 
     def test_expiry_ignored_before_cleanup_and_audited(self):
         self.manager.acquire_control(self.auto,"admin",self.auto)
-        self.switch(self.auto,access_mode="readonly")
         self.db.execute("UPDATE agent_runtime_bindings SET control_expires_at=1 WHERE session_id=?", (self.auto,))
-        self.assertEqual(resolve_authority(self.db,self.auto)["access_mode"],"readwrite")
         self.assertFalse(self.manager._has_control(self.auto,"admin",self.auto,renew=True))
         self.assertEqual(self.manager._binding(self.auto)["override_access_mode"],"")
 
     def test_restart_revokes_override(self):
         self.manager.acquire_control(self.auto,"admin",self.auto)
-        self.switch(self.auto,access_mode="readonly")
         self.duty.recover()
         self.assertFalse(resolve_authority(self.db,self.auto)["controller_active"])
-        self.assertEqual(resolve_authority(self.db,self.auto)["access_mode"],"readwrite")
 
     def test_multiple_manager_instances_do_not_revoke_control(self):
         self.manager.acquire_control(self.auto,"admin",self.auto)
@@ -131,260 +114,10 @@ class AuthorityTests(unittest.TestCase):
         result=asyncio.run(server.handle({"id":2,"method":"tools/call","params":{"name":"asset.list","arguments":{},"_meta":{TURN_LIFECYCLE_CAPABILITY:self.meta}}}))
         self.assertFalse(result["result"]["isError"])
 
-    def test_live_ro_write_rejects_and_rw_manual_waits(self):
-        self.manager.acquire_control(self.auto,"admin",self.auto)
-        self.switch(self.auto,access_mode="readonly")
-        with self.assertRaises(McpToolError) as caught:
-            asyncio.run(self.tools.call("knowledge.upsert", {"title":"probe","objects":["host"]}, invocation_context=self.meta))
-        self.assertEqual(caught.exception.code,"readonly_mode_rejects_write")
-        self.switch(self.auto,access_mode="readwrite",approval_mode="manual")
-        out=asyncio.run(self.tools.call("knowledge.upsert", {"title":"probe","objects":["host"],"approved":True}, invocation_context=self.meta))
-        self.assertEqual(out["error"],"approval_required")
-        row=self.db.query_one("SELECT * FROM session_write_ops WHERE action_key=?",(out["action_key"],))
-        self.assertEqual(row["session_id"],self.auto)
-        self.switch(self.auto,access_mode="readonly")
-        approved=self.bridge.approve_pending_write(out["incident_id"],out["action_key"],approved_by="admin")
-        self.assertEqual(approved["error"],"readonly_mode_rejects_write")
-
     def test_explicit_hard_readonly_survives_rw(self):
         self.ctx.readonly=True
-        self.duty.set_setting("auto_approval_mode","automatic")
         with self.assertRaises(McpToolError):
             asyncio.run(self.tools.call("knowledge.upsert", {}, invocation_context=self.meta))
-
-    def test_final_dispatch_rechecks_downgrade_and_approval(self):
-        self.manager.acquire_control(self.auto,"admin",self.auto)
-        self.switch(self.auto,approval_mode="automatic")
-        with session_dispatch_guard(self.db,self.auto,require_automatic=True):
-            self.switch(self.auto,access_mode="readonly")
-            with self.assertRaises(TransportError) as caught: check_dispatch_authority()
-            self.assertTrue(caught.exception.dispatch_not_started)
-        self.switch(self.auto,access_mode="readwrite",approval_mode="automatic")
-        with session_dispatch_guard(self.db,self.auto,require_automatic=True):
-            self.switch(self.auto,approval_mode="manual")
-            with self.assertRaises(TransportError) as caught: check_dispatch_authority()
-            self.assertEqual(caught.exception.code,"approval_required")
-
-    def test_no_cross_task_context_leak(self):
-        async def run():
-            self.duty.set_setting("auto_access_mode","readonly")
-            async def rejected():
-                with self.assertRaises(TransportError):
-                    with session_dispatch_guard(self.db,self.auto): pass
-            async def unrelated():
-                await asyncio.sleep(0)
-                check_dispatch_authority()
-            await asyncio.gather(rejected(),unrelated())
-        asyncio.run(run())
-
-
-class ExecutionAuthorityTests(unittest.IsolatedAsyncioTestCase):
-    setUp=AuthorityTests.setUp
-    tearDown=AuthorityTests.tearDown
-    switch=AuthorityTests.switch
-
-    def action_service(self):
-        from tests.test_p61_closed_loop_e2e import _seed, FakeTransport, FakeGate, FakePolicy, FakeProm
-        from ayana.actions import ActionService
-        _seed(self.db)
-        self.transport=FakeTransport()
-        self.actions=ActionService(self.db,self.transport,FakeGate(),FakePolicy(),FakeProm(),transport=self.transport)
-        self.duty.join_incident(self.auto,"inc1")
-        return self.actions
-
-    def propose(self):
-        return self.actions.propose(asset_id="host",object_id="obj",capability="service.restart",incident_id="inc1",mode="autonomous",proposer_type="agent",proposer_id="mimo",authority_session_id=self.auto)
-
-    async def test_action_all_permission_approval_combinations(self):
-        from ayana.actions import ActionError
-        self.action_service()
-        for access in ("readonly","readwrite"):
-            for approval in ("manual","automatic"):
-                self.duty.set_settings({"auto_access_mode":access,"auto_approval_mode":approval})
-                if access=="readonly":
-                    with self.assertRaises(ActionError) as caught:self.propose()
-                    self.assertEqual(caught.exception.code,"readonly_mode_rejects_write")
-                else:
-                    result=self.propose()
-                    self.assertEqual(result["state"],"proposed" if approval=="manual" else "approved")
-
-    async def test_action_system_approval_revoked_when_now_manual(self):
-        from ayana.actions import ActionError
-        self.action_service()
-        self.duty.set_setting("auto_approval_mode","automatic")
-        action=self.propose()
-        self.duty.set_setting("auto_approval_mode","manual")
-        with self.assertRaises(ActionError) as caught:
-            await self.actions.execute(action["id"],actor_type="agent",actor_id="mimo")
-        self.assertEqual(caught.exception.code,"approval_required")
-        row=self.db.query_one("SELECT state,approver_type FROM actions WHERE id=?",(action["id"],))
-        self.assertEqual(row["state"],"proposed")
-        self.assertFalse(row["approver_type"])
-        self.assertFalse(self.transport.calls)
-
-    async def test_action_final_gate_rechecks_after_identity_await(self):
-        from ayana.actions import ActionError
-        self.action_service()
-        self.duty.set_setting("auto_approval_mode","automatic")
-        action=self.propose()
-        original=self.actions.gate.verify_account
-        async def verify(*args,**kwargs):
-            result=await original(*args,**kwargs)
-            self.duty.set_setting("auto_access_mode","readonly")
-            return result
-        self.actions.gate.verify_account=verify
-        with self.assertRaises(ActionError) as caught:
-            await self.actions.execute(action["id"],actor_type="agent",actor_id="mimo")
-        self.assertEqual(caught.exception.code,"readonly_mode_rejects_write")
-        self.assertFalse(self.transport.calls)
-
-    def action_admin(self):
-        from ayana.access import AccessControl
-        self.db.execute("INSERT INTO users(username,password_hash,is_admin,created_at,updated_at) VALUES('approver','unused',1,0,0)")
-        self.actions.access_control = AccessControl(self.db)
-
-    async def test_human_approval_cannot_override_session_downgrade_to_readonly(self):
-        from ayana.actions import ActionError
-        self.action_service()
-        self.action_admin()
-        self.duty.set_setting("auto_approval_mode", "manual")
-        action = self.propose()
-        self.duty.set_setting("auto_access_mode", "readonly")
-        with self.assertRaises(ActionError) as caught:
-            self.actions.approve(action["id"], approver_id="approver")
-        self.assertEqual(caught.exception.code, "readonly_mode_rejects_write")
-        self.assertEqual(self.actions._get(action["id"])["state"], "proposed")
-        self.assertFalse(self.transport.calls)
-
-    async def test_human_approval_rechecks_paused_session(self):
-        from ayana.actions import ActionError
-        self.action_service()
-        self.action_admin()
-        self.duty.set_setting("auto_approval_mode", "manual")
-        action = self.propose()
-        self.db.execute("UPDATE duty_sessions SET paused_at=1 WHERE id=?", (self.auto,))
-        with self.assertRaises(ActionError) as caught:
-            self.actions.approve(action["id"], approver_id="approver")
-        self.assertEqual(caught.exception.code, "session_paused")
-        self.assertEqual(self.actions._get(action["id"])["state"], "proposed")
-
-    async def test_structured_agent_ignores_retired_rules_in_manual_approval_mode(self):
-        self.action_service()
-        self.action_admin()
-        self.duty.set_setting("auto_approval_mode", "manual")
-        self.db.execute("INSERT INTO permissions(subject_type,subject_id,asset_id,capability,object_id,allow,created_at,updated_at) VALUES('agent','mimo','host','service.restart','obj',0,0,0)")
-        self.db.execute("INSERT OR REPLACE INTO agent_ceiling(capability,allowed,allow_auto,updated_at,updated_by) VALUES('service.restart',0,0,0,'old')")
-        action = self.propose()
-        self.assertEqual(action["state"], "proposed")
-        approved = self.actions.approve(action["id"], approver_id="approver")
-        self.assertEqual(approved["state"], "approved")
-        self.assertFalse(self.transport.calls)
-
-    async def test_missing_persisted_session_never_falls_back_to_global_automatic(self):
-        from ayana.actions import ActionError
-        self.action_service()
-        self.duty.set_setting("auto_approval_mode", "automatic")
-        action = self.propose()
-        row = self.actions._get(action["id"])
-        payload = json.loads(row["params_json"])
-        payload.pop("_ayana_session_id")
-        self.db.execute("UPDATE actions SET params_json=? WHERE id=?", (json.dumps(payload), action["id"]))
-        with self.assertRaises(ActionError) as caught:
-            await self.actions.execute(action["id"], actor_type="agent", actor_id="mimo")
-        self.assertEqual(caught.exception.code, "authority_session_required")
-        self.assertFalse(self.transport.calls)
-
-    async def test_system_approval_rechecks_mode_before_recording_consent(self):
-        self.action_service()
-        self.duty.set_setting("auto_approval_mode", "automatic")
-        approve = self.actions._system_approve_autonomous
-        def switch_before_approval(*args, **kwargs):
-            self.duty.set_setting("auto_approval_mode", "manual")
-            return approve(*args, **kwargs)
-        self.actions._system_approve_autonomous = switch_before_approval
-        action = self.propose()
-        self.assertEqual(action["state"], "proposed")
-        self.assertTrue(action["require_approval"])
-        self.assertEqual(action["decision"], "approval_required")
-        self.assertFalse(self.actions._get(action["id"])["approver_id"])
-
-    async def test_pending_command_preserves_long_command_and_unknown_blocks(self):
-        from tests.test_p61_closed_loop_e2e import FakeTransport
-        self.ctx.transport=FakeTransport()
-        self.duty.set_setting("auto_approval_mode","manual")
-        command="printf '%s' '"+"a"*2500+"'"
-        result=await self.tools.call("host.exec",{"asset_id":"host","command":command},invocation_context=self.meta)
-        self.assertEqual(result["error"],"approval_required")
-        params=self.bridge.approve_pending_write(result["incident_id"],result["action_key"],approved_by="admin")["params"]
-        self.assertEqual(params["command"],command)
-        self.bridge.mark_unknown(result["incident_id"],result["action_key"])
-        repeated=await self.tools.call("host.exec",{"asset_id":"host","command":command},invocation_context=self.meta)
-        self.assertNotEqual(repeated.get("error"),"approval_required")
-        self.assertFalse(self.ctx.transport.calls)
-
-    async def test_same_rid_running_call_sees_switch_before_dispatch(self):
-        from ayana.ntsafe import NTResult
-        started,proceed=asyncio.Event(),asyncio.Event()
-        calls=[]
-        class PausedTransport:
-            async def exec_shell(inner,*args,**kwargs):
-                started.set();await proceed.wait()
-                check_dispatch_authority()
-                calls.append(args)
-                return NTResult(ok=True,output="ok",returncode=0,mode="exec",account="write")
-        self.ctx.transport=PausedTransport()
-        self.duty.set_setting("auto_approval_mode","automatic")
-        self.manager.acquire_control(self.auto,"admin",self.auto)
-        task=asyncio.create_task(self.tools.call("host.exec",{"asset_id":"host","command":"touch /tmp/probe"},invocation_context=self.meta))
-        await started.wait()
-        self.switch(self.auto,access_mode="readonly")
-        proceed.set();result=await task
-        self.assertEqual(result["error"],"readonly_mode_rejects_write")
-        self.assertFalse(calls)
-        self.assertEqual(resolve_remote_authority(self.db,"ses_trusted")["session_id"],self.auto)
-
-    async def test_generic_pending_executes_once_via_actual_web_handler(self):
-        from ayana.web import WebApp
-        self.duty.set_setting("auto_approval_mode","manual")
-        t=time.time()
-        self.db.execute("INSERT INTO incidents(id,title,status,created_at,updated_at) VALUES('probe','Probe','open',?,?)",(t,t))
-        self.duty.join_incident(self.auto,"probe")
-        result=await self.tools.call("incident.note",{"incident_id":"probe","text":"approved probe"},invocation_context=self.meta)
-        self.assertEqual(result["error"],"approval_required")
-        handler=WebApp.__new__(WebApp)
-        handler.db=self.db;handler.session_bridge=self.bridge;handler.transport=None;handler.prom=None
-        handler.incidents=self.incidents;handler.actions=None
-        handler._require_admin=lambda request:{"username":"admin","is_admin":True}
-        handler._check_csrf=lambda *args:None
-        class Request:
-            async def json(inner):return {"incident_id":result["incident_id"],"action_key":result["action_key"]}
-        reply=await handler.api_agent_pending_approve(Request())
-        out=json.loads(reply.text)
-        self.assertEqual(out.get("exec_state"),"success",out)
-        row=self.db.query_one("SELECT status FROM session_write_ops WHERE action_key=?",(result["action_key"],))
-        self.assertEqual(row["status"],"done")
-        reply=await handler.api_agent_pending_approve(Request())
-        self.assertFalse(json.loads(reply.text)["ok"])
-
-    async def test_permission_web_api_reports_confirmed_failure_and_conflict(self):
-        from ayana.web import WebApp
-        handler=WebApp.__new__(WebApp)
-        handler.db=self.db;handler.duty=self.duty;handler.agent_tui=self.manager
-        handler._require_admin=lambda request:{"username":"admin","is_admin":True}
-        handler._check_csrf=lambda *args:None
-        handler._agent_session_require=lambda user,sid,**kw:self.duty.get(sid)
-        payload={"connection_id":self.auto,"revision":resolve_authority(self.db,self.auto)["revision"],"access_mode":"readonly"}
-        class Request:
-            match_info={"sid":self.auto}
-            async def json(inner):return payload
-        reply=await handler.api_agent_session_permissions(Request())
-        self.assertEqual(reply.status,409)
-        self.assertEqual(json.loads(reply.text)["effective_permissions"]["access_mode"],"readwrite")
-        self.manager.acquire_control(self.auto,"admin",self.auto)
-        payload["revision"]=resolve_authority(self.db,self.auto)["revision"]
-        reply=await handler.api_agent_session_permissions(Request())
-        self.assertEqual(reply.status,200)
-        self.assertEqual(json.loads(reply.text)["effective_permissions"]["access_mode"],"readonly")
 
 
 class RuntimeAndMigrationTests(unittest.TestCase):
@@ -413,15 +146,14 @@ class RuntimeAndMigrationTests(unittest.TestCase):
             db=Database(path)
             from ayana.db import SCHEMA_VERSION
             self.assertEqual(db.schema_version(),SCHEMA_VERSION)
+            # PERM-03：历史会话保留；权威不再按旧三档读写
             before=resolve_authority(db,"sess_old")
-            self.assertEqual((before["access_mode"],before["approval_mode"]),("readonly","automatic"))
+            self.assertTrue(before["write_allowed"])
             duty=DutySessionManager(db)
             sid=duty.create(origin="manual")["session_id"]
-            self.assertEqual(resolve_authority(db,sid)["access_mode"],"readwrite")
-            duty.set_setting("auto_approval_mode","manual")
-            self.assertEqual(resolve_authority(db,sid)["approval_mode"],"automatic")
+            self.assertTrue(resolve_authority(db,sid)["write_allowed"])
             with db.tx() as conn:_migrate_v24_agent_authority(conn)
-            self.assertEqual(resolve_authority(db,sid)["approval_mode"],"automatic")
+            self.assertTrue(resolve_authority(db,sid)["write_allowed"])
             self.assertIsNotNone(db.query_one("SELECT id FROM duty_sessions WHERE id='sess_old'"))
             db.close()
 

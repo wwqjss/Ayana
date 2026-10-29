@@ -171,13 +171,17 @@ class DutySafetyTests(unittest.TestCase):
         result=self.bridge.attach_remote(session_id=sid,prompt="inspect")
         self.assertTrue(result["ok"]);self.assertEqual(observed,["ses_allocated"])
 
-    def test_ops_loop_recurrence_resets_budget_and_preserves_old_fact(self):
+    def test_ops_loop_recurrence_query_preserves_retired_history(self):
         loop=OpsLoop(self.db)
-        loop._state("i");loop._save("i",status="done",rounds=8)
+        self.db.execute("INSERT INTO ops_loop_state(incident_id,generation,status,rounds,updated_at) VALUES('i',1,'done',8,1)")
         self.db.execute("UPDATE incidents SET generation=2")
         state=loop.status("i")
-        self.assertEqual((state["generation"],state["rounds"],state["status"]),(2,0,"idle"))
-        self.assertIsNotNone(self.db.query_one("SELECT 1 FROM events WHERE type='ops_loop_generation_reset'"))
+        self.assertEqual((state["generation"],state["rounds"],state["status"]),(1,8,"done"))
+        observed=loop.observed_status("i")
+        self.assertEqual(observed["incident"]["generation"],2)
+        self.assertFalse(observed["legacy_loop"]["same_generation"])
+        self.assertFalse(observed["legacy_loop"]["active"])
+        self.assertIsNone(self.db.query_one("SELECT 1 FROM events WHERE type='ops_loop_generation_reset'"))
 
 
 class PhaseSafetyTests(unittest.IsolatedAsyncioTestCase):
@@ -189,25 +193,11 @@ class PhaseSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.ai.offer("i")
         self.db.execute("UPDATE investigation_jobs SET status='running',lease_expires_at=0 WHERE incident_id='i'")
 
-    async def test_conclusion_keeps_running_lease_until_closed_loop_finishes(self):
+    async def test_conclusion_finishes_job_without_second_phase(self):
+        # core-008：单会话调查完成后直接收尾，不再进入决策阶段
         self.ai._investigate=AsyncMock(return_value={"status":"completed","facts":[]})
-        async def inspect(*args,**kwargs):
-            row=self.ai._row("i")
-            self.assertEqual((row["status"],row["phase"]),("running","decision"))
-        self.ai._close_loop=AsyncMock(side_effect=inspect)
         await self.ai._run_job("i",self.ai._row("i"))
         self.assertEqual((self.ai._row("i")["status"],self.ai._row("i")["phase"]),("done","complete"))
-
-    async def test_restart_may_resume_only_readonly_decision_without_actions(self):
-        self.db.execute("UPDATE investigation_jobs SET phase='decision',last_conclusion_json=?,rounds=1",(json.dumps({"status":"completed","facts":[]}),))
-        result=self.ai.recover()
-        self.assertEqual(result["resumed_readonly_decisions"],1)
-        self.assertEqual(self.ai._row("i")["phase"],"resume_decision")
-        self.db.execute("UPDATE investigation_jobs SET status='running'")
-        self.ai._investigate=AsyncMock(side_effect=AssertionError("investigation replayed"));self.ai._close_loop=AsyncMock()
-        await self.ai._run_job("i",self.ai._row("i"))
-        self.ai._investigate.assert_not_awaited();self.ai._close_loop.assert_awaited_once()
-        self.assertEqual(self.ai._row("i")["rounds"],1)
 
     async def test_interrupted_execution_never_replays_and_escalates(self):
         self.db.execute("UPDATE investigation_jobs SET phase='execution'")

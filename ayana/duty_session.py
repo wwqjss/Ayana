@@ -62,6 +62,14 @@ class DutySessionManager:
         return {"ok": True, "key": key, "value": str(value)}
 
     def set_settings(self, changes: dict, *, actor: str = "web") -> dict[str, Any]:
+        if "ssh_default_group" in changes:
+            group = changes["ssh_default_group"]
+            if not isinstance(group, str) or not group.strip() or len(group.strip()) > 32:
+                raise ValueError("invalid_ssh_account_group")
+            group = group.strip()
+            if not self.db.query_one("SELECT 1 FROM ssh_account_groups WHERE name=?", (group,)):
+                raise ValueError("ssh_account_group_not_found")
+            changes = {**changes, "ssh_default_group": group}
         changes = {k: str(v) for k, v in changes.items()}
         if "auto_access_mode" in changes and changes["auto_access_mode"] not in ("readonly", "readwrite"):
             raise ValueError("invalid_access_mode")
@@ -86,12 +94,43 @@ class DutySessionManager:
         rows = self.db.query("SELECT key, value, updated_at, updated_by FROM agent_settings")
         out = {str(r["key"]): str(r["value"] or "") for r in rows}
         return {
-            "auto_access_mode": out.get("auto_access_mode", "readwrite"),
-            "auto_approval_mode": out.get("auto_approval_mode", "automatic"),
             "archive_delay_sec": int(float(out.get("archive_delay_sec") or DEFAULT_ARCHIVE_DELAY_SEC)),
-            "ssh_investigate_role": out.get("ssh_investigate_role", "read"),
-            "ssh_execute_role": out.get("ssh_execute_role", "write"),
+            "ssh_default_group": out.get("ssh_default_group", "") or "default",
         }
+
+    def set_session_account_group(self, session_id: str, group: str, *, actor: str = "web") -> dict[str, Any]:
+        """Select this session's SSH group; an empty selection follows the global default."""
+        if not isinstance(group, str) or len(group.strip()) > 32:
+            raise ValueError("invalid_ssh_account_group")
+        group = group.strip()
+        with self.db.tx() as conn:
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+            session = conn.execute("SELECT * FROM duty_sessions WHERE id=?", (session_id,)).fetchone()
+            if not session:
+                raise ValueError("session_not_found")
+            if session["deleted_at"]:
+                raise ValueError("session_deleted")
+            if session["delete_requested_at"]:
+                raise ValueError("session_deleting")
+            if session["status"] != "open":
+                raise ValueError("session_not_open")
+            if group and not conn.execute("SELECT 1 FROM ssh_account_groups WHERE name=?", (group,)).fetchone():
+                raise ValueError("ssh_account_group_not_found")
+            previous = session["ssh_account_group"]
+            changed = previous != group
+            if changed:
+                conn.execute(
+                    "UPDATE duty_sessions SET ssh_account_group=?,authority_revision=authority_revision+1,updated_at=? WHERE id=?",
+                    (group, now(), session_id))
+                self.db.audit("web_user", actor, "agent_session_account_group_changed", channel="agent",
+                              detail={"session_id": session_id, "previous": previous, "selection": group})
+            from .agent_authority import resolve_authority
+            authority = resolve_authority(self.db, session_id, conn=conn)
+        return {"ok": True, "changed": changed, "session_id": session_id,
+                "ssh_account_group": authority["ssh_account_group"], "ssh_account_group_override": group,
+                "ssh_account_group_source": authority["ssh_account_group_source"],
+                "effective_permissions": authority}
 
     # ---- 查询 ----
 
@@ -382,14 +421,27 @@ class DutySessionManager:
         runtime=dict(runtime) if runtime else {}
         blockers=self.native_admission_blockers(session_id) if session.get("status") == "open" else []
         unknown=any("unknown" in b for b in blockers) or bool(self.db.query_one("SELECT 1 FROM agent_native_submissions WHERE session_id=? AND state='unknown'",(session_id,)))
+        unknown = unknown or bool(self.db.query_one(
+            "SELECT 1 FROM session_write_ops WHERE session_id=? AND status='unknown' LIMIT 1", (session_id,)))
+        unknown = unknown or bool(self.db.query_one(
+            "SELECT 1 FROM actions WHERE json_valid(params_json) AND json_extract(params_json,'$._ayana_session_id')=? AND state='unknown' LIMIT 1", (session_id,)))
         recovering=bool(self.db.query_one("SELECT 1 FROM agent_native_submissions WHERE session_id=? AND state IN ('submitting','recovering')",(session_id,)))
         busy=bool(blockers) or recovering
+        interrupted_job = False
+        owned = self._owned_job_ids(session_id)
+        if owned:
+            marks = ','.join('?' for _ in owned)
+            jobs = self.db.query(
+                "SELECT j.status,j.phase FROM investigation_jobs j JOIN incidents i ON i.id=j.incident_id"
+                " WHERE j.incident_id IN (" + marks + ") AND j.generation=i.generation AND i.status='open'", tuple(owned))
+            busy = busy or any(job["status"] in ("queued", "running") for job in jobs)
+            interrupted_job = any(job["status"] == "failed" and job["phase"] == "interrupted" for job in jobs)
         if session.get("deleted_at"):state="deleted"
         elif session.get("delete_requested_at"):state="deleting"
         elif unknown:state="unknown"
         elif session.get("paused_at"):state="stopping" if busy else "paused"
         elif session.get("status") == "archived":state="archived"
-        elif runtime.get("receipt_status") in ("cancelled","canceled","aborted","interrupted","failed","error") and not busy:state="interrupted"
+        elif (runtime.get("receipt_status") in ("cancelled","canceled","aborted","interrupted","failed","error") or interrupted_job) and not busy:state="interrupted"
         elif busy:state="queued" if runtime.get("receipt_status") in ("queued","pending") else "running"
         else:state="idle"
         labels={"deleted":"会话已删除","deleting":"正在停止并删除" if busy else "正在删除","unknown":"执行结果待核对","stopping":"正在暂停，等待任务停止","paused":"已暂停","archived":"已归档","interrupted":"任务已中断，等待恢复","queued":"消息已排队","running":"任务执行中","idle":"空闲"}
@@ -514,6 +566,30 @@ class DutySessionManager:
             conn.execute("INSERT INTO agent_runtime_receipts(receipt_id,session_id,remote_session_id,status,origin,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(receipt_id) DO UPDATE SET updated_at=excluded.updated_at",(receipt_id,session_id,remote_session_id,str(status)[:40],str(origin)[:40],t,t))
             conn.execute("UPDATE duty_sessions SET archive_due_at=0,updated_at=? WHERE id=?",(t,session_id))
 
+    def record_native_turn(self, session_id: str, remote_session_id: str, message_id: str,
+                           state: str, *, receipt_id: str = "", engine: dict | None = None) -> None:
+        """Persist automatic input identity before POST so observation never needs a replay."""
+        if not message_id:
+            raise ValueError("native_message_id_required")
+        with self.db.tx() as conn:
+            session = conn.execute("SELECT remote_session_id FROM duty_sessions WHERE id=?", (session_id,)).fetchone()
+            if not session or session["remote_session_id"] != remote_session_id:
+                raise ValueError("runtime_binding_changed")
+            submission_id = "automatic_" + message_id
+            existing = conn.execute(
+                "SELECT payload_json FROM agent_native_submissions WHERE session_id=? AND submission_id=?",
+                (session_id, submission_id)).fetchone()
+            payload = json.loads(existing["payload_json"]) if existing else {"messageID": message_id, "engine": engine}
+            t = now()
+            conn.execute(
+                "INSERT INTO agent_native_submissions(session_id,submission_id,kind,state,created_at,updated_at,"
+                "remote_session_id,payload_json,receipt_id) VALUES(?,?,'automatic',?,?,?,?,?,?)"
+                " ON CONFLICT(session_id,submission_id) DO UPDATE SET"
+                " state=CASE WHEN agent_native_submissions.state IN ('completed','failed','cancelled')"
+                " THEN agent_native_submissions.state ELSE excluded.state END,updated_at=excluded.updated_at,"
+                " receipt_id=CASE WHEN excluded.receipt_id<>'' THEN excluded.receipt_id ELSE agent_native_submissions.receipt_id END",
+                (session_id, submission_id, state, t, t, remote_session_id, json.dumps(payload), receipt_id))
+
     def finish_receipt(self, receipt_id: str, status: str) -> None:
         if status not in _RECEIPT_TERMINAL:raise ValueError("receipt_terminal_status_required")
         self.db.execute("UPDATE agent_runtime_receipts SET status=?,updated_at=? WHERE receipt_id=?",(status,now(),receipt_id))
@@ -535,7 +611,9 @@ class DutySessionManager:
             blockers.append("native_turn_unknown")
         elif self.db.query_one("SELECT 1 FROM agent_native_submissions WHERE session_id=? AND state IN ('submitting','recovering')",(session_id,)):
             blockers.append("native_submission_pending")
-        if self.db.query_one(
+        if self.db.query_one("SELECT 1 FROM agent_runtime_receipts WHERE session_id=? AND status='unknown' LIMIT 1", (session_id,)):
+            blockers.append("native_turn_unknown")
+        elif self.db.query_one(
             "SELECT 1 FROM agent_runtime_receipts WHERE session_id=? AND status NOT IN (" + marks + ") LIMIT 1",
             (session_id, *terminals),
         ):

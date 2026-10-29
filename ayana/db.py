@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 32
 
 
 class MigrationError(RuntimeError):
@@ -144,20 +144,16 @@ CREATE TABLE IF NOT EXISTS ssh_endpoints (
   UNIQUE(asset_id, role)
 );
 
-CREATE TABLE IF NOT EXISTS permissions (
-  id INTEGER PRIMARY KEY,
-  subject_type TEXT NOT NULL, -- web_user|qq_user|qq_group|auto_rule|llm
-  subject_id TEXT NOT NULL,
-  asset_id TEXT NOT NULL DEFAULT '*',
-  capability TEXT NOT NULL,
-  object_id TEXT NOT NULL DEFAULT '*',
-  allow INTEGER NOT NULL DEFAULT 0,
-  require_approval INTEGER NOT NULL DEFAULT 1,
-  auto_allowed INTEGER NOT NULL DEFAULT 0,
+-- permissions / agent_ceiling / permission_changes 已于 v29 删除（旧权限模型）
+
+-- SSH 账号组：用户自定义名称/描述；组名只是标签，不代表权限档位
+CREATE TABLE IF NOT EXISTS ssh_account_groups (
+  name TEXT PRIMARY KEY,
+  label TEXT NOT NULL DEFAULT '',
+  description TEXT NOT NULL DEFAULT '',
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL,
-  created_by TEXT NOT NULL DEFAULT '',
-  UNIQUE(subject_type, subject_id, asset_id, capability, object_id)
+  created_by TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS config_versions (
@@ -341,39 +337,7 @@ CREATE TABLE IF NOT EXISTS work_items (
   UNIQUE(kind, identity)
 );
 
--- Agent 权限上限（用户可配）：强制 ⊆ capabilities 源码目录；后端在 Policy 判定时执行
-CREATE TABLE IF NOT EXISTS agent_ceiling (
-  capability TEXT PRIMARY KEY,
-  allowed INTEGER NOT NULL DEFAULT 1,
-  allow_auto INTEGER NOT NULL DEFAULT 0,
-  updated_at REAL NOT NULL,
-  updated_by TEXT NOT NULL DEFAULT ''
-);
-
-CREATE TABLE IF NOT EXISTS permission_changes (
-  id TEXT PRIMARY KEY,
-  subject_type TEXT NOT NULL,
-  subject_id TEXT NOT NULL,
-  capability TEXT NOT NULL,
-  asset_id TEXT NOT NULL DEFAULT '*',
-  object_id TEXT NOT NULL DEFAULT '*',
-  to_allow INTEGER NOT NULL DEFAULT 0,
-  to_require_approval INTEGER NOT NULL DEFAULT 1,
-  to_auto_allowed INTEGER NOT NULL DEFAULT 0,
-  reason TEXT NOT NULL DEFAULT '',
-  incident_id TEXT NOT NULL DEFAULT '',
-  state TEXT NOT NULL DEFAULT 'proposed',
-  created_by TEXT NOT NULL DEFAULT '',
-  created_channel TEXT NOT NULL DEFAULT '',
-  created_at REAL NOT NULL,
-  decided_by TEXT NOT NULL DEFAULT '',
-  decided_channel TEXT NOT NULL DEFAULT '',
-  decided_at REAL,
-  totp_verified_at REAL,
-  applied_at REAL,
-  from_snapshot_json TEXT NOT NULL DEFAULT '{}',
-  result_json TEXT NOT NULL DEFAULT '{}'
-);
+-- agent_ceiling / permission_changes 已于 v29 删除（旧权限模型）
 
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,
@@ -549,16 +513,11 @@ def _migrate_v3_recovery_columns(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_v4_agent_ceiling(conn: sqlite3.Connection) -> None:
-    """v4：Agent 权限上限（用户可配，强制 ⊆ 源码能力目录）。"""
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS agent_ceiling ("
-        " capability TEXT PRIMARY KEY,"
-        " allowed INTEGER NOT NULL DEFAULT 1,"
-        " allow_auto INTEGER NOT NULL DEFAULT 0,"
-        " updated_at REAL NOT NULL,"
-        " updated_by TEXT NOT NULL DEFAULT ''"
-        ")"
-    )
+    """v4 已退役：agent_ceiling 由 v29 删除；保留空迁移保证版本链完整。"""
+    try:
+        conn.execute("DROP TABLE IF EXISTS agent_ceiling")
+    except Exception:
+        pass
 
 
 def _migrate_v5_action_decision_id(conn: sqlite3.Connection) -> None:
@@ -1234,6 +1193,17 @@ def _migrate_v26_viewport_release(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE agent_runtime_bindings SET tmux_name=NULL WHERE tmux_name=''")
 
 
+def _migrate_v28_ops_loop_preflight(conn: sqlite3.Connection) -> None:
+    """OpsLoop preflight 独立计数（不占执行失败预算）。"""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(ops_loop_state)")}
+    for column, definition in (
+        ("preflight_blocks", "INTEGER NOT NULL DEFAULT 0"),
+        ("preflight_at", "REAL NOT NULL DEFAULT 0"),
+    ):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE ops_loop_state ADD COLUMN {column} {definition}")
+
+
 def _migrate_v27_write_op_adjudication(conn: sqlite3.Connection) -> None:
     """人工核销写结果：adjudication 与 actions.adjudicate 同语义（P4.1 补全）。"""
     for ddl in (
@@ -1245,6 +1215,159 @@ def _migrate_v27_write_op_adjudication(conn: sqlite3.Connection) -> None:
             conn.execute(ddl)
         except Exception:
             pass
+
+
+def _migrate_v29_retired_tables(conn: sqlite3.Connection) -> None:
+    """删除旧权限/旧自治表（先导出后删：scripts/export_retired_tables.py）。"""
+    for table in (
+        "permissions",
+        "agent_ceiling",
+        "permission_changes",
+        "incident_session",
+    ):
+        try:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        except Exception:
+            pass
+    # ai_provider_keys / ai_calls 留给离线归档导出；不在此自动删除
+
+
+def _migrate_v30_drop_recreated_retired_tables(conn: sqlite3.Connection) -> None:
+    """v29 后启动 DDL 曾重建旧表；本次连同 DDL 移除后再清一次。"""
+    for table in ("permissions", "agent_ceiling", "permission_changes"):
+        try:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        except Exception:
+            pass
+
+
+def _migrate_v31_ssh_account_groups(conn: sqlite3.Connection) -> None:
+    """账号组独立表；旧 read/write 残留并入 default，不保留幽灵组。"""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS ssh_account_groups ("
+        " name TEXT PRIMARY KEY,"
+        " label TEXT NOT NULL DEFAULT '',"
+        " description TEXT NOT NULL DEFAULT '',"
+        " created_at REAL NOT NULL,"
+        " updated_at REAL NOT NULL,"
+        " created_by TEXT NOT NULL DEFAULT ''"
+        ")"
+    )
+    t = __import__("time").time()
+    legacy_by_asset: dict[str, list[dict]] = {}
+    for row in conn.execute("SELECT * FROM ssh_endpoints WHERE role IN ('read','write','')").fetchall():
+        legacy_by_asset.setdefault(row["asset_id"], []).append(dict(row))
+    public_fields = (
+        "id", "asset_id", "role", "host", "port", "username", "credential_id",
+        "host_key_sha256", "host_key_line", "host_key_trusted_at", "enabled", "created_at", "updated_at",
+    )
+
+    def public_endpoint(row: dict) -> dict:
+        # Credential references and host public keys only; never load credential secrets.
+        return {key: row.get(key) for key in public_fields}
+
+    def same_identity(left: dict, right: dict) -> bool:
+        return all(left[key] == right[key] for key in ("asset_id", "host", "port", "username"))
+
+    for asset_id, legacy in legacy_by_asset.items():
+        legacy.sort(key=lambda row: ({"write": 0, "read": 1, "": 2}[row["role"]], row["id"]))
+        existing = conn.execute(
+            "SELECT * FROM ssh_endpoints WHERE asset_id=? AND role='default'", (asset_id,)
+        ).fetchone()
+        before = dict(existing) if existing else None
+        target = dict(before or legacy[0])
+        target["role"] = "default"
+        matches = [row for row in legacy if same_identity(target, row)]
+        merged_fields = []
+        if not target["credential_id"]:
+            credential_source = next((row for row in matches if row["credential_id"]), None)
+            if credential_source:
+                target["credential_id"] = credential_source["credential_id"]
+                merged_fields.append("credential_id")
+        for source in matches:
+            # Never assemble a trusted key from conflicting explicit selections,
+            # even when the endpoint identity itself is the same.
+            if any(target[key] and source[key] and target[key] != source[key]
+                   for key in ("host_key_sha256", "host_key_line")):
+                continue
+            if not source["host_key_sha256"]:
+                continue
+            for key in ("host_key_sha256", "host_key_line"):
+                if not target[key] and source[key]:
+                    target[key] = source[key]
+                    merged_fields.append(key)
+            if not target["host_key_trusted_at"] and source["host_key_trusted_at"]:
+                target["host_key_trusted_at"] = source["host_key_trusted_at"]
+                merged_fields.append("host_key_trusted_at")
+        if merged_fields:
+            target["updated_at"] = t
+        conn.execute(
+            "INSERT INTO audit_log(at,actor_type,actor_id,entry,asset_id,detail_json,channel)"
+            " VALUES(?,'system','migrate_v31','ssh_account_groups_migrated',?,?,'migration')",
+            (t, asset_id, json.dumps({
+                "schema_version": 31, "default_before": public_endpoint(before) if before else None,
+                "default_after": public_endpoint(target),
+                "legacy_endpoints": [public_endpoint(row) for row in legacy],
+                "merged_fields": sorted(set(merged_fields)),
+            }, ensure_ascii=False)),
+        )
+        # Resolve each asset independently so read+write cannot collide at default.
+        for row in legacy:
+            if row["id"] != target["id"]:
+                conn.execute("DELETE FROM ssh_endpoints WHERE id=?", (row["id"],))
+        conn.execute(
+            "UPDATE ssh_endpoints SET role='default',credential_id=?,host_key_sha256=?,"
+            "host_key_line=?,host_key_trusted_at=?,updated_at=? WHERE id=?",
+            (target["credential_id"], target["host_key_sha256"], target["host_key_line"],
+             target["host_key_trusted_at"], target["updated_at"], target["id"]),
+        )
+    conn.execute("DELETE FROM ssh_account_groups WHERE name IN ('read','write','')")
+    conn.execute(
+        "INSERT OR IGNORE INTO ssh_account_groups(name,label,description,created_at,updated_at,created_by)"
+        " VALUES('default','默认','',?,?,?)",
+        (t, t, "migrate"),
+    )
+    for r in conn.execute("SELECT DISTINCT role FROM ssh_endpoints WHERE role<>''").fetchall():
+        name = str(r[0] or "").strip()
+        if name and name != "default":
+            conn.execute(
+                "INSERT OR IGNORE INTO ssh_account_groups(name,label,description,created_at,updated_at,created_by)"
+                " VALUES(?,?,?,?,?,?)",
+                (name, name, "", t, t, "migrate"),
+            )
+    conn.execute(
+        "INSERT OR REPLACE INTO agent_settings(key,value,updated_at,updated_by) VALUES('ssh_investigate_role','default',?,?)",
+        (t, "migrate"),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO agent_settings(key,value,updated_at,updated_by) VALUES('ssh_execute_role','default',?,?)",
+        (t, "migrate"),
+    )
+
+
+def _migrate_v32_session_ssh_account_group(conn: sqlite3.Connection) -> None:
+    """One global account group, with an optional persistent session selection."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(duty_sessions)")}
+    if "ssh_account_group" not in columns:
+        conn.execute("ALTER TABLE duty_sessions ADD COLUMN ssh_account_group TEXT NOT NULL DEFAULT ''")
+    current = conn.execute("SELECT value FROM agent_settings WHERE key='ssh_default_group'").fetchone()
+    if current is not None:
+        return  # Never replace a canonical selection with retired stage keys.
+    legacy = {row["key"]: str(row["value"] or "").strip() for row in conn.execute(
+        "SELECT key,value FROM agent_settings WHERE key IN ('ssh_investigate_role','ssh_execute_role')")}
+    selected = legacy.get("ssh_execute_role") or legacy.get("ssh_investigate_role") or "default"
+    reason = "legacy_execution_group" if legacy.get("ssh_execute_role") else "legacy_investigation_group" if legacy.get("ssh_investigate_role") else "default"
+    if not conn.execute("SELECT 1 FROM ssh_account_groups WHERE name=?", (selected,)).fetchone():
+        selected, reason = "default", "legacy_group_missing"
+    t = time.time()
+    conn.execute(
+        "INSERT INTO agent_settings(key,value,updated_at,updated_by) VALUES('ssh_default_group',?,?,?)",
+        (selected, t, "migrate_v32"))
+    conn.execute(
+        "INSERT INTO audit_log(at,actor_type,actor_id,entry,detail_json,channel)"
+        " VALUES(?,'system','migrate_v32','ssh_default_group_migrated',?,'migration')",
+        (t, json.dumps({"ssh_default_group": selected, "selection_reason": reason,
+                        "legacy_stage_selections": legacy}, ensure_ascii=False)))
 
 
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
@@ -1275,6 +1398,11 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     25: _migrate_v25_session_lifecycle,
     26: _migrate_v26_viewport_release,
     27: _migrate_v27_write_op_adjudication,
+    28: _migrate_v28_ops_loop_preflight,
+    29: _migrate_v29_retired_tables,
+    30: _migrate_v30_drop_recreated_retired_tables,
+    31: _migrate_v31_ssh_account_groups,
+    32: _migrate_v32_session_ssh_account_group,
 }
 
 _MIGRATION_NAMES = {
@@ -1305,6 +1433,8 @@ _MIGRATION_NAMES = {
     25: "native_guidance_and_session_lifecycle",
     26: "viewport_release_lifecycle",
     27: "write_op_adjudication",
+    28: "ops_loop_preflight_budget",
+    32: "session_ssh_account_group",
 }
 
 

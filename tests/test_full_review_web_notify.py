@@ -14,7 +14,7 @@ from ayana.config import load_config, write_secrets_template
 from ayana.db import Database, now
 from ayana.incidents import IncidentService
 from ayana.notify import Notifier
-from ayana.policy import Policy
+from ayana.access import AccessControl as Policy
 from ayana.qqbot import QQBot
 from ayana.transport import SSHAssetStore
 from ayana.web import WebApp, web
@@ -59,7 +59,6 @@ class ReviewWebNotifyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_authenticated_readers_can_view_registered_inventory(self):
         for handler, match in ((self.app.api_incident_detail, {"inc_id": "inc-b"}),
-                               (self.app.api_action_detail, {"aid": "act-b"}),
                                (self.app.api_asset_detail, {"asset_id": "b"})):
             response = await handler(self.request(**match))
             self.assertEqual(response.status, 200)

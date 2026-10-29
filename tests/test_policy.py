@@ -1,4 +1,4 @@
-"""Legacy policy views are retired; the console decides by account role only."""
+﻿"""Legacy policy views are retired; the console decides by account role only."""
 from __future__ import annotations
 
 import tempfile
@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from ayana.db import Database, now
-from ayana.policy import Policy, PolicyDeny
+from ayana.access import AccessControl as Policy, PolicyDeny
 
 
 class TestTruthfulPolicyViews(unittest.TestCase):

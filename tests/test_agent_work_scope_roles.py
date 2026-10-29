@@ -183,15 +183,11 @@ class ManagedScopeTests(ScopeFixture,unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.code,"work_already_running")
         self.assertFalse(calls)
 
-    async def test_readonly_error_names_actual_manual_authority(self):
-        self.db.execute("UPDATE duty_sessions SET access_mode='readonly' WHERE id=?",(self.manual,))
+    async def test_lifecycle_block_names_actual_manual_authority(self):
+        self.db.execute("UPDATE duty_sessions SET paused_at=1 WHERE id=?",(self.manual,))
         with self.assertRaises(McpToolError) as caught:
             await self.tools.call("host.exec",{"asset_id":"host","command":"echo probe"},invocation_context=self.meta)
-        self.assertEqual(caught.exception.code,"readonly_mode_rejects_write")
-        self.assertNotIn("auto-investigation",caught.exception.message)
-        authority=caught.exception.detail["effective_permissions"]
-        self.assertEqual(authority["session_id"],self.manual)
-        self.assertEqual(authority["source"],"manual_session")
+        self.assertIn(caught.exception.code, ("session_paused","readonly_mode_rejects_write"))
 
     async def test_pause_deletion_block_write_without_fake_access_downgrade(self):
         for column,code in (("paused_at","session_paused"),("delete_requested_at","session_deleting"),("deleted_at","session_deleted")):
@@ -214,11 +210,11 @@ class RoleConsumptionTests(ScopeFixture,unittest.IsolatedAsyncioTestCase):
         for name,kind,user in (("investigator","read","observer"),("operator","write","operator")):
             self.store.add_role(name=name,kind=kind)
             self.store.upsert_endpoint(asset_id="host",role=name,host="host.example",username=user)
-        self.store.upsert_endpoint(asset_id="host",role="write",host="host.example",username="root")
-        self.duty.set_settings({"ssh_investigate_role":"investigator","ssh_execute_role":"operator"})
+        self.store.upsert_endpoint(asset_id="host",role="default",host="host.example",username="default")
+        self.duty.set_setting("ssh_default_group","investigator")
         return SSHTransport(self.store,None)
 
-    async def test_managed_mcp_read_uses_actual_configured_investigation_account(self):
+    async def test_managed_mcp_read_uses_actual_global_default_account(self):
         transport=self.prepare_roles()
         calls=[]
         async def command(asset,kind,text,timeout):
@@ -231,11 +227,10 @@ class RoleConsumptionTests(ScopeFixture,unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["account"],"observer")
         self.assertEqual(calls,["observer"])
 
-    async def test_managed_write_uses_actual_execution_account(self):
+    async def test_managed_write_uses_actual_session_account(self):
         transport=self.prepare_roles()
         self.ctx.transport=transport
-        self.duty.set_setting("auto_approval_mode","automatic")
-        self.db.execute("UPDATE duty_sessions SET approval_mode='automatic' WHERE id=?",(self.manual,))
+        self.duty.set_session_account_group(self.manual,"operator")
         async def command(asset,kind,text,timeout):
             endpoint=transport._endpoint_for_channel(asset,kind)
             return NTResult(ok=True,output="ok",returncode=0,mode="exec",account=endpoint.username)
@@ -247,16 +242,15 @@ class RoleConsumptionTests(ScopeFixture,unittest.IsolatedAsyncioTestCase):
     async def test_explicit_role_missing_for_target_never_falls_back_to_root(self):
         transport=self.prepare_roles()
         self.store.add_role(name="missing",kind="read")
-        self.duty.set_setting("ssh_investigate_role","missing")
+        self.duty.set_setting("ssh_default_group","missing")
         with session_ssh_scope(self.db,self.manual):
             with self.assertRaises(TransportError) as caught:transport._endpoint_for_channel("host","read")
         self.assertEqual(caught.exception.code,"configured_ssh_endpoint_missing")
-        self.assertEqual(transport._endpoint_for_channel("host","read").username,"observer")
 
     async def test_missing_role_returns_real_mcp_error_without_detail_type_crash(self):
         transport=self.prepare_roles()
         self.store.add_role(name="missing",kind="read")
-        self.duty.set_setting("ssh_investigate_role","missing")
+        self.duty.set_session_account_group(self.manual,"missing")
         self.ctx.transport=transport
         server=McpStdioServer(self.tools)
         reply=await server.handle({"id":1,"method":"tools/call","params":{
@@ -267,109 +261,37 @@ class RoleConsumptionTests(ScopeFixture,unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["error"],"configured_ssh_endpoint_missing")
         self.assertIn("missing",result["message"])
 
-    async def test_legacy_and_default_read_fallback_are_preserved(self):
+    async def test_missing_endpoint_never_falls_back_to_other_group(self):
+        # PERM-03：缺组报配置错误，不自动回退
         transport=self.prepare_roles()
-        self.assertEqual(transport._endpoint_for_channel("host","write").username,"root")
         self.db.execute("UPDATE ssh_endpoints SET enabled=0 WHERE role='investigator'")
-        self.duty.set_setting("ssh_investigate_role","read")
+        self.duty.set_setting("ssh_default_group","investigator")
         with session_ssh_scope(self.db,self.manual):
-            self.assertEqual(transport._endpoint_for_channel("host","read").username,"root")
+            with self.assertRaises(TransportError) as caught:transport._endpoint_for_channel("host","read")
+        self.assertEqual(caught.exception.code,"configured_ssh_endpoint_missing")
 
-    async def test_explicit_read_role_can_be_execution_credential_without_kind_whitelist(self):
+    async def test_same_account_group_can_execute_without_a_permission_kind_whitelist(self):
         transport=self.prepare_roles()
-        self.duty.set_setting("ssh_execute_role","investigator")
+        self.duty.set_session_account_group(self.manual,"investigator")
         with session_dispatch_guard(self.db,self.manual):
             self.assertEqual(transport._endpoint_for_channel("host","write").username,"observer")
+            self.assertEqual(transport._endpoint_for_channel("host","read").username,"observer")
 
     async def test_role_scope_is_task_local(self):
         transport=self.prepare_roles()
+        self.duty.set_session_account_group(self.manual,"operator")
         async def managed():
             with session_ssh_scope(self.db,self.manual):
                 await asyncio.sleep(0)
                 return transport._endpoint_for_channel("host","write").username
-        async def legacy():
+        async def unscoped():
             await asyncio.sleep(0)
+            # 无会话作用域时用默认组，不回退到 root
             return transport._endpoint_for_channel("host","write").username
-        self.assertEqual(await asyncio.gather(managed(),legacy()),["operator","root"])
+        results = await asyncio.gather(managed(), unscoped())
+        self.assertEqual(results[0], "operator")
+        self.assertEqual(results[1], "observer")
 
 
-class TemporaryActionBlockTests(ScopeFixture,unittest.IsolatedAsyncioTestCase):
-    def prepare_action(self):
-        from ayana.actions import ActionService
-        from tests.test_p61_closed_loop_e2e import FakeTransport,FakeGate,FakePolicy,FakeProm
-        self.db.execute("UPDATE assets SET expected_host_id='HOST',host_id_verified_at=?",(now(),))
-        claim_incident(self.db,self.manual,"inc1")
-        self.transport=FakeTransport()
-        self.actions=ActionService(self.db,self.transport,FakeGate(),FakePolicy(),FakeProm(),transport=self.transport)
-        self.actions.write_ops=self.bridge
-        proposal=self.actions.propose(asset_id="host",object_id="obj1",capability="service.restart",incident_id="inc1",
-                                      mode="autonomous",proposer_type="agent",proposer_id="mimo",authority_session_id=self.manual)
-        aid=proposal["id"]
-        self.db.execute("UPDATE actions SET state='approved',approver_type='web_user',approver_id='admin',approved_at=? WHERE id=?",(now(),aid))
-        return aid
-
-    async def test_pause_after_identity_preserves_human_approval_and_resumes_once(self):
-        from ayana.actions import ActionError
-        aid=self.prepare_action();original=self.actions.gate.verify_account
-        async def verify(*args,**kwargs):
-            result=await original(*args,**kwargs)
-            self.db.execute("UPDATE duty_sessions SET paused_at=? WHERE id=?",(now(),self.manual))
-            return result
-        self.actions.gate.verify_account=verify
-        with self.assertRaises(ActionError) as caught:await self.actions.execute(aid,actor_type="web_user",actor_id="admin",is_admin=True)
-        self.assertEqual(caught.exception.code,"session_paused")
-        row=self.db.query_one("SELECT state,approver_type,approver_id FROM actions WHERE id=?",(aid,))
-        self.assertEqual(tuple(row),("approved","web_user","admin"))
-        self.assertFalse(self.db.query_one("SELECT need_human FROM incidents WHERE id='inc1'")[0])
-        self.assertFalse(self.transport.calls)
-        self.db.execute("UPDATE duty_sessions SET paused_at=0 WHERE id=?",(self.manual,));self.actions.gate.verify_account=original
-        result=await self.actions.execute(aid,actor_type="web_user",actor_id="admin",is_admin=True)
-        self.assertEqual(result["state"],"success")
-        self.assertEqual(len(self.transport.calls),1)
-        ledger=self.db.query_one("SELECT session_id,status FROM session_write_ops WHERE incident_id='inc1'")
-        self.assertEqual(tuple(ledger),(self.manual,"done"))
-        with self.assertRaises(ActionError):await self.actions.execute(aid,actor_type="web_user",actor_id="admin",is_admin=True)
-        self.assertEqual(len(self.transport.calls),1)
-
-    async def test_peer_work_after_identity_preserves_approval_and_owner_context(self):
-        from ayana.actions import ActionError
-        aid=self.prepare_action();original=self.actions.gate.verify_account
-        async def verify(*args,**kwargs):
-            result=await original(*args,**kwargs);self.duty.set_runtime_state(self.auto,"running");return result
-        self.actions.gate.verify_account=verify
-        with self.assertRaises(ActionError) as caught:await self.actions.execute(aid,actor_type="web_user",actor_id="admin",is_admin=True)
-        self.assertEqual(caught.exception.code,"work_already_running")
-        self.assertEqual(caught.exception.context["owner_session_id"],self.auto)
-        self.assertEqual(self.db.query_one("SELECT state FROM actions WHERE id=?",(aid,))[0],"approved")
-        self.assertFalse(self.db.query_one("SELECT need_human FROM incidents WHERE id='inc1'")[0])
-        self.assertFalse(self.transport.calls)
-
-    async def test_delete_after_identity_cancels_not_yet_dispatched_action(self):
-        from ayana.actions import ActionError
-        aid=self.prepare_action();original=self.actions.gate.verify_account
-        async def verify(*args,**kwargs):
-            result=await original(*args,**kwargs)
-            self.db.execute("UPDATE duty_sessions SET delete_requested_at=? WHERE id=?",(now(),self.manual));return result
-        self.actions.gate.verify_account=verify
-        with self.assertRaises(ActionError) as caught:await self.actions.execute(aid,actor_type="web_user",actor_id="admin",is_admin=True)
-        self.assertEqual(caught.exception.code,"session_deleting")
-        self.assertEqual(self.db.query_one("SELECT state FROM actions WHERE id=?",(aid,))[0],"cancelled")
-        self.assertFalse(self.transport.calls)
-
-    async def test_delete_at_final_transport_guard_is_cancelled_not_unknown(self):
-        from ayana.actions import ActionError
-        from ayana.transport import check_dispatch_authority
-        aid=self.prepare_action()
-        async def exec_late(asset,tokens,timeout=None):
-            self.db.execute("UPDATE duty_sessions SET delete_requested_at=? WHERE id=?",(now(),self.manual))
-            check_dispatch_authority()
-            raise AssertionError("must not dispatch")
-        self.transport.exec=exec_late
-        with self.assertRaises(ActionError) as caught:await self.actions.execute(aid,actor_type="web_user",actor_id="admin",is_admin=True)
-        self.assertEqual(caught.exception.code,"session_deleting")
-        self.assertEqual(self.db.query_one("SELECT state FROM actions WHERE id=?",(aid,))[0],"cancelled")
-        self.assertEqual(self.db.query_one("SELECT status FROM session_write_ops WHERE incident_id='inc1'")[0],"released")
-        self.assertFalse(self.transport.calls)
-
-
-if __name__=="__main__":unittest.main()
+if __name__ == "__main__":
+    unittest.main()

@@ -17,17 +17,16 @@ from .db import now
 
 PROJECT_URL = "https://github.com/wwqjss/Ayana"
 RELEASE_URL = "https://api.github.com/repos/wwqjss/Ayana/releases/latest"
-PROMPT_KINDS = {"investigation": "mimo_investigation_prompt", "decision": "mimo_decision_prompt", "constraints": "ops_constraints"}
-PROMPT_LABELS = {"investigation": "调查提示词", "decision": "处置提示词", "constraints": "运维软约束"}
+PROMPT_KINDS = {"investigation": "mimo_investigation_prompt", "constraints": "ops_constraints"}
+PROMPT_LABELS = {"investigation": "会话提示词", "constraints": "运维软约束"}
 
 
 def prompt_default(key: str) -> str:
     if key == "constraints":
         from .ops_constraints import DEFAULT_CONSTRAINTS
         return DEFAULT_CONSTRAINTS
-    from .auto_investigate import CONCLUSION_PROMPT, DECISION_PROMPT
+    from .auto_investigate import CONCLUSION_PROMPT
     if key == "investigation": return CONCLUSION_PROMPT
-    if key == "decision": return DECISION_PROMPT
     raise ValueError("invalid_prompt_key")
 
 

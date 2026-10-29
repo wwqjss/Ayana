@@ -1,4 +1,4 @@
-"""P4.3 无人值守只读调查闭环。
+﻿"""P4.3 无人值守只读调查闭环。
 
 Alertmanager → Incident → SessionBridge → MiMo(只读) → 结论 → Incident 时间线。
 
@@ -59,24 +59,28 @@ class InvestConfig:
         )
 
 
-CONCLUSION_PROMPT = """你是值班运维调查助手（只读，禁止修复）。
-目标：调查该 Incident，收集证据并给出结构化结论。不要重启服务、不要改配置、不要写文件。
+CONCLUSION_PROMPT = """你是值班运维 Agent（MiMoCode）。Ayana 只负责监控、Incident、SSH 凭据与审计；你是唯一 AI 大脑。
+
+对本 Incident 在同一会话内自行完成：调查 → 修复 → 验证，并决定是否重试、继续或结束。
+不要把修复拆给第二套 AI；不要等待 Ayana 再替你做执行决策。
 
 ## 软约束（必须遵守）
-1. 无进展 3 轮停止：连续 3 轮未产生新证据 → 停止并输出 partial/failed。
+1. 无进展 3 轮停止：连续 3 轮未产生新证据或改善 → 停止并输出 partial/failed。
 2. 同方案失败 2 次停止：同一修复意图不得重复尝试超过 2 次。
 3. 证据不足转人工：根因不明或探测无样本 → root_cause=unknown，next_steps 标明需人工。
 
-只允许使用只读 MCP 工具（实际工具名使用下划线）：
-- ayana_knowledge_query / ayana_knowledge_get
+可用工具（实际工具名使用下划线）：
+- ayana_knowledge_query / ayana_knowledge_get / ayana_knowledge_upsert
 - ayana_metrics_query
-- ayana_incident_list / ayana_incident_get
+- ayana_incident_list / ayana_incident_get / ayana_incident_note / ayana_incident_close
 - ayana_asset_list
-- ayana_host_exec（仅 channel=read 且命令必须是只读，如 uptime / systemctl status）
-禁止：ayana_host_exec 写模式、ayana_knowledge_upsert、ayana_incident_close、ayana_session_remote、ayana_action_execute。
-若工具拒绝写操作，记录该事实，不得绕过。
+- ayana_host_exec（channel=read 标注调查用途，channel=write 标注变更用途；都使用当前会话账号组，未指定时继承全局默认；权限=目标机 SSH 账户）
 
-必须实际调用至少一次上述只读工具，并把工具返回内容写入 facts.evidence；不要编造命令输出或工具结果。
+执行要求：
+- 先用只读工具收集证据，再决定是否修复。
+- 修复命令用 host.exec channel=write；结果不明（unknown）时自行检查目标状态再决定是否重试，不得假设成功。
+- 修复后必须用指标/探针验证是否真实恢复（SSH 成功 ≠ 恢复）。
+- 已验证恢复后写知识（区分已验证/推测），并用 incident_note 提交最终报告。
 
 最后必须输出一个 JSON 对象（可包在 ```json 代码块），**放在回答的最末尾**，字段：
 {
@@ -85,35 +89,13 @@ CONCLUSION_PROMPT = """你是值班运维调查助手（只读，禁止修复）
   "facts": [{"claim": "已确认事实", "evidence": "工具返回的证据来源"}],
   "hypotheses": [{"claim": "可能原因", "confidence": "high|medium|low"}],
   "unconfirmed": ["未确认事项"],
-  "next_steps": ["建议的下一步只读/需授权操作"],
-  "root_cause": "unknown 或简述（无证据必须 unknown）"
+  "next_steps": ["建议的下一步"],
+  "root_cause": "unknown 或简述（无证据必须 unknown）",
+  "actions_taken": [{"command": "...", "channel": "write", "result": "success|failure|unknown"}],
+  "verified_recovered": false
 }
 
-要求：事实/推测/建议严格分开；无证据不得写 root_cause 已确认。
-"""
-
-# P6.1：调查后的自治决策（写权限受控阶段）。执行仍由 ActionService 完成。
-DECISION_PROMPT = """你是值班运维处置计划助手。本阶段只生成计划，不执行修复。
-基于调查结论决定是否应修复；禁止调用 action.execute、host.exec 写模式或本机写工具。
-Ayana 会在计划返回后统一通过 OpsLoop → ActionService 执行、验证并审计。
-
-## 软约束（必须遵守）
-1. 无进展 3 轮停止：连续 3 轮未改善 → decision=human。
-2. 同方案失败 2 次停止：同一 plan_sig 不得再选 → decision=human。
-3. 证据不足转人工：evidence_ok=false 或 root_cause=unknown 且无明确处置 → decision=human。
-
-只输出一个 JSON 对象（可放 ```json 代码块），放在回答最末尾：
-{
-  "decision": "execute|human|observe",
-  "capability": "service.restart 等（execute 时必填）",
-  "object_id": "登记对象 id 或 name",
-  "plan_sig": "简短方案签名，如 restart-mysql",
-  "reason": "理由",
-  "evidence_ok": true,
-  "params": {}
-}
-
-decision=observe 表示继续观察不写；decision=human 表示转人工并说明缺失证据。
+要求：事实/推测/建议严格分开；无证据不得写 root_cause 已确认；verified_recovered 必须以监控证据为准。
 """
 
 
@@ -460,22 +442,9 @@ class AutoInvestigator:
                 conclusion=result,
                 rounds=rounds if resume_decision else rounds + 1,
                 duration=now() - started,
-                continue_loop=bool(self.config.closed_loop and status in ("completed", "partial")),
+                continue_loop=False,
             )
-            # P6.1：调查完成 → 同一 Incident 进入自治决策/处置/结案
-            if accepted and self.config.closed_loop and status in ("completed", "partial"):
-                try:
-                    await self._close_loop(incident_id, result, generation=generation)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("close_loop failed for %s: %s", incident_id, e)
-                    try:
-                        if self.ops_loop:
-                            self.ops_loop.escalate(
-                                incident_id, reason="close_loop_error", detail=str(e)[:200]
-                            )
-                    except Exception:
-                        pass
-
+            # core-008：单 MiMoCode 会话自行调查/修复/验证；不再二次决策派发
             if accepted and self.config.closed_loop and status in ("completed", "partial"):
                 self.db.execute("UPDATE investigation_jobs SET status=?,phase='complete',lease_expires_at=0,updated_at=? WHERE incident_id=? AND generation=? AND status='running'",(job_status,now(),incident_id,generation))
 
@@ -590,190 +559,6 @@ class AutoInvestigator:
         return "\n".join(lines)
 
     # ---- P6.1 闭环：调查 → 决策 → autonomous 执行 → 验证 → 结案 ----
-
-    def _build_decision_prompt(self, incident_id: str, conclusion: dict[str, Any]) -> str:
-        inc = dict(self.db.query_one("SELECT * FROM incidents WHERE id=?", (incident_id,)) or {})
-        from .settings_admin import PromptSettings
-        prompts = PromptSettings(self.db)
-        return "\n".join(
-            [
-                prompts.current("decision")["text"],
-                "\n## 当前生效的运维软约束",
-                prompts.current("constraints")["text"],
-                f"\n## Incident {incident_id}",
-                f"title: {inc.get('title')}",
-                f"asset: {inc.get('asset_id')}  object: {inc.get('object_id')}",
-                f"generation: {inc.get('generation')}",
-                "",
-                "## 调查结论",
-                json.dumps(conclusion, ensure_ascii=False, default=str)[:6000],
-            ]
-        )
-
-    def _parse_decision(self, text: str, conclusion: dict[str, Any]) -> dict[str, Any]:
-        data = _extract_json(text or "") or {}
-        decision = str(data.get("decision") or "").strip().lower()
-        if decision not in ("execute", "human", "observe"):
-            # 无合法决策：证据不足 → 人工
-            data = {
-                "decision": "human",
-                "reason": "invalid_or_missing_decision_json",
-                "evidence_ok": False,
-                "plan_sig": "",
-            }
-        else:
-            data["decision"] = decision
-        if decision == "execute":
-            if not data.get("capability") or not data.get("object_id"):
-                data["decision"] = "human"
-                data["reason"] = data.get("reason") or "execute_missing_capability_or_object"
-            if data.get("evidence_ok") is not True:
-                data["decision"] = "human"
-                data["reason"] = data.get("reason") or "evidence_insufficient"
-            if not isinstance(data.get("params", {}), dict):
-                data["decision"] = "human"
-                data["reason"] = "execute_invalid_params"
-        if not data.get("plan_sig"):
-            data["plan_sig"] = str(data.get("capability") or "plan") + ":" + str(data.get("object_id") or "")
-        data["conclusion_root_cause"] = conclusion.get("root_cause") or ""
-        return data
-
-    async def _decide_remediation(
-        self, incident_id: str, conclusion: dict[str, Any], *, generation: int
-    ) -> dict[str, Any]:
-        """同一 Incident/Session 进入决策；写权限受控 MCP 会话产出 JSON 计划。"""
-        # Deterministic suggestions pass the same evidence/shape validation.
-        suggested = conclusion.get("suggested_action") or {}
-        if isinstance(suggested, dict) and suggested.get("capability") and suggested.get("object_id"):
-            decision = self._parse_decision(json.dumps({
-                **suggested, "decision": "execute",
-                "reason": suggested.get("reason") or "conclusion_suggested_action",
-            }, ensure_ascii=False), conclusion)
-            decision["source"] = "conclusion"
-            return decision
-        client = self.mimo_write or self.mimo
-        rid = str(conclusion.get("remote_session_id") or "")
-        text = ""
-        if client is not None:
-            prompt = self._build_decision_prompt(incident_id, conclusion)
-            try:
-                if rid and hasattr(client, "resume"):
-                    sent = await asyncio.to_thread(client.resume, rid, prompt, timeout=self.config.decision_timeout_sec)
-                else:
-                    sent = await asyncio.to_thread(client.create, title=f"ops:{incident_id}", prompt=prompt,
-                                                   timeout=self.config.decision_timeout_sec)
-                # Production returns RemoteSession; test adapters may return dict.
-                if isinstance(sent, dict):
-                    if sent.get("ok") is not False and sent.get("status") != "error":
-                        text = str(sent.get("text") or "")
-                elif getattr(sent, "status", "active") not in ("error", "timeout"):
-                    text = str(getattr(sent, "text", "") or "")
-            except Exception as exc:  # noqa: BLE001
-                return {
-                    "decision": "human", "reason": f"decision_session_failed:{type(exc).__name__}",
-                    "evidence_ok": False, "plan_sig": "",
-                }
-        decision = self._parse_decision(text, conclusion)
-        decision["source"] = "mimo_write" if text else "fallback_human"
-        return decision
-
-    async def _close_loop(
-        self, incident_id: str, conclusion: dict[str, Any], *, generation: int
-    ) -> dict[str, Any]:
-        """调查后闭环：决策 → ActionService.autonomous → 验证 → 结案 / 转人工。"""
-        out: dict[str, Any] = {"incident_id": incident_id, "generation": generation}
-        if self.ops_loop is None:
-            out["skipped"] = "ops_loop_unavailable"
-            return out
-        if not self._incident_is_current(incident_id, generation):
-            return {**out, "skipped": "incident_changed"}
-        if not self._runtime_ready():
-            return {**out, "skipped": "provider_not_verified"}
-        # The local Incident mapping, never model output, selects the authority scope.
-        mapping = self.bridge.get_mapping(incident_id) if self.bridge is not None else None
-        authority_session_id = str((mapping or {}).get("session_id") or "")
-        duty=getattr(self.bridge,"duty",None)
-        session_before=(duty.get(authority_session_id) if duty and authority_session_id else {}) or {}
-        human_revision=int(session_before.get("human_message_revision") or 0)
-        def operator_changed():
-            current=(duty.get(authority_session_id) if duty and authority_session_id else {}) or {}
-            return bool(current.get("paused_at") or current.get("delete_requested_at") or current.get("deleted_at")
-                        or int(current.get("human_message_revision") or 0)!=human_revision)
-        if operator_changed():return {**out,"skipped":"human_guidance"}
-        if authority_session_id:
-            from .agent_authority import AuthorityError, resolve_authority
-
-            try:
-                authority = resolve_authority(self.db, authority_session_id)
-            except AuthorityError as exc:
-                return {**out, "skipped": exc.code, "result": "authority_unavailable"}
-            if authority["access_mode"] == "readonly":
-                self.db.audit("agent", "auto_investigator", "agent_remediation_readonly",
-                              incident_id=incident_id, channel="agent",
-                              detail={"session_id": authority_session_id, "authority": authority})
-                return {**out, "skipped": "readonly_mode_rejects_write", "result": "readonly"}
-        decision = await self._decide_remediation(incident_id, conclusion, generation=generation)
-        out["decision"] = decision
-        if operator_changed():return {**out,"skipped":"human_guidance"}
-        if not self._incident_is_current(incident_id, generation):
-            return {**out, "skipped": "incident_changed"}
-        if not self._runtime_ready():
-            return {**out, "skipped": "provider_not_verified"}
-        kind = decision.get("decision")
-        if kind == "observe":
-            if self.incidents:
-                try:
-                    self.incidents.reconcile(incident_id)
-                except Exception:
-                    pass
-            out["result"] = "observed"
-            return out
-        if kind == "human":
-            self.ops_loop.escalate(
-                incident_id,
-                reason=str(decision.get("reason") or "decision_human")[:120],
-                detail=decision,
-            )
-            out["result"] = "need_human"
-            return out
-        # execute → ops_loop（记轮次 + autonomous + 验证）
-        inc_row = self.db.query_one("SELECT asset_id FROM incidents WHERE id=?", (incident_id,))
-        asset_id = str(decision.get("asset_id") or "")
-        if not asset_id and inc_row is not None:
-            asset_id = str(inc_row["asset_id"] or "")
-        self.db.execute("UPDATE investigation_jobs SET phase='execution',updated_at=? WHERE incident_id=? AND generation=? AND status='running'",(now(),incident_id,generation))
-        res = await self.ops_loop.run_action_and_verify(
-            incident_id=incident_id,
-            asset_id=asset_id,
-            object_id=str(decision.get("object_id") or ""),
-            capability=str(decision.get("capability") or ""),
-            params=decision.get("params") or {},
-            reason=str(decision.get("reason") or "closed_loop_remediate")[:200],
-            plan_sig=str(decision.get("plan_sig") or ""),
-            **({"authority_session_id": authority_session_id} if authority_session_id else {}),
-        )
-        out["action"] = res
-        if operator_changed():return {**out,"skipped":"human_guidance"}
-        if res.get("permission_blocked"):
-            return {**out, "result": "readonly"}
-        if res.get("approval_required"):
-            out["result"] = "awaiting_approval"
-            out["action_id"] = res.get("action_id") or ""
-            # 不 escalate：等人批后再继续
-            return out
-        closed = self.ops_loop.maybe_close(incident_id)
-        out["close"] = closed
-        # 证据不足 / 失败且未恢复 → 转人工
-        if not res.get("ok") and not closed.get("closed"):
-            st = self.ops_loop.status(incident_id)
-            if st.get("stop") or st.get("status") == "need_human" or not res.get("ok"):
-                if st.get("status") != "need_human":
-                    self.ops_loop.escalate(
-                        incident_id,
-                        reason="remediation_failed_or_unverified",
-                        detail={"action": res, "close": closed},
-                    )
-        return out
 
     def _finish(
         self,

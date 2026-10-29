@@ -1,4 +1,4 @@
-"""Retired permission model: stored defaults/exceptions are never evaluated."""
+﻿"""Retired permission model: stored defaults/exceptions are never evaluated."""
 from __future__ import annotations
 
 import os
@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 from ayana.db import Database
-from ayana.policy import Policy, PolicyDeny
+from ayana.access import AccessControl as Policy, PolicyDeny
 
 
 class PermModelTest(unittest.TestCase):

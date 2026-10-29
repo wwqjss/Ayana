@@ -148,7 +148,7 @@ class TestSSHTransportGuard(unittest.TestCase):
 
     def test_untrusted_host_key_refused(self):
         self.store.upsert_endpoint(
-            asset_id="nerv", role="read", host="h", username="u", actor="a"
+            asset_id="nerv", role="default", host="h", username="u", actor="a"
         )
         with self.assertRaises(TransportError) as ctx:
             asyncio.run(self.tr.probe("nerv", ["uptime"]))

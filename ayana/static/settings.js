@@ -204,37 +204,11 @@ async function settingsModel(context) {
   context.root.innerHTML = "";
   context.root.appendChild(settingsDescription("MiMoCode 用于事件调查与自治决策。这里显示当前生效的模型连接，密钥不会回填。"));
   const host = el("div", { id: "settings-model-host", class: "settings-section" }); context.root.appendChild(host);
-  let primaryDirty = false, auxiliaryDirty = false;
-  const markDirty = () => context.setDirty(primaryDirty || auxiliaryDirty);
-  await openMimoAdmin(host, { ...context, setDirty: (value) => { primaryDirty = Boolean(value); markDirty(); } });
+  await openMimoAdmin(host, context);
   if (!context.active()) return;
-  const details = el("details", { class: "settings-detail" });
-  details.appendChild(el("summary", { text: "表单辅助模型（可选）" }));
-  details.appendChild(settingsDescription("用于“帮我填表”等辅助操作，与上方自治模型分别保存。修改这里不会切换自治调查模型。"));
-  context.root.appendChild(details);
-  const reply = await api("/api/settings/global"); if (!context.active() || !reply?.ok) return;
-  const base = settingsInput("settings-assist-base", "url", reply.llm_base_url || "");
-  const model = settingsInput("settings-assist-model", "text", reply.llm_model || "");
-  const key = settingsInput("settings-assist-key", "password", "", { autocomplete: "new-password", placeholder: reply.llm_api_key_set ? "已保存，留空保留" : "API Key" });
-  [base, model, key].forEach((input) => input.addEventListener("input", () => { auxiliaryDirty = true; markDirty(); }));
-  details.appendChild(settingsField("接口地址", base)); details.appendChild(settingsField("模型", model)); details.appendChild(settingsField("API Key", key));
-  const message = el("p", { class: "settings-description", "aria-live": "polite" });
-  details.appendChild(el("button", { class: "btn", type: "button", text: "保存辅助配置", onclick: async () => {
-    if (!context.active() || settingsState.busy) return;
-    context.setBusy(true);
-    try {
-      const payload = { llm_base_url: base.value.trim(), llm_model: model.value.trim() }; if (key.value.trim()) payload.llm_api_key = key.value.trim();
-      const result = await api("/api/settings/global", { method: "POST", body: JSON.stringify(payload) });
-      if (!context.active()) return;
-      message.textContent = result?.ok ? "辅助模型配置已保存；自治模型未变更。" : result?.message || "保存失败。";
-      if (result?.ok) { key.value = ""; auxiliaryDirty = false; markDirty(); }
-    } catch (_) { if (context.active()) message.textContent = "保存未完成，请重试。"; }
-    finally { context.setBusy(false); }
-  } }));
-  details.appendChild(message);
   context.root.appendChild(el("details", { class: "settings-detail" }, [
     el("summary", { text: "Agent 工具连接" }),
-    settingsDescription("Ayana 在模型会话启动时自动连接 MCP，并绑定当前事件数据库。每个会话按自身权限使用工具，无需在监控接入中另行配置。"),
+    settingsDescription("Ayana 在模型会话启动时自动连接 MCP，并绑定当前事件数据库。可在会话中通过配置工具管理检查和通知；实际执行使用当前会话选定的 SSH 账号组。"),
   ]));
 }
 
@@ -348,7 +322,7 @@ async function settingsPrompts(context) {
   if (!reply?.ok) throw new Error("prompts_unavailable");
   const items = reply.items || [], currentItem = items.find((item) => item.key === settingsState.promptKey) || items[0];
   context.root.innerHTML = "";
-  context.root.appendChild(settingsDescription("编辑调查、处置提示词与运维软约束。保存后供下一次模型调用使用，当前已开始的调用保持原内容。执行权限与只读保护由系统独立控制。"));
+  context.root.appendChild(settingsDescription("编辑调查、处置提示词与运维软约束。保存后供下一次模型调用使用，当前已开始的调用保持原内容。实际执行权限由所选 SSH 账号决定，执行审计与未知结果保护仍由系统控制。"));
   if (!currentItem) { context.root.appendChild(settingsDescription("暂无可编辑提示词。")); return; }
   settingsState.promptKey = currentItem.key;
   const tabs = el("div", { class: "settings-tabs", "aria-label": "提示词类型" });
@@ -493,18 +467,7 @@ async function settingsAbout(context) {
       if (checked?.ok && typeof release === "string" && release.startsWith("https://github.com/wwqjss/Ayana/releases/")) card.appendChild(el("a", { href: release, target: "_blank", rel: "noopener noreferrer", text: "查看更新说明 ↗" }));
     } finally { context.setBusy(false); }
   });
-  if (state.user?.is_admin) {
-    const history = el("details", { class: "settings-detail" }, [el("summary", { text: "旧自治历史" }), settingsDescription("旧 Council 已退役，历史费用记录仍可追溯。")]);
-    const body = el("div"); history.appendChild(body); context.root.appendChild(history);
-    history.addEventListener("toggle", async () => {
-      if (!history.open || !context.active() || body.dataset.loaded) return;
-      try {
-        const usage = await api("/api/autonomy/usage"); if (!context.active()) return;
-        body.textContent = usage?.ok ? JSON.stringify(usage.usage || {}, null, 2) : "历史记录暂时无法读取。";
-        body.className = "settings-detail"; body.dataset.loaded = "true";
-      } catch (_) { if (context.active()) body.textContent = "历史记录暂时无法读取。"; }
-    });
-  }
+
 }
 
 function settingsNotificationSaving(value) {

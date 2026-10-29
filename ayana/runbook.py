@@ -147,81 +147,6 @@ class ManualTemplate:
             ).hexdigest()[:12]
 
 
-def auto_budget_state(
-    store: Any,
-    rule: RunbookRule,
-    asset_id: str,
-    object_id: str,
-    *,
-    at: float,
-    exclude_action_id: str = "",
-) -> dict[str, Any]:
-    """Agent 预检与事务内派发门共用同一预算定义，以已派发操作为准。
-
-    store 可为 Database 或 sqlite Connection；事务调用者保留原子领取职责。
-    unknown 也占用预算；未派发的取消/拒绝/过期提案不消耗预算。
-    """
-    obj = store.execute(
-        "SELECT id,name FROM objects WHERE asset_id=? AND (id=? OR name=?)",
-        (asset_id, object_id, object_id),
-    ).fetchone()
-    object_ref = obj["id"] if obj else object_id
-    object_name = obj["name"] if obj else (object_id or "").split(":")[-1]
-    rows = store.execute(
-        "SELECT COALESCE(dispatched_at,created_at) AS at FROM actions"
-        " WHERE asset_id=? AND object_id IN (?,?) AND mode IN ('auto','reviewed') AND id!=?"
-        " AND (?='' OR capability=?)"
-        " AND state IN ('dispatched','success','failure','unknown')"
-        " ORDER BY at DESC",
-        (asset_id, object_ref, object_name, exclude_action_id, rule.capability, rule.capability),
-    ).fetchall()
-    times = [float(row["at"] or 0) for row in rows]
-    recent = [t for t in times if t > at - 86400]
-    reasons: list[str] = []
-    retry_at = 0.0
-    code = ""
-    # max_per_day=0 / cooldown_sec=0 表示不限制
-    if rule.max_per_day > 0 and len(recent) >= rule.max_per_day:
-        code = "budget_exhausted"
-        retry_at = recent[rule.max_per_day - 1] + 86400
-        reasons.append(f"已达24小时执行上限（{len(recent)}/{rule.max_per_day}次）")
-    if rule.cooldown_sec > 0 and times and at - times[0] < rule.cooldown_sec:
-        code = code or "cooldown"
-        retry_at = max(retry_at, times[0] + rule.cooldown_sec)
-        reasons.append("冷却中")
-    cap = (
-        f"{len(recent)}/{rule.max_per_day} today"
-        if rule.max_per_day > 0
-        else f"{len(recent)}/unlimited today"
-    )
-    return {
-        "ok": not reasons,
-        "reason": "；".join(reasons) if reasons else f"ok ({cap})",
-        "retry_at": retry_at or None,
-        "code": code,
-        "count": len(recent),
-    }
-
-
-# 人工-only 模板：显式登记，避免用“人工”绕过 runbook 交集
-MANUAL_TEMPLATES: dict[str, ManualTemplate] = {
-    t.id: t
-    for t in (
-        ManualTemplate("tmpl_service_stop", "手工停止服务", "service.stop"),
-        ManualTemplate("tmpl_service_start", "手工启动服务", "service.start"),
-        ManualTemplate("tmpl_service_restart", "手工重启服务", "service.restart"),
-        ManualTemplate("tmpl_container_restart", "手工重启容器", "container.restart"),
-    )
-}
-
-CAPABILITY_TEMPLATE = {
-    "service.stop": "tmpl_service_stop",
-    "service.start": "tmpl_service_start",
-    "service.restart": "tmpl_service_restart",
-    "container.restart": "tmpl_container_restart",
-}
-
-
 # 默认 runbook 表：发行版不得内置针对特定资产的自动处置规则。
 # 运行时由 config.runbook_rules 注入（见 apply_runbook_rules）。
 RUNBOOK: list[RunbookRule] = []
@@ -268,57 +193,12 @@ def apply_runbook_rules(cfg_rules: Any) -> list[RunbookRule]:
     return list(RUNBOOK)
 
 
-def match_runbook(
-    *,
-    asset_id: str,
-    object_name: str,
-    alertname: str,
-    category: str = "",
-    runbook: list[RunbookRule] | None = None,
-) -> RunbookRule | None:
-    """查表匹配。多条件取最具体的规则。控制面对象永不匹配自动规则。"""
-    low = (object_name or "").lower()
-    if any(m in low for m in CONTROL_PLANE_MARKERS):
-        return None
-    rules = runbook if runbook is not None else RUNBOOK
-    best = None
-    best_score = -1
-    for r in rules:
-        if r.manual_only:
-            continue
-        score = 0
-        if r.asset_id != "*" and r.asset_id != asset_id:
-            continue
-        if r.object_name != "*" and r.object_name != object_name:
-            continue
-        if r.alertname != "*" and r.alertname != alertname:
-            continue
-        if r.category != "*" and r.category != category:
-            continue
-        if r.asset_id == asset_id:
-            score += 3
-        if r.object_name == object_name:
-            score += 3
-        if r.alertname == alertname:
-            score += 2
-        if r.category == category and category:
-            score += 1
-        if score > best_score:
-            best_score = score
-            best = r
-    return best
-
-
 def get_runbook_rule(rule_id: str, runbook: list[RunbookRule] | None = None) -> RunbookRule | None:
     rules = runbook if runbook is not None else RUNBOOK
     for r in rules:
         if r.id == rule_id:
             return r
     return None
-
-
-def get_manual_template(template_id: str) -> ManualTemplate | None:
-    return MANUAL_TEMPLATES.get(template_id)
 
 
 def list_runbook() -> list[dict[str, Any]]:

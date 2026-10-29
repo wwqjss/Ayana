@@ -15,12 +15,21 @@ from ayana.notify import Notifier
 import test_phase_c_p0 as fixtures
 
 
+class RecoveryProm:
+    """Supply fresh, target-matched recovery evidence for lifecycle fixtures."""
+
+    def evaluate_recovery_evidence_sync(self, profile, *, asset_id, service):
+        return {"verdict": "green", "contract": profile.id,
+                "asset": asset_id, "service": service}
+
+
 class LifecycleConsistencyTests(unittest.TestCase):
     def setUp(self):
         self.tmp, self.db, _, self.prom, self.actions, self.incidents = fixtures.make_env()
         self.addCleanup(fixtures.close, self.tmp, self.db)
         fixtures.seed_incident(self.db)
         fixtures.seed_success_action(self.db)
+        self.db.execute("UPDATE alert_episodes SET problem_family='availability' WHERE id='ep_inc1'")
 
     def incident(self):
         return dict(self.db.query_one("SELECT * FROM incidents WHERE id='inc1'"))
@@ -114,12 +123,13 @@ class LifecycleConsistencyTests(unittest.TestCase):
         self.assertEqual(self.incidents.reconcile('inc1')['stage'],'need_human')
 
     def test_old_episode_cannot_close_new_not_seen_failure(self):
+        self.incidents.prom = RecoveryProm()
         self.db.execute("UPDATE alert_episodes SET status='resolved',first_seen=? WHERE id='ep_inc1'",(now()-100,))
         self.db.event('incident_resolved',incident_id='inc1',episode_id='ep_inc1',payload={'generation':1})
         self.db.execute("UPDATE incidents SET generation=2,status='open',stage='pending' WHERE id='inc1'")
         self.db.execute("INSERT INTO alert_episodes(id,source_id,fingerprint,starts_at_norm,incident_id,"
-                        " alertname,status,asset_id,object_id,first_seen,last_seen,source_state,source_health)"
-                        " VALUES('new','am','new','new','inc1','TargetDown','firing','nerv','frps',?,?,'not_seen','ok')",
+                        " alertname,status,asset_id,object_id,first_seen,last_seen,source_state,source_health,problem_family)"
+                        " VALUES('new','am','new','new','inc1','TargetDown','firing','nerv','frps',?,?,'not_seen','ok','availability')",
                         (now(),now()))
         self.db.event('incident_reopened',incident_id='inc1',episode_id='new',payload={'generation':2,'episode_id':'new'})
         self.incidents.on_episode_resolved('ep_inc1')
@@ -146,8 +156,18 @@ class LifecycleConsistencyTests(unittest.TestCase):
 
     def test_verification_recovery_also_creates_one_notification_event(self):
         self.db.execute("UPDATE alert_episodes SET status='resolved'")
-        self.db.execute("INSERT INTO verifications(id,action_id,incident_id,status,started_at,generation)"
-                        " VALUES('passed','act1','inc1','passed',?,1)",(now(),))
+        t = now()
+        evidence = {
+            'baseline': t - 130, 'asset': 'nerv', 'service': 'frps',
+            'profile_id': 'svc.recover', 'action_id': 'act1', 'generation': 1,
+            'samples': [{'metric': {'asset': 'nerv', 'service': 'frps'},
+                         'sample_at': t - age, 'value': 1}
+                        for age in range(100, -1, -10)],
+        }
+        self.db.execute("INSERT INTO verifications(id,action_id,incident_id,status,started_at,generation,"
+                        " profile_id,finished_at,evidence_json)"
+                        " VALUES('passed','act1','inc1','passed',?,1,'svc.recover',?,?)",
+                        (t - 130, t, json.dumps(evidence)))
         self.incidents.reconcile('inc1')
         self.incidents.reconcile('inc1')
         rows=self.db.query("SELECT payload_json FROM events WHERE type='incident_resolved'")
@@ -225,6 +245,7 @@ class BatchedEpisodeBoundaryTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.addCleanup(db.close)
         incidents=IncidentService(db)
+        incidents.prom=RecoveryProm()
         ingest=AlertIngest(db,incidents=incidents)
         alerts=[{'status':'firing','startsAt':'2026-10-21T09:00:00Z',
                  'labels':{'alertname':name,'asset':'nerv','service':'frps'}}

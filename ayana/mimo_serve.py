@@ -340,7 +340,10 @@ class MimoServeManager:
             if managed:
                 # Schemas stay stable throughout a turn. Each actual MCP call
                 # is authorized from native metadata and live session state.
-                agents[MANAGED_AGENT] = {"mode":"primary", "disable":False, "tool_allowlist":list(tools), "permission":policy}
+                from .ops_constraints import MANAGED_EXECUTION_PROMPT
+                agents[MANAGED_AGENT] = {"mode":"primary", "disable":False,
+                    "prompt": MANAGED_EXECUTION_PROMPT,
+                    "tool_allowlist":list(tools), "permission":policy}
             config["default_agent"] = MANAGED_AGENT if managed else READONLY_AGENT
             config["permission"] = policy
             mcp = config.setdefault("mcp", {})

@@ -38,7 +38,7 @@ class Element {
   scrollIntoView() { this.scrolled = true; }
 }
 
-const hosts = [{ id: "romi", display_name: "ROMI", enabled: true, objects: [], ssh_endpoints: [{ asset_id: "romi", role: "write", username: "ops", host: "10.0.0.14", port: 22, credential_id: "key1", host_key_trusted_at: 1, host_key_sha256: "SHA256:host" }] }];
+const hosts = [{ id: "romi", display_name: "ROMI", enabled: true, objects: [], ssh_endpoints: [{ asset_id: "romi", role: "default", username: "ops", host: "10.0.0.14", port: 22, credential_id: "key1", host_key_trusted_at: 1, host_key_sha256: "SHA256:host" }] }];
 const credentials = [{ id: "key1", name: "Romi key", kind: "private_key", public_key: "ssh-ed25519 PUBLIC", secret: "MUST NEVER APPEAR" }, { id: "pw1", name: "Password", kind: "password", secret: "MUST NEVER APPEAR" }];
 const nodeStatus = { send: { enabled: true, node_id: "romi", target_url: "https://control.test/heartbeat", interval_sec: 15, last_send: { ok: true, at: 100 } }, recv: { enabled: false, allowed_nodes: [], timeout_sec: 180 }, peers: [{ node_id: "control", status: "online", last_seen_at: 101 }] };
 
@@ -47,7 +47,9 @@ function environment(reply, options = {}) {
   const body = new Element("body", nodes);
   const create = (id, tag = "div") => { const node = new Element(tag, nodes); node.id = id; nodes.set(id, node); body.appendChild(node); return node; };
   ["host-list", "ssh-creds", "host-list-count", "ssh-creds-count", "connections-load-error", "host-add-panel", "credential-editor-panel", "connections-sub-hosts", "connections-sub-nodewatch", "notify-sub-channels", "notify-sub-messages", "notify-sub-outbox", "tab-connections", "tab-notify", "modal", "modal-body", "notify-list", "notify-editor-panel", "notify-channel-count", "nw-status-summary", "nw-status", "nw-err", "nw-recv-box", "nw-send-box", "nw-invite-box", "nw-fp", "nw-parse-box", "nw-p-url", "nw-p-node", "nw-p-fp"].forEach((id) => create(id));
+  create("account-groups-list");
   ["host-cred", "host-role", "ssh-test-asset", "ssh-test-role", "nw-role", "ssh-cred-kind"].forEach((id) => create(id, "select"));
+  ["ag-assign-group", "ag-assign-asset", "ag-assign-cred"].forEach((id) => create(id, "select"));
   ["host-id", "ssh-cred-name", "ssh-cred-secret", "nw-interval", "nw-node-id", "nw-url", "nw-invite", "nw-paste", "nw-p-fp-in"].forEach((id) => create(id, "input"));
   ["connections-add-open", "nw-refresh", "nw-gen", "nw-gen-keep", "nw-copy", "nw-parse", "nw-apply", "nw-save-interval"].forEach((id) => create(id, "button"));
   const connectionTabs = ["hosts", "nodewatch"].map((sub) => { const node = create("connection-" + sub, "button"); node.dataset.sub = sub; return node; });
@@ -57,7 +59,8 @@ function environment(reply, options = {}) {
   const defaults = (url) => {
     if (url === "/api/assets") return { ok: true, assets: hosts };
     if (url === "/api/ssh/credentials") return { ok: true, credentials };
-    if (url === "/api/ssh/roles") return { ok: true, roles: [{ name: "write", kind: "write" }, { name: "read", kind: "read" }] };
+    if (url === "/api/ssh/roles") return { ok: true, roles: [{ name: "default", label: "默认" }, { name: "ops", label: "运维" }] };
+    if (url === "/api/ssh/account-groups") return { ok: true, groups: [{ name: "default", label: "默认", members: hosts[0].ssh_endpoints }, { name: "ops", label: "运维", members: [] }] };
     if (url === "/api/node-watch/status") return { ok: true, status: nodeStatus };
     if (url === "/api/node-watch/invite/generate") return { ok: true, invite: "INVITE", fp: "fp" };
     if (url === "/api/node-watch/invite/parse") return { ok: true, url: "https://control.test", node_id: "romi", fp: "verified-separately" };
@@ -83,7 +86,7 @@ function environment(reply, options = {}) {
     credLabel: (credential) => credential.name, fmtTime: (time) => "时间 " + time,
   });
   const cut = (start, end) => { const a = source.indexOf(start), b = source.indexOf(end, a); assert.ok(a >= 0 && b > a, start); return source.slice(a, b); };
-  for (const [start, end] of [["function el(", "async function api("], ["function currentTabFromHash(", "async function boot("], ["function fillSelect(", "async function refreshTab("], ["async function renderConnections(", 'on("host-auth", "change"'], ["function sshFormModal(", "const pcProgressByHost"], ["/* ---- 节点守望配对 ---- */", "/* ---- 外部事务 ---- */"], ["async function loadNotifyChannels(", "async function loadNotifyOutbox("]]) vm.runInContext(cut(start, end), context);
+  for (const [start, end] of [["function el(", "async function api("], ["function currentTabFromHash(", "async function boot("], ["function fillSelect(", "async function refreshTab("], ["function renderAccountGroups(", 'on("host-auth", "change"'], ["function sshFormModal(", "const pcProgressByHost"], ["/* ---- 节点守望配对 ---- */", "/* ---- 外部事务 ---- */"], ["async function loadNotifyChannels(", "async function loadNotifyOutbox("]]) vm.runInContext(cut(start, end), context);
   return { nodes, calls, opened, confirmations, state, location, events, run: (code) => vm.runInContext(code, context) };
 }
 
@@ -131,19 +134,42 @@ test("host and credential details start closed and summary rows contain no actio
 test("refresh retains expanded rows and selected role, credential and test host", async () => {
   const env = environment(); await env.run("renderConnections()");
   env.nodes.get("host-list").children[0].open = true; env.nodes.get("ssh-creds").children[1].open = true;
-  env.nodes.get("host-role").value = "read"; env.nodes.get("host-cred").value = "pw1"; env.nodes.get("ssh-test-asset").value = "romi";
+  env.nodes.get("host-role").value = "ops"; env.nodes.get("host-cred").value = "pw1"; env.nodes.get("ssh-test-asset").value = "romi";
   await env.run("renderConnections()");
   assert.equal(env.nodes.get("host-list").children[0].open, true); assert.equal(env.nodes.get("ssh-creds").children[1].open, true);
-  assert.equal(env.nodes.get("host-role").value, "read"); assert.equal(env.nodes.get("host-cred").value, "pw1"); assert.equal(env.nodes.get("ssh-test-asset").value, "romi");
+  assert.equal(env.nodes.get("host-role").value, "ops"); assert.equal(env.nodes.get("host-cred").value, "pw1"); assert.equal(env.nodes.get("ssh-test-asset").value, "romi");
 });
 test("failed loads retain previous lists and selector drafts with an explicit error", async () => {
   let fail = false; const env = environment(() => fail ? { ok: false } : undefined);
   await env.run("renderConnections()"); const previous = env.nodes.get("host-list").children[0];
-  env.nodes.get("host-cred").value = "pw1"; env.nodes.get("host-role").value = "read";
+  env.nodes.get("host-cred").value = "pw1"; env.nodes.get("host-role").value = "ops";
   fail = true; await env.run("renderConnections()");
   assert.equal(env.nodes.get("host-list").children[0], previous); assert.equal(env.nodes.get("ssh-creds").children.length, 2);
-  assert.equal(env.nodes.get("host-cred").value, "pw1"); assert.equal(env.nodes.get("host-role").value, "read");
+  assert.equal(env.nodes.get("host-cred").value, "pw1"); assert.equal(env.nodes.get("host-role").value, "ops");
   assert.ok(env.nodes.get("connections-load-error").textContent.includes("暂时无法加载"));
+});
+test("account groups show actual members and retain selections without restoring read/write groups", async () => {
+  const env = environment(); await env.run("renderConnections()");
+  assert.ok(env.nodes.get("account-groups-list").textContent.includes("ops@10.0.0.14:22"));
+  const group = env.nodes.get("ag-assign-group");
+  assert.deepEqual(group.children.map(option => option.value), ["default", "ops"]);
+  assert.equal(env.nodes.get("ag-assign-cred").children[0].textContent, "沿用已有账号凭据");
+  group.value = "ops"; env.nodes.get("ag-assign-cred").value = "key1";
+  await env.run("renderConnections()");
+  assert.equal(group.value, "ops"); assert.equal(env.nodes.get("ag-assign-cred").value, "key1");
+  assert.equal(env.nodes.get("ag-assign-asset").children[0].disabled, false);
+});
+test("a failed account-group refresh retains the confirmed member list and draft", async () => {
+  let failed = false;
+  const env = environment(({url}) => failed && url === "/api/ssh/account-groups" ? {ok:false} : undefined);
+  await env.run("renderConnections()");
+  const confirmed = env.nodes.get("account-groups-list").children[0];
+  env.nodes.get("ag-assign-group").value = "ops";
+  env.nodes.get("ag-assign-cred").value = "key1";
+  failed = true; await env.run("renderConnections()");
+  assert.equal(env.nodes.get("account-groups-list").children[0], confirmed);
+  assert.equal(env.nodes.get("ag-assign-group").value, "ops"); assert.equal(env.nodes.get("ag-assign-cred").value, "key1");
+  assert.ok(env.nodes.get("connections-load-error").textContent.includes("账号组成员暂时无法加载"));
 });
 test("a late connections request cannot replace a newer result", async () => {
   const first = deferred(), second = deferred(); let requests = 0;

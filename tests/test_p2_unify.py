@@ -1,4 +1,4 @@
-"""P2 统一改造回归：词表 / series_key / host_health_view / policy / 配置。"""
+﻿"""P2 统一改造回归：词表 / series_key / host_health_view / policy / 配置。"""
 from __future__ import annotations
 
 import asyncio
@@ -17,7 +17,7 @@ from ayana.business import host_health_view
 from ayana.db import Database, now
 from ayana.fmt import ZH_EVENT, ZH_STAGE, ZH_STATE, ZH_STATUS
 from ayana.health import sample_state
-from ayana.policy import Policy
+from ayana.access import AccessControl as Policy
 from ayana.prom import series_key, summarize_probe
 
 

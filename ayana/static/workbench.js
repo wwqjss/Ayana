@@ -5,7 +5,8 @@
   const appShowModal = typeof window.showModal === "function" ? window.showModal : null;
   const appCloseModal = typeof window.closeModal === "function" ? window.closeModal : null;
   const state = {
-    sessions: [], currentId: "", detail: null, settings: null, permissions: null, permissionBusy: false,
+    sessions: [], currentId: "", detail: null, settings: null, permissions: null, groupBusy: false,
+    sshGroups: [], groupOptionsVersion: 0, groupEventVersion: 0,
     active: false, generation: 0, mount: 0, pollTimer: null, polling: false,
     collapsedLeft: false, collapsedRight: false, settingsGeneration: 0, lifecycleBusy: false, taskEventVersion: 0,
   };
@@ -42,6 +43,48 @@
   const sessionPath = (sid) => "/api/agent/sessions/" + encodeURIComponent(sid);
   const manageable = () => !!state.detail && (state.detail.can_prepare === true || state.detail.can_control === true || (state.detail.can_prepare === undefined && state.detail.can_control === undefined));
   const openSession = () => state.detail && state.detail.session && state.detail.session.status === "open";
+
+  function groupLabel(name) {
+    const group = state.sshGroups.find((item) => item.name === name);
+    return group && group.label || (name === "default" ? "默认" : name) || "待确认";
+  }
+  function globalGroup() {
+    if (state.permissions && state.permissions.ssh_account_group_source === "global") return state.permissions.ssh_account_group;
+    return state.settings && state.settings.ssh_default_group || "default";
+  }
+  function sessionGroupOverride() {
+    const authority = state.permissions;
+    if (authority && authority.ssh_account_group_source) return authority.ssh_account_group_source === "session" ? authority.ssh_account_group : "";
+    return state.detail && state.detail.session && state.detail.session.ssh_account_group || "";
+  }
+  function adoptGroupOptions(reply) {
+    if (reply.settings) state.settings = reply.settings;
+    if (Array.isArray(reply.ssh_roles)) state.sshGroups = reply.ssh_roles.map((group) => typeof group === "string" ? { name: group } : group).filter((group) => group && group.name);
+  }
+  async function loadAccountGroups() {
+    const mount = state.mount, version = ++state.groupOptionsVersion;
+    try {
+      const reply = await api("/api/agent/settings");
+      if (!state.active || state.mount !== mount || version !== state.groupOptionsVersion || !reply || !reply.ok) return;
+      adoptGroupOptions(reply); updateTermUi();
+    } catch (_) { /* Keep the last confirmed account groups on a transient failure. */ }
+  }
+  function renderGroupSelector() {
+    const select = $("aw-account-group");
+    if (!select) return;
+    const selected = sessionGroupOverride();
+    const choices = [{ name: "", label: `跟随默认（${groupLabel(globalGroup())}）` }, ...state.sshGroups];
+    if (selected && !choices.some((group) => group.name === selected)) choices.push({ name: selected, label: selected + "（未配置）", enabled: false });
+    const signature = JSON.stringify(choices.map((group) => [group.name, group.label, group.enabled]));
+    if (select.dataset.options !== signature) {
+      select.innerHTML = "";
+      choices.forEach((group) => select.appendChild(el("option", { value: group.name, text: group.label || group.name, disabled: group.enabled === false ? "disabled" : null })));
+      select.dataset.options = signature;
+    }
+    select.value = selected;
+    const detail = state.detail || {}, session = detail.session || {};
+    select.disabled = !(manageable() && detail.can_control !== false && openSession() && !session.delete_requested_at && state.permissions && !state.groupBusy && state.sshGroups.length);
+  }
 
   function notice(text = "", failure = false) {
     const box = $("aw-term-notice");
@@ -107,13 +150,11 @@
     const d = state.detail;
     const prog = $("aw-progress");
     const incs = $("aw-incidents");
-    const pend = $("aw-pending");
     const res = $("aw-results");
     if (!prog) return;
     if (!d) {
       prog.textContent = "—";
       if (incs) incs.innerHTML = "";
-      if (pend) pend.innerHTML = "";
       if (res) res.innerHTML = "";
       return;
     }
@@ -136,50 +177,6 @@
         }
         incs.appendChild(row);
       });
-    }
-    if (pend) {
-      pend.innerHTML = "";
-      const writes = d.pending_writes || [];
-      const actions = d.pending_actions || [];
-      if (!writes.length && !actions.length) {
-        pend.appendChild(el("div", { class: "aw-muted", text: "无待审批" }));
-      }
-      writes.forEach((w) => {
-        const params = w.params || {};
-        const row = el("div", { class: "aw-pend-card" }, [
-          el("div", { class: "aw-pend-title", text: params.command || w.action_key || "写操作" }),
-          el("div", { class: "aw-pend-meta", text: `${w.target || ""} · ${w.incident_id || ""}` }),
-          el("div", { class: "aw-pend-actions" }, [
-            el("button", {
-              type: "button", class: "btn primary small", text: "批准",
-              onclick: () => approveWrite(w),
-            }),
-            el("button", {
-              type: "button", class: "btn ghost small", text: "拒绝",
-              onclick: () => rejectWrite(w),
-            }),
-          ]),
-        ]);
-        pend.appendChild(row);
-      });
-      actions.forEach((a) => {
-        const row = el("div", { class: "aw-pend-card" }, [
-          el("div", { class: "aw-pend-title", text: `${a.capability || ""} @ ${a.object_id || ""}` }),
-          el("div", { class: "aw-pend-meta", text: a.reason || a.incident_id || "" }),
-          el("div", { class: "aw-pend-actions" }, [
-            el("button", {
-              type: "button", class: "btn primary small", text: "批准并执行",
-              onclick: () => approveAction(a),
-            }),
-            el("button", {
-              type: "button", class: "btn ghost small", text: "拒绝",
-              onclick: () => rejectAction(a),
-            }),
-          ]),
-        ]);
-        pend.appendChild(row);
-      });
-      pend.querySelectorAll("button").forEach((button) => { button.disabled = !manageable() || !openSession(); });
     }
     if (res) {
       res.innerHTML = "";
@@ -243,23 +240,6 @@
     } catch (_) { alert("请求未完成，请刷新核对操作状态。不要重复提交未确认的执行请求。"); }
     finally { pendingDecisions.delete(key); }
   }
-  function approveWrite(write) {
-    if (pendingDecisions.has("write:" + write.action_key)) return;
-    if (!confirm("批准该操作？执行仍受 Ayana 权限与审计约束。")) return;
-    return decide("/api/agent/pending-writes/approve", { incident_id: write.incident_id, action_key: write.action_key }, "write:" + write.action_key);
-  }
-  function rejectWrite(write) {
-    return decide("/api/agent/pending-writes/reject", { incident_id: write.incident_id, action_key: write.action_key, reason: "human_rejected" }, "write:" + write.action_key);
-  }
-  function approveAction(action) {
-    if (pendingDecisions.has("action:" + action.id)) return;
-    const totp = prompt("动态验证码（若账号已启用 2FA，否则留空）:", "");
-    if (totp === null) return;
-    return decide("/api/actions/" + encodeURIComponent(action.id) + "/decision", { decision: "execute_once", totp }, "action:" + action.id);
-  }
-  function rejectAction(action) {
-    return decide("/api/actions/" + encodeURIComponent(action.id) + "/reject", { reason: "human_rejected" }, "action:" + action.id);
-  }
   async function loadSessions() {
     const mount = state.mount;
     const result = await api("/api/agent/sessions?limit=100");
@@ -273,6 +253,7 @@
   async function loadDetail(sid, generation = state.generation) {
     if (!sid) return false;
     const taskEventVersion = state.taskEventVersion;
+    const groupEventVersion = state.groupEventVersion;
     const result = await api(sessionPath(sid));
     if (!current(sid, generation)) return false;
     if (!result || !result.ok) {
@@ -287,6 +268,10 @@
     if (taskEventVersion !== state.taskEventVersion && state.detail) {
       result.task_state = state.detail.task_state;
       result.task_state_label = state.detail.task_state_label;
+    }
+    if (groupEventVersion !== state.groupEventVersion && state.permissions) {
+      result.effective_permissions = state.permissions;
+      if (result.session) result.session.ssh_account_group = sessionGroupOverride();
     }
     state.detail = result;
     if (result.can_control === false) term.control = false;
@@ -305,9 +290,9 @@
     const generation = ++state.generation;
     disconnectTerminal();
     state.currentId = sid;
-    state.permissions = null; state.permissionBusy = false;
+    state.permissions = null; state.groupBusy = false;
     state.detail = null; state.viewport = null;
-    state.taskEventVersion = 0; state.lifecycleBusy = false;
+    state.taskEventVersion = 0; state.groupEventVersion = 0; state.lifecycleBusy = false;
     taskFeedback("");
     renderHeader(); renderRight(); renderSessionList();
     notice("正在读取会话…");
@@ -353,7 +338,7 @@
   }
   async function archiveCurrent() {
     const sid = state.currentId, generation = state.generation;
-    if (!sid || !confirm("归档当前会话？仍有运行任务或待审批时将保留会话。")) return;
+    if (!sid || !confirm("归档当前会话？仍有运行任务或待核对写结果时将保留会话。")) return;
     const result = await api(sessionPath(sid) + "/archive", { method: "POST", body: "{}" });
     if (!current(sid, generation)) return;
     if (!result || !result.ok) taskFeedback(result && (result.message || result.error) || "当前会话暂不能归档。", true);
@@ -422,6 +407,7 @@
     catch (_) { taskFeedback("无法读取 Agent 设置，请重试。", true); return; }
     if (!state.active || mount !== state.mount || generation !== state.settingsGeneration) return;
     if (!reply || !reply.ok) { taskFeedback(reply && (reply.message || reply.error) || "无法读取 Agent 设置。", true); return; }
+    adoptGroupOptions(reply); updateTermUi();
     if (!appShowModal) { taskFeedback("设置面板暂不可用。", true); return; }
     const settings = reply.settings || {}, endpoints = reply.ssh_endpoints || [];
     const wrap = el("div", { class: "aw-agent-settings" });
@@ -434,49 +420,38 @@
     function field(label, control, help = "") {
       return el("label", { class: "settings-field" }, [el("span", { text: label }), control, ...(help ? [el("small", { text: help })] : [])]);
     }
-    function segmented(id, label, choices, value) {
-      const group = el("div", { id, class: "aw-segmented", role: "group", "aria-label": label });
-      const buttons = [];
-      group.value = value;
-      group.setValue = (selected) => {
-        group.value = selected;
-        buttons.forEach(([key, button]) => { button.classList.toggle("selected", key === selected); button.setAttribute("aria-pressed", String(key === selected)); });
-      };
-      choices.forEach(([key, text]) => {
-        const button = el("button", { type: "button", class: "btn", text, onclick: () => { group.setValue(key); dirty(); } });
-        buttons.push([key, button]); group.appendChild(button);
-      });
-      group.setValue(value); return group;
-    }
-    const dutyCard = section("自动值班", "统一使用执行权限和审批模式控制 Agent。自动会话无人接管时采用这里的配置；手动会话保留各自权限，接管期间的临时切换会在释放后恢复。");
-    const access = segmented("agent-auto-access", "自动值班执行权限", [["readonly", "只读"], ["readwrite", "读写"]], settings.auto_access_mode || "readwrite");
-    const approval = segmented("agent-auto-approval", "自动值班审批模式", [["manual", "人工审批"], ["automatic", "自动执行"]], settings.auto_approval_mode || "automatic");
-    dutyCard.appendChild(field("执行权限", access, "只读拒绝写操作；读写时再按审批模式执行。"));
-    dutyCard.appendChild(field("审批模式", approval, "人工审批：修改前由你确认；自动执行：允许直接修改。只读模式始终禁止修改。"));
-    const sshCard = section("SSH 账户", "选择实际登录账户。角色名称只表示用途，服务器实际权限由账户和 sudo 配置决定。");
-    const roles = (reply.ssh_roles || []).map((role) => typeof role === "string" ? { name: role } : role).filter((role) => role && role.name);
-    endpoints.forEach((endpoint) => { if (endpoint.role && !roles.some((role) => role.name === endpoint.role)) roles.push({ name: endpoint.role }); });
+    const sshCard = section("默认账号组", "会话和后台检查统一使用此组。单个会话可在顶部另选账号组，从下一次执行生效。账号能执行哪些命令，由服务器账号及 sudo 决定；缺少该组账号时会提示配置，不会换用其他组。");
+    const manageHint = el("p", { class: "muted small" }, [
+      el("span", { text: "要新建账号组或把 SSH 账号挂进组，请到 " }),
+      el("button", { type: "button", class: "btn link", text: "连接 → 账号组", onclick: () => {
+        if (appCloseModal) appCloseModal();
+        const btn = document.querySelector('nav [data-tab="connections"]');
+        if (btn) btn.click();
+        queueMicrotask(() => {
+          const panel = document.getElementById("account-groups-panel");
+          if (panel) { panel.open = true; panel.scrollIntoView({ block: "nearest" }); }
+        });
+      } }),
+      el("span", { text: "。" }),
+    ]);
+    sshCard.appendChild(manageHint);
+    const roles = state.sshGroups.slice();
     function rolePicker(id, label, selected) {
       const select = el("select", { id, "aria-label": label });
       const choices = roles.slice();
       if (!choices.some((role) => role.name === selected)) choices.push({ name: selected, missing: true });
-      choices.forEach((role) => select.appendChild(el("option", { value: role.name, disabled: role.enabled === false ? "disabled" : null, text: (role.display_name || role.name) + (role.missing ? "（待配置）" : role.enabled === false ? "（已停用）" : role.kind ? " · " + (role.kind === "write" ? "执行角色" : "调查角色") : "") })));
+      choices.forEach((role) => select.appendChild(el("option", { value: role.name, disabled: role.enabled === false ? "disabled" : null, text: (role.label || role.name) + (role.missing ? "（待配置）" : role.enabled === false ? "（已停用）" : "") + (role.description ? " · " + role.description : "") })));
       select.value = selected;
-      const accounts = el("div", { class: "aw-role-accounts", "aria-live": "polite" });
+      const accounts = el("div", { class: "aw-account-list", "aria-live": "polite" });
       function renderAccounts() {
         accounts.innerHTML = "";
         const assets = [...new Set(endpoints.map((endpoint) => endpoint.asset_id))];
         if (!assets.length) accounts.appendChild(el("span", { class: "aw-muted", text: "暂无 SSH 端点，请在「连接」中配置。" }));
         assets.forEach((asset) => {
           const enabled = endpoints.filter((endpoint) => endpoint.enabled && endpoint.asset_id === asset);
-          let endpoint = enabled.find((candidate) => candidate.role === select.value);
-          if (!endpoint && ["read", "write"].includes(select.value)) {
-            const compatibleRoles = roles.filter((role) => role.kind === select.value && role.enabled !== false).map((role) => role.name);
-            endpoint = compatibleRoles.map((role) => enabled.find((candidate) => candidate.role === role)).find(Boolean);
-            if (!endpoint && select.value === "read") endpoint = enabled.find((candidate) => candidate.role === "write");
-          }
-          const text = endpoint ? `${endpoint.username || "未设置账户"}@${endpoint.host || "未设置地址"}` + (endpoint.role !== select.value ? ` · 回退至 ${endpoint.role}` : "") : "未配置该角色的可用端点";
-          accounts.appendChild(el("div", { class: "aw-role-account" }, [el("span", { text: asset || "资产" }), el("code", { text })]));
+          const endpoint = enabled.find((candidate) => candidate.role === select.value);
+          const text = endpoint ? `${endpoint.username || "未设置账户"}@${endpoint.host || "未设置地址"}${endpoint.port ? ":" + endpoint.port : ""}` : "未加入此账号组";
+          accounts.appendChild(el("div", { class: "aw-account-row" }, [el("span", { class: "aw-account-asset", text: asset || "资产", title: asset }), el(endpoint ? "code" : "span", { class: endpoint ? "aw-account-address" : "aw-account-missing", text, title: text })]));
         });
       }
       select.onchange = () => { renderAccounts(); dirty(); };
@@ -484,8 +459,7 @@
       sshCard.appendChild(field(label, select)); sshCard.appendChild(accounts);
       return select;
     }
-    const investigateRole = rolePicker("agent-ssh-investigate", "调查账户角色", settings.ssh_investigate_role || "read");
-    const executeRole = rolePicker("agent-ssh-execute", "执行账户角色", settings.ssh_execute_role || "write");
+    const defaultGroup = rolePicker("agent-ssh-default", "默认账号组", settings.ssh_default_group || "default");
     const archiveCard = section("会话归档", "自动值班关联工单全部关闭后开始缓冲；新告警会取消倒计时。手动会话独立管理。");
     const presets = [["60", "1 分钟"], ["300", "5 分钟"], ["900", "15 分钟"], ["1800", "30 分钟"], ["custom", "自定义"]];
     const delayValue = String(settings.archive_delay_sec || 300);
@@ -513,12 +487,13 @@
       const stillCurrent = () => state.active && state.settingsGeneration === generation && wrap.isConnected !== false;
       try {
         const result = await api("/api/agent/settings", { method: "POST", body: JSON.stringify({
-          auto_access_mode: access.value, auto_approval_mode: approval.value, archive_delay_sec: seconds,
-          ssh_investigate_role: investigateRole.value, ssh_execute_role: executeRole.value,
+          archive_delay_sec: seconds,
+          ssh_default_group: defaultGroup.value,
         }) });
         if (!stillCurrent()) return;
         if (!result || !result.ok) { feedback.textContent = result && (result.message || result.error) || "保存失败，请重试。"; feedback.classList.add("error"); return; }
         state.settings = result.settings || state.settings;
+        updateTermUi();
         feedback.textContent = "已保存并生效"; cancel.textContent = "关闭";
         if (state.currentId) await loadDetail(state.currentId);
       } catch (_) { if (stillCurrent()) { feedback.textContent = "保存结果未确认，请重新读取设置后核对。"; feedback.classList.add("error"); } }
@@ -536,7 +511,7 @@
 
 
   function adoptPermissions(value) {
-    if (!value || value.session_id !== state.currentId || !["readonly","readwrite"].includes(value.access_mode) || !["manual","automatic"].includes(value.approval_mode)) return;
+    if (!value || value.session_id !== state.currentId || typeof value.ssh_account_group !== "string") return;
     if (state.permissions && value.revision < state.permissions.revision) return;
     state.permissions = value;
     if (value.controller_active === false) term.control = false;
@@ -595,25 +570,28 @@
     try { await bridge.copyPending(); }
     finally { if (button && current(sid, generation) && term.clipboard === bridge) button.disabled = false; }
   }
-  async function changePermissions(changes) {
-    const sid=state.currentId, generation=state.generation, attempt=term.attempt, connectionId=term.connectionId;
-    if (!term.control || !state.permissions || state.permissionBusy) { updateTermUi(); return; }
-    const revision=state.permissions.revision;
-    state.permissionBusy=true; updateTermUi();
+  async function changeAccountGroup(group) {
+    const sid=state.currentId, generation=state.generation;
+    if (!manageable() || !openSession() || state.groupBusy || !state.permissions || state.detail.can_control === false) { updateTermUi(); return; }
+    state.groupBusy=true; updateTermUi();
     try {
-      const result=await api(sessionPath(sid)+"/permissions", {method:"POST",body:JSON.stringify({connection_id:connectionId,revision,...changes})});
-      if (!current(sid,generation) || term.attempt!==attempt || term.connectionId!==connectionId) return;
+      const result=await api(sessionPath(sid)+"/account-group", {method:"POST",body:JSON.stringify({group})});
+      if (!current(sid,generation)) return;
       adoptPermissions(result && result.effective_permissions);
-      if (!result || !result.ok) taskFeedback(result && (result.message || result.error) || "权限切换未生效。",true);
-      else taskFeedback("权限已更新。");
-    } catch (_) { if(current(sid,generation) && term.attempt===attempt) taskFeedback("权限切换尚未确认，请核对后端状态。",true); }
-    finally { if(current(sid,generation)) {state.permissionBusy=false;updateTermUi();} }
+      if (!result || !result.ok) taskFeedback(result && (result.message || result.error) || "账号组切换未生效。",true);
+      else {
+        ++state.groupEventVersion;
+        if (state.detail && state.detail.session) state.detail.session.ssh_account_group = typeof result.group === "string" ? result.group : group;
+        taskFeedback("当前会话账号组已更新，下次执行生效。");
+      }
+    } catch (_) { if(current(sid,generation)) taskFeedback("账号组切换尚未确认，请核对当前状态。",true); }
+    finally { if(current(sid,generation)) {state.groupBusy=false;updateTermUi();} }
   }
   function updateTermUi() {
     const status = $("aw-term-status");
     if (status) {
-      const mode = state.permissions ? (state.permissions.access_mode === "readwrite" ? "读写" : "只读") : "权限待确认";
-      status.textContent = term.connecting ? "接入中" : term.ready && term.rendered ? (term.control ? "控制中" : "观察")+"·"+mode : term.ready ? "等待原生画面" : (state.viewport && state.viewport.released_at ? "已释放，可连接" : "未接入");
+      const group = state.permissions ? groupLabel(state.permissions.ssh_account_group) : "账号组待确认";
+      status.textContent = term.connecting ? "接入中" : term.ready && term.rendered ? (term.control ? "接管" : "观察")+" · "+group : term.ready ? "等待原生画面" : (state.viewport && state.viewport.released_at ? "已释放，可连接" : "未接入");
       status.classList.toggle("ready", term.ready && term.rendered);
       status.classList.toggle("control", term.control);
     }
@@ -624,10 +602,8 @@
     if (taskBadge) { taskBadge.textContent = state.detail ? taskLabel() : ""; taskBadge.dataset.state = task; }
     const copy = $("aw-copy-result");
     if (copy) { copy.disabled = !state.currentId || !state.detail; copy.textContent = term.xterm && typeof term.xterm.hasSelection === "function" && term.xterm.hasSelection() ? "复制选中文本" : "复制结果"; }
-    const access=$("aw-access-mode"), approval=$("aw-approval-mode"), permissions=state.permissions;
     const canControl = admin && detail.can_control !== false && !session.delete_requested_at;
-    if(access) {access.disabled=!(term.control && canControl && permissions && term.ready && open && !state.permissionBusy);access.textContent=permissions ? permissions.access_mode==="readwrite" ? "读写" : "只读" : "权限待确认";access.setAttribute("aria-checked",String(!!permissions && permissions.access_mode==="readwrite"));}
-    if(approval) {approval.disabled=!(term.control && canControl && permissions && term.ready && open && !state.permissionBusy);if(permissions)approval.value=permissions.approval_mode;}
+    renderGroupSelector();
     toggle("aw-term-acquire", term.ready && term.rendered && !term.control && canControl && open);
     toggle("aw-term-release", term.ready && term.control);
     toggle("aw-term-reconnect", !!state.currentId && !term.connecting && !term.ready);
@@ -913,9 +889,8 @@
       "aw-toggle-left": () => toggleColumn("left"), "aw-toggle-right": () => toggleColumn("right"),
     };
     Object.entries(handlers).forEach(([id, callback]) => { const node = $(id); if (node) node.onclick = callback; });
-    const access=$("aw-access-mode"),approval=$("aw-approval-mode");
-    if(access)access.onclick=()=>changePermissions({access_mode:state.permissions && state.permissions.access_mode==="readwrite" ? "readonly" : "readwrite"});
-    if(approval)approval.onchange=()=>{const mode=approval.value;updateTermUi();return changePermissions({approval_mode:mode});};
+    const group=$("aw-account-group");
+    if(group)group.onchange=()=>changeAccountGroup(group.value);
     window.addEventListener("resize", fitTerminal);
     window.addEventListener("pagehide", suspendAgentWorkbench);
   }
@@ -924,7 +899,7 @@
     if (!state.active) { state.active = true; ++state.mount; }
     const mount = state.mount;
     try {
-      await loadSessions();
+      await Promise.all([loadSessions(), loadAccountGroups()]);
       if (!state.active || state.mount !== mount) return;
       const selected = state.sessions.find((item) => item.id === state.currentId);
       const next = selected || state.sessions.find((item) => item.status === "open" && item.origin === "auto") || state.sessions[0];

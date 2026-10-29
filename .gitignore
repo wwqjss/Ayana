@@ -21,6 +21,8 @@ ui-*.png
 ayana-verify.png
 .pw-verify/
 .playwright-cli/
+.test-tmp/
+outputs/retired-export/
 backups/
 _rt_*.py
 .deploy-nw/

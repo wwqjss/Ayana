@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from ayana.actions import ActionError, ActionService, legacy_action_block
+from ayana.exec_facts import ActionError, legacy_action_block
 from ayana.db import Database, now
 from ayana.ops_constraints import DEFAULT_CONSTRAINTS, OpsConstraints
 from ayana.ops_loop import MAX_NO_PROGRESS_ROUNDS, MAX_SAME_PLAN_FAILURES, OpsLoop, ensure_ops_loop_schema
@@ -109,8 +109,9 @@ class SoftConstraintTests(unittest.TestCase):
     def test_loop_no_progress_stop(self):
         loop = OpsLoop(self.db)
         last = {}
-        for _ in range(MAX_NO_PROGRESS_ROUNDS):
-            last = loop.note_round("incX", progressed=False, plan_sig="p1", write_ok=False)
+        for index in range(MAX_NO_PROGRESS_ROUNDS):
+            # 不同方案连续无进展；同一方案应先触发两次执行失败门槛。
+            last = loop.note_round("incX", progressed=False, plan_sig=f"p{index}", write_ok=False)
         self.assertTrue(last["stop"])
         self.assertEqual(last["stop_reason"], "no_progress_3_rounds")
         self.assertEqual(loop.status("incX")["status"], "need_human")
@@ -130,8 +131,9 @@ class McpToolRegistrationTests(unittest.TestCase):
     def test_new_tools_listed(self):
         from ayana.mcp_tools import TOOL_SPECS
         names = {s["name"] for s in TOOL_SPECS}
+        self.assertNotIn("action.execute", names)
         for n in (
-            "action.execute", "ops.constraints", "ops.loop_status",
+            "host.exec", "ops.constraints", "ops.loop_status",
             "config.prom_target_add", "config.prom_target_update", "config.prom_target_delete",
         ):
             self.assertIn(n, names)

@@ -179,12 +179,7 @@ class WeComBot:
                     "· 紧急呼叫 [说明]\n"
                     "· 设置\n"
                     "· AYANA-WATCH-PING <request_id>\n"
-                    "也可继续使用 @Ayana /help、@Ayana -c …"
-                )
-            elif entry.kind == "approval":
-                reply = await self.qqbot._handle_approval(
-                    entry, user_id=user_id, actor_type="wecom_user", channel="wecom_aibot",
-                    channel_id=channel_id,
+                    "可使用 @Ayana /help 查看当前命令；主机操作请使用 Web 中的 MiMoCode 会话。"
                 )
             elif entry.kind == "slash":
                 reply = await self.qqbot.dispatch(

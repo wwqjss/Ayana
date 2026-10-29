@@ -2,7 +2,7 @@
 
 统一消息入口：
 - `@Ayana /cmd` → 斜杠命令
-- `@Ayana -c <host> <cmd>` → 受控命令（跳过 Agent）
+- 旧 `-c` 与逐动作审批命令仅返回退役提示
 - `@Ayana <自然语言>` → Agent 监控查询
 """
 
@@ -12,15 +12,13 @@ import logging
 from contextlib import nullcontext as _public_command
 from typing import Any
 
-from .actions import ActionError, ActionService
-from .approval import ApprovalService
+from .exec_facts import ActionError
 from .alertmanager import AlertIngest
 from .agent_query import AgentQueryService
-from .controlled import ControlledExecutor
 from .db import Database
 from .incidents import IncidentService
 from .investigation import InvestigationService
-from .msgentry import ERR_TARGET_UNAVAILABLE, error_reply, parse_entry, usage_hint_for_controlled
+from .msgentry import ERR_TARGET_UNAVAILABLE, error_reply, parse_entry
 from .notify import Notifier
 from .onewbot import OneBotServer, extract_text
 from .access import AccessControl, authenticated_channel_operator
@@ -32,14 +30,10 @@ HELP = """Ayana 命令
 @Ayana /health 自身状态
 @Ayana /help 本帮助
 @Ayana /status 总览
-@Ayana -c <host> <cmd> 受控命令
 @Ayana 查询 <host> 状态 自然语言查询
 @Ayana /incident [id] 事件
 @Ayana /investigate <asset> [object] 发起只读调查
-@Ayana /actions 待批准操作
-@Ayana /approve <action_id> 批准并执行
-@Ayana /reject <action_id> [原因] 拒绝操作
-@Ayana /cancel <action_id> 取消操作
+主机操作请使用 Web 中的 MiMoCode 会话。
 """
 
 # 词表唯一来源：fmt.py（P2-3）
@@ -65,7 +59,7 @@ class QQBot:
         ob: OneBotServer,
         incidents: IncidentService,
         investigation: InvestigationService,
-        actions: ActionService,
+        actions: Any,
         policy: AccessControl,
         notifier: Notifier,
         *,
@@ -89,7 +83,7 @@ class QQBot:
         self.version = version
         self.mlog = None  # MessageLog | None
         self.agent_query: AgentQueryService | None = None
-        self.controlled: ControlledExecutor | None = None
+        self.controlled = None  # 受控 -c 入口已退役
         self.ob.set_message_handler(self.on_event)
 
     async def on_event(self, event: dict) -> None:
@@ -136,9 +130,7 @@ class QQBot:
             return
 
         try:
-            if entry.kind == "approval":
-                reply = await self._handle_approval(entry, user_id=user_id)
-            elif entry.kind == "slash":
+            if entry.kind == "slash":
                 reply = await self.dispatch(
                     entry.text, user_id=user_id, group_id=group_id
                 )
@@ -230,63 +222,8 @@ class QQBot:
         self, entry, *, user_id: str, group_id: str, log_id: str = "",
         actor_type: str = "qq_user", channel: str = "qq", channel_id: str = "",
     ) -> str:
-        """已配置的渠道管理员可发起受控命令；写操作仍逐次审批。"""
-        if not self._is_channel_admin(actor_type, user_id, channel_id):
-            return ERR_TARGET_UNAVAILABLE
-        if not self.controlled:
-            return "受控命令服务未就绪"
-        with authenticated_channel_operator(actor_type, user_id):
-            res = await self.controlled.execute(
-                host=entry.host,
-                cmd_tokens=entry.cmd_tokens,
-                is_write=entry.is_write,
-                actor_type=actor_type,
-                actor_id=user_id,
-                channel=channel,
-            )
-        # 消息记录：关联执行状态
-        if log_id and self.mlog:
-            try:
-                self.mlog.update_state(
-                    log_id,
-                    detail={
-                        "kind": "controlled",
-                        "host": entry.host,
-                        "is_write": entry.is_write,
-                        "exec_ok": res.get("ok", False),
-                        "need_approval": res.get("need_approval", False),
-                        "action_id": res.get("action_id", ""),
-                    },
-                )
-            except Exception:
-                pass
-        return res.get("reply") or ""
-
-    async def _handle_approval(
-        self, entry, *, user_id: str, actor_type: str = "qq_user", channel: str = "qq", channel_id: str = "",
-    ) -> str:
-        """管理身份来自本渠道配置；批准仅作用于当前一次操作。"""
-        if not self._is_channel_admin(actor_type, user_id, channel_id):
-            return ERR_TARGET_UNAVAILABLE
-        from .fmt import approval_error
-        try:
-            with authenticated_channel_operator(actor_type, user_id):
-                result = await ApprovalService(self.actions).decide(
-                    entry.approval_decision,
-                    actor_type=actor_type, actor_id=user_id, channel=channel,
-                    is_admin=self._is_channel_admin(actor_type, user_id, channel_id),
-                )
-        except ActionError as e:
-            return approval_error(e.code)
-        if result.get("decision") == "reject":
-            return "已选择不执行，本次处置已跳过。"
-        prefix = ""
-        if result.get("already"):
-            return prefix + "这条操作已经处理，没有重复执行。"
-        if result.get("executed"):
-            state = ZH_STATE.get(result.get("state"), "已提交")
-            return prefix + f"已批准本次处置，执行结果：{state}。"
-        return prefix + "已批准本次处置，执行尚未完成，请在事件详情查看。"
+        """受控 -c 命令入口已退役（PERM-15）。"""
+        return "受控 -c 命令入口已退役，请通过 MiMoCode 会话操作。"
 
     def _is_channel_admin(self, actor_type: str, actor_id: str, channel_id: str = "") -> bool:
         if not actor_id:
@@ -503,72 +440,16 @@ class QQBot:
         return "\n".join(lines)[:1500]
 
     def _actions_text(self, actor_type: str = "qq_user", actor_id: str = "") -> str:
-        # S04: 操作列表也按资产可见范围过滤
-        visible = self._visible_assets(actor_type, actor_id) if actor_id else []
-        if not visible:
-            return ERR_TARGET_UNAVAILABLE
-        visible_ids = {a["id"] for a in visible}
-        rows = self.actions.list_actions(limit=10)
-        if not rows:
-            return "无操作记录"
-        lines = []
-        for r in rows:
-            if r.get("asset_id") not in visible_ids:
-                continue
-            lines.append(
-                f"{r['id']} [{_zstate(r['state'])}] {r['capability']} {r['asset_id']}/{r['object_id']}"
-            )
-        return "\n".join(lines) if lines else "无操作记录"
+        return "结构化动作列表已退役；写入口为 host.exec + 统一审计。"
 
     async def _approve(self, args: list[str], actor_type: str, actor_id: str, channel: str = "qq", channel_id: str = "") -> str:
-        if not args:
-            return "用法: /approve <action_id>"
-        try:
-            res = await ApprovalService(self.actions).decide(
-                "execute_once", action_id=args[0],
-                actor_type=actor_type,
-                actor_id=actor_id,
-                channel=channel,
-                reason=f"{channel}_approve",
-                is_admin=self._is_channel_admin(actor_type, actor_id, channel_id),
-            )
-            if res.get("already"):
-                return f"{args[0]} 已是 {res.get('state')}，未重复派发"
-            if res.get("executed"):
-                return f"已批准并执行 {res['id']} → {res.get('state')}"
-            return (
-                f"已批准 {res.get('id')}，但执行未完成: "
-                f"{res.get('error') or res.get('state')}"
-            )
-        except ActionError as e:
-            return f"批准失败: {e}"
+        return "逐动作审批已删除。"
 
     async def _reject(self, args: list[str], actor_type: str, actor_id: str, channel: str = "qq") -> str:
-        if not args:
-            return "用法: /reject <action_id> [原因]"
-        reason = " ".join(args[1:]) if len(args) > 1 else ""
-        try:
-            res = await ApprovalService(self.actions).decide(
-                "reject", action_id=args[0],
-                actor_type=actor_type,
-                actor_id=actor_id,
-                channel=channel,
-                reason=reason,
-            )
-            return f"已拒绝 {res['id']}" + (f"（{reason}）" if reason else "")
-        except ActionError as e:
-            return f"拒绝失败: {e}"
+        return "逐动作审批已删除。"
 
     def _cancel(self, args: list[str], actor_type: str, actor_id: str, channel: str = "qq") -> str:
-        if not args:
-            return "用法: /cancel <action_id>"
-        try:
-            self.actions.cancel(
-                args[0], actor_type=actor_type, actor_id=actor_id, channel=channel
-            )
-            return f"已取消 {args[0]}"
-        except ActionError as e:
-            return f"取消失败: {e}"
+        return "结构化动作执行已退役。"
 
     async def notify_incident(self, incident_id: str, typ: str, body: str, target: str = "") -> None:
         target = target or (f"user:{self.admin_qq}" if self.admin_qq else "")
