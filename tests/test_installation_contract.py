@@ -174,6 +174,28 @@ class DeploymentFixture(unittest.TestCase):
             unittest.mock.call('systemctl', 'start', 'ayana.service'),
         ])
 
+    def test_first_install_partial_start_failure_stops_both_units_without_success(self):
+        self.args.no_start = False
+        def run_command(*argv):
+            if argv[:2] == ('systemctl', 'start'):
+                raise subprocess.CalledProcessError(1, argv)
+        self.run.side_effect = run_command
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(deployment, 'set_permissions'):
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    deployment.install(self.args, self.source)
+        self.assertIn(unittest.mock.call('systemctl', 'stop', *deployment.UNITS), self.run.call_args_list)
+        self.assertNotIn('健康检查通过', output.getvalue())
+        self.assertIn('journalctl', errors.getvalue())
+
+    def test_prepared_install_does_not_claim_services_are_running(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            deployment.install(self.args, self.source)
+        self.assertIn('have not been started', output.getvalue())
+        self.assertNotIn('= active', output.getvalue())
+
     def test_rollback_makes_rescue_backup_before_restoring_old_database(self):
         self.install()
         self.make_db('old')
@@ -309,6 +331,88 @@ class DeploymentFixture(unittest.TestCase):
             self.assertIn('ayana/static/xterm/xterm.js', archive.namelist())
             self.assertIn('ayana/static/xterm/xterm-addon-fit.js', archive.namelist())
 
+
+
+class WebStartupTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.temporary.cleanup)
+        base = Path(self.temporary.name)
+        self.args = deployment.normalise(deployment.parser().parse_args([
+            '--system', '--prefix', str(base / 'code'), '--data', str(base / 'data'),
+            '--conf-dir', str(base / 'config'), '--unit-dir', str(base / 'units')]))
+        self.args.prefix.mkdir()
+        (self.args.prefix / 'pyproject.toml').write_text('[project]\nversion = "0.8.2"\n')
+
+    def response(self, value):
+        response = io.BytesIO(json.dumps(value).encode())
+        response.status = 200
+        return response
+
+    def test_other_service_or_old_version_on_the_port_cannot_pass_startup(self):
+        for value in ({'ok': True}, {'ok': True, 'service': 'other', 'version': '0.8.2'},
+                      {'ok': True, 'service': 'ayana', 'version': '0.8.1'}, []):
+            with self.subTest(value=value):
+                with patch.object(deployment, 'urlopen', return_value=self.response(value)):
+                    with self.assertRaisesRegex(deployment.InstallError, 'did not confirm'):
+                        deployment.health(self.args)
+
+    def test_correct_web_version_still_requires_both_services_active(self):
+        value = {'ok': True, 'service': 'ayana', 'version': '0.8.2'}
+        with patch.object(deployment, 'urlopen', return_value=self.response(value)):
+            with patch.object(deployment, 'run') as run:
+                self.assertEqual(deployment.health(self.args), value)
+        self.assertEqual(run.call_args_list, [
+            unittest.mock.call('systemctl', 'is-active', '--quiet', name) for name in deployment.UNITS])
+
+    def test_specific_host_and_ipv6_health_use_the_configured_listener(self):
+        self.args.conf_dir.mkdir()
+        for host, expected in [('192.0.2.10', '192.0.2.10'), ('::', '[::1]'),
+                               ('::1', '[::1]'), ('0.0.0.0', '127.0.0.1')]:
+            with self.subTest(host=host):
+                (self.args.conf_dir / 'config.json').write_text(json.dumps({'http_host': host, 'http_port': 7012}))
+                with patch.object(deployment, 'urlopen', return_value=self.response(
+                        {'ok': True, 'service': 'ayana', 'version': '0.8.2'})) as open_url:
+                    with patch.object(deployment, 'run'):
+                        deployment.health(self.args)
+                open_url.assert_called_once_with(f'http://{expected}:7012/health', timeout=5)
+
+    def test_slow_start_can_pass_after_the_previous_ten_second_limit(self):
+        with patch.object(deployment, 'health', side_effect=[URLError('starting')] * 12 + [{'ok': True}]):
+            with patch.object(deployment.time, 'sleep') as sleep:
+                self.assertEqual(deployment.wait_health(self.args), {'ok': True})
+        self.assertEqual(sleep.call_count, 12)
+
+    def test_first_health_request_timeout_is_retried(self):
+        with patch.object(deployment, 'health', side_effect=[TimeoutError(), {'ok': True}]):
+            with patch.object(deployment.time, 'sleep') as sleep:
+                self.assertEqual(deployment.wait_health(self.args), {'ok': True})
+        sleep.assert_called_once_with(1)
+
+    def test_access_summary_uses_actual_database_directory_and_hides_token(self):
+        self.args.conf_dir.mkdir()
+        custom = self.args.data / 'database'
+        custom.mkdir(parents=True)
+        token = custom / 'setup-admin.token'
+        token.write_text('must-not-appear-in-install-logs')
+        (self.args.conf_dir / 'config.json').write_text(json.dumps({'db_path': str(custom / 'ayana.db')}))
+        output = io.StringIO()
+        with patch.dict(os.environ, {'SSH_CONNECTION': '192.0.2.1 1234 192.0.2.2 22', 'USER': 'root'}, clear=True):
+            with contextlib.redirect_stdout(output):
+                deployment.report_installation(self.args, running=True)
+        self.assertIn('root@192.0.2.2', output.getvalue())
+        self.assertIn(str(token), output.getvalue())
+        self.assertNotIn('must-not-appear-in-install-logs', output.getvalue())
+        self.assertIn('API Key', output.getvalue())
+        self.assertNotIn('sudo cat', output.getvalue())
+
+    def test_sudo_access_summary_preserves_the_ssh_port_and_admin_commands(self):
+        output = io.StringIO()
+        with patch.dict(os.environ, {'SUDO_USER': 'operator', 'SSH_CONNECTION': '192.0.2.1 1234 192.0.2.2 2222'}, clear=True):
+            with contextlib.redirect_stdout(output):
+                deployment.report_installation(self.args, running=True)
+        self.assertIn('ssh -N -p 2222 -L 6200:127.0.0.1:6200 operator@192.0.2.2', output.getvalue())
+        self.assertIn('sudo systemctl', output.getvalue())
 
 
 class NativeObservationTests(unittest.TestCase):

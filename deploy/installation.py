@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -109,9 +110,8 @@ def native_status(args, *, require_idle=True):
 
 
 def web_is_online(args):
-    port = int(effective_config(args).get('http_port') or args.http_port)
     try:
-        with urlopen(f'http://127.0.0.1:{port}/health', timeout=3):
+        with urlopen(web_url(args) + '/health', timeout=3):
             return True
     except HTTPError:
         return True
@@ -390,24 +390,79 @@ def grant_venv_access(root: Path, group_id: int):
         path.chmod(mode)
 
 
-def health(args, units=None):
+def web_url(args):
     cfg = effective_config(args)
-    port = int(cfg.get('http_port') or args.http_port)
-    with urlopen(f'http://127.0.0.1:{port}/health', timeout=5) as response:
-        if response.status != 200 or not json.load(response).get('ok'):
-            raise InstallError('Web health failed')
+    host = str(cfg.get('http_host') or args.http_host)
+    host = {'0.0.0.0': '127.0.0.1', '::': '::1'}.get(host, host)
+    if ':' in host and not host.startswith('['):
+        host = f'[{host}]'
+    return f'http://{host}:{int(cfg.get("http_port") or args.http_port)}'
+
+
+def health(args, units=None):
+    metadata = args.prefix / 'pyproject.toml'
+    if not metadata.is_file():
+        raise InstallError('installed project metadata is missing; cannot verify the running version')
+    expected = tomllib.loads(metadata.read_text(encoding='utf-8'))['project']['version']
+    with urlopen(web_url(args) + '/health', timeout=5) as response:
+        try:
+            result = json.load(response)
+        except ValueError as exc:
+            raise InstallError('Web health returned invalid JSON') from exc
+        if (response.status != 200 or not isinstance(result, dict) or result.get('ok') is not True
+                or result.get('service') != 'ayana' or result.get('version') != expected):
+            raise InstallError(f'Web health did not confirm Ayana v{expected}')
     if args.system and not args.no_start:
         for name in (UNITS if units is None else units):
             run('systemctl', 'is-active', '--quiet', name)
+    return result
+
+
+def report_installation(args, *, running):
+    if not running:
+        print('Installation files prepared; services have not been started.')
+        if args.no_start:
+            print('No services or system accounts were changed (--no-start).')
+        if not args.system:
+            print(f'Runtime: {venv_python(args.prefix)} -m ayana.agent_runtime {args.conf_dir / "config.json"}')
+            print(f'Web: {venv_python(args.prefix)} -m ayana.main {args.conf_dir / "config.json"}')
+        return
+    version = tomllib.loads((args.prefix / 'pyproject.toml').read_text(encoding='utf-8'))['project']['version']
+    admin = 'sudo ' if os.environ.get('SUDO_USER') not in (None, '', 'root') else ''
+    print(f'\nAyana v{version} 已启动，Web 健康检查通过。')
+    print('服务：ayana = active；ayana-agent-runtime = active')
+    address = web_url(args)
+    print(f'Web 地址：{address}')
+    cfg = effective_config(args)
+    host = str(cfg.get('http_host') or args.http_host)
+    port = int(cfg.get('http_port') or args.http_port)
+    if host in ('127.0.0.1', 'localhost', '::1', '[::1]'):
+        connection = os.environ.get('SSH_CONNECTION', '').split()
+        server = connection[2] if len(connection) == 4 else '<服务器地址>'
+        ssh_port = f' -p {connection[3]}' if len(connection) == 4 and connection[3].isdigit() and connection[3] != '22' else ''
+        user = os.environ.get('SUDO_USER') or os.environ.get('USER') or 'root'
+        remote = f'{user}@{server}'
+        forward_host = '[::1]' if ':' in host else '127.0.0.1'
+        print('远程安装：在你电脑的终端建立 SSH 转发，再在浏览器打开上述地址：')
+        print(f'  ssh -N{ssh_port} -L {port}:{forward_host}:{port} {remote}')
+        if server == '<服务器地址>':
+            print('  <服务器地址> 使用你当前连接的服务器 IP 或域名。')
+    elif host in ('0.0.0.0', '::', '[::]'):
+        print(f'已监听所有网卡；浏览器使用服务器地址和端口 {port} 访问。')
+    token = db_path(args).resolve().parent / 'setup-admin.token'
+    if token.is_file() and not token.is_symlink():
+        print('首次注册令牌读取命令（在服务器执行）：')
+        print(f'  {admin}cat {shlex.quote(str(token))}')
+    print('首次进入 Web 后设置模型接口和 API Key，并保存验证；未配置模型时原生服务等待设置。')
+    print(f'查看服务：{admin}systemctl status ayana ayana-agent-runtime --no-pager')
 
 
 def wait_health(args, units=None):
-    for attempt in range(10):
+    for attempt in range(60):
         try:
-            health(args, units)
-            return
-        except (URLError, InstallError, subprocess.CalledProcessError):
-            if attempt == 9:
+            return health(args, units)
+        except (URLError, TimeoutError, InstallError, subprocess.CalledProcessError):
+            if attempt == 59:
                 raise
             time.sleep(1)
 
@@ -520,8 +575,8 @@ def install(args, source: Path):
         if managed:
             run('systemctl', 'daemon-reload')
             run('systemctl', 'enable', *UNITS)
-            run('systemctl', 'start', 'ayana-agent-runtime.service', 'ayana.service')
             started_new = True
+            run('systemctl', 'start', 'ayana-agent-runtime.service', 'ayana.service')
             wait_health(args)
             if was_ready:
                 for attempt in range(10):
@@ -533,13 +588,13 @@ def install(args, source: Path):
                         if attempt == 9:
                             raise
                         time.sleep(1)
-        print('Installed. Register using setup-admin.token, then save and verify the MiMo provider/model in Web settings.')
-        if args.no_start:
-            print('No services or system accounts were changed (--no-start).')
-        if not args.system:
-            print(f'Runtime: {venv_python(args.prefix)} -m ayana.agent_runtime {args.conf_dir / "config.json"}')
-            print(f'Web: {venv_python(args.prefix)} -m ayana.main {args.conf_dir / "config.json"}')
+        report_installation(args, running=managed)
     except BaseException:
+        if started_new:
+            admin = 'sudo ' if os.environ.get('SUDO_USER') not in (None, '', 'root') else ''
+            print('服务未通过启动检查，安装未完成。诊断：', file=sys.stderr)
+            print(f'  {admin}systemctl status ayana ayana-agent-runtime --no-pager', file=sys.stderr)
+            print(f'  {admin}journalctl -u ayana -u ayana-agent-runtime -n 60 --no-pager', file=sys.stderr)
         if managed and (runtime_stopped or started_new):
             run('systemctl', 'stop', *UNITS)
         if snapshot is not None:

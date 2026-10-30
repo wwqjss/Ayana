@@ -2,7 +2,7 @@
 
 Ayana 是一个以事件为中心的运维工作台。接入告警后，MiMoCode 在同一个原生会话内调查、执行主机命令、核对恢复证据；你可以在 Web 中观察过程、接管会话，并追溯每次操作。
 
-当前发布版本：**v0.8.1**。
+当前发布版本：**v0.8.2**。
 
 ```text
 告警 / 业务检查 → 工单与故障代次 → MiMoCode 原生会话
@@ -26,14 +26,16 @@ Ayana 是一个以事件为中心的运维工作台。接入告警后，MiMoCode
 
 ## 安装
 
-生产部署使用 Linux、Python 3.11+、tmux、OpenSSH 客户端，以及已准备好的兼容 MiMoCode CLI。安装器会检查这些条件；MiMoCode CLI 需要你按其发行方说明安装。
+在使用 systemd 的 Linux 服务器上复制执行以下命令。root 账号直接安装，普通账号会请求 sudo；脚本会自动准备系统依赖和官方 MiMoCode CLI，安装 Ayana、启动两个服务，并检查 Web 是否正常响应：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/wwqjss/Ayana/main/deploy/bootstrap.sh -o ayana-bootstrap.sh
-sudo bash ayana-bootstrap.sh --system --mimo-bin /absolute/path/to/mimo
+curl -fsSL https://raw.githubusercontent.com/wwqjss/Ayana/main/deploy/bootstrap.sh -o ayana-bootstrap.sh &&
+bash ayana-bootstrap.sh --system
 ```
 
-引导脚本下载最新正式 Release 并校验 SHA256。系统安装默认使用：
+完成后，终端会显示服务状态、访问方式和首次注册令牌的位置。在远程服务器安装时，按输出提示建立 SSH 转发，再用本机浏览器打开 `http://127.0.0.1:6200`；模型接口和 API Key 在页面中设置。
+
+脚本支持 apt、dnf 或 yum，要求系统软件源能提供 Python 3.11+。已有配置与可用 CLI 会沿用。Ayana 下载使用最新正式 Release 并校验 SHA256。系统安装默认使用：
 
 - 程序：`/opt/ayana`
 - 配置：`/etc/ayana`
