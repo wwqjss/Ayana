@@ -64,6 +64,13 @@ main:has(#tab-agent.tab-panel:not(.hidden)) { max-width: none !important; paddin
 .aw-pend-meta { font-size: 11px; color: #8f9aa9; margin: 4px 0 8px; overflow-wrap: anywhere; }
 .aw-pend-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .aw-muted { color: #8f9aa9; font-size: 12px; }
+.aw-progress-overview { line-height: 1.6; margin-bottom: 10px; }
+.aw-tool-fact { padding: 9px 10px; margin-bottom: 8px; border: 1px solid #ffffff15; border-radius: 7px; background: #ffffff03; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.aw-tool-fact.warning { border-color: #e5b96940; background: #e5b96908; }
+.aw-fact-label { color: #8f9aa9; font-size: 10px; margin-bottom: 4px; }
+.aw-fact-tool { color: #c9d8eb; }
+.aw-fact-result { color: #d2dbe6; white-space: pre-wrap; }
+.aw-tool-fact.warning .aw-fact-result { color: #e5bc81; }
 .aw-toggle { position: absolute; top: 22px; z-index: 5; width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--line); background: #1b1f27; color: #8f9aa9; cursor: pointer; font-size: 12px; }
 .aw-toggle-left { left: 4px; }
 .aw-toggle-right { right: 5px; }

@@ -363,12 +363,19 @@ def _readonly_diagnostic_shell(command: str) -> bool:
         if not safe_tokens(argv):
             return False
         prog, args = argv[0], argv[1:]
+        if prog in {"true", "false"}:
+            return not args
         if prog == "which":
             if args[:1] == ["-a"]:
                 args = args[1:]
             return bool(args) and all(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.+-]*", a) for a in args)
         if prog == "nginx":
             return args in (["-v"], ["-V"])
+        if prog == "getent":
+            # Explicit host/service lookups only; no NSS override modules,
+            # credentials databases, enumeration or arbitrary options.
+            return (len(args) == 2 and args[0] in {"hosts", "ahosts", "ahostsv4", "ahostsv6", "services"}
+                    and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,252}", args[1])))
         if prog == "head" and piped_input:
             # Only bound an existing pipeline's output; do not add file reads.
             count = (args[0][1:] if len(args) == 1 and re.fullmatch(r"-[1-9][0-9]{0,4}", args[0])

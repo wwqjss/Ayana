@@ -215,6 +215,86 @@ test("metric and business failures are isolated and source errors retain readabl
   assert.ok(env.nodes.get("monitor-business").textContent.includes("没有读取这部分探测结果"));
 });
 
+test("missing optional Prometheus produces one neutral source notice across repeated refreshes", async () => {
+  const health = { state: "ok", cls: "ok", label: "原生检查正常", source: "native" };
+  const env = environment(({ url }) => {
+    if (url.startsWith("/api/monitor/host/")) return {
+      ...emptyMetrics, health, monitor_not_configured: true,
+      overview: { state: "not_configured", metrics: {} }, history: { state: "not_configured", metrics: {} },
+    };
+    if (url.startsWith("/api/monitor/business/")) return {
+      ...businessFor("control", [{ ...native, state: "ok" }]),
+      errors: ["mysql_up", "probe_success", "replica_io", "replica_sql"].map((metric) => ({
+        source: "prometheus", metric, message: "暂时无法获取 Prometheus 业务检查，请稍后刷新。",
+      })),
+      warnings: [{ source: "prometheus", fatal: false, message: "Prometheus 暂不可用" }],
+    };
+  });
+  for (let refresh = 0; refresh < 2; refresh++) {
+    await env.run("renderMonitor()");
+    const box = env.nodes.get("monitor-business"), notices = box.querySelectorAll(".monitor-source-status");
+    assert.equal(notices.length, 1, "query-level failures must not become repeated rows");
+    assert.ok(notices[0].textContent.includes("Prometheus（可选来源）"));
+    assert.ok(notices[0].classList.contains("muted")); assert.equal(box.querySelectorAll(".error").length, 0);
+    assert.ok(box.textContent.includes("containerd")); assert.ok(box.textContent.includes("正常"));
+    assert.equal(env.nodes.get("monitor-host").children[0].textContent, "Control · 原生检查正常");
+    const chip = env.nodes.get("monitor-hosts-strip").children[0];
+    assert.ok(chip.querySelector("span").classList.contains("ok")); assert.ok(chip.title.includes("原生检查正常"));
+    const metrics = env.nodes.get("monitor-body");
+    assert.ok(metrics.textContent.includes("暂无当前资源数据"));
+    assert.equal(metrics.querySelectorAll(".metric-card").length, 0, "native health cannot fabricate CPU or memory values");
+    assert.equal(metrics.querySelectorAll("canvas").length, 0);
+    assert.equal(metrics.querySelectorAll(".warn").length, 0, "an unconnected optional source is not a host warning");
+  }
+});
+
+test("optional source notices do not hide errors reading native checks", async () => {
+  const env = environment(({ url }) => url.startsWith("/api/monitor/business/") ? {
+    ...businessFor("control", []), errors: [
+      { source: "prometheus", message: "Prometheus 暂未连接" },
+      { source: "ayana", message: "当前账号没有读取原生检查的权限。" },
+    ],
+  } : undefined);
+  await env.run("renderMonitor()");
+  const errors = env.nodes.get("monitor-business").querySelectorAll(".error");
+  assert.equal(errors.length, 1); assert.ok(errors[0].textContent.includes("没有读取原生检查的权限"));
+  assert.ok(!errors[0].textContent.includes("Prometheus"));
+});
+
+test("native failure, stale, unknown and disabled results remain visible without Prometheus", async () => {
+  for (const value of [
+    { state: "fail", hostState: "bad", cls: "bad", label: "原生检查异常", text: "异常" },
+    { state: "stale", hostState: "unknown", cls: "warn", label: "原生检查结果过期", text: "样本过期" },
+    { state: "unknown", hostState: "unknown", cls: "warn", label: "原生检查待确认", text: "未能确定结果" },
+    { state: "disabled", hostState: "no_data", cls: "dim", label: "原生检查未启用", text: "已停用" },
+  ]) {
+    const env = environment(({ url }) => {
+      if (url.startsWith("/api/monitor/host/")) return {
+        ...emptyMetrics, monitor_not_configured: true,
+        health: { state: value.hostState, cls: value.cls, label: value.label, source: "native" },
+      };
+      if (url.startsWith("/api/monitor/business/")) return businessFor("control", [{
+        ...native, state: value.state, last_state: "ok", enabled: value.state !== "disabled",
+      }]);
+    });
+    await env.run("renderMonitor()");
+    const dot = env.nodes.get("monitor-hosts-strip").children[0].querySelector("span");
+    assert.ok(dot.classList.contains(value.cls), value.state); assert.ok(!dot.classList.contains("ok"), value.state);
+    assert.ok(env.nodes.get("monitor-host").children[0].textContent.includes(value.label));
+    const row = env.nodes.get("monitor-business").querySelectorAll("tr")[1];
+    assert.ok(row.textContent.includes(value.text));
+    assert.ok(!row.children[2].textContent.includes("正常"), "old success cannot hide " + value.state);
+  }
+});
+
+test("a disabled native check never displays a leftover successful state as healthy", () => {
+  const env = environment();
+  env.run("renderMonitorBusiness(" + JSON.stringify(businessFor("control", [{ ...native, enabled: false, state: "ok" }])) + ", 'control')");
+  const status = env.nodes.get("monitor-business").querySelectorAll("tr")[1].children[2];
+  assert.ok(status.textContent.includes("已停用")); assert.ok(!status.textContent.includes("正常"));
+  assert.ok(!status.querySelector("span").classList.contains("ok"));
+});
+
 test("freshness and disabled states from the unified API override old successful results", async () => {
   const env = environment();
   const stale = { ...native, state: "stale", last_state: "ok" };

@@ -51,6 +51,11 @@ class LiveExecutionContractTests(unittest.TestCase):
         self.assertIn("真实 incident_id", DEFAULT_CONSTRAINTS)
         self.assertIn("该工单当前代次", DEFAULT_CONSTRAINTS)
 
+    def test_progress_guidance_requests_public_facts_without_repeated_logs_or_reasoning(self):
+        for requirement in ("简短中文", "关键阶段", "失败原因", "下一步", "内部思考", "验证依据", "无需逐次复述工具日志"):
+            self.assertIn(requirement, MANAGED_EXECUTION_PROMPT)
+        self.assertIn("工具调用错误不等于目标业务故障", DEFAULT_CONSTRAINTS)
+
     def test_custom_active_constraints_remain_the_current_version(self):
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "test.db")

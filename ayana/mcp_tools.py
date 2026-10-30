@@ -17,10 +17,14 @@ from .transport import TransportError, session_dispatch_guard, session_ssh_scope
 
 
 class McpToolError(Exception):
-    def __init__(self, code: str, message: str = "", detail: dict | None = None):
+    def __init__(self, code: str, message: str = "", detail: dict | None = None, *,
+                 dispatch_not_started: bool = False):
         self.code = code
         self.message = message or code
         self.detail = detail if isinstance(detail,dict) else {}
+        self.dispatch_not_started = dispatch_not_started
+        if dispatch_not_started:
+            self.detail = {**self.detail, "executed": False, "dispatch_not_started": True}
         super().__init__(self.message)
 
 
@@ -89,7 +93,7 @@ TOOL_SPECS: list[dict[str, Any]] = [
     },
     {
         "name": "metrics.query",
-        "description": "任意 PromQL 即时查询（不设白名单）。返回样本列表。",
+        "description": "查询已接入的 Prometheus（PromQL 即时查询，返回样本列表）。不读取 Ayana 原生检查；未接入 Prometheus 时请用 config.check_list 查看原生结果，无需为此安装 Prometheus。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -332,24 +336,36 @@ TOOL_SPECS: list[dict[str, Any]] = [
     {
         "name": "config.check_add",
         "description": (
-            "新增轻量 SSH 业务检查（service|port|command）。"
+            "新增 Ayana 原生 SSH 业务检查（不依赖 Prometheus，service|port|command）。"
             "校验规则与 Web 表单一致：kind=service 需 params.unit；"
-            "kind=port 需 params.proto/port；kind=command 需 params.cmd（仅允许安全程序白名单）。"
-            "返回校验通过后的 check；校验失败时给出 issues/missing。"
+            "kind=port 使用 params.protocol/port，例如 {protocol:'tcp',port:443}；"
+            "kind=command 使用 params.argv 字符串数组，例如 {argv:['curl','-q','-fsS','https://example.com/health']}，expect 省略或 {exit_code:0}。"
+            "命令仅允许 curl/wget/ps/ss/echo/true/false/nc/ping；curl 必须以 -q 开头，禁止 shell 管道、脚本和任意文件读写。"
+            "参数拒绝表示未创建检查，按 issues 和返回的参数契约修正，不要仅更换 name 重复试探。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "asset_id": {"type": "string"},
                 "kind": {"type": "string", "enum": ["service", "port", "command"]},
-                "name": {"type": "string"},
-                "params": {"type": "object"},
-                "expect": {"type": "object"},
+                "name": {"type": "string", "maxLength": 64, "description": "显示名称；省略时自动生成"},
+                "params": {"type": "object", "properties": {
+                    "unit": {"type": "string", "maxLength": 64, "description": "service 检查的 systemd unit，例如 nginx.service"},
+                    "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                    "protocol": {"type": "string", "enum": ["tcp", "udp"], "default": "tcp"},
+                    "argv": {"type": "array", "minItems": 1, "maxItems": 8,
+                             "items": {"type": "string", "minLength": 1, "maxLength": 120},
+                             "description": "command 检查的分词数组，例如 ['curl','-q','-fsS','https://example.com/health']；不是 cmd 字符串"},
+                }, "additionalProperties": False},
+                "expect": {"type": "object", "properties": {
+                    "active_state": {"type": "string", "enum": ["active"]},
+                    "exit_code": {"type": "integer", "enum": [0]},
+                }, "additionalProperties": False, "description": "可省略；service 默认 active，command 默认 exit_code=0，port 使用空对象"},
                 "interval_sec": {"type": "integer", "minimum": 15, "maximum": 3600},
-                "fail_threshold": {"type": "integer", "minimum": 1, "maximum": 20},
+                "fail_threshold": {"type": "integer", "minimum": 1, "maximum": 10},
                 "severity": {"type": "string", "enum": ["info", "warning", "critical"]},
             },
-            "required": ["asset_id", "kind", "name", "params"],
+            "required": ["asset_id", "kind", "params"],
         },
     },
     {
@@ -532,7 +548,9 @@ class OpsTools:
             if getattr(exc, "dispatch_not_started", False):
                 br.release_write(incident_id, action_key, confirmed_safe=True, reason=getattr(exc, "code", "failed"))
             else:
-                br.mark_unknown(incident_id, action_key, reason=type(exc).__name__)
+                code = str(getattr(exc, "code", "") or type(exc).__name__)
+                reason = code + (": " + str(exc)[:300] if str(exc) and str(exc) != code else "")
+                br.mark_unknown(incident_id, action_key, reason=reason)
             raise
         br.complete_write(incident_id, action_key, ok=out.get("ok", True), result=json.dumps(out, default=str))
         self._audit_write("", name, "success" if out.get("ok", True) else "failed", sid)
@@ -580,7 +598,10 @@ class OpsTools:
         if channel == "read" and cls != "read":
             raise McpToolError(
                 "write_not_allowed_on_read_channel",
-                f"classified={cls}; use channel=write for controlled execution",
+                f"classified={cls}; 命令未被识别为受支持的只读语法，本次没有执行。"
+                "普通会话可用 channel=write 将此诊断记入受控执行台账，仍使用同一账号组；只读会话不能这样重试。",
+                {"classified": cls, "executed": False,
+                 "next_step": "use_channel_write_with_ledger", "same_account_group": True},
             )
         # 只读模式：只要分类是 read 就走读通道，不进写台账
         if getattr(self.ctx, "readonly", False):
@@ -777,7 +798,19 @@ class OpsTools:
         prom = self.ctx.prom
         if hasattr(prom, "timeout"):
             prom.timeout = timeout_f
-        data = await prom.query(query)
+        from .prom import PromError
+        try:
+            if prom is None:
+                raise PromError("not_configured")
+            data = await prom.query(query)
+        except (PromError, TimeoutError):
+            # An optional observation source being absent is a data result, not
+            # a fatal MCP exception that cancels parallel native investigations.
+            return {"ok": False, "available": False, "source": "prometheus",
+                    "state": "unavailable", "error": "prometheus_unavailable",
+                    "optional": True, "fatal": False, "result": None,
+                    "message": "Prometheus 当前未接入或查询暂不可用；这不是目标主机的故障证据。可继续查询原生检查。",
+                    "next_tool": "ayana_config_check_list"}
         return {"ok": True, "result": data}
 
     # ---- incident ----
@@ -1102,7 +1135,17 @@ class OpsTools:
         c = getattr(self.ctx, "constraints", None)
         if c is None:
             raise McpToolError("unavailable", "constraints not wired")
-        return {"ok": True, "constraints": c.current()}
+        from .formspec import get_form
+        form = get_form("checks")
+        command_field = next(field for field in form["fields"] if field["name"] == "params.cmd")
+        return {"ok": True, "constraints": c.current(), "native_checks": {
+            "requires_prometheus": False, "list_tool": "ayana_config_check_list",
+            "command_programs": command_field.get("allowed_programs", []),
+            "command_boundary": form.get("command_boundary", {}),
+            "params": {"service": {"unit": "nginx.service"},
+                       "port": {"protocol": "tcp", "port": 443},
+                       "command": {"argv": ["curl", "-q", "-fsS", "https://example.com/health"]}},
+        }}
 
     async def ops_loop_status(self, args: dict[str, Any]) -> dict[str, Any]:
         loop = getattr(self.ctx, "ops_loop", None)
@@ -1178,14 +1221,14 @@ class OpsTools:
         self._require_write_mode("config.check_add")
         try:
             item = self._checks_service().create_check(
-                asset_id=str(args.get("asset_id") or ""),
-                kind=str(args.get("kind") or ""),
-                name=str(args.get("name") or ""),
-                params=args.get("params") or {},
+                asset_id=args.get("asset_id", ""),
+                kind=args.get("kind", ""),
+                name=args.get("name", ""),
+                params=args.get("params", {}),
                 expect=args.get("expect"),
-                interval_sec=int(args.get("interval_sec") or 60),
-                fail_threshold=int(args.get("fail_threshold") or 2),
-                severity=str(args.get("severity") or "warning"),
+                interval_sec=args.get("interval_sec", 60),
+                fail_threshold=args.get("fail_threshold", 2),
+                severity=args.get("severity", "warning"),
                 actor="mcp_agent",
             )
             return {"ok": True, "check": item}
@@ -1193,9 +1236,15 @@ class OpsTools:
             detail = {
                 "issues": getattr(e, "issues", None),
                 "missing": getattr(e, "missing", None),
+                "expected_params": {"service": {"unit": "nginx.service"},
+                                    "port": {"protocol": "tcp", "port": 443},
+                                    "command": {"argv": ["true"]}},
+                "expected_expect": {"service": {"active_state": "active"},
+                                    "port": {}, "command": {"exit_code": 0}},
             }
             raise McpToolError(
-                getattr(e, "code", "check_validation_failed"), str(e)[:300], detail
+                getattr(e, "code", "check_validation_failed"), str(e)[:300], detail,
+                dispatch_not_started=getattr(e, "dispatch_not_started", False),
             ) from e
 
     async def config_check_update(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -1208,7 +1257,9 @@ class OpsTools:
             )
             return {"ok": True, "check": item}
         except Exception as e:  # noqa: BLE001
-            raise McpToolError(getattr(e, "code", "check_failed"), str(e)[:300]) from e
+            raise McpToolError(getattr(e, "code", "check_failed"), str(e)[:300],
+                               {"issues": getattr(e, "issues", None)},
+                               dispatch_not_started=getattr(e, "dispatch_not_started", False)) from e
 
     async def config_check_delete(self, args: dict[str, Any]) -> dict[str, Any]:
         self._require_write_mode("config.check_delete")
@@ -1216,7 +1267,8 @@ class OpsTools:
             self._checks_service().delete_check(str(args.get("id") or ""), actor="mcp_agent")
             return {"ok": True}
         except Exception as e:  # noqa: BLE001
-            raise McpToolError(getattr(e, "code", "check_failed"), str(e)[:300]) from e
+            raise McpToolError(getattr(e, "code", "check_failed"), str(e)[:300],
+                               dispatch_not_started=getattr(e, "dispatch_not_started", False)) from e
 
 
 def tool_result(ok: bool, data: dict[str, Any] | None = None, error: str = "") -> dict[str, Any]:

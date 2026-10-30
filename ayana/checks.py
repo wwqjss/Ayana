@@ -55,10 +55,12 @@ COMMAND_BOUNDARY = _COMMAND_BOUNDARY
 
 
 class CheckError(Exception):
-    def __init__(self, code: str, detail: str = "", *, issues: list[dict] | None = None):
+    def __init__(self, code: str, detail: str = "", *, issues: list[dict] | None = None,
+                 dispatch_not_started: bool = False):
         self.code = code
         self.detail = detail
         self.issues = issues or []
+        self.dispatch_not_started = dispatch_not_started
         super().__init__(f"{code}: {detail}" if detail else code)
 
 
@@ -452,12 +454,12 @@ class CheckService:
     def update_check(self, check_id: str, *, actor: str = "web", **fields) -> dict[str, Any]:
         cur = self.get_check(check_id)
         if not cur:
-            raise CheckError("not_found", check_id)
+            raise CheckError("not_found", check_id, dispatch_not_started=True)
         allowed = {"name", "params", "expect", "interval_sec", "fail_threshold", "severity", "enabled"}
         if set(fields) - allowed:
-            raise CheckError("unknown_field", "更新内容包含当前表单不支持的配置项。")
+            raise CheckError("unknown_field", "更新内容包含当前表单不支持的配置项。", dispatch_not_started=True)
         if "enabled" in fields and not isinstance(fields["enabled"], bool):
-            raise CheckError("bad_enabled", "启用状态必须选择启用或停用。")
+            raise CheckError("bad_enabled", "启用状态必须选择启用或停用。", dispatch_not_started=True)
         if fields == {"enabled": False}:
             # 禁用旧检查不执行探测，也不改变旧参数；新增校验规则不能使旧配置无法停止。
             payload = {key: cur[key] for key in allowed - {"enabled"}}
@@ -487,6 +489,15 @@ class CheckService:
 
     def _validated_payload(self, payload: dict, *, allow_disabled_asset: bool = False) -> dict:
         """创建、更新和 AI 草稿共用同一契约，写入前一次完成校验。"""
+        try:
+            return self._validate_payload_before_write(payload, allow_disabled_asset=allow_disabled_asset)
+        except CheckError as exc:
+            # Only this pure validation phase can certify that no mutation ran.
+            # Database/audit failures after INSERT/UPDATE must remain unknown.
+            exc.dispatch_not_started = True
+            raise
+
+    def _validate_payload_before_write(self, payload: dict, *, allow_disabled_asset: bool = False) -> dict:
         from .formspec import _validation_error, validate_check_payload
         assets = [dict(row) for row in self.db.query("SELECT id, display_name, enabled FROM assets")]
         # 已停用资产上的检查仍应能关闭，避免资产停用后无法清理旧检查。
@@ -513,7 +524,7 @@ class CheckService:
     def delete_check(self, check_id: str, *, actor: str = "web") -> None:
         cur = self.get_check(check_id)
         if not cur:
-            raise CheckError("not_found", check_id)
+            raise CheckError("not_found", check_id, dispatch_not_started=True)
         self.db.execute("DELETE FROM checks WHERE id=?", (check_id,))
         self.db.audit("web_user", actor, "check_delete", asset_id=cur["asset_id"], detail={"id": check_id})
 

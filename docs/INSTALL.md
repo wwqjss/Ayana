@@ -1,6 +1,6 @@
 # 安装、升级与回滚
 
-适用于 **Ayana v0.8.2**。这是项目的安装手册，命令以 Linux 系统安装的默认路径为例。
+适用于 **Ayana v0.8.3**。这是项目的安装手册，命令以 Linux 系统安装的默认路径为例。
 
 ## 1. 安装条件
 
@@ -35,7 +35,7 @@ bash ayana-bootstrap.sh --system
 需要固定本次版本时：
 
 ```bash
-env AYANA_VERSION=v0.8.2 bash ayana-bootstrap.sh --system
+env AYANA_VERSION=v0.8.3 bash ayana-bootstrap.sh --system
 ```
 
 也可在 Release 页面下载版本安装包及同名 `.sha256`，校验并解压，然后从解压目录运行 `deploy/install.sh`。依赖由 `pyproject.toml` 声明，安装器创建独立虚拟环境并执行项目安装；安装包包含完整 Web 静态资源。
@@ -147,7 +147,7 @@ sudo bash deploy/install.sh --system --force --mimo-bin /usr/local/bin/mimo
 已安装实例也可使用同一生命周期入口更新到明确版本：
 
 ```bash
-sudo bash /opt/ayana/deploy/ayana-setup.sh update --system --ref v0.8.2 \
+sudo bash /opt/ayana/deploy/ayana-setup.sh update --system --ref v0.8.3 \
   --mimo-bin /usr/local/bin/mimo
 ```
 

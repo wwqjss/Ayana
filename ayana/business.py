@@ -71,8 +71,9 @@ async def prometheus_checks(prom: Any, asset: dict) -> tuple[list[dict], list[di
     results = await asyncio.gather(*(fetch(metric) for metric in sorted(metrics)))
     by_metric = {metric: samples for metric, samples, _ in results}
     failed = {metric for metric, _, error in results if error}
-    errors = [{"source": "prometheus", "message": error, "metric": metric}
-              for metric, _, error in results if error]
+    # One unavailable optional source is one notice, not one failure per query.
+    errors = [{"source": "prometheus", "message": "Prometheus 暂不可用；原生业务检查仍可独立使用。",
+               "metrics": sorted(failed), "optional": True, "fatal": False}] if failed else []
     items, claimed = [], set()
 
     def append_item(metric: str, name: str, samples: list[dict], selector: dict,
@@ -134,14 +135,35 @@ def native_check_items(checks: list[dict]) -> list[dict]:
     items = []
     for check in checks:
         state = check.get("last_state") or "no_data"
+        last_at = _finite(check.get("last_at"), 0)
+        interval = _finite(check.get("interval_sec"), 60)
         if not check.get("enabled", True):
             state = "disabled"
-        elif not check.get("last_at"):
+        elif last_at <= 0 or last_at > at:
             state = "no_data"
-        elif at - float(check["last_at"]) > max(120, 2 * int(check.get("interval_sec") or 60)):
+        elif at - last_at > max(120, 2 * interval):
             state = "stale"
-        items.append({**check, "source": "ayana", "state": state, "last_at": check.get("last_at") or 0})
+        elif state not in ("ok", "fail"):
+            state = "no_data"
+        items.append({**check, "source": "ayana", "state": state, "last_at": last_at})
     return items
+
+
+def native_check_summary(items: list[dict]) -> dict[str, Any]:
+    """Summarize observed enabled checks; disabled rows never prove health."""
+    active = [item for item in items if item.get("enabled", True) and item.get("state") != "disabled"]
+    states = [item.get("state") or "no_data" for item in active]
+    failed = sum(state in ("fail", "bad", "unhealthy") for state in states)
+    healthy = states.count("ok")
+    stale = states.count("stale")
+    unknown = len(states) - healthy - failed - stale
+    state = "bad" if failed else "stale" if stale else "no_data" if unknown or not active else "ok"
+    return {"source": "native", "state": state,
+            "label": {"ok": "原生检查正常", "bad": "原生检查异常", "stale": "原生检查已过期", "no_data": "原生检查尚未观测"}[state],
+            "total": len(items), "enabled": len(active), "healthy": healthy,
+            "failed": failed, "stale": stale, "unknown": unknown,
+            "disabled": len(items) - len(active), "fresh": healthy + failed,
+            "last_at": max((_finite(item.get("last_at"), 0) for item in active), default=0)}
 
 
 def required_health(items: list[dict]) -> str:
@@ -173,9 +195,11 @@ def host_health_view(
     *,
     prom_items: list[dict],
     native_states: list[str] | None = None,
+    native_items: list[dict] | None = None,
     metric_state: str = "",
     metric_error: str = "",
     firing_severities: list[str] | None = None,
+    prom_errors: list[dict] | None = None,
 ) -> dict[str, Any]:
     """统一 host_health 拼装（P2-1）：overview / hosts / host 三 endpoint 共用。
 
@@ -186,8 +210,12 @@ def host_health_view(
       required_state / firing
     """
     required_state = required_health(prom_items)
+    native = native_items if native_items is not None else [{"state": state} for state in (native_states or [])]
+    native_summary = native_check_summary(native)
+    active_native_states = [item.get("state") or "no_data" for item in native
+                            if item.get("enabled", True) and item.get("state") != "disabled"]
     check_states = [item["state"] for item in prom_items if not item.get("required")]
-    check_states.extend(native_states or [])
+    check_states.extend(active_native_states)
     firing = list(firing_severities or [])
     dot = host_health(
         metric_state=metric_state,
@@ -197,6 +225,34 @@ def host_health_view(
         firing_severities=firing,
         collect_error=metric_error if metric_state == "collect_error" else "",
     )
+    raw_sources = dot["sources"]
+    if native_summary["enabled"]:
+        # Native checks and Node metrics are independent observations. Missing
+        # optional Prometheus data must not erase a known native result. Actual
+        # resource warnings/failures, failed probes and firing alerts still count.
+        dot = host_health(
+            metric_state=metric_state if metric_state in ("ok", "warn", "bad") else "",
+            check_states=[item["state"] for item in prom_items if item["state"] in ("ok", "fail")]
+                         + active_native_states,
+            firing_severities=firing,
+        )
+        dot["sources"] = raw_sources
+    prom_observed = metric_state in ("ok", "warn", "bad", "partial_no_data") or any(
+        item["state"] in ("ok", "fail") for item in prom_items)
+    source = ("mixed" if prom_observed else "native") if native_summary["enabled"] else "prometheus" if prom_observed else "none"
+    dot["source"] = source
+    dot["source_label"] = {"native": "原生检查", "prometheus": "Prometheus", "mixed": "原生检查与 Prometheus", "none": "尚未观测"}[source]
+    if dot["state"] == "ok" and source == "native":
+        dot["label"] = native_summary["label"]
+    unavailable = metric_state in ("no_data", "not_configured", "collect_error", "partial_no_data") or bool(prom_errors)
+    warnings = [{"source": "prometheus", "optional": True, "fatal": False,
+                 "message": "Prometheus 资源指标暂不可用或观测不全；原生业务检查独立呈现。"}] if unavailable else []
+    source_state = metric_state or ("collect_error" if prom_errors else "ok" if prom_observed else "no_data")
+    monitor_sources = {
+        "native": native_summary,
+        "prometheus": {"state": source_state, "error": metric_error, "optional": True,
+                       "business_errors": list(prom_errors or [])},
+    }
     required_items = [item for item in prom_items if item.get("required")]
     health = {
         "state": required_state or "unknown",
@@ -206,7 +262,7 @@ def host_health_view(
             for item in required_items
         ],
     }
-    all_states = [item["state"] for item in prom_items] + list(native_states or [])
+    all_states = [item["state"] for item in prom_items] + active_native_states
     business_summary = {
         "total": len(all_states),
         "healthy": all_states.count("ok"),
@@ -219,4 +275,8 @@ def host_health_view(
         "business_summary": business_summary,
         "required_state": required_state,
         "firing": firing,
+        "overall": dot,
+        "native_summary": native_summary,
+        "monitor_sources": monitor_sources,
+        "warnings": warnings,
     }

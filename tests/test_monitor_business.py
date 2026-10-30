@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from aiohttp import web
 
-from ayana.business import native_check_items, prometheus_checks, required_health
+from ayana.business import host_health_view, native_check_items, native_check_summary, prometheus_checks, required_health
 from ayana.checks import CheckService
 from ayana.db import Database
 from ayana.health import apply_required_checks
@@ -217,6 +217,39 @@ class PrometheusBusinessTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(required_health([{"required": False, "state": "fail"}]), "")
         self.assertEqual(required_health([{"required": True, "state": "ok"}, {"required": False, "state": "fail"}]), "healthy")
 
+    def test_future_and_nonfinite_native_timestamps_cannot_prove_health(self):
+        records = [{"id": str(index), "enabled": True, "last_state": "ok", "last_at": stamp}
+                   for index, stamp in enumerate((AT + 1, float("nan"), float("inf"), "invalid", -1))]
+        rows = native_check_items(records)
+        self.assertTrue(all(row["state"] == "no_data" for row in rows))
+        self.assertEqual(native_check_summary(rows)["healthy"], 0)
+
+    def test_native_summary_requires_enabled_current_observations(self):
+        for records, expected in (([], "no_data"),
+                                  ([{"enabled": False, "state": "disabled"}], "no_data"),
+                                  ([{"state": "ok"}, {"state": "no_data"}], "no_data"),
+                                  ([{"state": "ok"}, {"state": "stale"}], "stale"),
+                                  ([{"state": "ok"}, {"state": "fail"}], "bad")):
+            with self.subTest(records=records):
+                self.assertEqual(native_check_summary(records)["state"], expected)
+
+    async def test_optional_prometheus_errors_are_one_source_notice(self):
+        prom = CatalogProm(failures={"probe_success", "mysql_up", "mysql_slave_status_replica_io_running",
+                                     "mysql_slave_status_replica_sql_running"})
+        _, errors = await prometheus_checks(prom, {"id": "demo"})
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(len(errors[0]["metrics"]), 4)
+        self.assertTrue(errors[0]["optional"])
+        self.assertFalse(errors[0]["fatal"])
+
+    def test_real_prometheus_failure_is_not_hidden_by_another_collection_error(self):
+        view = host_health_view(
+            prom_items=[{"name": "failed", "state": "fail", "required": True},
+                        {"name": "unavailable", "state": "collect_error", "required": True}],
+            native_states=["ok"], metric_state="not_configured")
+        self.assertEqual(view["health_dot"]["state"], "bad")
+        self.assertEqual(view["health_dot"]["sources"]["required"], "collect_error")
+
 
 class BusinessAPITest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -345,11 +378,86 @@ class BusinessAPITest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(business["items"][0]["state"], "ok")
         self.assertEqual(strip["metric_state"], "no_data")
         for health in (strip["health"], detail["health"], home["health_dot"]):
-            self.assertEqual(health["state"], "warn")
-            self.assertEqual(health["label"], "部分未观测")
+            self.assertEqual(health["state"], "ok")
+            self.assertEqual(health["label"], "原生检查正常")
+            self.assertEqual(health["source"], "native")
             self.assertEqual(health["sources"]["checks"], ["ok"])
         self.assertEqual(home["business_summary"], {"total": 1, "healthy": 1, "failed": 0, "unknown": 0})
         self.assertEqual(self.snapshot(), before)
+
+    async def test_native_health_keeps_optional_metrics_missing_without_fake_values(self):
+        self.prom.failures.update({"probe_success", "mysql_up", "mysql_slave_status_replica_io_running",
+                                   "mysql_slave_status_replica_sql_running"})
+        self.monitor.hosts_status.side_effect = lambda assets: [
+            {"asset_id": asset["id"], "state": "collect_error", "error": "upstream failed", "summary": {"cpu": None}}
+            for asset in assets]
+        self.monitor.host_overview.side_effect = lambda identifier: {
+            "asset_id": identifier, "state": "collect_error", "error": "upstream failed",
+            "metrics": {"cpu": {"value": None, "state": "collect_error"},
+                        "memory": {"value": None, "state": "collect_error"}}}
+        before = self.snapshot()
+        strip, detail, home, _ = await self.observed_states("control")
+        for health in (strip["health"], detail["health"], home["health_dot"]):
+            self.assertEqual(health["state"], "ok")
+            self.assertEqual(health["sources"]["metric"], "collect_error")
+        for data in (strip, detail):
+            self.assertEqual(data["native_summary"]["healthy"], 1)
+            self.assertEqual(data["native_summary"]["fresh"], 1)
+            self.assertEqual(data["overall"], data["health"])
+            self.assertEqual(data["monitor_sources"]["prometheus"]["state"], "collect_error")
+            self.assertEqual(len(data["warnings"]), 1)
+            self.assertFalse(data["warnings"][0]["fatal"])
+        self.assertIsNone(strip["summary"]["cpu"])
+        for metric in ("cpu", "memory"):
+            self.assertIsNone(detail["overview"]["metrics"][metric]["value"])
+            self.assertEqual(detail["overview"]["metrics"][metric]["state"], "collect_error")
+        self.assertEqual(self.snapshot(), before)
+
+    async def test_native_fail_unknown_stale_and_disabled_never_render_green(self):
+        for state, stamp, enabled, expected in (("fail", AT - 15, 1, "bad"),
+                                                 ("ok", 0, 1, "no_data"),
+                                                 ("ok", AT - 150, 1, "warn"),
+                                                 ("ok", AT - 15, 0, "no_data")):
+            with self.subTest(state=state, stamp=stamp, enabled=enabled):
+                self.db.execute("UPDATE checks SET last_state=?,last_at=?,enabled=? WHERE id='chk_control'", (state, stamp, enabled))
+                self.app._overview_cache = None
+                strip, detail, home, _ = await self.observed_states("control")
+                for health in (strip["health"], detail["health"], home["health_dot"]):
+                    self.assertEqual(health["state"], expected)
+                    self.assertNotEqual(health["cls"], "ok")
+                self.assertEqual(detail["native_summary"]["enabled"], enabled)
+
+    async def test_resource_provider_crash_keeps_native_api_available(self):
+        self.monitor.hosts_status.side_effect = RuntimeError("metrics service unavailable")
+        self.monitor.host_overview.side_effect = RuntimeError("metrics service unavailable")
+        self.monitor.host_history.side_effect = RuntimeError("metrics service unavailable")
+        hosts = await self.app.api_monitor_hosts(SimpleNamespace())
+        detail = await self.app.api_monitor_host(SimpleNamespace(match_info={"asset_id": "control"}, rel_url=SimpleNamespace(query={})))
+        self.assertEqual(hosts.status, 200)
+        self.assertEqual(detail.status, 200)
+        host = next(item for item in json.loads(hosts.body)["hosts"] if item["asset_id"] == "control")
+        payload = json.loads(detail.body)
+        self.assertEqual(host["health"]["state"], "ok")
+        self.assertEqual(payload["health"]["state"], "ok")
+        self.assertEqual(payload["overview"]["metrics"], {})
+        self.assertEqual(payload["history"]["metrics"], {})
+        self.assertEqual(payload["monitor_sources"]["prometheus"]["history_state"], "collect_error")
+        self.transport.probe.assert_not_awaited()
+
+    async def test_known_resource_failure_or_current_alert_still_overrides_native_green(self):
+        for source in ("resource", "alert"):
+            with self.subTest(source=source):
+                self.monitor.hosts_status.side_effect = lambda assets: [
+                    {"asset_id": asset["id"], "state": "bad" if source == "resource" else "no_data", "error": "", "summary": {}}
+                    for asset in assets]
+                self.monitor.host_overview.side_effect = lambda identifier: {
+                    "asset_id": identifier, "state": "bad" if source == "resource" else "no_data", "error": "", "metrics": {}}
+                self.app._overview_cache = None
+                with patch.object(self.app, "_monitor_firing", return_value={"control": ["critical"]} if source == "alert" else {}):
+                    strip, detail, home, _ = await self.observed_states("control")
+                for health in (strip["health"], detail["health"], home["health_dot"]):
+                    self.assertEqual(health["state"], "bad")
+                self.assertEqual(detail["native_summary"]["healthy"], 1)
 
     async def test_proxy_sample_times_and_missing_service_have_consistent_all_view_states(self):
         self.app._visible_asset_ids.return_value = {"asset-b"}

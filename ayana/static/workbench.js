@@ -146,6 +146,38 @@
     if (meta) meta.textContent = session ? [session.origin === "auto" ? "自动值班" : "手动会话", session.status === "open" ? "会话开放" : "已归档", session.archive_due_at > 0 ? "归档缓冲中" : ""].filter(Boolean).join(" · ") : "";
     updateTermUi();
   }
+  function nativeFacts(detail) {
+    const activity = detail.native_activity;
+    if (!activity || activity.available !== true) return { available: false, tools: [], message: activity && activity.message || "暂无可核对的原生步骤，请查看会话记录。" };
+    const tools = (Array.isArray(activity.tools) ? activity.tools : []).filter((item) => item && typeof item.tool === "string")
+      .slice().sort((a, b) => Number(a.at || 0) - Number(b.at || 0) || String(a.id || "").localeCompare(String(b.id || "")));
+    return {
+      available: true, tools,
+      current: activity.current || tools.filter((item) => ["pending", "running"].includes(item.status)).at(-1),
+      error: activity.latest_error || tools.filter((item) => item.status === "error").at(-1),
+    };
+  }
+  function toolLabel(name) {
+    return ({ ayana_host_exec: "执行主机命令", ayana_asset_list: "读取主机列表", ayana_metrics_query: "查询指标",
+      ayana_ops_constraints: "读取当前运维约束", ayana_ops_loop_status: "核对工单状态", ayana_config_check_list: "读取原生检查",
+      ayana_config_check_add: "添加原生检查", ayana_config_check_update: "更新原生检查", ayana_config_check_delete: "删除原生检查",
+      ayana_incident_list: "查询工单", ayana_incident_get: "读取工单详情", ayana_incident_note: "记录工单证据",
+      ayana_session_write_ops: "核对执行台账", ayana_session_claim: "关联当前工单", ayana_knowledge_query: "查询运维知识",
+      mcp_tool_search: "查找可用工具" })[name] || name;
+  }
+  const toolTarget = (item) => toolLabel(item.tool) + (item.target ? " @ " + item.target : "");
+  function toolError(item) {
+    return item.error && typeof item.error === "object" ? item.error.message || item.error.code || "工具返回错误。" : "工具返回错误，详情请查看原生记录。";
+  }
+  function appendToolResult(root, item, label) {
+    const failed = item.status === "error";
+    root.appendChild(el("div", { class: "aw-tool-fact" + (failed ? " warning" : "") }, [
+      el("div", { class: "aw-fact-label", text: label + " · 执行记录" }),
+      el("div", { class: "aw-fact-tool", title: item.tool, text: toolTarget(item) }),
+      el("div", { class: "aw-fact-result", text: failed ? "工具调用未完成：" + toolError(item) : item.notice || "工具已返回" }),
+      el("div", { class: "aw-inc-meta", text: fmtTime(item.at) }),
+    ]));
+  }
   function renderRight() {
     const d = state.detail;
     const prog = $("aw-progress");
@@ -160,7 +192,20 @@
     }
     const incidents = d.incidents || [];
     const openN = incidents.filter((i) => i.status === "open").length;
-    prog.textContent = `${taskLabel()} · ` + (incidents.length ? `关联 ${incidents.length} 个工单 · 未关闭 ${openN}` : "无关联工单");
+    const facts = nativeFacts(d), task = taskState();
+    prog.innerHTML = "";
+    prog.appendChild(el("div", { class: "aw-progress-overview", text: `${taskLabel()} · ` + (incidents.length ? `关联 ${incidents.length} 个工单 · 未关闭 ${openN}` : "无关联工单") }));
+    let step = "当前没有执行中的工具记录。";
+    if (task === "unknown" || (d.pending_write_results || []).length) step = "写结果尚未确认，请先核对执行记录。";
+    else if (["paused", "stopping", "interrupted", "deleting", "archived", "deleted"].includes(task)) step = taskLabel();
+    else if (!facts.available) step = facts.message;
+    else if (facts.current && ["running", "busy", "queued"].includes(task)) step = (facts.current.channel === "read" ? "正在调查，等待工具返回：" : "等待工具返回：") + toolTarget(facts.current);
+    else if (task === "queued") step = "消息已排队，等待原生任务接收。";
+    else if (["running", "busy"].includes(task)) step = "任务执行中，等待新的步骤记录。";
+    prog.appendChild(el("div", { class: "aw-tool-fact" }, [
+      el("div", { class: "aw-fact-label", text: "当前步骤 · 系统状态" }),
+      el("div", { class: "aw-fact-result", text: step }),
+    ]));
     if (incs) {
       incs.innerHTML = "";
       if (!incidents.length) incs.appendChild(el("div", { class: "aw-muted", text: "暂无" }));
@@ -184,7 +229,10 @@
       const evs = (d.events || []).filter((e) =>
         ["tool_call", "tool_result", "action_proposed", "session_archived"].includes(e.type)
       );
-      if (!results.length && !evs.length) res.appendChild(el("div", { class: "aw-muted", text: "暂无" }));
+      const latestResult = facts.tools.filter((item) => ["completed", "error"].includes(item.status)).at(-1);
+      if (latestResult) appendToolResult(res, latestResult, "最近结果");
+      if (facts.error && (!latestResult || facts.error.id !== latestResult.id || facts.error.at !== latestResult.at)) appendToolResult(res, facts.error, "最近调用错误");
+      if (!results.length && !evs.length && !latestResult && !facts.error) res.appendChild(el("div", { class: "aw-muted", text: "暂无" }));
       results.forEach((w) => {
         const row = el("div", { class: "aw-pend-card" }, [
           el("div", { class: "aw-pend-title", text: `写结果待核销${w.target ? " @ " + w.target : ""}` }),
@@ -768,7 +816,7 @@
             else delete state.detail.task_state_label;
           }
           if (message.type === "action_ack" || message.message) taskFeedback(message.message || (message.queued ? "输入已排队，将在当前任务之后处理。" : "任务状态已更新。"), !!message.error || message.state === "error" || message.ok === false);
-          renderHeader();
+          renderHeader(); renderRight();
         }
         return;
       }

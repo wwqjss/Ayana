@@ -1888,12 +1888,28 @@ class WebApp:
         linked = {row["incident_id"] for row in incs}
         pending_actions = [row for row in pending_actions if row.get("incident_id") in linked]
         task=duty.task_info(sid)
+        native_activity = {"available": True, "tools": []}
+        if s.get("remote_session_id"):
+            from .agent_activity import read_native_activity
+            native_activity = {"available": False, "tools": [], "message": "原生步骤暂不可读。"}
+            try:
+                submission = self.db.query_one(
+                    "SELECT payload_json FROM agent_native_submissions WHERE session_id=? AND remote_session_id=?"
+                    " ORDER BY created_at DESC,submission_id DESC LIMIT 1", (sid, s["remote_session_id"]))
+                context = json.loads(submission["payload_json"]) if submission else {}
+                parent_id = context.get("messageID") or context.get("parent_id") or ""
+                native_activity = await read_native_activity(
+                    self.mimo_serve.client(), s["remote_session_id"], parent_id=parent_id,
+                    exclude_message_ids=context.get("before_ids"))
+            except Exception:
+                pass  # Observation failure never changes native ownership or write protection.
         return _json({
             "ok": True,
             "session": s,
             "incidents": incs,
             "messages": msgs,
             "events": events,
+            "native_activity": native_activity,
             "pending_writes": pending_writes,
             "pending_write_results": pending_write_results,
             "pending_actions": pending_actions,
@@ -3501,11 +3517,14 @@ class WebApp:
         self._business_cache = {entry: value for entry, value in cache.items() if time.time() - value[0] < 5}
         return result
 
-    def _native_business_states(self, asset_id: str) -> list[str]:
+    def _native_business_items(self, asset_id: str) -> list[dict]:
         from .business import native_check_items
 
-        rows = self.db.query("SELECT last_state,last_at,interval_sec FROM checks WHERE asset_id=? AND enabled=1", (asset_id,))
-        return [item["state"] for item in native_check_items([dict(row) for row in rows])]
+        rows = self.db.query("SELECT id,last_state,last_at,interval_sec,enabled FROM checks WHERE asset_id=?", (asset_id,))
+        return native_check_items([dict(row) for row in rows])
+
+    def _native_business_states(self, asset_id: str) -> list[str]:
+        return [item["state"] for item in self._native_business_items(asset_id) if item.get("enabled")]
 
     def _monitor_firing(self) -> dict[str, list[str]]:
         out: dict[str, list[str]] = {}
@@ -3545,7 +3564,15 @@ class WebApp:
                 items.extend(native_check_items(self._checks().list_checks(asset_id)))
             except Exception:
                 errors.append({"source": "ayana", "message": "暂时无法获取原生业务检查，请稍后刷新。"})
-        return _json({"ok": True, "asset": dict(row), "items": items, "errors": errors})
+        from .business import host_health_view
+        view = host_health_view(
+            prom_items=[item for item in items if item.get("source") == "prometheus"],
+            native_items=[item for item in items if item.get("source") == "ayana"],
+            prom_errors=[error for error in errors if error.get("source") == "prometheus"],
+            firing_severities=self._monitor_firing().get(asset_id, []),
+        )
+        return _json({"ok": True, "asset": dict(row), "items": items, "errors": errors,
+                      **{key: view[key] for key in ("native_summary", "overall", "monitor_sources", "warnings")}})
 
     async def api_monitor_hosts(self, request: web.Request) -> web.Response:
         sess = self._require_auth(request)
@@ -3559,7 +3586,8 @@ class WebApp:
         try:
             status = await self._monitor().hosts_status(assets)
         except Exception as e:
-            return _json({"ok": False, "error": str(e)}, 502)
+            status = [{"asset_id": asset["id"], "state": "collect_error", "error": str(e)[:200],
+                       "summary": {}} for asset in assets]
 
         # 统一健康：指标 + required checks + 业务检查 + 当前 firing（不吸收历史未结案）
         by_id = {s.get("asset_id"): s for s in status}
@@ -3579,16 +3607,17 @@ class WebApp:
             metric_state = item.get("state") or ""
             metric_error = item.get("error") or ""
 
-            prom_items, _ = await self._prom_business_items(a)
+            prom_items, prom_errors = await self._prom_business_items(a)
             try:
-                native_states = self._native_business_states(aid)
+                native_items = self._native_business_items(aid)
             except Exception:
-                native_states = []
+                native_items = []
             view = host_health_view(
                 prom_items=prom_items,
-                native_states=native_states,
+                native_items=native_items,
                 metric_state=metric_state,
                 metric_error=metric_error,
+                prom_errors=prom_errors,
                 firing_severities=firing_by_asset.get(aid, []),
             )
             hh = view["health_dot"]
@@ -3598,6 +3627,7 @@ class WebApp:
             item["firing"] = view["firing"]
             item["host"] = a.get("host") or ""
             item["sample"] = self._is_sample_asset(a)
+            item.update({key: view[key] for key in ("native_summary", "overall", "monitor_sources", "warnings")})
             out.append(item)
         return _json({"ok": True, "hosts": out})
 
@@ -3615,23 +3645,31 @@ class WebApp:
         prom_asset = row["prom_asset"] or asset_id
         try:
             overview = await self._monitor().host_overview(prom_asset)
+        except Exception as e:
+            overview = {"asset_id": prom_asset, "state": "collect_error", "error": str(e)[:200], "metrics": {}}
+        try:
             history = await self._monitor().host_history(prom_asset, range_key)
         except Exception as e:
-            return _json({"ok": False, "error": str(e)}, 502)
+            history = {"asset_id": prom_asset, "range": range_key, "state": "collect_error", "error": str(e)[:200], "metrics": {}}
         from .business import host_health_view
 
-        prom_items, _ = await self._prom_business_items(dict(row))
+        prom_items, prom_errors = await self._prom_business_items(dict(row))
         try:
-            native_states = self._native_business_states(asset_id)
+            native_items = self._native_business_items(asset_id)
         except Exception:
-            native_states = []
+            native_items = []
+        if history.get("error"):
+            prom_errors = [*prom_errors, {"source": "prometheus", "message": "资源历史指标暂不可用。", "optional": True}]
         view = host_health_view(
             prom_items=prom_items,
-            native_states=native_states,
+            native_items=native_items,
             metric_state=overview.get("state", ""),
             metric_error=overview.get("error", ""),
+            prom_errors=prom_errors,
             firing_severities=self._monitor_firing().get(asset_id, []),
         )
+        view["monitor_sources"]["prometheus"].update(history_state=history.get("state", ""),
+                                                     history_error=history.get("error", ""))
         health = view["health_dot"]
         # 示例资产 / 未接入监控：明确区分，不伪装成采集故障
         sample = self._is_sample_asset(row)
@@ -3646,6 +3684,7 @@ class WebApp:
                 "sample": sample,
                 "monitor_not_configured": not_onboarded,
                 "prometheus_url": getattr(self.prom, "base_url", ""),
+                **{key: view[key] for key in ("native_summary", "overall", "monitor_sources", "warnings")},
             }
         )
 

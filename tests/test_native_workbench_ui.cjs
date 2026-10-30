@@ -152,6 +152,78 @@ test("selecting a session never starts a viewport; connecting is an explicit act
   assert.equal(env.calls.filter(c => c.url.endsWith("/terminal") && c.method === "POST").length, 1);
   assert.equal(env.calls.some(c => c.url.endsWith("/prompt") || c.url.includes("/events")), false);
 });
+test("current native tool and target are visible as system facts without copying narration", async () => {
+  const env = environment((call, normal) => {
+    const reply = normal(call);
+    return call.url === "/api/agent/sessions/sess_a" ? { ...reply, task_state: "running",
+      messages: [{ role: "assistant", body: "private model narration" }],
+      native_activity: { available: true, tools: [{ id: "tool", tool: "ayana_host_exec", status: "running", target: "nerv", channel: "read", at: 20 }] } } : reply;
+  });
+  await env.window.renderAgentWorkbench();
+  const progress = env.nodes.get("aw-progress").textContent;
+  assert.ok(progress.includes("当前步骤 · 系统状态"));
+  assert.ok(progress.includes("正在调查，等待工具返回"));
+  assert.ok(progress.includes("执行主机命令 @ nerv"));
+  assert.equal(progress.includes("private model narration"), false);
+  assert.equal(env.nodes.get("aw-term-host").textContent.includes("private model narration"), false);
+  assert.equal(env.sockets.length, 0);
+});
+test("latest tool error follows real timestamps and cannot imply a business fault", async () => {
+  const env = environment((call, normal) => {
+    const reply = normal(call);
+    return call.url === "/api/agent/sessions/sess_a" ? { ...reply, task_state: "running", native_activity: { available: true, tools: [
+      { id: "later", tool: "ayana_config_check_add", status: "error", at: 40, error: { code: "unknown_field", message: "参数字段不符合当前工具要求。" } },
+      { id: "old", tool: "ayana_metrics_query", status: "error", at: 30, error: { message: "较早错误" } },
+    ] } } : reply;
+  });
+  await env.window.renderAgentWorkbench();
+  const results = env.nodes.get("aw-results").textContent;
+  assert.ok(results.includes("最近结果 · 执行记录"));
+  assert.ok(results.includes("添加原生检查"));
+  assert.ok(results.includes("工具调用未完成：参数字段不符合当前工具要求。"));
+  assert.equal(results.includes("较早错误"), false);
+  assert.equal(results.includes("业务故障"), false);
+  assert.ok(env.nodes.get("aw-progress").textContent.includes("等待新的步骤记录"));
+});
+test("returned tools never clear unknown write protection or announce recovery", async () => {
+  const env = environment((call, normal) => {
+    const reply = normal(call);
+    return call.url === "/api/agent/sessions/sess_a" ? { ...reply, task_state: "unknown",
+      pending_write_results: [{ id: "write", target: "nerv", status: "unknown" }],
+      native_activity: { available: true, tools: [{ id: "returned", tool: "ayana_host_exec", status: "completed", target: "nerv", at: 40 }] } } : reply;
+  });
+  await env.window.renderAgentWorkbench();
+  assert.ok(env.nodes.get("aw-progress").textContent.includes("写结果尚未确认"));
+  const results = env.nodes.get("aw-results");
+  assert.ok(results.textContent.includes("工具已返回"));
+  assert.equal(results.textContent.includes("已恢复"), false);
+  assert.equal(results.querySelectorAll("button").length, 3);
+});
+test("missing native progress never promotes historical tool calls into current activity", async () => {
+  const env = environment((call, normal) => {
+    const reply = normal(call);
+    return call.url === "/api/agent/sessions/sess_a" ? { ...reply, task_state: "running",
+      events: [{ id: 1, type: "tool_call", title: "old tool", created_at: 1 }] } : reply;
+  });
+  await env.window.renderAgentWorkbench();
+  const progress = env.nodes.get("aw-progress").textContent;
+  assert.ok(progress.includes("暂无可核对的原生步骤"));
+  assert.equal(progress.includes("old tool"), false);
+  assert.equal(progress.includes("等待工具返回"), false);
+});
+test("switching sessions removes old activity and exposes unreadable status honestly", async () => {
+  const env = environment((call, normal) => {
+    const reply = normal(call);
+    if (call.url === "/api/agent/sessions/sess_a") return { ...reply, native_activity: { available: true, tools: [{ id: "old", tool: "ayana_host_exec", target: "old-target", status: "error", at: 20, error: { message: "old refusal" } }] } };
+    if (call.url === "/api/agent/sessions/sess_b") return { ...reply, native_activity: { available: false, tools: [], message: "原生步骤暂不可读。" } };
+    return reply;
+  });
+  await env.window.renderAgentWorkbench();
+  assert.ok(env.nodes.get("aw-results").textContent.includes("old refusal"));
+  await env.select("sess_b");
+  assert.ok(env.nodes.get("aw-progress").textContent.includes("原生步骤暂不可读"));
+  assert.equal(env.nodes.get("aw-results").textContent.includes("old-target"), false);
+});
 test("released viewports show the last terminal text snapshot before connecting", async () => {
   const env = environment((call, normal) => call.url.endsWith("/terminal") && call.method === "GET"
     ? { ok: true, attached: false, binding: null, released_at: 12, last_capture: "line one\nline two" }

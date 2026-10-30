@@ -3623,7 +3623,7 @@ function monitorHostPresentation(host) {
     not_configured: ["监控未接入", "dim"],
     partial_no_data: ["部分未观测", "warn"], unknown: ["观测不全", "warn"],
   };
-  const [label, cls] = states[host.state] || ["状态暂不可用", "dim"];
+  const [label, cls] = states[health.state || host.state] || ["状态暂不可用", "dim"];
   let text = health.label || label;
   // 示例资产（demo-* 未填主机）不伪装成真实故障
   const id = String(host.asset_id || "");
@@ -3636,10 +3636,14 @@ function renderMonitorHostControls() {
   const strip = $("monitor-hosts-strip");
   if (strip) {
     strip.innerHTML = "";
-    monitorState.hosts.forEach((item) => strip.appendChild(el("button", {
-      type: "button", class: "monitor-chip" + (item.asset_id === monitorState.host ? " active" : ""),
-      onclick: () => selectMonitorHost(item.asset_id),
-    }, [el("span", { class: "dot " + monitorHostPresentation(item).cls }), el("span", { text: item.display_name || item.asset_id })])));
+    monitorState.hosts.forEach((item) => {
+      const presentation = monitorHostPresentation(item);
+      const label = (item.display_name || item.asset_id) + " · " + presentation.label;
+      strip.appendChild(el("button", {
+        type: "button", class: "monitor-chip" + (item.asset_id === monitorState.host ? " active" : ""),
+        title: label, "aria-label": label, onclick: () => selectMonitorHost(item.asset_id),
+      }, [el("span", { class: "dot " + presentation.cls }), el("span", { text: item.display_name || item.asset_id })]));
+    });
   }
   fillSelect("monitor-host", monitorState.hosts.map((item) => ({
     v: item.asset_id, t: (item.display_name || item.asset_id) + " · " + monitorHostPresentation(item).label,
@@ -3690,14 +3694,14 @@ function renderMonitorMetrics(body, res, range) {
   const history = res.history || {}, overview = res.overview || {};
   const bannerState = history.state || overview.state;
   if (bannerState === "not_configured" || res.monitor_not_configured) body.appendChild(el("div", {
-    class: "banner warn",
-    text: "监控尚未接入：无法连接 Prometheus 或还没有采集数据。可在上方配置地址，或点击「一键接入监控」。原生业务检查显示在下方。",
+    class: "banner",
+    text: "暂无当前资源数据：CPU、内存等指标需接入资源采集后显示。原生业务检查独立显示在下方。",
   }));
   else if (bannerState === "collect_error") body.appendChild(el("div", {
     class: "banner warn", text: "资源采集暂不可用，请检查采集器和监控连接。下方业务检查单独显示。",
   }));
   else if (!monitorHasCurrentMetrics(res)) body.appendChild(el("div", {
-    class: "banner warn", text: "这台主机暂无当前资源数据，可以使用上方入口接入监控。业务检查显示在下方。",
+    class: "banner", text: "这台主机暂无当前资源数据，可以使用上方入口接入资源采集。原生业务检查独立显示在下方。",
   }));
   if (res.sample) body.appendChild(el("div", {
     class: "banner",
@@ -3713,6 +3717,7 @@ function renderMonitorMetrics(body, res, range) {
 }
 
 function businessCheckState(item) {
+  if (item.source === "ayana" && item.enabled === false) return "disabled";
   if (item.state) return item.state;
   if (item.source === "ayana") return !item.enabled ? "disabled" : !item.last_at ? "no_data" : item.last_state;
   return item.state || "no_data";
@@ -3739,12 +3744,24 @@ function renderMonitorBusiness(res, assetId) {
   }
   const items = (res.items || []).filter((item) => !item.asset_id || item.asset_id === assetId);
   box.appendChild(el("p", { class: "muted small", text: "主机「" + ((res.asset || {}).display_name || checkHostLabel(assetId)) + "」 · 共 " + items.length + " 项业务检查" }));
-  (res.errors || []).forEach((error) => box.appendChild(el("p", {
-    class: "error small", text: (error.source === "ayana" ? "Ayana 原生检查" : "Prometheus 业务监控") + "："
-      + humanFormError(error, "暂时无法读取此来源的检查结果。").slice(0, 240),
-  })));
+  // A source may fail several metric queries in one refresh. Show its status once,
+  // regardless of how many queries (or the warnings compatibility field) report it.
+  const sourceIssues = new Map();
+  [...(res.errors || []), ...(res.warnings || [])].forEach((issue) => {
+    const source = issue.source || "unknown";
+    if (!sourceIssues.has(source)) sourceIssues.set(source, issue);
+  });
+  sourceIssues.forEach((issue, source) => {
+    const optional = source === "prometheus";
+    const label = optional ? "Prometheus（可选来源）" : source === "ayana" ? "Ayana 原生检查" : "业务检查来源";
+    box.appendChild(el("p", {
+      class: "monitor-source-status small " + (optional ? "muted" : "error"),
+      role: "status", text: label + "：" + humanFormError(issue, "暂时无法读取此来源的检查结果。").slice(0, 240)
+        + (optional ? " 原生业务检查仍单独显示，资源趋势需接入此来源后查看。" : ""),
+    }));
+  });
   if (!items.length) {
-    box.appendChild(el("p", { class: "muted small", text: (res.errors || []).length
+    box.appendChild(el("p", { class: "muted small", text: sourceIssues.size
       ? "当前可读取的来源中还没有业务检查。" : "这台主机还没有业务检查，可点击「配置业务检查」添加。" }));
     return;
   }

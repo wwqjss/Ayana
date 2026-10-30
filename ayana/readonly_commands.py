@@ -116,7 +116,7 @@ def readonly_command(tokens: list[str]) -> bool:
         if verb in {"status", "is-active", "is-enabled", "is-failed", "show"}:
             return _options(rest, shorts="lq", flags={"--no-pager", "--full", "--quiet", "--all", "--value"}, values={"-p": _name, "--property": _name}, operand=_name, minimum=1)
         if verb in {"list-units", "list-unit-files", "list-jobs", "list-timers", "list-sockets"}:
-            return _options(rest, flags={"--no-pager", "--no-legend", "--all", "--failed", "--plain"}, values={"--type": lambda v: v in {"service", "socket", "target", "timer", "mount", "path"}}, operand=_name)
+            return _options(rest, flags={"--no-pager", "--no-legend", "--all", "--failed", "--plain"}, values={"--type": lambda v: v in {"service", "socket", "target", "timer", "mount", "path"}, "--state": lambda v: bool(v) and all(part in {"active", "inactive", "failed", "activating", "deactivating", "reloading", "running", "dead", "exited", "listening", "waiting", "mounted"} for part in v.split(','))}, operand=_name)
     if prog == "service":
         return len(args) == 2 and _name(args[0]) and args[1] == "status"
     if prog in {"docker", "podman"} and args:
