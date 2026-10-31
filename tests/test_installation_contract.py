@@ -96,6 +96,139 @@ class DeploymentFixture(unittest.TestCase):
             self.assertEqual(connection.execute('SELECT value FROM facts').fetchone()[0], 'before')
         self.run.assert_not_called()
 
+    def test_lite_install_has_two_services_without_mimo_or_terminal_configuration(self):
+        self.args.agent_mode = 'lite'
+        self.args.mimo_bin = None
+        self.install()
+        config = deployment.read_json(self.args.conf_dir / 'config.json')
+        self.assertEqual(config['agent_mode'], 'lite')
+        self.assertFalse(config['agent_tui_enabled'])
+        self.assertNotIn('mimo_bin', config)
+        self.assertNotIn('mimo_config_dir', config)
+        for name in deployment.UNITS:
+            self.assertTrue((self.args.unit_dir / name).is_file())
+        before = (self.args.conf_dir / 'config.json').read_bytes()
+        secrets = (self.args.conf_dir / 'secrets.json').read_bytes()
+        self.args.agent_mode = None
+        self.install()
+        self.assertEqual((self.args.conf_dir / 'config.json').read_bytes(), before)
+        self.assertEqual((self.args.conf_dir / 'secrets.json').read_bytes(), secrets)
+        self.assertEqual(deployment.selected_agent_mode(self.args), 'lite')
+
+    def test_explicit_mode_switch_preserves_configuration_and_has_a_paired_backup(self):
+        self.install()
+        config = deployment.read_json(self.args.conf_dir / 'config.json')
+        config['custom_setting'] = {'preserve': 'user value'}
+        path = self.args.conf_dir / 'config.json'
+        path.write_text(json.dumps(config))
+        original = path.read_bytes()
+        secrets = (self.args.conf_dir / 'secrets.json').read_bytes()
+        self.args.agent_mode = 'lite'
+        self.install()
+        current = deployment.read_json(path)
+        self.assertEqual(current['agent_mode'], 'lite')
+        self.assertFalse(current['agent_tui_enabled'])
+        self.assertEqual(current['custom_setting'], config['custom_setting'])
+        self.assertEqual(current['mimo_bin'], config['mimo_bin'])
+        self.assertEqual((self.args.conf_dir / 'secrets.json').read_bytes(), secrets)
+        backup = Path((self.args.backup_dir / 'LAST').read_text())
+        self.assertEqual((backup / 'config/config.json').read_bytes(), original)
+        self.args.agent_mode = 'mimo'
+        self.install()
+        self.assertTrue(deployment.read_json(path)['agent_tui_enabled'])
+
+    def test_mode_switch_does_not_bypass_unknown_writes(self):
+        self.install()
+        self.make_db()
+        with contextlib.closing(sqlite3.connect(self.args.data / 'ayana.db')) as connection, connection:
+            connection.execute('CREATE TABLE session_write_ops(status TEXT)')
+            connection.execute("INSERT INTO session_write_ops VALUES('unknown')")
+        config = (self.args.conf_dir / 'config.json').read_bytes()
+        self.args.agent_mode = 'lite'
+        with self.assertRaisesRegex(deployment.InstallError, 'pending work'):
+            self.install()
+        self.assertEqual((self.args.conf_dir / 'config.json').read_bytes(), config)
+        self.run.assert_not_called()
+
+    def test_failed_mode_switch_restores_the_previous_mode_and_secrets(self):
+        self.install()
+        config = (self.args.conf_dir / 'config.json').read_bytes()
+        secrets = (self.args.conf_dir / 'secrets.json').read_bytes()
+        self.args.agent_mode = 'lite'
+        with patch.object(deployment, 'install_dependencies', side_effect=deployment.InstallError('simulated dependency failure')):
+            with self.assertRaisesRegex(deployment.InstallError, 'simulated dependency failure'):
+                self.install()
+        self.assertEqual((self.args.conf_dir / 'config.json').read_bytes(), config)
+        self.assertEqual((self.args.conf_dir / 'secrets.json').read_bytes(), secrets)
+        self.assertEqual(deployment.read_json(self.args.conf_dir / 'config.json')['agent_mode'], 'mimo')
+
+    def test_backup_records_configuration_and_external_provider_ownership(self):
+        self.install()
+        self.make_db()
+        config_path = self.args.conf_dir / 'config.json'
+        config = deployment.read_json(config_path)
+        config['mimo_config_dir'] = str(self.base / 'external-provider')
+        config_path.write_text(json.dumps(config))
+        provider = self.base / 'external-provider/mimocode.json'
+        provider.parent.mkdir()
+        provider.write_text('{"key":"private"}')
+        snapshot = deployment.backup(self.args)
+        metadata = deployment.read_json(snapshot / 'backup.json')
+        self.assertEqual(metadata['database_permissions'], deployment.permission_record(self.args.data / 'ayana.db'))
+        recorded = next(item for item in metadata['provider_files'] if item['path'] == str(provider))
+        self.assertEqual(recorded['permissions'], deployment.permission_record(provider))
+        self.assertEqual(recorded['parent_permissions'], deployment.permission_record(provider.parent))
+        recorded_config = next(item for item in metadata['config_permissions'] if item['relative'] == 'config.json')
+        self.assertEqual({key: recorded_config[key] for key in ('uid', 'gid', 'mode')},
+                         deployment.permission_record(config_path))
+        self.assertTrue(any(item['relative'] == '.' for item in metadata['config_permissions']))
+
+    def test_managed_restore_repairs_service_access_then_restores_exact_external_secret_permissions(self):
+        self.install()
+        config_path = self.args.conf_dir / 'config.json'
+        config = deployment.read_json(config_path)
+        config['mimo_config_dir'] = str(self.base / 'external-provider')
+        config_path.write_text(json.dumps(config))
+        provider = self.base / 'external-provider/mimocode.json'
+        provider.parent.mkdir()
+        provider.write_text('{"key":"original"}')
+        snapshot = deployment.backup(self.args)
+        metadata = deployment.read_json(snapshot / 'backup.json')
+        for item in metadata['provider_files']:
+            if item['path'] == str(provider):
+                item['permissions'] = {'uid': 2345, 'gid': 3456, 'mode': 0o600}
+                item['parent_permissions'] = {'uid': 2345, 'gid': 3456, 'mode': 0o700}
+        (snapshot / 'backup.json').write_text(json.dumps(metadata))
+        provider.write_text('{"key":"new"}')
+        self.args.no_start = False
+        events = []
+        with patch.object(deployment, 'set_permissions', side_effect=lambda args: events.append('repair')) as repair:
+            with patch.object(deployment.os, 'chown', side_effect=lambda *args: events.append(args), create=True):
+                deployment.restore(self.args, snapshot)
+        repair.assert_called_once_with(self.args)
+        self.assertEqual(events[0], 'repair')
+        self.assertIn((provider, 2345, 3456), events)
+        self.assertIn((provider.parent, 2345, 3456), events)
+        self.assertEqual(provider.read_text(), '{"key":"original"}')
+        self.assertEqual(deployment.stat.S_IMODE(provider.stat().st_mode) & 0o600, 0o600)
+
+    def test_failed_managed_mode_switch_repairs_restored_access_before_restarting_services(self):
+        self.install()
+        self.args.no_start = False
+        self.args.agent_mode = 'lite'
+        events = []
+        self.run.side_effect = lambda *args: events.append(args)
+        with patch.object(deployment, 'ensure_quiescent', return_value=True):
+            with patch.object(deployment, 'set_permissions', side_effect=lambda args: events.append(('restore_permissions',))):
+                with patch.object(deployment.os, 'chown', create=True):
+                    with patch.object(deployment, 'install_dependencies', side_effect=deployment.InstallError('simulated failure')):
+                        with self.assertRaisesRegex(deployment.InstallError, 'simulated failure'):
+                            self.install()
+        repair = events.index(('restore_permissions',))
+        restart = next(index for index, event in enumerate(events) if event[:2] == ('systemctl', 'start'))
+        self.assertLess(repair, restart)
+        self.assertEqual(deployment.read_json(self.args.conf_dir / 'config.json')['agent_mode'], 'mimo')
+
     def test_backup_and_restore_pair_code_database_config_and_provider(self):
         self.install()
         self.make_db()
@@ -365,6 +498,23 @@ class WebStartupTests(unittest.TestCase):
         self.assertEqual(run.call_args_list, [
             unittest.mock.call('systemctl', 'is-active', '--quiet', name) for name in deployment.UNITS])
 
+    def test_lite_health_requires_the_selected_mode_and_a_live_worker(self):
+        self.args.conf_dir.mkdir()
+        (self.args.conf_dir / 'config.json').write_text(json.dumps({'agent_mode': 'lite'}))
+        value = {'ok': True, 'service': 'ayana', 'version': '0.8.2', 'agent_mode': 'mimo'}
+        with patch.object(deployment, 'urlopen', return_value=self.response(value)):
+            with self.assertRaisesRegex(deployment.InstallError, 'did not confirm'):
+                deployment.health(self.args)
+        value['agent_mode'] = 'lite'
+        for ready in (False, True):
+            with self.subTest(ready=ready), patch.object(deployment, 'urlopen', return_value=self.response(value)):
+                with patch.object(deployment, 'run'), patch.object(deployment, 'native_status', return_value=ready):
+                    if ready:
+                        self.assertEqual(deployment.health(self.args), value)
+                    else:
+                        with self.assertRaisesRegex(deployment.InstallError, 'not confirmed startup'):
+                            deployment.health(self.args)
+
     def test_specific_host_and_ipv6_health_use_the_configured_listener(self):
         self.args.conf_dir.mkdir()
         for host, expected in [('192.0.2.10', '192.0.2.10'), ('::', '[::1]'),
@@ -478,6 +628,84 @@ class NativeObservationTests(unittest.TestCase):
         with patch.object(deployment.shutil, 'which', return_value=None):
             missing = deployment.environment_report(self.args)
         self.assertTrue(any('conflicts with existing config' in item for item in missing))
+
+    def test_lite_prerequisites_do_not_require_mimo_or_tmux(self):
+        self.args.agent_mode = 'lite'
+        self.args.mimo_bin = '/unavailable/mimo'
+        with patch.object(deployment.shutil, 'which', side_effect=lambda name: '/tools/' + name if name in ('ssh', 'ssh-keyscan') else None):
+            self.assertEqual(deployment.environment_report(self.args), [])
+        self.args.agent_mode = 'mimo'
+        with patch.object(deployment.shutil, 'which', return_value=None):
+            missing = deployment.environment_report(self.args)
+        self.assertIn('tmux', missing)
+        self.assertTrue(any('MiMo CLI' in item for item in missing))
+
+    def test_switch_to_lite_still_observes_the_installed_mimo_runtime(self):
+        self.args.agent_mode = 'lite'
+        self.args.conf_dir.mkdir()
+        (self.args.conf_dir / 'config.json').write_text('{}')
+        response = io.BytesIO(json.dumps({'session': {'type': 'busy'}}).encode())
+        with patch.object(deployment, 'urlopen', return_value=response) as request:
+            with self.assertRaisesRegex(deployment.InstallError, 'busy'):
+                deployment.native_status(self.args)
+        request.assert_called_once()
+
+    def test_lite_runtime_observation_requires_matching_live_fresh_owner(self):
+        self.args.conf_dir.mkdir()
+        (self.args.conf_dir / 'config.json').write_text(json.dumps({'agent_mode': 'lite'}))
+        state = self.args.data / 'agent-runtime/lite-attestation.json'
+        state.parent.mkdir(parents=True)
+        proc = self.args.data / 'proc'
+        process = proc / '1234'
+        process.mkdir(parents=True)
+        (process / 'stat').write_text('1234 (worker with spaces) ' + ' '.join(['S'] + ['0'] * 18 + ['12345']))
+        value = {'mode': 'lite', 'owner_pid': 1234, 'owner_start': '12345',
+                 'updated_at': deployment.time.time(), 'status': 'idle'}
+        with patch.object(deployment, 'PROC', proc), patch.object(deployment, 'urlopen', side_effect=AssertionError('MiMo network call')):
+            for status in ('idle', 'waiting_configuration'):
+                value['status'] = status
+                state.write_text(json.dumps(value))
+                self.assertTrue(deployment.native_status(self.args))
+            value['status'] = 'busy'
+            state.write_text(json.dumps(value))
+            with self.assertRaisesRegex(deployment.InstallError, 'busy'):
+                deployment.native_status(self.args)
+            self.assertTrue(deployment.native_status(self.args, require_idle=False))
+            value.update(status='idle', updated_at=1)
+            state.write_text(json.dumps(value))
+            with self.assertRaisesRegex(deployment.InstallError, 'cannot be verified'):
+                deployment.native_status(self.args)
+            value.update(owner_start='different-process', updated_at=deployment.time.time())
+            state.write_text(json.dumps(value))
+            self.assertFalse(deployment.native_status(self.args))
+            (process / 'stat').unlink()
+            process.rmdir()
+            value['owner_start'] = '12345'
+            state.write_text(json.dumps(value))
+            self.assertFalse(deployment.native_status(self.args))
+
+    def test_unknown_agent_mode_is_not_silently_treated_as_mimo(self):
+        self.args.conf_dir.mkdir()
+        (self.args.conf_dir / 'config.json').write_text(json.dumps({'agent_mode': 'typo'}))
+        with self.assertRaisesRegex(deployment.InstallError, 'agent_mode'):
+            deployment.environment_report(self.args)
+
+    def test_missing_lite_heartbeat_cannot_hide_a_held_runtime_lock(self):
+        self.args.conf_dir.mkdir()
+        (self.args.conf_dir / 'config.json').write_text(json.dumps({'agent_mode': 'lite'}))
+        lock = self.args.data / 'agent-runtime/lite-runtime.lock'
+        lock.parent.mkdir(parents=True)
+        lock.write_text('unchanged lock contents')
+        fcntl = Mock(LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)
+        with patch.dict(sys.modules, {'fcntl': fcntl}):
+            fcntl.flock.side_effect = BlockingIOError()
+            with self.assertRaisesRegex(deployment.InstallError, 'running without a verifiable heartbeat'):
+                deployment.native_status(self.args)
+            self.assertEqual(lock.read_text(), 'unchanged lock contents')
+            fcntl.flock.side_effect = None
+            self.assertFalse(deployment.native_status(self.args))
+        self.assertTrue(lock.exists())
+        self.assertEqual(lock.read_text(), 'unchanged lock contents')
 
     def test_service_venv_access_preserves_executables_and_skips_python_symlink(self):
         root = self.args.prefix / '.venv'

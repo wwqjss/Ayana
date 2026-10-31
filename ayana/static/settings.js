@@ -202,13 +202,17 @@ document.addEventListener("keydown", (event) => {
 
 async function settingsModel(context) {
   context.root.innerHTML = "";
-  context.root.appendChild(settingsDescription("MiMoCode 用于事件调查与自治决策。这里显示当前生效的模型连接，密钥不会回填。"));
+  context.root.appendChild(settingsDescription(state.agentMode === "lite"
+    ? "当前为轻量后台值班模式。这里只配置模型连接，后台自动处理告警；不提供聊天或交互终端。"
+    : "MiMoCode 用于事件调查与自治决策。这里显示当前生效的模型连接，密钥不会回填。"));
   const host = el("div", { id: "settings-model-host", class: "settings-section" }); context.root.appendChild(host);
   await openMimoAdmin(host, context);
   if (!context.active()) return;
   context.root.appendChild(el("details", { class: "settings-detail" }, [
     el("summary", { text: "Agent 工具连接" }),
-    settingsDescription("Ayana 在模型会话启动时自动连接 MCP，并绑定当前事件数据库。可在会话中通过配置工具管理检查和通知；实际执行使用当前会话选定的 SSH 账号组。"),
+    settingsDescription(state.agentMode === "lite"
+      ? "轻量 Agent 复用 Ayana 运维工具，实际执行使用默认 SSH 账号组，并保留执行台账和恢复检查。"
+      : "Ayana 在模型会话启动时自动连接 MCP，并绑定当前事件数据库。可在会话中通过配置工具管理检查和通知；实际执行使用当前会话选定的 SSH 账号组。"),
   ]));
 }
 
@@ -453,7 +457,7 @@ async function settingsAbout(context) {
   if (!reply?.ok) throw new Error("about_unavailable");
   context.root.innerHTML = "";
   const card = settingsCard("Ayana", "事件驱动的运维工作台" );
-  [["Ayana 版本", reply.ayana_version], ["MiMoCode 版本", reply.mimocode_version || "未检测到"]].forEach(([label, value]) => card.appendChild(el("div", { class: "settings-row" }, [el("span", { text: label }), el("strong", { text: value || "未知" })])));
+  [["Ayana 版本", reply.ayana_version], ...(reply.agent_mode === "lite" ? [["Agent 模式", "轻量后台值班"]] : [["MiMoCode 版本", reply.mimocode_version || "未检测到"]])].forEach(([label, value]) => card.appendChild(el("div", { class: "settings-row" }, [el("span", { text: label }), el("strong", { text: value || "未知" })])));
   const project = reply.project_url === "https://github.com/wwqjss/Ayana" ? reply.project_url : "https://github.com/wwqjss/Ayana";
   card.appendChild(el("div", { class: "settings-row" }, [el("span", { text: "项目地址" }), el("a", { href: project, target: "_blank", rel: "noopener noreferrer", text: "GitHub · Ayana ↗" })]));
   const status = el("p", { id: "settings-update-result", class: "settings-description", "aria-live": "polite", text: "检查更新会查询项目发布版本。" }); card.appendChild(status);

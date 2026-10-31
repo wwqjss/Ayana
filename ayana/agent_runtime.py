@@ -33,12 +33,17 @@ async def _check_tmux_owner(tui) -> None:
 
 async def run(config_path: str) -> None:
     from .config import load_config
+    cfg = load_config(config_path)
+    from .agent_mode import agent_mode
+    if agent_mode(cfg) == "lite":
+        from .lite_worker import run as run_lite
+        await run_lite(cfg)
+        return
     from .db import Database
     from .mimo_admin import MimoAdmin
     from .mimo_runtime_config import runtime_paths, verified_runtime
     from .mimo_serve import MimoServeManager, MimoServeClient
     from .agent_tui import AgentTuiManager
-    cfg = load_config(config_path)
     paths = runtime_paths(cfg)
     if os.name != "posix":
         raise RuntimeError("native_runtime_requires_posix")

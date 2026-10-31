@@ -1,8 +1,10 @@
 # 运维手册
 
-适用于 **Ayana v0.8.3**，系统路径以默认安装为例。
+适用于 **Ayana v0.9.0**，系统路径以默认安装为例。
 
 ## 日常使用
+
+安装时选择的 `agent_mode` 决定运行方式：`mimo` 支持原生交互和接管；`lite` 只在后台自动处理告警，没有聊天、终端或人工接管。轻量模式通过工单、执行记录、通知和服务日志核对处置过程，已有会话记录仍可只读查看。下面的原生画面和手动会话操作仅适用于 MiMo 模式。
 
 “事件”追踪故障，“Agent”承载原生任务，“审计”保留执行事实。核对结果时应同时查看工单、故障代次、执行台账和恢复依据。
 
@@ -49,13 +51,13 @@ sudo bash /opt/ayana/deploy/ayana-setup.sh status --system
 sudo bash /opt/ayana/deploy/ayana-setup.sh health --system
 ```
 
-Web 与原生运行时分别管理。只需刷新 Web 进程时可运行：
+Web 与 Agent 运行时分别管理；`ayana-agent-runtime` 根据模式持有 MiMo 原生服务或轻量后台值班进程。只需刷新 Web 进程时可运行：
 
 ```bash
 sudo systemctl restart ayana
 ```
 
-重启 `ayana-agent-runtime` 会影响原生服务和终端进程，应先等待任务空闲。完整代码升级也应在任务结束后进行；不能仅凭 Web 不再显示连接，就认定后台已经空闲。
+重启 `ayana-agent-runtime` 会中断当前 Agent 任务（MiMo 模式还包括终端进程），应先等待任务空闲。完整代码升级也应在任务结束后进行；不能仅凭 Web 不再显示连接，就认定后台已经空闲。
 
 ## 备份与恢复
 
@@ -104,7 +106,7 @@ curl --fail http://127.0.0.1:6200/health
 
 ### 安装时提示缺少依赖或 CLI
 
-使用当前 README 中的 `bootstrap.sh --system` 命令，正常安装会自动准备系统依赖与缺少的官方 CLI。系统软件源必须能提供 Python 3.11+，下载官方 CLI 需要能够访问小米安装服务。失败时查看脚本最后报告的原因，修复网络或软件源后重新运行。
+使用当前 README 中的 `bootstrap.sh --system` 命令，正常安装会按模式准备依赖；仅 MiMo 模式准备 tmux 与缺少的官方 CLI。轻量模式无需安装这两项。系统软件源必须能提供 Python 3.11+，下载官方 CLI 需要能够访问小米安装服务。失败时查看脚本最后报告的原因，修复网络或软件源后重新运行。
 
 `--check`、`--no-start`、用户模式和直接运行解压包中的 `install.sh` 不会自动安装这些前置条件。`--mimo-bin` 应填写真实可执行文件路径；系统服务启用 `ProtectHome`，不能使用指回 `/root` 或用户主目录的软链接。已有 CLI 不会因更新 Ayana 而自动升级。
 

@@ -135,6 +135,8 @@ def seed_assets(db: Database) -> None:
 class App:
     def __init__(self, cfg: dict):
         self.cfg = cfg
+        from .agent_mode import agent_mode
+        self.agent_mode = agent_mode(cfg)
         self.db = Database(cfg["db_path"])
         import os
         log.info("db path resolved to: %s (base_dir=%s) cwd=%s abs=%s",
@@ -312,16 +314,17 @@ class App:
             home=_native_paths["home"], state_dir=str(Path(_native_paths["state_dir"]) / "tui"),
             proxy_port=int(cfg.get("agent_tui_proxy_port") or 6291), runtime_resolver=_mimo_runtime,
             redactor_factory=self.mimo_admin.redactor,
-        )
+        ) if self.agent_mode == "mimo" else None
         # Manual chat shares the verified read-only client rather than a no_mimo bridge.
-        self.session_bridge.mimo = self.mimo_read_client
+        self.session_bridge.mimo = self.mimo_read_client if self.agent_mode == "mimo" else None
         self.auto_investigator = None
         if _ai_cfg.enabled:
-            _ai_bridge = SessionBridge(self.db, knowledge=self.knowledge, mimo=self.mimo_read_client, duty=self.duty)
+            _ai_bridge = SessionBridge(self.db, knowledge=self.knowledge, mimo=self.session_bridge.mimo, duty=self.duty)
             self.auto_investigator = AutoInvestigator(
-                self.db, knowledge=self.knowledge, mimo=self.mimo_read_client,
-                bridge=_ai_bridge, config=_ai_cfg, mimo_write=self.mimo_decision_client,
-                readiness_callback=_mimo_ready,
+                self.db, knowledge=self.knowledge, mimo=self.session_bridge.mimo,
+                bridge=_ai_bridge, config=_ai_cfg,
+                mimo_write=self.mimo_decision_client if self.agent_mode == "mimo" else None,
+                readiness_callback=_mimo_ready if self.agent_mode == "mimo" else None,
             )
             self.incidents.auto_investigator = self.auto_investigator
             log.info("auto_investigate enabled closed_loop=%s max_concurrent=%s timeout=%s",
@@ -506,6 +509,7 @@ class App:
             mimo_serve=self.mimo_serve,
             agent_tui=self.agent_tui,
             mimo_events=lambda: getattr(self, "mimo_live_events", []),
+            agent_mode=self.agent_mode,
             alertmanager_webhook_path=cfg.get("alertmanager_webhook_path") or "/hooks/alertmanager",
         )
         self._stop = asyncio.Event()
@@ -675,10 +679,11 @@ class App:
         if (self.agent_tui is not None and bool(self.cfg.get("agent_tui_enabled", False))
                 and not bool(self.cfg.get("mimo_serve_external", False))):
             await self.agent_tui.start()
-        self._bg_tasks.append(asyncio.create_task(self._bg_mimo_serve()))
-        self._bg_tasks.append(asyncio.create_task(self._bg_native_receipts()))
+        if self.agent_mode == "mimo":
+            self._bg_tasks.append(asyncio.create_task(self._bg_mimo_serve()))
+            self._bg_tasks.append(asyncio.create_task(self._bg_native_receipts()))
         # P4.3：只读调查 worker（独立于旧自治）
-        if self.auto_investigator is not None:
+        if self.auto_investigator is not None and self.agent_mode == "mimo":
             self._bg_tasks.append(asyncio.create_task(self.auto_investigator.run_forever()))
         # Manual authorization expiry is independent of any investigation worker.
         self._bg_tasks.append(asyncio.create_task(self._bg_maintenance()))

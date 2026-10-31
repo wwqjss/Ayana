@@ -14,6 +14,14 @@
   "alertmanager_webhook_path": "/hooks/alertmanager",
   "admin_qq": "",
   "admin_wecom_users": [],
+  "agent_mode": "mimo",
+  "lite_agent": {
+    "max_rounds": 12,
+    "max_tool_calls": 40,
+    "request_timeout_sec": 60,
+    "max_tokens": 2048,
+    "max_context_chars": 80000
+  },
   "mimo_bin": "/usr/local/bin/mimo",
   "mimo_workdir": "/var/lib/ayana/agent-workspace",
   "agent_runtime_home": "/var/lib/ayana",

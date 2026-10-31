@@ -73,6 +73,19 @@ def effective_config(args) -> dict:
     return config
 
 
+def configured_agent_mode(cfg: dict) -> str:
+    value = cfg.get('agent_mode', 'mimo')
+    if value not in ('mimo', 'lite'):
+        raise InstallError('agent_mode must be mimo or lite')
+    return value
+
+
+def selected_agent_mode(args) -> str:
+    """An omitted option preserves the installed mode; old installs use MiMo."""
+    configured = configured_agent_mode(effective_config(args))
+    return getattr(args, 'agent_mode', None) or configured
+
+
 def db_path(args) -> Path:
     value = Path(effective_config(args).get('db_path') or args.data / 'ayana.db')
     return value if value.is_absolute() else args.conf_dir / value
@@ -80,6 +93,10 @@ def db_path(args) -> Path:
 
 def native_status(args, *, require_idle=True):
     cfg = effective_config(args)
+    # Observe the installed runtime, even when a different target was requested.
+    # Selecting --agent-mode lite cannot bypass an old MiMo owner's state.
+    if configured_agent_mode(cfg) == 'lite':
+        return lite_status(args, require_idle=require_idle)
     port = int(cfg.get('mimo_serve_port') or 6290)
     password = str(cfg.get('mimo_serve_password') or cfg.get('webhook_token') or '')
     home = Path(cfg.get('agent_runtime_home') or args.data)
@@ -107,6 +124,64 @@ def native_status(args, *, require_idle=True):
         raise InstallError('native runtime state cannot be observed; refuse update') from exc
     except (ValueError, TimeoutError) as exc:
         raise InstallError('native runtime returned an invalid or incomplete state') from exc
+
+
+def lite_offline(state: Path):
+    """A missing/dead heartbeat is offline only if no worker holds its lock."""
+    lock = state.parent / 'lite-runtime.lock'
+    if lock.is_symlink():
+        raise InstallError('lightweight runtime lock cannot be a symlink')
+    if lock.exists():
+        try:
+            import fcntl
+            with lock.open('r+') as stream:
+                try:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise InstallError('lightweight runtime is running without a verifiable heartbeat; refuse update') from exc
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        except (ImportError, OSError) as exc:
+            raise InstallError('lightweight runtime lock cannot be verified; refuse update') from exc
+    return False
+
+
+def lite_status(args, *, require_idle=True):
+    cfg = effective_config(args)
+    home = Path(cfg.get('agent_runtime_home') or args.data)
+    state = Path(cfg.get('agent_runtime_state_dir') or home / 'agent-runtime') / 'lite-attestation.json'
+    if state.is_symlink():
+        raise InstallError('lightweight runtime state cannot be a symlink')
+    if not state.exists():
+        return lite_offline(state)
+    try:
+        if state.is_symlink() or state.stat().st_size > 16384:
+            raise ValueError('unsafe runtime status')
+        value = read_json(state)
+        if value.get('mode') != 'lite' or type(value.get('owner_pid')) is not int or value['owner_pid'] <= 0:
+            raise ValueError('invalid runtime identity')
+        if not isinstance(value.get('owner_start'), str) or not value['owner_start']:
+            raise ValueError('missing runtime identity')
+        if PROC is None or not PROC.is_dir():
+            raise ValueError('process state unavailable')
+        process = PROC / str(value['owner_pid'])
+        if not process.exists():
+            return lite_offline(state)
+        raw = (process / 'stat').read_text()
+        actual_start = raw[raw.rfind(')') + 2:].split()[19]
+        if actual_start != value['owner_start']:
+            # A PID reused by another process is not the recorded worker.
+            return lite_offline(state)
+        age = time.time() - float(value.get('updated_at') or 0)
+        if not 0 <= age <= 20:
+            raise ValueError('runtime heartbeat is stale')
+        status = value.get('status')
+        if status not in ('idle', 'busy', 'waiting_configuration'):
+            raise ValueError('unknown runtime state')
+        if require_idle and status == 'busy':
+            raise InstallError('lightweight runtime is busy; finish/reconcile tasks before update')
+        return True
+    except (OSError, ValueError, TypeError, IndexError) as exc:
+        raise InstallError('lightweight runtime state cannot be verified; refuse unobserved update') from exc
 
 
 def web_is_online(args):
@@ -167,25 +242,27 @@ def environment_report(args) -> list[str]:
     missing = []
     if sys.version_info < (3, 11):
         missing.append('Python >= 3.11')
-    for binary in ('ssh', 'ssh-keyscan', 'tmux'):
+    agent_mode = selected_agent_mode(args)
+    for binary in (('ssh', 'ssh-keyscan', 'tmux') if agent_mode == 'mimo' else ('ssh', 'ssh-keyscan')):
         if shutil.which(binary) is None:
             missing.append(binary)
     cfg = effective_config(args)
-    configured = cfg.get('mimo_bin') or (cfg.get('auto_investigate') or {}).get('mimo_bin')
-    if args.mimo_bin and configured:
-        selected_path = Path(shutil.which(str(args.mimo_bin)) or args.mimo_bin).resolve()
-        configured_path = Path(shutil.which(str(configured)) or configured).resolve()
-        if selected_path != configured_path:
-            missing.append('--mimo-bin conflicts with existing config; explicitly update config before installation')
-    candidate = args.mimo_bin or configured or shutil.which('mimo')
-    if not candidate or not (Path(candidate).is_file() or shutil.which(str(candidate))):
-        missing.append('MiMo CLI (install it separately, then pass --mimo-bin /usr/local/bin/mimo)')
-    else:
-        args.mimo_bin = str(Path(shutil.which(str(candidate)) or candidate).resolve())
-        if not os.access(args.mimo_bin, os.X_OK):
-            missing.append('MiMo CLI must be executable')
-        if args.system and (args.mimo_bin.startswith('/root/') or args.mimo_bin.startswith('/home/')):
-            missing.append('MiMo CLI in a system-readable path outside /root and /home (ProtectHome=true)')
+    if agent_mode == 'mimo':
+        configured = cfg.get('mimo_bin') or (cfg.get('auto_investigate') or {}).get('mimo_bin')
+        if args.mimo_bin and configured:
+            selected_path = Path(shutil.which(str(args.mimo_bin)) or args.mimo_bin).resolve()
+            configured_path = Path(shutil.which(str(configured)) or configured).resolve()
+            if selected_path != configured_path:
+                missing.append('--mimo-bin conflicts with existing config; explicitly update config before installation')
+        candidate = args.mimo_bin or configured or shutil.which('mimo')
+        if not candidate or not (Path(candidate).is_file() or shutil.which(str(candidate))):
+            missing.append('MiMo CLI (install it separately, then pass --mimo-bin /usr/local/bin/mimo)')
+        else:
+            args.mimo_bin = str(Path(shutil.which(str(candidate)) or candidate).resolve())
+            if not os.access(args.mimo_bin, os.X_OK):
+                missing.append('MiMo CLI must be executable')
+            if args.system and (args.mimo_bin.startswith('/root/') or args.mimo_bin.startswith('/home/')):
+                missing.append('MiMo CLI in a system-readable path outside /root and /home (ProtectHome=true)')
     if args.system and not args.no_start:
         if os.name != 'posix' or os.geteuid() != 0:
             missing.append('root for --system')
@@ -228,6 +305,30 @@ def validate_backup_scope(args):
         raise InstallError('venv directory cannot be a symlink')
 
 
+def permission_record(path: Path) -> dict:
+    info = path.stat()
+    return {'uid': info.st_uid, 'gid': info.st_gid, 'mode': stat.S_IMODE(info.st_mode)}
+
+
+def configuration_permissions(directory: Path) -> list[dict]:
+    if not directory.is_dir():
+        return []
+    return [{'relative': path.relative_to(directory).as_posix(), **permission_record(path)}
+            for path in [directory, *directory.rglob('*')] if not path.is_symlink()]
+
+
+def restore_permission_record(path: Path, record: dict):
+    if path.is_symlink():
+        raise InstallError('cannot restore permissions through a symlink')
+    if any(type(record.get(key)) is not int or record[key] < 0 for key in ('uid', 'gid', 'mode')):
+        raise InstallError('invalid backup ownership metadata')
+    if record['mode'] > 0o7777:
+        raise InstallError('invalid backup permission mode')
+    if hasattr(os, 'chown'):
+        os.chown(path, record['uid'], record['gid'])
+    path.chmod(record['mode'])
+
+
 def backup(args) -> Path:
     validate_backup_scope(args)
     destination = args.backup_dir / datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
@@ -248,7 +349,9 @@ def backup(args) -> Path:
     for index, path in enumerate(provider_config_files(args)):
         if path.is_symlink():
             raise InstallError('provider configuration cannot be a symlink')
-        provider_files.append({'path': str(path), 'present': path.is_file(), 'backup': f'provider-{index}.json'})
+        provider_files.append({'path': str(path), 'present': path.is_file(), 'backup': f'provider-{index}.json',
+                               **({'permissions': permission_record(path),
+                                   'parent_permissions': permission_record(path.parent)} if path.is_file() else {})})
         if path.is_file():
             shutil.copy2(path, destination / f'provider-{index}.json')
     database = db_path(args)
@@ -263,6 +366,8 @@ def backup(args) -> Path:
     write_json(destination / 'backup.json', {'prefix': str(args.prefix), 'data': str(args.data),
                                            'conf_dir': str(args.conf_dir), 'database': str(database),
                                            'had_database': database.exists(), 'provider_files': provider_files,
+                                           'database_permissions': permission_record(database) if database.is_file() else None,
+                                           'config_permissions': configuration_permissions(args.conf_dir),
                                            'units': [name for name in UNITS if (units / name).is_file()]})
     (args.backup_dir / 'LAST').write_text(str(destination), encoding='utf-8')
     return destination
@@ -319,16 +424,46 @@ def configure(args, source: Path):
                    args.data / 'agent-runtime', args.conf_dir):
         folder.mkdir(parents=True, exist_ok=True, mode=0o700)
     config = args.conf_dir / 'config.json'
+    mode = selected_agent_mode(args)
     if not config.exists():
-        write_json(config, {'http_host': args.http_host, 'http_port': args.http_port,
+        initial = {'http_host': args.http_host, 'http_port': args.http_port,
                            'ws_host': '127.0.0.1', 'ws_port': 6199, 'db_path': str(args.data / 'ayana.db'),
                            'log_file': str(args.data / 'log/ayana.log'), 'knowledge_dir': str(args.data / 'knowledge'),
-                           'agent_runtime_home': str(args.data), 'mimo_workdir': str(args.data / 'agent-workspace'),
+                           'agent_runtime_home': str(args.data),
                            'agent_runtime_state_dir': str(args.data / 'agent-runtime'),
-                           'mimo_config_dir': str(args.data / '.config/mimocode'),
-                           'mimo_bin': args.mimo_bin or '/usr/local/bin/mimo',
-                           'mimo_serve_external': True, 'agent_tui_enabled': True,
-                           'prometheus_url': 'http://127.0.0.1:9090', 'alertmanager_url': 'http://127.0.0.1:9093'})
+                           'agent_mode': mode,
+                           'mimo_serve_external': True, 'agent_tui_enabled': mode == 'mimo',
+                           'prometheus_url': 'http://127.0.0.1:9090', 'alertmanager_url': 'http://127.0.0.1:9093'}
+        if mode == 'mimo':
+            initial.update(mimo_workdir=str(args.data / 'agent-workspace'),
+                           mimo_config_dir=str(args.data / '.config/mimocode'),
+                           mimo_bin=args.mimo_bin or '/usr/local/bin/mimo')
+        write_json(config, initial)
+    elif getattr(args, 'agent_mode', None) is not None:
+        # Called only after the old owner was observed idle/stopped and backed up.
+        # Preserve all user settings and credentials when explicitly switching.
+        if config.is_symlink():
+            raise InstallError('configuration cannot be a symlink')
+        current = read_json(config)
+        if configured_agent_mode(current) != mode:
+            current.update(agent_mode=mode, agent_tui_enabled=mode == 'mimo')
+            if mode == 'mimo':
+                current['mimo_serve_external'] = True
+                if args.mimo_bin and not current.get('mimo_bin'):
+                    current['mimo_bin'] = args.mimo_bin
+            permissions = stat.S_IMODE(config.stat().st_mode)
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=config.parent,
+                                                 prefix='.ayana-config-', delete=False) as stream:
+                    temporary = Path(stream.name)
+                    json.dump(current, stream, indent=2, ensure_ascii=False)
+                    stream.write('\n')
+                temporary.chmod(permissions)
+                os.replace(temporary, config)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
     secret_file = args.conf_dir / 'secrets.json'
     if not secret_file.exists():
         write_json(secret_file, {key: secrets.token_urlsafe(32) for key in (
@@ -404,21 +539,31 @@ def health(args, units=None):
     if not metadata.is_file():
         raise InstallError('installed project metadata is missing; cannot verify the running version')
     expected = tomllib.loads(metadata.read_text(encoding='utf-8'))['project']['version']
+    mode = configured_agent_mode(effective_config(args))
     with urlopen(web_url(args) + '/health', timeout=5) as response:
         try:
             result = json.load(response)
         except ValueError as exc:
             raise InstallError('Web health returned invalid JSON') from exc
         if (response.status != 200 or not isinstance(result, dict) or result.get('ok') is not True
-                or result.get('service') != 'ayana' or result.get('version') != expected):
+                or result.get('service') != 'ayana' or result.get('version') != expected
+                or result.get('agent_mode', 'mimo') != mode):
             raise InstallError(f'Web health did not confirm Ayana v{expected}')
     if args.system and not args.no_start:
         for name in (UNITS if units is None else units):
             run('systemctl', 'is-active', '--quiet', name)
+    if mode == 'lite' and not native_status(args, require_idle=False):
+        raise InstallError('lightweight Agent runtime has not confirmed startup')
     return result
 
 
 def report_installation(args, *, running):
+    mode = selected_agent_mode(args)
+    if mode == 'lite':
+        print('Agent 模式：轻量后台值班；不安装 MiMo，不提供聊天或交互终端。')
+        print('模型配置：llm_base_url、llm_model、llm_api_key（secrets.json / AYANA_LLM_* / Web 设置）。')
+    else:
+        print('Agent 模式：MiMoCode，支持原生交互终端与自动值班。')
     if not running:
         print('Installation files prepared; services have not been started.')
         if args.no_start:
@@ -453,7 +598,7 @@ def report_installation(args, *, running):
     if token.is_file() and not token.is_symlink():
         print('首次注册令牌读取命令（在服务器执行）：')
         print(f'  {admin}cat {shlex.quote(str(token))}')
-    print('首次进入 Web 后设置模型接口和 API Key，并保存验证；未配置模型时原生服务等待设置。')
+    print('首次进入 Web 后设置模型接口和 API Key，并保存验证；未配置模型时 Agent 服务等待设置。')
     print(f'查看服务：{admin}systemctl status ayana ayana-agent-runtime --no-pager')
 
 
@@ -485,6 +630,29 @@ def validate_snapshot(args, snapshot: Path):
 
 def restore(args, snapshot: Path):
     snapshot, meta = validate_snapshot(args, snapshot)
+    database = Path(meta['database'])
+    database_permissions = meta.get('database_permissions') or (permission_record(database) if database.is_file() else None)
+    if (args.system and not args.no_start and meta['had_database'] and database_permissions is None
+            and not database.resolve().is_relative_to(args.data)):
+        raise InstallError('database ownership is unavailable; a complete offline restore is required')
+    # Older snapshots have no ownership metadata. Preserve the live ownership
+    # before copy2 replaces files; new snapshots carry the original values.
+    config_permissions = meta.get('config_permissions', configuration_permissions(args.conf_dir))
+    provider_permissions = {}
+    provider_parent_permissions = {}
+    for item in meta.get('provider_files', []):
+        target = Path(item['path'])
+        if target.is_symlink():
+            raise InstallError('unsafe provider configuration restore target')
+        if item['present']:
+            record = item.get('permissions') or (permission_record(target) if target.is_file() else None)
+            managed_path = any(target.resolve().is_relative_to(directory) for directory in (args.data, args.conf_dir))
+            if args.system and not args.no_start and record is None and not managed_path:
+                raise InstallError('provider ownership is unavailable; a complete offline restore is required')
+            provider_permissions[str(target)] = record
+            parent_record = item.get('parent_permissions') or (permission_record(target.parent) if target.parent.is_dir() else None)
+            if parent_record is not None:
+                provider_parent_permissions[str(target.parent)] = parent_record
     for name in (*MANAGED_DIRS, *MANAGED_FILES, '.venv'):
         target = args.prefix / name
         if target.is_symlink():
@@ -502,7 +670,6 @@ def restore(args, snapshot: Path):
         if args.conf_dir.exists():
             shutil.rmtree(args.conf_dir)
         shutil.copytree(snapshot / 'config', args.conf_dir, symlinks=True)
-    database = Path(meta['database'])
     for path in (database, Path(str(database) + '-wal'), Path(str(database) + '-shm')):
         if path.exists():
             path.unlink()
@@ -525,6 +692,25 @@ def restore(args, snapshot: Path):
             shutil.copy2(snapshot / 'units' / name, target)
         elif target.exists():
             target.unlink()
+    if args.system and not args.no_start:
+        # Restored code/venv is copied by root. Repair service access before any
+        # caller restarts it, then restore exact config/provider ownership rather
+        # than applying service ownership to externally managed model secrets.
+        set_permissions(args)
+        for record in config_permissions:
+            relative = Path(record['relative'])
+            target = args.conf_dir / relative
+            if relative.is_absolute() or '..' in relative.parts or not target.resolve().is_relative_to(args.conf_dir):
+                raise InstallError('unsafe backup configuration permission path')
+            if target.exists():
+                restore_permission_record(target, record)
+        for name, record in provider_permissions.items():
+            if record is not None:
+                restore_permission_record(Path(name), record)
+        for name, record in provider_parent_permissions.items():
+            restore_permission_record(Path(name), record)
+        if meta['had_database'] and database_permissions is not None:
+            restore_permission_record(database, database_permissions)
 
 
 def install(args, source: Path):
@@ -544,7 +730,8 @@ def install(args, source: Path):
     validate_source(source)
     validate_backup_scope(args)
     cfg = effective_config(args)
-    if cfg and cfg.get('mimo_serve_external') is not True and not args.no_start:
+    if (cfg and configured_agent_mode(cfg) == 'mimo' and selected_agent_mode(args) == 'mimo'
+            and cfg.get('mimo_serve_external') is not True and not args.no_start):
         raise InstallError('existing config must explicitly set mimo_serve_external=true before installing the independent runtime')
     existing = (args.prefix / 'ayana/main.py').exists()
     has_state = existing or (args.conf_dir / 'config.json').exists() or db_path(args).exists()
@@ -578,11 +765,11 @@ def install(args, source: Path):
             started_new = True
             run('systemctl', 'start', 'ayana-agent-runtime.service', 'ayana.service')
             wait_health(args)
-            if was_ready:
+            if was_ready or selected_agent_mode(args) == 'lite':
                 for attempt in range(10):
                     try:
                         if not native_status(args, require_idle=False):
-                            raise InstallError('previously ready native runtime did not return')
+                            raise InstallError('Agent runtime did not return after installation')
                         break
                     except InstallError:
                         if attempt == 9:
@@ -624,6 +811,8 @@ def parser():
     result.add_argument('--http-host', default='127.0.0.1')
     result.add_argument('--http-port', type=int, default=6200)
     result.add_argument('--mimo-bin')
+    result.add_argument('--agent-mode', choices=('mimo', 'lite'),
+                        help='Agent backend; omitted preserves the installed mode (new installs: mimo)')
     result.add_argument('--skip-pip', action='store_true')
     result.add_argument('--no-start', action='store_true')
     result.add_argument('--check', action='store_true')
@@ -651,11 +840,13 @@ def main(argv=None):
     if args.check:
         missing = environment_report(args)
         print(json.dumps({'missing_prerequisites': missing, 'installed': (args.prefix / 'ayana/main.py').is_file(),
+                          'agent_mode': selected_agent_mode(args),
                           'config_present': (args.conf_dir / 'config.json').is_file(),
                           'units_present': {name: (args.unit_dir / name).is_file() for name in UNITS}}))
         return 1 if missing else 0
     if args.command == 'status':
         print(json.dumps({'prefix': str(args.prefix), 'data': str(args.data), 'config': str(args.conf_dir / 'config.json'),
+                          'agent_mode': selected_agent_mode(args),
                           'last_backup': (args.backup_dir / 'LAST').read_text() if (args.backup_dir / 'LAST').is_file() else None}))
         return 0
     if args.command == 'health':
@@ -679,7 +870,6 @@ def main(argv=None):
                 runtime_stopped = True
             rescue = backup(args)
             restore(args, snapshot)
-            set_permissions(args)
             if managed:
                 run('systemctl', 'daemon-reload')
                 prior_units = snapshot_meta['units']

@@ -737,6 +737,32 @@ test("OSC52 is registered, rejects queries and ignores replay after reattachment
   env.terminals.at(-1).oscHandlers.get(52)(payload);handler(payload);
   assert.equal(env.nodes.get("aw-copy-text").value,"");assert.equal(env.nodes.get("aw-copy-panel").classList.contains("hidden"),true);
 });
+test("lite mode shows existing duty records without opening or probing native terminals", async () => {
+  const env = environment((call, normal) => {
+    const reply = normal(call);
+    return call.url.includes("/api/agent/") ? { ...reply, agent_mode: "lite", can_prepare: false, can_control: false,
+      messages: [{role: "assistant", body: "已完成检查，工单仍需核对恢复。"}] } : reply;
+  });
+  await env.window.renderAgentWorkbench();
+  assert.equal(env.sockets.length, 0);
+  assert.equal(env.calls.some(call => call.url.includes("/terminal")), false);
+  assert.ok(env.nodes.get("aw-term-host").textContent.includes("已完成检查"));
+  for (const id of ["aw-new-session", "aw-term-reconnect", "aw-term-acquire", "aw-recover-task"]) {
+    assert.equal(env.nodes.get(id).classList.contains("hidden"), true, id);
+  }
+  await env.nodes.get("aw-new-session").click(); await env.attach();
+  assert.equal(env.calls.some(call => call.method === "POST"), false);
+  assert.equal(env.modals.length, 0);
+});
+
+test("lite mode without sessions waits for alerts without suggesting MiMo installation", async () => {
+  const env = environment((call, normal) => ({ ...normal(call), agent_mode: "lite", sessions: [] }));
+  await env.window.renderAgentWorkbench();
+  assert.ok(env.nodes.get("aw-term-notice").textContent.includes("等待告警"));
+  assert.equal(env.nodes.get("aw-term-notice").textContent.includes("MiMoCode"), false);
+  assert.equal(env.calls.some(call => call.url.includes("/terminal")), false);
+});
+
 test("logout and navigation both invoke the workbench suspension hook", () => {
   const login = app.slice(app.indexOf("function showLogin()"), app.indexOf("function showLogin()") + 220);
   const navigate = app.slice(app.indexOf("function activateTab("), app.indexOf("function setMonitorSub("));

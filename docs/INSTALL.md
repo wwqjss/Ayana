@@ -1,6 +1,6 @@
 # 安装、升级与回滚
 
-适用于 **Ayana v0.8.3**。这是项目的安装手册，命令以 Linux 系统安装的默认路径为例。
+适用于 **Ayana v0.9.0**。这是项目的安装手册，命令以 Linux 系统安装的默认路径为例。
 
 ## 1. 安装条件
 
@@ -9,13 +9,13 @@
 | 操作系统 | 支持 systemd 的 Linux；用户模式可不使用 systemd |
 | 系统权限 | root 可直接安装；普通账号会请求 sudo |
 | 软件源 | apt、dnf 或 yum 可用，能提供 Python 3.11+；缺少的系统依赖由引导脚本安装 |
-| 系统工具 | Bash 和 curl 用于下载引导脚本；tmux、OpenSSH 等运行依赖由脚本准备 |
-| MiMoCode | 首次缺少 CLI 时自动从小米官方安装；已有配置与可用 CLI 沿用 |
+| 系统工具 | Bash 和 curl 用于下载引导脚本；OpenSSH 等依赖由脚本准备；tmux 仅 MiMo 模式需要 |
+| MiMoCode | 仅 MiMo 模式需要：首次缺少 CLI 时自动从小米官方安装，已有配置与可用 CLI 沿用 |
 | 网络 | 能访问模型接口、受管主机 SSH，以及选择接入的监控或通知服务 |
 
 使用当前系统软件源能提供 Python 3.11+ 的 Debian / Ubuntu 或 dnf / yum 发行版。较旧发行版的软件源若无法满足该版本，脚本会说明缺失条件并停止；先准备受支持的 Python，或使用较新的系统。
 
-自动准备仅用于引导脚本的正常 `--system` 安装。`--check`、`--no-start` 和用户模式不会自动安装系统依赖或下载 CLI。直接从源码或解压包运行 `deploy/install.sh` 时，也应先自行准备 Python 3.11+、venv、pip、tmux、OpenSSH 客户端和兼容 MiMoCode CLI。
+自动准备仅用于引导脚本的正常 `--system` 安装。`--check`、`--no-start` 和用户模式不会自动安装系统依赖或下载 CLI。直接从源码或解压包运行 `deploy/install.sh` 时，也应先自行准备 Python 3.11+、venv、pip 和 OpenSSH 客户端；MiMo 模式另外需要 tmux 与兼容 MiMoCode CLI。
 
 Prometheus、Alertmanager 和机器人渠道均按需接入，不是打开 Web 的前提。
 
@@ -26,7 +26,20 @@ curl -fsSL https://raw.githubusercontent.com/wwqjss/Ayana/main/deploy/bootstrap.
 bash ayana-bootstrap.sh --system
 ```
 
-引导脚本从 GitHub Release 下载安装包，要求存在匹配的 SHA256 校验文件，校验通过后调用安装器。它会准备缺少的系统依赖；首次没有可用 MiMoCode CLI 时，通过小米官方 `https://mimo.xiaomi.com/install` 安装 v0.1.16，并把可执行文件放在系统服务可读取的公共目录。已安装的 CLI 和现有 `mimo_bin` 配置会沿用，更新 Ayana 不会顺带升级 CLI。已有安装找不到其 CLI 时会停止并提示修复路径，不会自动换成另一个版本。
+默认选择 MiMo 交互模式；需要纯后台自动值班时，安装命令改为：
+
+```bash
+bash ayana-bootstrap.sh --system --agent-mode lite
+```
+
+| 模式 | 运行方式 |
+| --- | --- |
+| `--agent-mode mimo` | 官方 MiMoCode，支持聊天、原生终端、观察和人工接管 |
+| `--agent-mode lite` | 内置后台 Agent 直接调用模型 API，仅自动值班，不安装 MiMoCode 或 tmux |
+
+两种模式均保留 Ayana Web 的连接、监控、工单、通知和审计管理。轻量模式的 Agent 没有交互界面，已有会话记录可只读查看。未指定模式的新安装默认 `mimo`；已有安装沿用其配置。
+
+引导脚本从 GitHub Release 下载安装包，要求存在匹配的 SHA256 校验文件，校验通过后调用安装器。它会按所选模式准备缺少的系统依赖；MiMo 模式首次没有可用 MiMoCode CLI 时，通过小米官方 `https://mimo.xiaomi.com/install` 安装 v0.1.16，并把可执行文件放在系统服务可读取的公共目录。已安装的 CLI 和现有 `mimo_bin` 配置会沿用，更新 Ayana 不会顺带升级 CLI。已有安装找不到其 CLI 时会停止并提示修复路径，不会自动换成另一个版本。
 
 系统服务以专用用户 `ayana` 运行。若官方 CLI 已装在 root 的 `~/.mimocode/bin/mimo`，脚本会复制实际二进制到公共目录，不使用指向 `/root` 的软链接。需要使用自行准备的兼容 CLI 时，可增加 `--mimo-bin /usr/local/bin/mimo`；指定路径及其依赖必须对服务用户可用。
 
@@ -35,7 +48,7 @@ bash ayana-bootstrap.sh --system
 需要固定本次版本时：
 
 ```bash
-env AYANA_VERSION=v0.8.3 bash ayana-bootstrap.sh --system
+env AYANA_VERSION=v0.9.0 bash ayana-bootstrap.sh --system
 ```
 
 也可在 Release 页面下载版本安装包及同名 `.sha256`，校验并解压，然后从解压目录运行 `deploy/install.sh`。依赖由 `pyproject.toml` 声明，安装器创建独立虚拟环境并执行项目安装；安装包包含完整 Web 静态资源。
@@ -57,7 +70,7 @@ env AYANA_VERSION=v0.8.3 bash ayana-bootstrap.sh --system
 安装器生成两个服务：
 
 - `ayana.service`：Web、告警接入和业务后台。
-- `ayana-agent-runtime.service`：MiMoCode 服务和原生会话的独立运行时。
+- `ayana-agent-runtime.service`：所选 Agent 的独立运行时；MiMo 模式管理原生会话，轻量模式运行后台值班任务。
 
 ```bash
 sudo systemctl status ayana ayana-agent-runtime --no-pager
@@ -110,6 +123,7 @@ sudo bash deploy/install.sh --system --check --mimo-bin /usr/local/bin/mimo
 | 参数 | 用途 |
 | --- | --- |
 | `--system` | 系统安装，要求 root，正常引导安装时自动准备依赖并启动两个服务 |
+| `--agent-mode lite\|mimo` | 选择轻量后台值班或 MiMo 交互模式；升级未指定时沿用已有模式 |
 | `--user` | 当前用户安装，默认模式，不安装系统服务 |
 | `--prefix PATH` | 程序目录 |
 | `--data PATH` | 数据目录 |
@@ -123,7 +137,7 @@ sudo bash deploy/install.sh --system --check --mimo-bin /usr/local/bin/mimo
 
 可通过 `PYTHON_BIN` 选择 Python，例如 `PYTHON_BIN=python3.12 bash deploy/install.sh --check`。
 
-用户模式需要自行准备 Python 3.11+、venv、pip、tmux、OpenSSH 客户端和兼容 MiMoCode CLI。默认安装位置为 `~/.local/share/ayana`、`~/.local/share/ayana-data` 和 `~/.config/ayana`。按安装器输出的命令分别启动 Web 与原生运行时；需要长期运行时请由自己的进程管理器托管。
+用户模式需要自行准备 Python 3.11+、venv、pip 和 OpenSSH 客户端；MiMo 模式另外需要 tmux 与兼容 MiMoCode CLI。默认安装位置为 `~/.local/share/ayana`、`~/.local/share/ayana-data` 和 `~/.config/ayana`。按安装器输出的命令分别启动 Web 与原生运行时；需要长期运行时请由自己的进程管理器托管。
 
 用户模式更新前，先结束任务、释放会话接管，再正常停止自己启动的 Web 与原生运行时两个进程。安装器不会替用户模式调用 systemd；任一进程仍在线或状态无法确认时会拒绝更新。
 
@@ -134,7 +148,7 @@ sudo bash deploy/install.sh --system --check --mimo-bin /usr/local/bin/mimo
 1. 下载新版本安装包并核对校验值。
 2. 确认两个服务都可安全停止，记录当前版本和备份位置。
 3. 备份代码、配置、秘密、数据库及运行数据，见[备份与恢复](OPERATIONS.md#备份与恢复)。
-   安装器保留现有配置；核对其中 `mimo_serve_external=true`、`agent_tui_enabled=true`，并为 `mimo_bin` 和原生运行目录填写实际路径。字段说明见[配置手册](CONFIGURATION.md)。
+   安装器保留现有配置；MiMo 模式核对其中 `mimo_serve_external=true`、`agent_tui_enabled=true`，并为 `mimo_bin` 和原生运行目录填写实际路径；轻量模式核对 `agent_mode=lite`、`llm_*` 模型设置与运行目录。字段说明见[配置手册](CONFIGURATION.md)。
 4. 从新包目录运行安装器，沿用原来的路径参数：
 
 ```bash
@@ -147,13 +161,25 @@ sudo bash deploy/install.sh --system --force --mimo-bin /usr/local/bin/mimo
 已安装实例也可使用同一生命周期入口更新到明确版本：
 
 ```bash
-sudo bash /opt/ayana/deploy/ayana-setup.sh update --system --ref v0.8.3 \
+sudo bash /opt/ayana/deploy/ayana-setup.sh update --system --ref v0.9.0 \
   --mimo-bin /usr/local/bin/mimo
 ```
 
 该方式从项目仓库获取指定版本；默认引用为当前 `main`。生产更新建议指定发布 tag，或通过引导脚本使用正式 Release。
 
 Web 重启和完整升级具有不同范围。只重启 Web 可保留独立运行时中的任务；更新运行时、核心代码或数据库时，应先等待任务结束，再按完整升级流程执行。
+
+### 切换 Agent 模式
+
+先等待现有任务结束、释放接管，并核对所有结果未知的写操作，再从新版本安装包运行：
+
+```bash
+sudo bash deploy/install.sh --system --agent-mode lite
+# 切回完整交互模式：
+sudo bash deploy/install.sh --system --agent-mode mimo --mimo-bin /usr/local/bin/mimo
+```
+
+沿用原来的路径参数。安装器先检查旧运行时是否空闲，再切换模式；不会通过切换模式绕过未决任务，也不会删除原有 MiMo、账号组、会话或审计。两种模式轮流持有自动值班任务，不会同时重复处置同一故障。
 
 ## 7. 回滚
 
@@ -180,4 +206,4 @@ python3 -m venv .venv
 python -m pip install .
 ```
 
-需要固定发布源码时检出对应 tag。完整原生会话运行仍需要前述 Linux 工具、兼容 MiMoCode CLI 和可用模型配置。开发测试见[测试说明](TESTING.md)。
+需要固定发布源码时检出对应 tag。MiMo 原生会话需要前述 Linux 工具、兼容 MiMoCode CLI 和可用模型配置；轻量后台值班只需其系统依赖和 `llm_*` 模型配置。开发测试见[测试说明](TESTING.md)。

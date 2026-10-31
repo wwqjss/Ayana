@@ -2,6 +2,7 @@
 const state = {
   csrf: "",
   user: null,
+  agentMode: "mimo",
   tab: "overview",
   monitorSub: "metrics",
   notifySub: "messages",
@@ -323,6 +324,7 @@ on("setup-form", "submit", async (e) => {
   }
   state.csrf = res.csrf_token || "";
   state.user = res.user || { username, is_admin: true, must_change_password: false };
+  state.agentMode = res.agent_mode || "mimo";
   showMain();
   await loadMeta();
 });
@@ -417,7 +419,57 @@ on("chg-pw-btn", "click", () => openSettings("profile"));
 /* ---- 运维软约束 / MiMoCode 管理（最终架构） ---- */
 async function openOpsConstraints() { return openSettings("prompts"); }
 
+async function openLiteAgentSettings(host = null, context = null) {
+  const active = () => !context || context.active();
+  const wrap = el("div", { class: "settings-card form-col" });
+  const present = () => {
+    if (!active()) return;
+    if (host) host.replaceChildren(wrap); else showModal("轻量后台值班", [wrap]);
+  };
+  wrap.appendChild(el("h3", { text: "轻量后台值班 Agent" }));
+  wrap.appendChild(el("p", { class: "muted small", text: "自动处理告警、调查、修复并核对恢复。此模式不需要 MiMoCode，不提供聊天、交互终端或人工接管。" }));
+  present();
+  let saved;
+  try { saved = await api("/api/settings/global"); }
+  catch (_) { if (active()) wrap.appendChild(el("p", { class: "error", text: "配置加载失败，请重试。" })); return; }
+  if (!active()) return;
+  if (!saved || !saved.ok) { wrap.appendChild(el("p", { class: "error", text: saved && saved.message || "配置暂不可用。" })); return; }
+  const base = el("input", { id: "lite-base-url", type: "url", value: saved.llm_base_url || "", placeholder: "https://api.example.com/v1" });
+  const model = el("input", { id: "lite-model", value: saved.llm_model || "", placeholder: "支持工具调用的模型 ID" });
+  const key = el("input", { id: "lite-api-key", type: "password", autocomplete: "new-password", placeholder: saved.llm_api_key_set ? "已保存；留空保留，更换地址需重新填写" : "填写 API Key" });
+  const message = el("p", { class: "muted small", role: "status" });
+  [["接口地址", base], ["模型 ID", model], ["API Key", key]].forEach(([label, input]) => {
+    wrap.appendChild(el("label", { text: label }, [input]));
+    input.addEventListener("input", () => { if (context) context.setDirty(true); });
+  });
+  wrap.appendChild(el("p", { class: "muted small", text: "使用兼容 OpenAI Chat Completions 且支持工具调用的 HTTPS 接口。密钥不会回填。保存后在下一次后台任务读取；测试会发起一次真实模型请求。" }));
+  let busy = false;
+  const buttons = [];
+  const run = async (test) => {
+    if (busy || !active()) return;
+    if (!base.value.trim() || !model.value.trim()) { message.textContent = "请填写接口地址和模型 ID。"; message.className = "error"; return; }
+    busy = true; if (context) context.setBusy(true);
+    [...buttons, base, model, key].forEach((node) => { node.disabled = true; });
+    message.className = "muted small"; message.textContent = test ? "正在验证模型连接…" : "正在保存…";
+    try {
+      const reply = await api(test ? "/api/settings/model/test" : "/api/settings/global", { method: "POST", body: JSON.stringify({ llm_base_url: base.value.trim(), llm_model: model.value.trim(), llm_api_key: key.value.trim() }) });
+      if (!active()) return;
+      message.className = reply && reply.ok ? "small" : "error";
+      message.textContent = reply && reply.ok ? test ? "连接成功，配置尚未保存。" : "已保存，下次后台任务读取配置。" : reply && (reply.message || reply.error) || "操作未完成，请重试。";
+      if (reply && reply.ok && !test) { key.value = ""; key.placeholder = "已保存；留空保留，更换地址需重新填写"; if (context) context.setDirty(false); }
+    } catch (_) { if (active()) { message.className = "error"; message.textContent = "请求未完成，请刷新核对后重试。"; } }
+    finally { busy = false; if (context) context.setBusy(false); [...buttons, base, model, key].forEach((node) => { node.disabled = false; }); }
+  };
+  [["测试连接", true], ["保存模型配置", false]].forEach(([text, test]) => {
+    const button = el("button", { class: test ? "btn" : "btn primary", type: "button", text, onclick: () => run(test) });
+    buttons.push(button);
+    if (context && !test) context.actions.appendChild(button); else wrap.appendChild(button);
+  });
+  wrap.appendChild(message);
+}
+
 async function openMimoAdmin(host = null, context = null) {
+  if (state.agentMode === "lite") return openLiteAgentSettings(host, context);
   const current = () => !context || context.active();
   const present = (title, children) => {
     if (!current()) return;
@@ -851,6 +903,7 @@ async function boot() {
     return;
   }
   state.user = me.user;
+  state.agentMode = me.agent_mode || "mimo";
   state.csrf = me.csrf_token || state.csrf;
   // 版本取服务端 health，不硬编码
   try {

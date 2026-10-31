@@ -9,6 +9,7 @@
     sshGroups: [], groupOptionsVersion: 0, groupEventVersion: 0,
     active: false, generation: 0, mount: 0, pollTimer: null, polling: false,
     collapsedLeft: false, collapsedRight: false, settingsGeneration: 0, lifecycleBusy: false, taskEventVersion: 0,
+    agentMode: "mimo",
   };
   const term = {
     ws: null, xterm: null, fit: null, observer: null, connectionId: "",
@@ -43,6 +44,7 @@
   const sessionPath = (sid) => "/api/agent/sessions/" + encodeURIComponent(sid);
   const manageable = () => !!state.detail && (state.detail.can_prepare === true || state.detail.can_control === true || (state.detail.can_prepare === undefined && state.detail.can_control === undefined));
   const openSession = () => state.detail && state.detail.session && state.detail.session.status === "open";
+  const interactive = () => state.agentMode !== "lite";
 
   function groupLabel(name) {
     const group = state.sshGroups.find((item) => item.name === name);
@@ -58,6 +60,7 @@
     return state.detail && state.detail.session && state.detail.session.ssh_account_group || "";
   }
   function adoptGroupOptions(reply) {
+    if (reply.agent_mode) state.agentMode = reply.agent_mode;
     if (reply.settings) state.settings = reply.settings;
     if (Array.isArray(reply.ssh_roles)) state.sshGroups = reply.ssh_roles.map((group) => typeof group === "string" ? { name: group } : group).filter((group) => group && group.name);
   }
@@ -142,11 +145,12 @@
   function renderHeader() {
     const session = state.detail && state.detail.session;
     const title = $("aw-chat-title"), meta = $("aw-chat-meta");
-    if (title) title.textContent = session ? session.title || session.id : "MiMoCode 工作台";
+    if (title) title.textContent = session ? session.title || session.id : interactive() ? "MiMoCode 工作台" : "后台自动值班";
     if (meta) meta.textContent = session ? [session.origin === "auto" ? "自动值班" : "手动会话", session.status === "open" ? "会话开放" : "已归档", session.archive_due_at > 0 ? "归档缓冲中" : ""].filter(Boolean).join(" · ") : "";
     updateTermUi();
   }
   function nativeFacts(detail) {
+    if (!interactive()) return { available: true, tools: [] };
     const activity = detail.native_activity;
     if (!activity || activity.available !== true) return { available: false, tools: [], message: activity && activity.message || "暂无可核对的原生步骤，请查看会话记录。" };
     const tools = (Array.isArray(activity.tools) ? activity.tools : []).filter((item) => item && typeof item.tool === "string")
@@ -200,7 +204,7 @@
     else if (["paused", "stopping", "interrupted", "deleting", "archived", "deleted"].includes(task)) step = taskLabel();
     else if (!facts.available) step = facts.message;
     else if (facts.current && ["running", "busy", "queued"].includes(task)) step = (facts.current.channel === "read" ? "正在调查，等待工具返回：" : "等待工具返回：") + toolTarget(facts.current);
-    else if (task === "queued") step = "消息已排队，等待原生任务接收。";
+    else if (task === "queued") step = interactive() ? "消息已排队，等待原生任务接收。" : "故障已排队，等待后台值班任务接收。";
     else if (["running", "busy"].includes(task)) step = "任务执行中，等待新的步骤记录。";
     prog.appendChild(el("div", { class: "aw-tool-fact" }, [
       el("div", { class: "aw-fact-label", text: "当前步骤 · 系统状态" }),
@@ -294,6 +298,7 @@
     if (!state.active || state.mount !== mount) return false;
     if (!result || !result.ok) return false;
     state.sessions = (result.sessions || []).filter((session) => !session.deleted_at);
+    if (result.agent_mode) state.agentMode = result.agent_mode;
     if (result.settings) state.settings = result.settings;
     renderSessionList();
     return true;
@@ -322,15 +327,17 @@
       if (result.session) result.session.ssh_account_group = sessionGroupOverride();
     }
     state.detail = result;
+    if (result.agent_mode) state.agentMode = result.agent_mode;
     if (result.can_control === false) term.control = false;
     adoptPermissions(result.effective_permissions);
-    if (!term.ready && !term.connecting) {
+    if (interactive() && !term.ready && !term.connecting) {
       try {
         const viewport = await api(sessionPath(sid) + "/terminal");
         if (current(sid, generation)) state.viewport = viewport && viewport.ok ? viewport : null;
       } catch (_) { if (current(sid, generation)) state.viewport = null; }
       renderTerminalIdle();
     }
+    if (!interactive()) renderTerminalIdle();
     renderHeader(); renderRight(); renderSessionList();
     return true;
   }
@@ -347,13 +354,14 @@
     try {
       if (await loadDetail(sid, generation)) {
         renderTerminalIdle();
-        notice("点击「连接会话」接入 MiMoCode。");
+        notice(interactive() ? "点击「连接会话」接入 MiMoCode。" : "轻量 Agent 在后台自动值班；这里仅查看已有任务记录。");
       }
     } catch (_) {
       if (current(sid, generation)) notice("会话暂不可达，请重试。", true);
     }
   }
   function createSession() {
+    if (!interactive()) return;
     if (!appShowModal) { notice("会话创建面板暂不可用。", true); return; }
     const input = el("input", { type: "text", maxlength: "120", placeholder: "会话标题（可留空）", "aria-label": "会话标题" });
     const error = el("p", { class: "aw-muted", role: "status" });
@@ -636,6 +644,14 @@
     finally { if(current(sid,generation)) {state.groupBusy=false;updateTermUi();} }
   }
   function updateTermUi() {
+    if (!interactive()) {
+      for (const id of ["aw-new-session", "aw-term-acquire", "aw-term-release", "aw-term-reconnect", "aw-term-disconnect", "aw-term-stop", "aw-archive", "aw-reopen", "aw-pause-duty", "aw-resume-duty", "aw-recover-task", "aw-delete-session", "aw-delete-stop", "aw-copy-result", "aw-account-group"]) {
+        const node = $(id); if (node) node.classList.add("hidden");
+      }
+      const status = $("aw-term-status"); if (status) status.textContent = "后台值班 · 无交互终端";
+      const badge = $("aw-task-state"); if (badge) { badge.textContent = state.detail ? taskLabel() : ""; badge.dataset.state = taskState(); }
+      return;
+    }
     const status = $("aw-term-status");
     if (status) {
       const group = state.permissions ? groupLabel(state.permissions.ssh_account_group) : "账号组待确认";
@@ -718,6 +734,14 @@
     const host = $("aw-term-host");
     if (!host || term.ready || term.connecting) return;
     host.innerHTML = "";
+    if (!interactive()) {
+      host.appendChild(el("p", { class: "aw-muted", text: "轻量 Agent 只在后台自动调查、修复和验证，不提供聊天或终端。处理结果可在工单、执行记录和通知中查看。" }));
+      const messages = state.detail && state.detail.messages || [];
+      messages.filter((item) => item.role === "assistant" && typeof item.body === "string").slice(-5).forEach((item) => {
+        host.appendChild(el("pre", { class: "aw-term-snapshot", text: item.body }));
+      });
+      updateTermUi(); return;
+    }
     const viewport = state.viewport;
     if (viewport && viewport.last_capture) {
       const pre = document.createElement("pre");
@@ -728,6 +752,7 @@
     updateTermUi();
   }
   async function connectTerminal(sid = state.currentId, generation = state.generation) {
+    if (!interactive()) return;
     if (!sid || !current(sid, generation)) return;
     disconnectTerminal();
     const attempt = term.attempt;
@@ -951,7 +976,7 @@
       if (!state.active || state.mount !== mount) return;
       const selected = state.sessions.find((item) => item.id === state.currentId);
       const next = selected || state.sessions.find((item) => item.status === "open" && item.origin === "auto") || state.sessions[0];
-      if (!next) { notice("选择或新建会话后，点击「连接会话」进入 MiMoCode。"); renderHeader(); }
+      if (!next) { notice(interactive() ? "选择或新建会话后，点击「连接会话」进入 MiMoCode。" : "轻量 Agent 在后台等待告警，无需新建或连接会话。"); renderHeader(); if (!interactive()) renderTerminalIdle(); }
       else if (state.currentId !== next.id || !term.sessionId) await selectSession(next.id);
       else await loadDetail(next.id);
       if (state.active && state.mount === mount) startPoll();

@@ -134,6 +134,7 @@ class WebApp:
         mimo_serve=None,
         agent_tui=None,
         mimo_events=None,
+        agent_mode: str = "mimo",
         alertmanager_webhook_path: str = "/hooks/alertmanager",
     ):
         self.db = db
@@ -170,6 +171,9 @@ class WebApp:
         self.mimo_serve = mimo_serve
         self.agent_tui = agent_tui
         self.mimo_events = mimo_events
+        if agent_mode not in ("mimo", "lite"):
+            raise ValueError("invalid_agent_mode")
+        self.agent_mode = agent_mode
         # 旧自治历史浏览已退役；必要历史数据走离线归档
         self.autonomy = None
         self.providers = None
@@ -212,6 +216,7 @@ class WebApp:
         app.router.add_post("/api/setup/monitor", self.api_setup_monitor_post)
         app.router.add_get("/api/settings/global", self.api_settings_global_get)
         app.router.add_post("/api/settings/global", self.api_settings_global_post)
+        app.router.add_post("/api/settings/model/test", self.api_settings_model_test)
         app.router.add_get("/api/settings/prompts", self.api_settings_prompts_get)
         app.router.add_post("/api/settings/prompts", self.api_settings_prompts_save)
         app.router.add_post("/api/settings/prompts/restore", self.api_settings_prompts_restore)
@@ -521,6 +526,7 @@ class WebApp:
             {
                 "ok": True,
                 "service": "ayana",
+                "agent_mode": getattr(self, "agent_mode", "mimo"),
                 "version": self.version,
                 "uptime_ok": True,
             }
@@ -645,6 +651,7 @@ class WebApp:
                     "totp_enabled": bool(self.auth.totp_enabled(sess["username"])),
                 },
                 "csrf_token": sess["csrf_token"],
+                **self._agent_capabilities(),
             }
         )
 
@@ -946,6 +953,7 @@ class WebApp:
                 "ok": True,
                 "csrf_token": sess["csrf_token"],
                 "user": {"username": str(username), "is_admin": True, "must_change_password": False},
+                **self._agent_capabilities(),
             }
         )
         resp.set_cookie(
@@ -1015,6 +1023,49 @@ class WebApp:
         if api_key is not None and api_key != "":
             llm.api_key = api_key
 
+    def _agent_capabilities(self) -> dict:
+        mode = getattr(self, "agent_mode", "mimo")
+        interactive = mode == "mimo"
+        return {"agent_mode": mode, "capabilities": {
+            "automatic_duty": True, "interactive_agent": interactive,
+            "terminal": interactive, "manual_sessions": interactive,
+        }}
+
+    def _require_mimo_mode(self, request: web.Request | None = None) -> None:
+        if getattr(self, "agent_mode", "mimo") != "lite":
+            return
+        if request is not None:
+            self._require_auth(request)
+        raise web.HTTPConflict(text=json.dumps({
+            "ok": False, "error": "interactive_agent_disabled", "agent_mode": "lite",
+            "message": "当前为轻量后台值班模式，不提供聊天、原生终端或人工接管。已有记录仍可查看。",
+        }, ensure_ascii=False), content_type="application/json")
+
+    async def api_settings_model_test(self, request: web.Request) -> web.Response:
+        """Explicit administrator probe; never save input or expose provider errors."""
+        sess = self._require_admin(request)
+        self._check_csrf(request, sess)
+        body = await self._settings_body(request, {"llm_base_url", "llm_model", "llm_api_key"})
+        if body is None or any(not isinstance(value, str) for value in body.values()):
+            return _json({"ok": False, "error": "bad_request", "message": "模型配置格式不正确。"}, 400)
+        llm = getattr(self, "llm", None)
+        base = body.get("llm_base_url", "").strip().rstrip("/")
+        model = body.get("llm_model", "").strip()
+        key = body.get("llm_api_key", "").strip()
+        if not key and llm and base == str(getattr(llm, "base_url", "")).rstrip("/"):
+            key = str(getattr(llm, "api_key", ""))
+        if not base or not model or not key or len(base) > 2048 or len(model) > 256 or len(key) > 8192:
+            return _json({"ok": False, "error": "model_config_required", "message": "请填写接口地址、模型 ID 和 API Key；更换地址时需重新填写密钥。"}, 400)
+        from .llm import LLMClient
+        probe = LLMClient(key, base, model, timeout=30, secure_network=True)
+        if not probe._endpoint_allowed():
+            return _json({"ok": False, "error": "invalid_provider_url", "message": "模型接口须使用可公开访问的 HTTPS 地址。"}, 400)
+        result = await probe.chat_raw([{"role": "user", "content": "Reply with OK."}], max_tokens=32)
+        ok = bool(isinstance(result, dict) and not result.get("error") and isinstance(result.get("content"), str) and result["content"].strip())
+        self.db.audit("web_user", sess["username"], "lite_model_test", detail={"ok": ok}, channel="web")
+        return _json({"ok": ok, "saved": False,
+                      "message": "连接成功，配置尚未保存。" if ok else "连接验证失败，请检查接口地址、模型和密钥。"}, 200 if ok else 502)
+
     async def api_settings_global_get(self, request: web.Request) -> web.Response:
         sess = self._require_admin(request)
         llm = getattr(self, "llm", None)
@@ -1024,6 +1075,7 @@ class WebApp:
         return _json(
             {
                 "ok": True,
+                **self._agent_capabilities(),
                 "llm_base_url": getattr(llm, "base_url", "") if llm else "",
                 "llm_model": getattr(llm, "model", "") if llm else "",
                 "llm_api_key_set": bool(getattr(llm, "api_key", "")) if llm else False,
@@ -1060,14 +1112,32 @@ class WebApp:
                 )
         if llm_key is not None and not isinstance(llm_key, str):
             return _json({"ok": False, "error": "bad_api_key", "message": "API Key 格式不正确"}, 400)
+        if getattr(self, "agent_mode", "mimo") == "lite" and any(key.startswith("llm_") for key in body):
+            from .llm import LLMClient
+            current_llm = getattr(self, "llm", None)
+            current_base = str(getattr(current_llm, "base_url", "")).rstrip("/")
+            next_base = llm_base.rstrip("/") or current_base
+            if next_base != current_base and not (isinstance(llm_key, str) and llm_key.strip()):
+                return _json({"ok": False, "error": "api_key_required_for_new_endpoint", "message": "更换接口地址时请重新填写 API Key。"}, 400)
+            candidate = LLMClient("validation", next_base, llm_model, secure_network=True)
+            if not candidate._endpoint_allowed() or len(next_base) > 2048 or len(llm_model) > 256:
+                return _json({"ok": False, "error": "invalid_provider_url", "message": "模型接口须使用可公开访问的 HTTPS 地址，模型 ID 最长 256 字符。"}, 400)
 
-        # 持久化到 meta（不覆盖 secrets.json 文件，服务内生效）
+        # A worker must see one complete provider snapshot, never a new URL with
+        # the previous provider's key. Blank fields retain their saved values.
+        model_changes = {}
         if llm_base:
-            self._meta_set("llm_base_url", llm_base.rstrip("/"))
+            model_changes["llm_base_url"] = llm_base.rstrip("/")
         if llm_model:
-            self._meta_set("llm_model", llm_model)
+            model_changes["llm_model"] = llm_model
         if isinstance(llm_key, str) and llm_key.strip():
-            self._meta_set("llm_api_key", llm_key.strip())
+            model_changes["llm_api_key"] = llm_key.strip()
+        if model_changes:
+            with self.db.tx() as conn:
+                if not conn.in_transaction:
+                    conn.execute("BEGIN IMMEDIATE")
+                for key, value in model_changes.items():
+                    conn.execute("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
         if prom_url:
             self._meta_set("prometheus_url", prom_url.rstrip("/"))
             if getattr(self, "prom", None):
@@ -1224,6 +1294,9 @@ class WebApp:
 
     async def api_settings_skills(self, request: web.Request) -> web.Response:
         self._require_admin(request)
+        if getattr(self, "agent_mode", "mimo") == "lite":
+            return _json({"ok": True, "items": [], "skills": [], **self._agent_capabilities(),
+                          "message": "轻量后台值班模式不加载 MiMo 技能或插件。"})
         from .settings_admin import discover_skills
         try:
             result = await asyncio.to_thread(discover_skills, workdir=Path(self._mimo().workdir or Path(__file__).resolve().parents[1]))
@@ -1244,8 +1317,9 @@ class WebApp:
     async def api_settings_about(self, request: web.Request) -> web.Response:
         self._require_auth(request)
         from .settings_admin import PROJECT_URL
-        status = await self._mimo().status()
-        return _json({"ok": True, "ayana_version": self.version, "mimocode_version": status.get("version") or "未安装或无法读取",
+        status = await self._mimo().status() if getattr(self, "agent_mode", "mimo") == "mimo" else {}
+        return _json({"ok": True, "ayana_version": self.version, "mimocode_version": "轻量模式无需安装" if getattr(self, "agent_mode", "mimo") == "lite" else status.get("version") or "未安装或无法读取",
+                      **self._agent_capabilities(),
                       "project_url": PROJECT_URL, "update_supported": True, "update_note": "检查项目正式发布版本，不会安装或执行更新。"})
 
     async def api_settings_updates_check(self, request: web.Request) -> web.Response:
@@ -1325,12 +1399,16 @@ class WebApp:
         })
 
     def _mimo(self):
+        self._require_mimo_mode()
         if not self.mimo_admin:
             raise web.HTTPNotFound(text=json.dumps({"error": "mimo_admin_unavailable"}))
         return self.mimo_admin
 
     async def api_mimo_status(self, request: web.Request) -> web.Response:
         self._require_auth(request)
+        if getattr(self, "agent_mode", "mimo") == "lite":
+            return _json({"ok": True, "enabled": False, "required": False, **self._agent_capabilities(),
+                          "message": "轻量后台值班模式不需要安装 MiMoCode。"})
         st = await self._mimo().status()
         return _json(st)
 
@@ -1510,6 +1588,7 @@ class WebApp:
         return _json({**result, "verified": False})
 
     async def api_mimo_chat(self, request: web.Request) -> web.Response:
+        self._require_mimo_mode(request)
         sess = self._require_admin(request)
         self._check_csrf(request, sess)
         try:
@@ -1604,6 +1683,7 @@ class WebApp:
         return _json({"ok": False, "error": "runtime_unavailable", "message": "原生运行服务暂不可用，或当前模型配置尚未验证。任务和历史记录已保留。"}, 503)
 
     async def api_agent_terminal_prepare(self, request: web.Request) -> web.Response:
+        self._require_mimo_mode(request)
         user = self._require_admin(request); self._check_csrf(request, user)
         sid = request.match_info.get("sid") or ""
         session = self._agent_session_require(user, sid, control=True)
@@ -1627,12 +1707,14 @@ class WebApp:
             return self._agent_runtime_failure()
 
     async def api_agent_terminal_status(self, request: web.Request) -> web.Response:
+        self._require_mimo_mode(request)
         user = self._require_auth(request); sid = request.match_info.get("sid") or ""
         self._agent_session_require(user, sid)
         manager = getattr(self, "agent_tui", None)
         return _json(await manager.status(sid)) if manager else _json({"ok": True, "attached": False, "binding": None})
 
     async def api_agent_terminal_control(self, request: web.Request) -> web.Response:
+        self._require_mimo_mode(request)
         user = self._require_admin(request); self._check_csrf(request, user)
         sid = request.match_info.get("sid") or ""
         session = self._agent_session_require(user, sid, control=True)
@@ -1656,6 +1738,7 @@ class WebApp:
             return _json({"ok": False, "error": "control_unavailable", "message": "控制权当前不可用，可能已由其他窗口持有。"}, 409)
 
     async def api_agent_session_reopen(self, request: web.Request) -> web.Response:
+        self._require_mimo_mode(request)
         user = self._require_admin(request); self._check_csrf(request, user)
         sid = request.match_info.get("sid") or ""
         self._agent_session_require(user, sid, control=True)
@@ -1670,7 +1753,7 @@ class WebApp:
         if not result.get("ok"):return _json(result,409)
         self._duty().interrupt_business_work(sid,actor=user["username"])
         rid=session.get("remote_session_id")
-        if rid and getattr(self,"mimo_serve",None):
+        if getattr(self, "agent_mode", "mimo") == "mimo" and rid and getattr(self,"mimo_serve",None):
             try:
                 await self.mimo_serve.client().abort(rid)
                 result["stop_requested"]=True
@@ -1689,6 +1772,7 @@ class WebApp:
         return _json(result,200 if result.get("ok") else 409)
 
     async def api_agent_session_recover(self, request: web.Request) -> web.Response:
+        self._require_mimo_mode(request)
         user=self._require_admin(request);self._check_csrf(request,user)
         sid=request.match_info.get("sid") or ""
         self._agent_session_require(user,sid,control=True)
@@ -1723,7 +1807,7 @@ class WebApp:
                 await self.agent_tui.release_viewport(sid,"session_deleted")
             except Exception:
                 log.warning("viewport release on delete failed sid=%s",sid)
-        if result.get("pending") and session.get("remote_session_id") and getattr(self,"mimo_serve",None):
+        if getattr(self, "agent_mode", "mimo") == "mimo" and result.get("pending") and session.get("remote_session_id") and getattr(self,"mimo_serve",None):
             try:
                 await self.mimo_serve.client().abort(session["remote_session_id"])
                 result["stop_requested"]=True
@@ -1736,7 +1820,7 @@ class WebApp:
         sid=request.match_info.get("sid") or ""
         session=self._agent_session_require(user,sid)
         rid=session.get("remote_session_id")
-        if not rid or not getattr(self,"mimo_serve",None):
+        if getattr(self, "agent_mode", "mimo") == "lite" or not rid or not getattr(self,"mimo_serve",None):
             return _json({"ok":False,"error":"no_assistant_result","message":"会话还没有可复制的原生回复。"},409)
         try:
             messages=await self.mimo_serve.client().messages(rid,limit=100)
@@ -1782,6 +1866,7 @@ class WebApp:
         return _json({"ok": False, "error": "session_permissions_retired", "retired": True}, 410)
 
     async def ws_agent_terminal(self, request: web.Request) -> web.StreamResponse:
+        self._require_mimo_mode(request)
         # Upgrade only after authentication, Origin and complete session ACL.
         user = self._require_auth(request)
         origin = request.headers.get("Origin", "")
@@ -1828,9 +1913,10 @@ class WebApp:
                 "delete_requested_at":r.get("delete_requested_at") or 0,
                 **duty.task_info(r["id"]),
             })
-        return _json({"ok": True, "sessions": out, "settings": duty.settings()})
+        return _json({"ok": True, "sessions": out, "settings": duty.settings(), **self._agent_capabilities()})
 
     async def api_agent_session_create(self, request: web.Request) -> web.Response:
+        self._require_mimo_mode(request)
         sess = self._require_admin(request)
         self._check_csrf(request, sess)
         duty = self._duty()
@@ -1889,7 +1975,7 @@ class WebApp:
         pending_actions = [row for row in pending_actions if row.get("incident_id") in linked]
         task=duty.task_info(sid)
         native_activity = {"available": True, "tools": []}
-        if s.get("remote_session_id"):
+        if getattr(self, "agent_mode", "mimo") == "mimo" and s.get("remote_session_id"):
             from .agent_activity import read_native_activity
             native_activity = {"available": False, "tools": [], "message": "原生步骤暂不可读。"}
             try:
@@ -1913,14 +1999,15 @@ class WebApp:
             "pending_writes": pending_writes,
             "pending_write_results": pending_write_results,
             "pending_actions": pending_actions,
-            "can_prepare": bool(sess.get("is_admin")),
-            "can_control": bool(sess.get("is_admin") and s.get("status") == "open" and not s.get("delete_requested_at")),
+            "can_prepare": bool(sess.get("is_admin") and getattr(self, "agent_mode", "mimo") == "mimo"),
+            "can_control": bool(getattr(self, "agent_mode", "mimo") == "mimo" and sess.get("is_admin") and s.get("status") == "open" and not s.get("delete_requested_at")),
             **task,
-            "can_recover":bool(sess.get("is_admin") and task["can_recover"]),
+            "can_recover":bool(getattr(self, "agent_mode", "mimo") == "mimo" and sess.get("is_admin") and task["can_recover"]),
             "can_delete":bool(sess.get("is_admin") and not task["deletion_blockers"] and not s.get("delete_requested_at")),
             "can_request_delete":bool(sess.get("is_admin") and not s.get("deleted_at")),
             "effective_permissions": resolve_authority(self.db, sid),
-            "runtime": (await self.agent_tui.status(sid)).get("binding") if getattr(self, "agent_tui", None) else None,
+            "runtime": (await self.agent_tui.status(sid)).get("binding") if getattr(self, "agent_mode", "mimo") == "mimo" and getattr(self, "agent_tui", None) else None,
+            **self._agent_capabilities(),
         })
 
     async def api_agent_write_result_adjudicate(self, request: web.Request) -> web.Response:
@@ -1959,6 +2046,7 @@ class WebApp:
         return _json(result)
 
     async def api_agent_session_prompt(self, request: web.Request) -> web.Response:
+        self._require_mimo_mode(request)
         import uuid
         user=self._require_admin(request);self._check_csrf(request,user)
         sid=request.match_info.get("sid") or ""
@@ -1981,6 +2069,7 @@ class WebApp:
             return _json({"ok":False,"error":code,"message":str(error)},503 if code=="native_backend_unavailable" else 409)
 
     async def api_agent_session_abort(self, request: web.Request) -> web.Response:
+        self._require_mimo_mode(request)
         sess = self._require_admin(request)
         self._check_csrf(request, sess)
         duty = self._duty()
@@ -2038,6 +2127,12 @@ class WebApp:
 
     async def api_agent_serve_status(self, request: web.Request) -> web.Response:
         self._require_auth(request)
+        if getattr(self, "agent_mode", "mimo") == "lite":
+            llm = getattr(self, "llm", None)
+            return _json({"ok": True, **self._agent_capabilities(), "health": {
+                "configured": bool(llm and llm.enabled and llm.model),
+                "message": "轻量 Agent 由后台值班服务运行，不提供交互终端。",
+            }})
         serve = getattr(self, "mimo_serve", None)
         if not serve:
             return _json({"ok": False, "error": "not_configured"})
@@ -2093,7 +2188,7 @@ class WebApp:
                     })
         except Exception:
             ssh_accounts = []
-        return _json({"ok": True, "settings": settings, "ssh_endpoints": ssh_accounts,"ssh_roles":ssh_roles})
+        return _json({"ok": True, "settings": settings, "ssh_endpoints": ssh_accounts,"ssh_roles":ssh_roles, **self._agent_capabilities()})
 
     async def api_agent_settings_post(self, request: web.Request) -> web.Response:
         sess = self._require_admin(request)

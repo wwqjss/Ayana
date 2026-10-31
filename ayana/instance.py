@@ -3,14 +3,24 @@
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 from typing import Any
 
 
-def acquire_single_instance_lock(lock_path: str | Path) -> Any:
+def acquire_single_instance_lock(lock_path: str | Path, *, nofollow: bool = False) -> Any:
     path = Path(lock_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(path, "a+")
+    if nofollow:
+        if path.is_symlink():
+            raise RuntimeError("unsafe_instance_lock")
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise RuntimeError("unsafe_instance_lock")
+        fh = os.fdopen(fd, "r+")
+    else:
+        fh = open(path, "a+")
     try:
         if os.name == "nt":
             import msvcrt

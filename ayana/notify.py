@@ -30,6 +30,7 @@ LIFECYCLE_TYPES = (
     "agent_auto_exec",
     "agent_escalated",
     "autonomy_notice",
+    "lite_duty_finished",
 )
 
 
@@ -159,6 +160,9 @@ class Notifier:
 
     def _event_is_actionable(self, event: Any, payload: dict) -> bool:
         """授权/等待/升级消息只描述当前义务，不能在恢复后补发过期请求。"""
+        if event and event["type"] == "lite_duty_finished":
+            incident = self.db.query_one("SELECT generation FROM incidents WHERE id=?", (event["incident_id"],))
+            return bool(incident and int(payload.get("generation") or 0) == int(incident["generation"] or 1))
         # 旧版 Agent 使用独立直接发送键，不能将其历史事件猜成新的通知义务。
         if event and event["type"] in ("proposal_waiting", "agent_waiting", "agent_escalated", "agent_auto_exec", "autonomy_notice"):
             if not isinstance(payload.get("body"), str) or not payload["body"]:

@@ -26,7 +26,6 @@ from .db import Database
 from .incidents import IncidentService
 from .knowledge import KnowledgeBase, knowledge_root
 from .mcp_tools import McpToolError, OpsContext, OpsTools
-from .mimo_session import MimoSessionClient
 from .prom import PromClient
 from .session_bridge import SessionBridge
 from .transport import SSHAssetStore, SSHTransport
@@ -38,12 +37,13 @@ SERVER_INFO = {"name": "ayana-mcp", "version": "0.1.0"}
 TURN_LIFECYCLE_CAPABILITY = "com.xiaomi.mimo/turn-lifecycle"
 
 
-def build_ops_context(cfg: dict[str, Any]) -> OpsContext:
+def build_ops_context(cfg: dict[str, Any], *, environment_bindings: bool = True) -> OpsContext:
     """装配 MCP 最小服务面（与 App 共用模块，不拉起 Web/自治）。"""
     # Only the launching Ayana process sets this explicit same-instance binding.
     cfg = dict(cfg)
-    cfg["db_path"] = os.environ.get("AYANA_MCP_DB_PATH") or cfg["db_path"]
-    cfg["knowledge_dir"] = os.environ.get("AYANA_MCP_KNOWLEDGE_DIR") or cfg.get("knowledge_dir", "")
+    if environment_bindings:
+        cfg["db_path"] = os.environ.get("AYANA_MCP_DB_PATH") or cfg["db_path"]
+        cfg["knowledge_dir"] = os.environ.get("AYANA_MCP_KNOWLEDGE_DIR") or cfg.get("knowledge_dir", "")
     db = Database(cfg["db_path"])
     knowledge = KnowledgeBase(db, root=knowledge_root(cfg))
     try:
@@ -60,13 +60,14 @@ def build_ops_context(cfg: dict[str, Any]) -> OpsContext:
     transport = SSHTransport(ssh_store, creds)
     checks = CheckService(db, transport, incidents=incidents)
     mimo = None
-    if os.environ.get("AYANA_MIMO_BIN") or os.environ.get("AYANA_MIMO_MODEL"):
+    if environment_bindings and (os.environ.get("AYANA_MIMO_BIN") or os.environ.get("AYANA_MIMO_MODEL")):
+        from .mimo_session import MimoSessionClient
         mimo = MimoSessionClient(
             mimo_bin=os.environ.get("AYANA_MIMO_BIN") or "mimo",
             model=os.environ.get("AYANA_MIMO_MODEL") or "",
         )
-    readonly = str(os.environ.get("AYANA_MCP_READONLY") or "").strip() in ("1", "true", "yes", "on")
-    managed_context = str(os.environ.get("AYANA_MCP_MANAGED_CONTEXT") or "").strip() in ("1", "true", "yes", "on")
+    readonly = environment_bindings and str(os.environ.get("AYANA_MCP_READONLY") or "").strip() in ("1", "true", "yes", "on")
+    managed_context = environment_bindings and str(os.environ.get("AYANA_MCP_MANAGED_CONTEXT") or "").strip() in ("1", "true", "yes", "on")
     bridge = SessionBridge(db, knowledge=knowledge, mimo=mimo)
     incidents.session_bridge = bridge
     from .ops_constraints import OpsConstraints

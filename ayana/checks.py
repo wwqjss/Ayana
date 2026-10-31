@@ -547,7 +547,7 @@ class CheckService:
 
     # ---- 执行 ----
 
-    async def run_one(self, check: dict[str, Any]) -> dict[str, Any]:
+    async def run_one(self, check: dict[str, Any], *, record_guard=None) -> dict[str, Any]:
         kind = check["kind"]
         outputs = []
         ok = False
@@ -569,7 +569,17 @@ class CheckService:
             ok, state, detail = False, "unknown", e.detail or "检查配置不符合当前执行规则，请修改检查配置。"
         except Exception as e:
             ok, state, detail = False, "unknown", str(e)[:200]
-        await self._record(check, ok=ok, state=state, detail=detail)
+        if record_guard is None:
+            await self._record(check, ok=ok, state=state, detail=detail)
+        else:
+            # A background Agent may be stopped or superseded while its probe
+            # awaits SSH. Keep the final scope check and persisted evidence in
+            # one transaction; recording contains no external network awaits.
+            with self.db.tx() as conn:
+                if not conn.in_transaction:
+                    conn.execute("BEGIN IMMEDIATE")
+                record_guard()
+                await self._record(check, ok=ok, state=state, detail=detail)
         return {"ok": ok, "state": state, "detail": detail}
 
     async def _record(self, check: dict[str, Any], *, ok: bool, state: str, detail: str) -> None:

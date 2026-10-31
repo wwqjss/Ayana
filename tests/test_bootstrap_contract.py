@@ -351,6 +351,50 @@ printf '%s\0' "$@" > "$BOOTSTRAP_TEST_SUDO_LOG"
         self.assertEqual(self.urls.read_text().splitlines()[-1], "https://mimo.xiaomi.com/install")
         self.assertEqual(list(self.work.iterdir()), [])
 
+    def test_lite_system_install_skips_mimo_and_tmux(self):
+        result = self.run_bootstrap(*self.system_args('--agent-mode', 'lite'),
+                                    extra_env=self.automatic_system(missing='tmux'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        if self.package_log.exists():
+            self.assertNotIn('tmux', self.package_log.read_text(), 'Lite attempted to install its missing terminal dependency')
+        self.assertFalse(self.mimo_log.exists())
+        self.assertFalse(self.destination.exists())
+        self.assertNotIn('https://mimo.xiaomi.com/install', self.urls.read_text())
+        self.assertIn('background automatic duty only', result.stdout)
+        self.assertIn('--agent-mode\nlite', self.execution.read_text())
+
+    def test_omitted_mode_preserves_an_installed_lite_configuration(self):
+        path = self.conf_dir / 'config.json'
+        original = json.dumps({'agent_mode': 'lite', 'mimo_bin': '/old/unavailable/mimo'})
+        path.write_text(original)
+        result = self.run_bootstrap(*self.system_args(), extra_env=self.automatic_system(missing='tmux'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        if self.package_log.exists():
+            self.assertNotIn('tmux', self.package_log.read_text())
+        self.assertFalse(self.mimo_log.exists())
+        self.assertNotIn('--mimo-bin', self.execution.read_text())
+        self.assertEqual(path.read_text(), original)
+
+    def test_switch_from_lite_to_mimo_can_prepare_the_missing_cli(self):
+        path = self.conf_dir / 'config.json'
+        path.write_text(json.dumps({'agent_mode': 'lite'}))
+        result = self.run_bootstrap(*self.system_args('--agent-mode=mimo'), extra_env=self.automatic_system())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(self.destination.is_file())
+        self.assertTrue(self.mimo_log.exists())
+        self.assertIn('tmux', self.package_log.read_text())
+        self.assertEqual(json.loads(path.read_text())['agent_mode'], 'lite',
+                         'Bootstrap changed the mode before the real installer checked old tasks')
+
+    def test_invalid_mode_is_rejected_before_download_or_package_installation(self):
+        for option in (('--agent-mode', 'typo'), ('--agent-mode=',)):
+            with self.subTest(option=option):
+                result = self.run_bootstrap(*self.system_args(*option), extra_env=self.automatic_system())
+                self.assert_rejected(result)
+                self.assertFalse(self.urls.exists())
+                self.assertFalse(self.package_log.exists())
+                self.assertFalse(self.mimo_log.exists())
+
     def test_fresh_apt_host_installs_python_venv_before_download(self):
         env = self.automatic_system(missing="curl tmux")
         env["BOOTSTRAP_TEST_MISSING_PYTHON"] = "1"

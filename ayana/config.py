@@ -21,6 +21,7 @@ from typing import Any
 log_name = "ayana.config"
 
 DEFAULTS: dict[str, Any] = {
+    "agent_mode": "mimo",
     "ws_host": "127.0.0.1",
     "ws_port": 6199,
     "ws_path": "/ws",
@@ -129,6 +130,11 @@ def load_config(base_dir: str | Path) -> dict[str, Any]:
 
     cfg = dict(DEFAULTS)
     cfg.update(_read_json(cfg_path))
+    from .agent_mode import agent_mode
+    try:
+        agent_mode(cfg)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
     for retired_key in RETIRED_AUTONOMY_KEYS:
         cfg.pop(retired_key, None)
 

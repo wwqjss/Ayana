@@ -462,6 +462,23 @@ class OpsTools:
         with session_ssh_scope(self.ctx.db,authority_session_id):
             return await scoped._call(name, arguments)
 
+    async def call_for_session(
+        self, name: str, arguments: dict[str, Any], *, authority_session_id: str,
+    ) -> dict[str, Any]:
+        """Trusted in-process worker entry; never registered as an MCP tool.
+
+        The worker supplies its persistent session binding, independently of
+        model arguments. All existing account-group, dispatch and ledger
+        checks still run in the shared handlers.
+        """
+        session = self.ctx.db.query_one(
+            "SELECT status FROM duty_sessions WHERE id=?", (authority_session_id,))
+        if not session or session["status"] != "open":
+            raise McpToolError("session_not_open", dispatch_not_started=True)
+        scoped = self._with_authority(authority_session_id)
+        with session_dispatch_guard(self.ctx.db, authority_session_id):
+            return await scoped._call(name, arguments)
+
     def _validate_incident_scope(self, args: dict[str, Any]) -> None:
         sid = getattr(self.ctx, "authority_session_id", "")
         incident_id = args.get("incident_id") or args.get("source_incident")

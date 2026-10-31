@@ -13,10 +13,10 @@ fetch() {
   else printf 'Need curl or wget\n' >&2; return 1; fi
 }
 # A bootstrap check neither downloads nor creates a work directory.
-CHECK=0; SYSTEM=0; NO_START=0; PREFIX=""; CONF_DIR=/etc/ayana; EXPLICIT_MIMO=0
+CHECK=0; SYSTEM=0; NO_START=0; PREFIX=""; CONF_DIR=""; EXPLICIT_MIMO=0; AGENT_MODE=""; EXPLICIT_AGENT_MODE=0
 for ((i=0; i<${#ARGS[@]}; i++)); do
   case "${ARGS[i]}" in
-    -h|--help) printf 'Usage: bootstrap.sh [--system|--user] [installer options]\n--system prepares Linux dependencies and MiMoCode; --user/--no-start use existing dependencies.\nAYANA_VERSION=latest or a release tag; SHA256 verification is required.\nAYANA_MIMO_VERSION=0.1.16 by default; AYANA_MIMO_INSTALL_PATH=/usr/local/bin/mimo.\n'; exit 0 ;;
+    -h|--help) printf 'Usage: bootstrap.sh [--system|--user] [--agent-mode mimo|lite] [installer options]\n--agent-mode lite installs a background duty Agent without MiMoCode or a terminal.\nOmitting --agent-mode preserves the installed mode; new installations use mimo.\n--system prepares Linux dependencies; --user/--no-start use existing dependencies.\nAYANA_VERSION=latest or a release tag; SHA256 verification is required.\nAYANA_MIMO_VERSION=0.1.16 by default; AYANA_MIMO_INSTALL_PATH=/usr/local/bin/mimo.\n'; exit 0 ;;
     --check) CHECK=1 ;;
     --system) SYSTEM=1 ;;
     --no-start) NO_START=1 ;;
@@ -25,8 +25,18 @@ for ((i=0; i<${#ARGS[@]}; i++)); do
     --conf-dir|--conf) CONF_DIR="${ARGS[i+1]:?missing config directory}" ;;
     --conf-dir=*|--conf=*) CONF_DIR="${ARGS[i]#*=}" ;;
     --mimo-bin|--mimo-bin=*) EXPLICIT_MIMO=1 ;;
+    --agent-mode) AGENT_MODE="${ARGS[i+1]:?missing agent mode}"; EXPLICIT_AGENT_MODE=1 ;;
+    --agent-mode=*) AGENT_MODE="${ARGS[i]#*=}"; EXPLICIT_AGENT_MODE=1 ;;
   esac
 done
+if [[ -z "$CONF_DIR" ]]; then
+  if [[ "$SYSTEM" == 1 ]]; then CONF_DIR=/etc/ayana; else CONF_DIR="$HOME/.config/ayana"; fi
+fi
+case "$AGENT_MODE" in
+  '') [[ "$EXPLICIT_AGENT_MODE" == 0 ]] || fail 'Agent mode must be mimo or lite.' ;;
+  mimo|lite) ;;
+  *) fail 'Agent mode must be mimo or lite.' ;;
+esac
 if [[ "$CHECK" == 1 ]]; then
   if [[ -z "$PREFIX" ]]; then
     if [[ "$SYSTEM" == 1 ]]; then PREFIX=/opt/ayana; else PREFIX="$HOME/.local/share/ayana"; fi
@@ -78,7 +88,7 @@ package_install() {
   elif command -v yum >/dev/null 2>&1; then
     yum install -y "$@" || fail 'System dependency installation failed; installation stopped.'
   else
-    fail 'No supported package manager (apt-get/dnf/yum); prepare Python >=3.11, venv, curl, CA certificates, tmux and OpenSSH, then retry.'
+    fail 'No supported package manager (apt-get/dnf/yum); prepare Python >=3.11, venv, curl, CA certificates and OpenSSH (plus tmux for MiMo), then retry.'
   fi
 }
 prepare_dependencies() {
@@ -94,7 +104,7 @@ prepare_dependencies() {
   fi
   command -v curl >/dev/null 2>&1 || packages+=(curl)
   if [[ "$phase" == all ]]; then
-    command -v tmux >/dev/null 2>&1 || packages+=(tmux)
+    if [[ "$AGENT_MODE" == mimo ]]; then command -v tmux >/dev/null 2>&1 || packages+=(tmux); fi
     if ! command -v ssh >/dev/null 2>&1 || ! command -v ssh-keyscan >/dev/null 2>&1; then
       if [[ "$apt" == 1 ]]; then packages+=(openssh-client); else packages+=(openssh-clients); fi
     fi
@@ -112,7 +122,10 @@ prepare_dependencies() {
   "$PYTHON_BIN" -c 'import ensurepip, venv' >/dev/null 2>&1 || fail 'Python venv/ensurepip is unavailable; install the venv package for the selected Python.'
   local binary
   local required=(curl sha256sum install realpath ln)
-  if [[ "$phase" == all ]]; then required+=(tmux ssh ssh-keyscan tar); fi
+  if [[ "$phase" == all ]]; then
+    required+=(ssh ssh-keyscan tar)
+    if [[ "$AGENT_MODE" == mimo ]]; then required+=(tmux); fi
+  fi
   for binary in "${required[@]}"; do
     command -v "$binary" >/dev/null 2>&1 || fail "Missing dependency after package installation: $binary"
   done
@@ -125,6 +138,22 @@ if [[ "$AUTO" == 1 ]]; then
 else
   select_python || fail 'Prepare Python >=3.11 before --user/--no-start installation.'
 fi
+# Read the installed mode only after a suitable Python is available. Keep the
+# original arguments intact so the installer can distinguish an explicit switch.
+MODE_INFO="$("$PYTHON_BIN" - "$CONF_DIR/config.json" "$AGENT_MODE" <<'PY'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1]).expanduser()
+config = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+previous = config.get('agent_mode', 'mimo')
+if previous not in ('mimo', 'lite'):
+    raise SystemExit('agent_mode must be mimo or lite')
+print((sys.argv[2] or previous) + ':' + previous)
+PY
+)" || fail 'Could not read the installed Agent mode; installation stopped.'
+AGENT_MODE="${MODE_INFO%%:*}"
+PREVIOUS_AGENT_MODE="${MODE_INFO##*:}"
+printf 'Agent mode: %s.\n' "$AGENT_MODE"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ayana-install.XXXXXXXX")"
 STAGED_MIMO=""
 cleanup() {
@@ -161,6 +190,7 @@ with tarfile.open(root/'package.tar.gz', 'r:gz') as archive:
     archive.extractall(root/'source', members=members, **options)
 PY
 prepare_mimo() {
+  [[ "$AGENT_MODE" == mimo ]] || return 0
   [[ "$EXPLICIT_MIMO" == 0 ]] || return 0
   local configured candidate destination version destination_dir
   configured="$("$PYTHON_BIN" - "$CONF_DIR/config.json" <<'PY'
@@ -195,7 +225,7 @@ PY
     fail "MiMo destination already exists but is not executable; use --mimo-bin to select a valid CLI: $destination"
   fi
   # A prior Ayana install must never upgrade/install a CLI behind active tasks.
-  if [[ -f "$CONF_DIR/config.json" || -f "${PREFIX:-/opt/ayana}/deploy/installation.py" ]]; then
+  if [[ "$PREVIOUS_AGENT_MODE" != lite && ( -f "$CONF_DIR/config.json" || -f "${PREFIX:-/opt/ayana}/deploy/installation.py" ) ]]; then
     fail 'Existing Ayana installation has no public MiMo CLI; set --mimo-bin to its existing system-readable CLI.'
   fi
   destination="$(realpath -m "$destination")"
@@ -242,6 +272,9 @@ if [[ "$AUTO" == 1 ]]; then
   printf 'Preparing system runtime dependencies.\n'
   prepare_dependencies
   prepare_mimo
+fi
+if [[ "$AGENT_MODE" == lite ]]; then
+  printf 'Lightweight mode: background automatic duty only; MiMoCode and terminal dependencies are not installed.\n'
 fi
 printf 'Installing Ayana from the verified release.\n'
 bash "$WORK/source/deploy/install.sh" "${ARGS[@]}"

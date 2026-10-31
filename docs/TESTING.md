@@ -63,6 +63,24 @@ node --test tests/test_monitor_ui.cjs tests/test_native_workbench_ui.cjs
 
 验证应覆盖：Prometheus 缺失时有效原生检查仍决定主机状态，缺失指标不被造值；重复刷新只保留一个来源提示；业务异常、未知、过期和停用结果准确区分；当前步骤只显示真实工具事实；未执行的参数校验失败与执行后的未知结果分别处理。
 
+## 轻量后台值班与模式隔离
+
+轻量 Agent 的模型与工具测试使用模拟回复，不发起真实模型请求、不操作生产主机。应验证模型工具调用预算、未知写结果保护、账号组绑定，以及轻量模式无法从 Web 启动 MiMo、手动会话或交互终端。
+
+```bash
+python -m unittest discover -s tests -p test_lite_agent.py
+python -m unittest discover -s tests -p test_lite_worker.py
+python -m unittest discover -s tests -p test_lite_web.py
+node tests/test_lite_model_ui.cjs
+node tests/test_native_workbench_ui.cjs
+```
+
+模式安装测试还须覆盖：新安装默认 MiMo、轻量安装无需 MiMo/tmux、升级保留原模式，以及切换前仍检查旧运行时和未决写操作。
+
+v0.9.0 本次验证结果：核心集成实际执行的 400 项通过，另有 2 个历史夹具导入错误和 1 个平台跳过；轻量模型循环 29 项通过，轻量 Web 10 项通过，安装契约 47 项中 46 项通过、1 项环境跳过。后续补充的轻量 Worker 用例验证暂停、跨代次探测、未知写结果、取消与重启保护及通知补偿；文件锁软链接用例在 Windows 环境跳过，在 Linux 隔离环境验证。
+
+全量只运行一次摸底：1252 项，3 个失败、14 个错误、4 个跳过。失败名称与此前 v0.8.3 记录一致：旧配置示例键检查及两项旧 Prometheus 审批语义；错误仍来自已删除的权限表、缺失历史夹具和废弃接口导入。前端相关 207 项检查通过，另有旧审批按钮测试失败，已在干净 v0.8.3 源码复现。未恢复已退役架构。
+
 ## 安装与发行包
 
 安装测试应在临时目录验证路径、配置、两个服务单元、依赖安装、重复执行、升级与回滚，不针对正在使用的安装目录进行试验。
