@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 
 
 class MigrationError(RuntimeError):
@@ -1370,6 +1370,14 @@ def _migrate_v32_session_ssh_account_group(conn: sqlite3.Connection) -> None:
                         "legacy_stage_selections": legacy}, ensure_ascii=False)))
 
 
+def _migrate_v33_write_result_observation(conn: sqlite3.Connection) -> None:
+    """Durable facts for automatic, read-only verification of uncertain writes."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(session_write_ops)")}
+    for column in ("operation_json", "reconciliation_json"):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE session_write_ops ADD COLUMN {column} TEXT NOT NULL DEFAULT '{{}}'")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_v1_baseline,
     2: _migrate_v2_p0_p1_columns,
@@ -1403,6 +1411,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     30: _migrate_v30_drop_recreated_retired_tables,
     31: _migrate_v31_ssh_account_groups,
     32: _migrate_v32_session_ssh_account_group,
+    33: _migrate_v33_write_result_observation,
 }
 
 _MIGRATION_NAMES = {
@@ -1435,6 +1444,7 @@ _MIGRATION_NAMES = {
     27: "write_op_adjudication",
     28: "ops_loop_preflight_budget",
     32: "session_ssh_account_group",
+    33: "write_result_observation",
 }
 
 

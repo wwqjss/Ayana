@@ -43,6 +43,10 @@ class NativeTurns:
             if conn.execute("SELECT 1 FROM agent_runtime_receipts WHERE session_id=? AND status='unknown'",(sid,)).fetchone():
                 raise NativeAdmissionError("native_turn_unknown")
             if kind=="prompt":
+                uncertain=conn.execute("SELECT 1 FROM session_write_ops WHERE session_id=? AND status='unknown'",(sid,)).fetchone()
+                uncertain=uncertain or conn.execute("SELECT 1 FROM actions WHERE json_valid(params_json) AND json_extract(params_json,'$._ayana_session_id')=? AND state='unknown'",(sid,)).fetchone()
+                if uncertain:
+                    raise NativeAdmissionError("external_result_unknown","上次变更的结果尚未确认，系统会根据执行凭据检查。为避免重复变更，当前消息暂未发送；无需猜测执行结果。")
                 external=conn.execute("SELECT 1 FROM session_write_ops WHERE session_id=? AND status IN ('claimed','unknown')",(sid,)).fetchone()
                 external=external or conn.execute("SELECT 1 FROM actions WHERE json_valid(params_json) AND json_extract(params_json,'$._ayana_session_id')=? AND state IN ('dispatched','unknown','verifying')",(sid,)).fetchone()
                 owned=self.duty._owned_job_ids(sid)

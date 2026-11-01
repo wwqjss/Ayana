@@ -10,6 +10,7 @@
     active: false, generation: 0, mount: 0, pollTimer: null, polling: false,
     collapsedLeft: false, collapsedRight: false, settingsGeneration: 0, lifecycleBusy: false, taskEventVersion: 0,
     agentMode: "mimo",
+    resultDetails: new Set(),
   };
   const term = {
     ws: null, xterm: null, fit: null, observer: null, connectionId: "",
@@ -109,7 +110,8 @@
     return detail.task_state || (session.paused_at ? "paused" : detail.runtime && detail.runtime.state) || "idle";
   }
   function taskLabel() {
-    const names = {idle:"空闲",running:"任务执行中",busy:"任务执行中",queued:"输入已排队",interrupted:"任务已中断",paused:"值班已暂停",unknown:"执行结果待核对",stopping:"正在停止",deleting:"正在停止并删除",archived:"已归档",deleted:"已删除"};
+    if (taskState() === "unknown") return reconciliationFact(state.detail || {}).label;
+    const names = {idle:"空闲",running:"任务执行中",busy:"任务执行中",queued:"输入已排队",interrupted:"任务已中断",paused:"值班已暂停",unknown:"结果尚未确认",stopping:"正在停止",deleting:"正在停止并删除",archived:"已归档",deleted:"已删除"};
     return state.detail && state.detail.task_state_label || names[taskState()] || "状态待确认";
   }
   function renderSessionList() {
@@ -162,12 +164,59 @@
     };
   }
   function toolLabel(name) {
+    const publicName = String(name || "").includes(".") ? "ayana_" + name.replace(/\./g, "_") : name;
     return ({ ayana_host_exec: "执行主机命令", ayana_asset_list: "读取主机列表", ayana_metrics_query: "查询指标",
       ayana_ops_constraints: "读取当前运维约束", ayana_ops_loop_status: "核对工单状态", ayana_config_check_list: "读取原生检查",
       ayana_config_check_add: "添加原生检查", ayana_config_check_update: "更新原生检查", ayana_config_check_delete: "删除原生检查",
       ayana_incident_list: "查询工单", ayana_incident_get: "读取工单详情", ayana_incident_note: "记录工单证据",
       ayana_session_write_ops: "核对执行台账", ayana_session_claim: "关联当前工单", ayana_knowledge_query: "查询运维知识",
-      mcp_tool_search: "查找可用工具" })[name] || name;
+      ayana_config_prom_target_add: "添加监控目标", ayana_config_prom_target_update: "更新监控目标", ayana_config_prom_target_delete: "删除监控目标",
+      ayana_incident_close: "确认工单恢复", ayana_knowledge_upsert: "更新运维知识",
+      mcp_tool_search: "查找可用工具" })[publicName] || name;
+  }
+  function writeReason(item) {
+    const raw = String(item.result || "").toLowerCase();
+    if (raw.includes("permission denied") || raw.includes("permission_denied")) return "检查配置时遇到文件访问权限问题，尚不能确认这次变更的结果。";
+    if (raw.includes("promtool_failed")) return "监控配置检查未通过，尚不能确认这次变更的结果。";
+    if (raw.includes("timeout") || raw.includes("lease_expired")) return "等待执行结果超时；超时本身不能说明变更是否生效。";
+    if (raw.includes("interrupted") || raw.includes("disconnect") || raw.includes("not connected")) return "执行连接中断，尚未收到可靠的完成结果。";
+    return "尚未收到可靠的完成结果；不能据此判断变更成功或失败。";
+  }
+  function reconciliationFact(detail) {
+    const writes = detail.pending_write_results || [];
+    const pending = writes.find((item) => item.reconciliation && ["checking", "pending"].includes(item.reconciliation.status)) || writes[0];
+    const fact = pending && pending.reconciliation || {};
+    const status = fact.status || (pending && pending.status === "claimed" ? "executing" : "unsupported");
+    const labels = { executing: "正在等待执行结果", checking: "正在自动确认结果", pending: "等待自动确认结果", blocked: "自动确认暂受阻", unsupported: "结果尚未确认" };
+    return { label: labels[status] || "结果尚未确认", message: fact.message || (status === "executing" ? "变更已派发，正在等待执行端返回结果。" : pending ? writeReason(pending) : "任务尚未返回可靠结果。"), status, next_check_at: fact.next_check_at };
+  }
+  function appendPendingResult(root, item) {
+    const check = item.reconciliation || {};
+    const status = check.status || (item.status === "claimed" ? "executing" : "unsupported");
+    const labels = { executing: "正在等待执行结果", checking: "正在自动确认结果", pending: "等待自动确认结果", blocked: "自动确认暂受阻", unsupported: "结果尚未确认" };
+    const namedTool = item.tool && toolLabel(item.tool);
+    const operation = item.operation_label || (namedTool && namedTool !== item.tool ? namedTool : "变更操作");
+    const row = el("div", { class: "aw-pend-card" }, [
+      el("div", { class: "aw-pend-title", text: operation + (item.target ? " · " + item.target : "") }),
+      el("div", { class: "aw-pend-state", text: labels[status] || "结果尚未确认" }),
+      el("div", { class: "aw-fact-result", text: check.message || (status === "executing" ? "变更已派发，正在等待执行端返回结果。" : writeReason(item)) }),
+      el("div", { class: "aw-pend-meta", text: [fmtTime(item.created_at), check.checked_at ? "最近确认：" + fmtTime(check.checked_at) : "", check.next_check_at ? "下次自动确认：" + fmtTime(check.next_check_at) : ""].filter(Boolean).join(" · ") }),
+      el("div", { class: "aw-pend-next", text: ["checking", "pending", "executing"].includes(status) ? "系统会根据实际结果更新状态，无需选择是否已执行。" : "为避免重复变更，相关写入暂缓。无需猜测执行结果。" }),
+    ]);
+    const details = el("details", { class: "aw-pend-details" }, [
+      el("summary", { text: "技术详情与人工处理" }),
+      el("pre", { class: "aw-pend-technical", text: [`操作记录：${item.id || ""}`, item.incident_id ? `关联记录：${item.incident_id}` : "", item.tool ? `工具：${item.tool}` : "", item.result ? `原始结果：${item.result}` : "", check.evidence ? "自动确认依据：" + (typeof check.evidence === "string" ? check.evidence : JSON.stringify(check.evidence)) : ""].filter(Boolean).join("\n") }),
+      el("p", { class: "aw-pend-meta", text: "仅供已掌握目标主机证据的维护人员处理。不确定时请保留待确认，勿按猜测解除保护。" }),
+      el("div", { class: "aw-pend-actions" }, [
+        el("button", { type: "button", class: "btn ghost small", text: "确认已生效", onclick: () => adjudicateResult(item, "executed") }),
+        el("button", { type: "button", class: "btn ghost small", text: "确认未执行", onclick: () => adjudicateResult(item, "not_executed") }),
+        el("button", { type: "button", class: "btn ghost small", text: "保留待确认", onclick: () => adjudicateResult(item, "still_unknown") }),
+      ]),
+    ]);
+    const detailKey = state.currentId + ":" + item.id;
+    details.open = state.resultDetails.has(detailKey);
+    details.addEventListener("toggle", () => { if (details.open) state.resultDetails.add(detailKey); else state.resultDetails.delete(detailKey); });
+    row.appendChild(details); root.appendChild(row);
   }
   const toolTarget = (item) => toolLabel(item.tool) + (item.target ? " @ " + item.target : "");
   function toolError(item) {
@@ -180,6 +229,30 @@
       el("div", { class: "aw-fact-tool", title: item.tool, text: toolTarget(item) }),
       el("div", { class: "aw-fact-result", text: failed ? "工具调用未完成：" + toolError(item) : item.notice || "工具已返回" }),
       el("div", { class: "aw-inc-meta", text: fmtTime(item.at) }),
+    ]));
+  }
+  function automaticResults(detail) {
+    return (detail.events || []).filter((event) => event.type === "write_result_auto_verified")
+      .slice().sort((a, b) => Number(a.created_at || 0) - Number(b.created_at || 0) || Number(a.id || 0) - Number(b.id || 0));
+  }
+  function automaticResultFact(event) {
+    const payload = event.payload && typeof event.payload === "object" ? event.payload : {};
+    const outcomes = {
+      executed: { title: "系统已确认操作完成。", next: "本次变更已确认，后续恢复状态以业务检查为准。" },
+      not_executed: { title: "系统已确认本次变更未生效。", next: "已解除本次操作阻塞，可由值班任务重新处理。" },
+      retry_safe: { title: "本次操作可以安全重试。", next: "原执行结果仍未知；系统已解除本次操作阻塞，可继续处理。" },
+    };
+    const fact = outcomes[payload.outcome] || { title: "系统已自动检查执行结果。", next: "处理结论已记录。" };
+    return { ...fact, title: event.title || fact.title,
+      summary: payload.evidence && typeof payload.evidence.summary === "string" ? payload.evidence.summary : "" };
+  }
+  function appendAutomaticResult(root, event) {
+    const fact = automaticResultFact(event);
+    root.appendChild(el("div", { class: "aw-tool-fact aw-auto-result" }, [
+      el("div", { class: "aw-fact-label", text: "系统自动处理 · " + fmtTime(event.created_at) }),
+      el("div", { class: "aw-fact-tool", text: fact.title }),
+      ...(fact.summary ? [el("div", { class: "aw-fact-result", text: fact.summary })] : []),
+      el("div", { class: "aw-pend-next", text: fact.next }),
     ]));
   }
   function renderRight() {
@@ -197,11 +270,19 @@
     const incidents = d.incidents || [];
     const openN = incidents.filter((i) => i.status === "open").length;
     const facts = nativeFacts(d), task = taskState();
+    const automatic = automaticResults(d), latestAutomatic = automatic.at(-1);
     prog.innerHTML = "";
     prog.appendChild(el("div", { class: "aw-progress-overview", text: `${taskLabel()} · ` + (incidents.length ? `关联 ${incidents.length} 个工单 · 未关闭 ${openN}` : "无关联工单") }));
     let step = "当前没有执行中的工具记录。";
-    if (task === "unknown" || (d.pending_write_results || []).length) step = "写结果尚未确认，请先核对执行记录。";
+    if (task === "unknown" || (d.pending_write_results || []).length) {
+      const check = reconciliationFact(d);
+      step = check.message + (["checking", "pending", "executing"].includes(check.status) ? " 系统将自动更新结果，无需手动判断。" : " 相关写入暂缓，避免重复变更。");
+    }
     else if (["paused", "stopping", "interrupted", "deleting", "archived", "deleted"].includes(task)) step = taskLabel();
+    else if (task === "idle" && latestAutomatic) {
+      const result = automaticResultFact(latestAutomatic);
+      step = "最近自动处理：" + result.title + " " + result.next;
+    }
     else if (!facts.available) step = facts.message;
     else if (facts.current && ["running", "busy", "queued"].includes(task)) step = (facts.current.channel === "read" ? "正在调查，等待工具返回：" : "等待工具返回：") + toolTarget(facts.current);
     else if (task === "queued") step = interactive() ? "消息已排队，等待原生任务接收。" : "故障已排队，等待后台值班任务接收。";
@@ -234,30 +315,12 @@
         ["tool_call", "tool_result", "action_proposed", "session_archived"].includes(e.type)
       );
       const latestResult = facts.tools.filter((item) => ["completed", "error"].includes(item.status)).at(-1);
-      if (latestResult) appendToolResult(res, latestResult, "最近结果");
-      if (facts.error && (!latestResult || facts.error.id !== latestResult.id || facts.error.at !== latestResult.at)) appendToolResult(res, facts.error, "最近调用错误");
-      if (!results.length && !evs.length && !latestResult && !facts.error) res.appendChild(el("div", { class: "aw-muted", text: "暂无" }));
-      results.forEach((w) => {
-        const row = el("div", { class: "aw-pend-card" }, [
-          el("div", { class: "aw-pend-title", text: `写结果待核销${w.target ? " @ " + w.target : ""}` }),
-          el("div", { class: "aw-pend-meta", text: `${w.incident_id || ""} · ${fmtTime(w.created_at)} · ${w.result || w.status}` }),
-          el("div", { class: "aw-pend-actions" }, [
-            el("button", {
-              type: "button", class: "btn primary small", text: "已执行",
-              onclick: () => adjudicateResult(w, "executed"),
-            }),
-            el("button", {
-              type: "button", class: "btn ghost small", text: "未执行",
-              onclick: () => adjudicateResult(w, "not_executed"),
-            }),
-            el("button", {
-              type: "button", class: "btn ghost small", text: "仍未知",
-              onclick: () => adjudicateResult(w, "still_unknown"),
-            }),
-          ]),
-        ]);
-        res.appendChild(row);
-      });
+      automatic.slice(-4).reverse().forEach((event) => appendAutomaticResult(res, event));
+      const historical = (item) => latestAutomatic && Number(item.at || 0) < Number(latestAutomatic.created_at || 0);
+      if (latestResult) appendToolResult(res, latestResult, historical(latestResult) ? "此前调用记录" : "最近结果");
+      if (facts.error && (!latestResult || facts.error.id !== latestResult.id || facts.error.at !== latestResult.at)) appendToolResult(res, facts.error, historical(facts.error) ? "此前调用错误" : "最近调用错误");
+      if (!results.length && !evs.length && !latestResult && !facts.error && !automatic.length) res.appendChild(el("div", { class: "aw-muted", text: "暂无" }));
+      results.forEach((item) => appendPendingResult(res, item));
       res.querySelectorAll("button").forEach((button) => { button.disabled = !manageable(); });
       evs.slice(-8).forEach((e) => {
         res.appendChild(el("div", { class: "aw-res-row", text: `${fmtTime(e.created_at)} ${e.title || e.type}` }));
@@ -273,10 +336,11 @@
   function adjudicateResult(w, outcome) {
     const key = "wop:" + w.id;
     if (pendingDecisions.has(key)) return;
-    const names = { executed: "已执行", not_executed: "未执行", still_unknown: "仍未知" };
-    const reason = prompt(`核销写结果（${names[outcome]}）：请填写核对依据。`, outcome === "executed" ? "已在目标主机确认生效" : outcome === "not_executed" ? "已确认未执行" : "暂无法确认");
+    const names = { executed: "确认已生效", not_executed: "确认未执行", still_unknown: "保留待确认" };
+    const reason = prompt(`人工处理（${names[outcome]}）：请填写实际检查的证据，勿凭猜测解除保护。`, "");
     if (reason === null) return;
-    return decide("/api/agent/write-ops/" + encodeURIComponent(w.id) + "/adjudicate", { outcome, reason }, key);
+    if (!reason.trim()) { alert("请填写实际检查的证据；未填写时将保留当前状态。"); return; }
+    return decide("/api/agent/write-ops/" + encodeURIComponent(w.id) + "/adjudicate", { outcome, reason: reason.trim() }, key);
   }
 
 

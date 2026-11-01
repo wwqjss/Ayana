@@ -26,10 +26,14 @@ _ERRORS = {
     "write_not_allowed_on_read_channel": "命令未通过只读通道校验。",
     "endpoint_missing": "缺少当前账号组的目标连接。",
     "work_already_running": "目标已有任务执行中，未重复派发。",
-    "idempotent_block": "已有执行记录，未重复派发；请核对原结果。",
+    "idempotent_block": "已有执行记录，系统已避免重复变更；原结果由系统继续检查。",
     "incident_not_open": "指定工单已关闭。",
     "session_paused": "会话已暂停。",
-    "execution_unknown": "执行结果待核对，请勿重复派发。",
+    "execution_unknown": "执行结果尚未确认，相关变更已暂缓；系统将根据执行凭据检查。",
+    "timeout": "等待工具结果超时，系统将检查执行凭据，暂不重复变更。",
+    "not_connected": "工具连接暂时中断，系统正在等待连接恢复。",
+    "promtool_failed": "监控配置未通过校验，系统正在确认配置是否已恢复。",
+    "reload_failed": "监控配置未能重载，系统正在确认配置与运行状态。",
 }
 
 

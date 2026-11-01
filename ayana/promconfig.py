@@ -33,9 +33,12 @@ _SAFE_REL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$")
 
 
 class PromConfigError(Exception):
-    def __init__(self, code: str, detail: str = ""):
+    def __init__(self, code: str, detail: str = "", *, dispatch_not_started: bool = False,
+                 execution_facts: dict[str, Any] | None = None):
         self.code = code
         self.detail = detail
+        self.dispatch_not_started = dispatch_not_started
+        self.execution_facts = execution_facts or {}
         super().__init__(f"{code}: {detail}" if detail else code)
 
 
@@ -637,6 +640,7 @@ class ConfigFS(Protocol):
     async def list_dir(self, rel: str) -> list[str]: ...
     async def exists(self, rel: str) -> bool: ...
     async def mkdir(self, rel: str) -> None: ...
+    async def remove(self, rel: str) -> None: ...
     def describe(self) -> dict[str, Any]: ...
 
 
@@ -712,6 +716,9 @@ class LocalConfigFS:
 
     async def mkdir(self, rel: str) -> None:
         self._path(rel).mkdir(parents=True, exist_ok=True)
+
+    async def remove(self, rel: str) -> None:
+        self._path(rel).unlink(missing_ok=True)
 
     def describe(self) -> dict[str, Any]:
         return {"mode": "local", "base_dir": str(self.base)}
@@ -795,6 +802,12 @@ class SSHConfigFS:
     async def mkdir(self, rel: str) -> None:
         remote = self._remote(rel)
         await self.transport.exec(self.asset_id, ["mkdir", "-p", remote], timeout=12)
+
+    async def remove(self, rel: str) -> None:
+        remote = self._remote(rel)
+        res = await self.transport.exec(self.asset_id, ["rm", "-f", remote], timeout=15)
+        if not getattr(res, "ok", False):
+            raise PromConfigError("ssh_remove_failed", rel)
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -1242,13 +1255,29 @@ class PromConfigService:
         labels = _clean_labels(labels or {})
         if job != MANAGED_JOB:
             raise PromConfigError("job_not_managed", job)
-        items = await self._load_file_sd()
-        for it in items:
-            if address in (it.get("targets") or []):
-                raise PromConfigError("target_exists", address)
-        items.append({"targets": [address], "labels": labels})
-        await self._write_file_sd(items, actor, action="target_add", detail={"address": address, "labels": labels})
-        await self._ensure_job_and_rules_entry(actor)
+        async with self._write_lock:
+            items = await self._load_file_sd()
+            for it in items:
+                if address in (it.get("targets") or []):
+                    raise PromConfigError("target_exists", address, dispatch_not_started=True)
+            items.append({"targets": [address], "labels": labels})
+            # The discovery file and its job/rule links form one transaction.
+            # A second failed transaction must not conceal a successful first write.
+            try:
+                raw = await self.fs.read_text(CONFIG_FILE)
+            except Exception as exc:
+                if getattr(exc, "code", "") == "not_found":
+                    raise PromConfigError("prom_config_missing", "未找到 prometheus.yml，本次没有修改配置。", dispatch_not_started=True) from exc
+                exc.dispatch_not_started = True
+                raise
+            linked, _ = ensure_file_sd_job(raw, job_name=MANAGED_JOB,
+                file_sd_path=_config_ref(MANAGED_FILE_SD, self.config_path_prefix), interval="30s")
+            linked, _ = ensure_rule_files_entry(linked, _config_ref(MANAGED_RULES, self.config_path_prefix))
+            writes = {MANAGED_FILE_SD: json.dumps(items, ensure_ascii=False, indent=2) + "\n"}
+            if linked != raw:
+                writes[CONFIG_FILE] = linked
+            await self._apply_write_unlocked(actor, "target_add", writes=writes,
+                                            detail={"address": address, "labels": labels})
         return {"ok": True, "address": address, "labels": labels}
 
     async def _add_http_probe(
@@ -1288,7 +1317,11 @@ class PromConfigService:
         }
         # Hold the same lock for the read/modify/write to avoid lost updates.
         async with self._write_lock:
-            raw = await self.fs.read_text(CONFIG_FILE)
+            try:
+                raw = await self.fs.read_text(CONFIG_FILE)
+            except Exception as exc:
+                exc.dispatch_not_started = True
+                raise
             new_raw, changed, job_name = ensure_http_probe_job(raw, job)
             if changed:
                 await self._apply_write_unlocked(
@@ -1391,13 +1424,21 @@ class PromConfigService:
         for rel in writes:
             try:
                 originals[rel] = await self.fs.read_text(rel)
-            except PromConfigError:
+            except PromConfigError as exc:
+                if exc.code != "not_found":
+                    exc.dispatch_not_started = True
+                    raise
                 originals[rel] = None
-        for rel, orig in originals.items():
-            if orig is not None:
-                await self._backup_if_exists(rel, actor, action)
+        try:
+            for rel, orig in originals.items():
+                if orig is not None:
+                    await self._backup_if_exists(rel, actor, action)
+        except Exception as exc:
+            exc.dispatch_not_started = True
+            raise
         check: dict[str, Any] = {}
         relr: dict[str, Any] = {}
+        reload_attempted = False
         try:
             for rel, content in writes.items():
                 if content is None:
@@ -1421,6 +1462,7 @@ class PromConfigService:
                             "或把 prometheus_config.local_dir / ssh_asset_id 指向真实 Prometheus。",
                         )
                     raise PromConfigError("promtool_failed", detail)
+            reload_attempted = True
             relr = await self._try_reload()
             if not relr.get("ok"):
                 raise PromConfigError("reload_failed", str(relr)[:400])
@@ -1442,22 +1484,48 @@ class PromConfigService:
             )
             return {"ok": True, "promtool": check, "reload": relr, "txn": self._txn_seq}
         except Exception as e:
+            restored = True
+            rollback_errors = []
             for rel, orig in originals.items():
-                if orig is not None:
-                    try:
+                try:
+                    if orig is None:
+                        await self.fs.remove(rel)
+                    else:
                         await self.fs.write_text(rel, orig)
-                    except Exception:
-                        pass
+                    try:
+                        actual = await self.fs.read_text(rel)
+                    except PromConfigError as exc:
+                        if orig is None and exc.code == "not_found":
+                            actual = None
+                        else:
+                            raise
+                    if actual != orig:
+                        raise RuntimeError("restored content differs")
+                except Exception as rollback_error:
+                    restored = False
+                    rollback_errors.append(f"{rel}: {type(rollback_error).__name__}")
+            rollback_reload = {"ok": True, "skipped": "reload_not_attempted"}
+            if reload_attempted:
+                try:
+                    rollback_reload = await self._try_reload()
+                except Exception as rollback_error:
+                    rollback_reload = {"ok": False, "error": type(rollback_error).__name__}
+            facts = {"transaction_rolled_back": bool(restored and rollback_reload.get("ok")),
+                     "files_restored": restored, "reload_attempted": reload_attempted,
+                     "rollback_reload_ok": bool(rollback_reload.get("ok")),
+                     "rollback_errors": rollback_errors}
+            # Preserve uncertainty when either file restoration or runtime
+            # restoration failed; a validator error alone does not prove rollback.
+            e.execution_facts = facts
             try:
-                await self._try_reload()
+                self._audit(
+                    "web_user", actor, f"promconfig_{action}_failed",
+                    {"detail": str(e)[:300], "paths": list(writes.keys()), "execution_facts": facts},
+                )
             except Exception:
+                # Keep the original failure and independently verified rollback
+                # facts even when the audit sink itself is unavailable.
                 pass
-            self._audit(
-                "web_user",
-                actor,
-                f"promconfig_{action}_failed",
-                {"detail": str(e)[:300], "paths": list(writes.keys())},
-            )
             raise
 
     async def _ensure_job_and_rules_entry(self, actor: str) -> None:

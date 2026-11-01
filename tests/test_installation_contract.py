@@ -223,6 +223,159 @@ class DeploymentFixture(unittest.TestCase):
         with sqlite3.connect(self.args.data / 'ayana.db') as connection:
             self.assertEqual(connection.execute('SELECT value FROM facts').fetchone()[0], 'before')
 
+    def test_migration_rereads_config_and_new_dropins_after_environment_preparation(self):
+        self.require_symlink()
+        self.install()
+        self.make_db()
+        original_scripts = (self.args.prefix / 'scripts/fnbk_collector.py').read_bytes()
+        dropin = self.args.unit_dir / 'ayana.service.d/added.conf'
+        def concurrent_change(_):
+            path = self.args.conf_dir / 'config.json'
+            config = deployment.read_json(path)
+            config['http_port'] = 7359
+            path.write_text(json.dumps(config))
+            dropin.parent.mkdir()
+            dropin.write_text('ReadWritePaths=' + str(self.args.data) + '\n')
+        self.migration_args()
+        with patch.object(deployment, 'install_dependencies', side_effect=concurrent_change), contextlib.redirect_stdout(io.StringIO()):
+            migration.migrate_layout(self.args, deployment)
+        root = self.args.root
+        self.assertEqual(deployment.read_json(root / 'config/config.json')['http_port'], 7359)
+        self.assertIn(str(root / 'data'), dropin.read_text())
+        self.assertTrue((root / 'scripts').is_symlink())
+        self.assertEqual((root / 'scripts/fnbk_collector.py').read_bytes(), original_scripts)
+        report = json.loads(Path((root / 'backups/MIGRATION-LAST').read_text()).read_text())
+        self.assertEqual(report['legacy_scripts_compatibility_link'], str(root / 'scripts'))
+
+    def test_migration_copies_dedicated_logs_with_backup_permissions_and_logrotate_compatibility(self):
+        self.require_symlink()
+        self.install()
+        self.make_db()
+        old_logs = self.base / 'external-ayana-log'
+        old_logs.mkdir()
+        logfile = old_logs / 'ayana.log'
+        logfile.write_bytes(b'original operational log\n')
+        logfile.chmod(0o640)
+        config = deployment.read_json(self.args.conf_dir / 'config.json')
+        config['log_file'] = str(logfile)
+        (self.args.conf_dir / 'config.json').write_text(json.dumps(config))
+        dropin = self.args.unit_dir / 'ayana.service.d/logs.conf'
+        dropin.parent.mkdir()
+        dropin.write_text('ReadWritePaths=' + str(old_logs) + '\n')
+        self.migration_args()
+        with patch.object(migration, 'DEDICATED_LOG_DIR', old_logs), contextlib.redirect_stdout(io.StringIO()):
+            migration.migrate_layout(self.args, deployment)
+        root = self.args.root
+        self.assertTrue(old_logs.is_symlink())
+        self.assertEqual(logfile.read_bytes(), b'original operational log\n')
+        self.assertEqual((root / 'data/log/ayana.log').read_bytes(), logfile.read_bytes())
+        if os.name == 'posix':
+            self.assertEqual((root / 'data/log/ayana.log').stat().st_mode & 0o777, 0o640)
+        self.assertEqual(deployment.read_json(root / 'config/config.json')['log_file'], str(root / 'data/log/ayana.log'))
+        self.assertIn(str(root / 'data/log'), dropin.read_text())
+        report = json.loads(Path((root / 'backups/MIGRATION-LAST').read_text()).read_text())
+        with tarfile.open(Path(report['snapshot']) / 'external-logs.tar.gz') as archive:
+            self.assertEqual(archive.extractfile('log/ayana.log').read(), logfile.read_bytes())
+
+    def test_migration_does_not_move_shared_external_log_directory(self):
+        self.require_symlink()
+        self.install()
+        self.make_db()
+        shared = self.base / 'shared-log'
+        shared.mkdir()
+        logfile = shared / 'ayana.log'
+        logfile.write_text('keep in place')
+        config = deployment.read_json(self.args.conf_dir / 'config.json')
+        config['log_file'] = str(logfile)
+        (self.args.conf_dir / 'config.json').write_text(json.dumps(config))
+        self.migration_args()
+        with contextlib.redirect_stdout(io.StringIO()):
+            migration.migrate_layout(self.args, deployment)
+        self.assertFalse(shared.is_symlink())
+        self.assertEqual(logfile.read_text(), 'keep in place')
+        self.assertEqual(deployment.read_json(self.args.root / 'config/config.json')['log_file'], str(logfile))
+        report = json.loads(Path((self.args.root / 'backups/MIGRATION-LAST').read_text()).read_text())
+        self.assertEqual(report['external_log_file_preserved'], str(logfile))
+
+    def test_late_failure_restores_external_logs_and_original_collector_directory(self):
+        self.require_symlink()
+        self.install()
+        self.make_db()
+        logs = self.base / 'external-ayana-log'
+        logs.mkdir()
+        (logs / 'ayana.log').write_text('retained log')
+        config_path = self.args.conf_dir / 'config.json'
+        config = deployment.read_json(config_path)
+        config['log_file'] = str(logs / 'ayana.log')
+        config_path.write_text(json.dumps(config))
+        scripts = self.args.prefix / 'scripts'
+        collector_bytes = (scripts / 'fnbk_collector.py').read_bytes()
+        self.migration_args()
+        original_replace = migration._replace_json
+        def fail_commit(path, value):
+            if value.get('status') == 'complete':
+                raise OSError('commit marker failure')
+            original_replace(path, value)
+        with patch.object(migration, 'DEDICATED_LOG_DIR', logs), patch.object(migration, '_replace_json', side_effect=fail_commit), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(OSError, 'commit marker failure'):
+                migration.migrate_layout(self.args, deployment)
+        self.assertFalse(logs.is_symlink())
+        self.assertEqual((logs / 'ayana.log').read_text(), 'retained log')
+        self.assertFalse(scripts.is_symlink())
+        self.assertEqual((scripts / 'fnbk_collector.py').read_bytes(), collector_bytes)
+        self.assertEqual(deployment.read_json(config_path)['log_file'], str(logs / 'ayana.log'))
+        self.assertFalse((self.args.root / 'app').exists())
+
+    def test_log_directory_collision_rolls_back_without_overwriting_either_log(self):
+        self.require_symlink()
+        self.install()
+        self.make_db()
+        old_logs = self.base / 'external-ayana-log'
+        old_logs.mkdir()
+        (old_logs / 'ayana.log').write_text('external')
+        internal = self.args.data / 'log/ayana.log'
+        internal.parent.mkdir(exist_ok=True)
+        internal.write_text('internal')
+        config = deployment.read_json(self.args.conf_dir / 'config.json')
+        config['log_file'] = str(old_logs / 'ayana.log')
+        (self.args.conf_dir / 'config.json').write_text(json.dumps(config))
+        self.migration_args()
+        with patch.object(migration, 'DEDICATED_LOG_DIR', old_logs), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(deployment.InstallError, 'review before merging'):
+                migration.migrate_layout(self.args, deployment)
+        self.assertFalse(old_logs.is_symlink())
+        self.assertEqual((old_logs / 'ayana.log').read_text(), 'external')
+        self.assertEqual(internal.read_text(), 'internal')
+        self.assertFalse((self.args.root / 'app').exists())
+
+    def test_config_edits_during_copying_are_preserved_and_migration_refuses_overwrite(self):
+        self.require_symlink()
+        self.install()
+        self.make_db()
+        config_path = self.args.conf_dir / 'config.json'
+        original_copy = migration.copy_tree
+        def changed_copy(source, target, ignored):
+            original_copy(source, target, ignored)
+            if source == self.args.conf_dir:
+                value = deployment.read_json(config_path)
+                value['http_port'] = 7359
+                config_path.write_text(json.dumps(value))
+        self.migration_args()
+        with patch.object(migration, 'copy_tree', side_effect=changed_copy), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(deployment.InstallError, 'configuration changed during copying'):
+                migration.migrate_layout(self.args, deployment)
+        self.assertEqual(deployment.read_json(config_path)['http_port'], 7359)
+        self.assertFalse((self.args.root / 'app').exists())
+
+    def test_user_backup_without_explicit_units_does_not_copy_system_units(self):
+        self.install()
+        self.make_db()
+        self.args.system = False
+        self.args.unit_dir_explicit = False
+        snapshot = deployment.backup(self.args)
+        self.assertEqual(deployment.read_json(snapshot / 'backup.json')['units'], [])
+        self.assertEqual(list((snapshot / 'units').iterdir()), [])
+
     def test_lite_migration_keeps_verified_mimo_credentials_and_literal_fingerprint(self):
         from ayana.mimo_admin import MimoAdmin
         self.require_symlink()

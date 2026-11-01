@@ -157,6 +157,66 @@ class LiteWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.ssh.calls), 1)
         self.assertEqual(self.db.query_one("SELECT status FROM session_write_ops")[0], "unknown")
 
+    async def settled_unknown(self):
+        model = FakeModel(tool("host.exec", {"asset_id": "host", "command": "systemctl restart worker"}),
+                          tool("incident.verify", ident="call_after_verify"), conclusion())
+        worker = await self.worker(model)
+        self.ssh.unknown = True
+        job = await self.run_job(worker)
+        operation = self.db.query_one("SELECT * FROM session_write_ops")
+        self.bridge.resolve_write_result(operation["incident_id"], operation["action_key"], outcome="retry_safe",
+            evidence={"kind": "fixture_objective_receipt", "summary": "fixture execution receipt permits one safe continuation"})
+        self.ssh.unknown = False
+        return worker, model, job
+
+    async def test_verified_write_resumes_after_cooldown_with_original_round_budget(self):
+        worker, model, job = await self.settled_unknown()
+        self.assertEqual(worker.resume_verified_writes(), 0)
+        self.assertEqual(worker._row(self.iid)["status"], "partial")
+        with patch("ayana.lite_worker.now", return_value=job["updated_at"] + worker.config.cooldown_sec + 1):
+            self.assertEqual(worker.resume_verified_writes(), 1)
+        queued = worker._row(self.iid)
+        self.assertEqual((queued["status"], queued["rounds"]), ("queued", job["rounds"]))
+        self.assertEqual(len(model.requests), 1)
+        # The normal scheduler, rather than the observer, admits the next turn.
+        self.ssh.healthy = True
+        await worker.tick_once()  # reap the previous owner
+        await worker.tick_once()
+        await asyncio.gather(*worker._running.values())
+        self.assertEqual(worker._row(self.iid)["status"], "done")
+        self.assertEqual(worker._row(self.iid)["rounds"], job["rounds"] + 1)
+        self.assertEqual(len(self.ssh.calls), 1)  # no replay of the original write
+
+    async def test_settled_write_only_triggers_one_continuation(self):
+        worker, _, job = await self.settled_unknown()
+        with patch("ayana.lite_worker.now", return_value=job["updated_at"] + worker.config.cooldown_sec + 1):
+            self.assertEqual(worker.resume_verified_writes(), 1)
+            self.db.execute("UPDATE investigation_jobs SET status='partial',updated_at=1 WHERE incident_id=?", (self.iid,))
+            self.assertEqual(worker.resume_verified_writes(), 0)
+        self.assertEqual(self.db.query_one("SELECT count(*) FROM audit_log WHERE entry='lite_resumed_after_write_verification'")[0], 1)
+
+    async def test_verified_result_never_overrides_operator_mode_budget_or_other_obligations(self):
+        worker, _, job = await self.settled_unknown()
+        stamp = job["updated_at"] + worker.config.cooldown_sec + 1
+        with patch("ayana.lite_worker.now", return_value=stamp):
+            worker.config.enabled = False
+            self.assertEqual(worker.resume_verified_writes(), 0)
+            worker.config.enabled = True
+            worker.cfg["agent_mode"] = "mimo"
+            self.assertEqual(worker.resume_verified_writes(), 0)
+            worker.cfg["agent_mode"] = "lite"
+            self.db.execute("UPDATE investigation_jobs SET rounds=? WHERE incident_id=?", (worker.config.max_rounds, self.iid))
+            self.assertEqual(worker.resume_verified_writes(), 0)
+            self.db.execute("UPDATE investigation_jobs SET rounds=? WHERE incident_id=?", (job["rounds"], self.iid))
+            self.bridge.duty.pause_session(self.sid, actor="operator")
+            self.assertEqual(worker.resume_verified_writes(), 0)
+            self.db.execute("UPDATE duty_sessions SET paused_at=0,pause_reason='' WHERE id=?", (self.sid,))
+            self.incidents.set_need_human(self.iid, "unrelated_existing_obligation")
+            self.assertEqual(worker.resume_verified_writes(), 0)
+            self.assertEqual(self.db.query_one("SELECT need_human_reason FROM incidents WHERE id=?", (self.iid,))[0], "unrelated_existing_obligation")
+            self.db.execute("UPDATE incidents SET need_human=0,need_human_reason='',generation=generation+1 WHERE id=?", (self.iid,))
+            self.assertEqual(worker.resume_verified_writes(), 0)
+
     async def test_pause_while_model_responds_prevents_dispatch(self):
         model = FakeModel(tool("host.exec", {"asset_id": "host", "command": "systemctl restart worker"}))
         worker = await self.worker(model)

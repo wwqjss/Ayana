@@ -1944,7 +1944,13 @@ class WebApp:
         s = self._agent_session_require(sess, sid)
         incs = duty.incidents(sid)
         msgs = duty.messages(sid, limit=200)
-        events = duty.events(sid, limit=100)
+        # Detail is a current-state view. Keep the incremental event reader's
+        # after_id ordering unchanged, but start this snapshot at its last 100
+        # rows so a long session can show newly verified execution results.
+        event_start = self.db.query_one(
+            "SELECT MIN(id) AS first_id FROM (SELECT id FROM session_events"
+            " WHERE session_id=? ORDER BY id DESC LIMIT 100)", (sid,))
+        events = duty.events(sid, after_id=max(0, int(event_start["first_id"] or 0) - 1), limit=100)
         pending_writes = []
         try:
             bridge = self._bridge()

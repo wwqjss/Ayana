@@ -511,6 +511,7 @@ class SessionBridge:
         retry_safe: bool = False,
         authority_session_id: str = "",
         incident_generation: int = 0,
+        operation: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not incident_id or not action_key:
             raise ValueError("incident_id and action_key required")
@@ -559,8 +560,8 @@ class SessionBridge:
                 conn.execute(
                     "INSERT INTO session_write_ops("
                     " id, incident_id, session_id, action_key, status, result,"
-                    " created_at, updated_at, lease_expires_at, target, params_hash, claimed_by)"
-                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " created_at, updated_at, lease_expires_at, target, params_hash, claimed_by, operation_json)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         new_id("wop"),
                         incident_id,
@@ -574,6 +575,7 @@ class SessionBridge:
                         (target or "")[:120],
                         params_hash,
                         (claimed_by or "")[:64],
+                        json.dumps(operation or {}, ensure_ascii=False, default=str),
                     ),
                 )
             return {"ok": True, "claimed": True, "action_key": action_key, "already_done": False}
@@ -668,15 +670,27 @@ class SessionBridge:
         }
 
     def complete_write(
-        self, incident_id: str, action_key: str, *, ok: bool, result: str = ""
+        self, incident_id: str, action_key: str, *, ok: bool, result: str = "",
+        observed_result: bool = False,
     ) -> dict[str, Any]:
+        """Complete a claim; unknown requires a definitive executing-code result.
+
+        observed_result is internal to the executor's return path. It must not
+        be supplied from model arguments, an idle state or an elapsed timeout.
+        """
         status = "done" if ok else "failed"
         with self.db.tx() as conn:
-            conn.execute(
+            allowed = "status IN ('claimed','unknown')" if observed_result else "status='claimed'"
+            changed = conn.execute(
                 "UPDATE session_write_ops SET status=?, result=?, updated_at=?, lease_expires_at=0"
-                " WHERE incident_id=? AND action_key=? AND status='claimed'",
+                " WHERE incident_id=? AND action_key=? AND " + allowed,
                 (status, (result or "")[:2000], now(), incident_id, action_key),
-            )
+            ).rowcount
+            if not changed:
+                row = conn.execute("SELECT status FROM session_write_ops WHERE incident_id=? AND action_key=?",
+                                   (incident_id, action_key)).fetchone()
+                return {"ok": False, "error": "completion_not_admitted", "status": row["status"] if row else "",
+                        "action_key": action_key}
         return {"ok": True, "status": status, "action_key": action_key}
 
     def mark_unknown(
@@ -689,6 +703,57 @@ class SessionBridge:
                 (f"unknown:{(reason or '')[:180]}", now(), incident_id, action_key),
             )
         return {"ok": True, "status": "unknown", "action_key": action_key}
+
+    def set_write_observation(self, incident_id: str, action_key: str, *,
+                              operation: dict[str, Any] | None = None,
+                              reconciliation: dict[str, Any] | None = None) -> None:
+        """Save machine facts; this does not release an uncertain execution lock."""
+        fields, values = [], []
+        for column, value in (("operation_json", operation), ("reconciliation_json", reconciliation)):
+            if value is not None:
+                fields.append(column + "=?")
+                values.append(json.dumps(value, ensure_ascii=False, default=str))
+        if fields:
+            self.db.execute("UPDATE session_write_ops SET " + ",".join(fields) +
+                            " WHERE incident_id=? AND action_key=?", (*values, incident_id, action_key))
+
+    def resolve_write_result(self, incident_id: str, action_key: str, *, outcome: str,
+                             evidence: dict[str, Any]) -> dict[str, Any]:
+        """Resolve only from objective evidence, retaining the original uncertain result.
+
+        Callers must read a durable receipt or verify the requested effect. An AI
+        statement, an expired timeout, or an ended native turn is never evidence.
+        """
+        if outcome not in ("executed", "not_executed", "retry_safe") or not evidence:
+            raise ValueError("objective evidence and a supported outcome are required")
+        stamp = now()
+        status = "done" if outcome == "executed" else "released"
+        message = {"executed": "系统已确认操作完成。", "not_executed": "系统已确认本次变更未生效。",
+                   "retry_safe": "系统已确认没有同类命令仍在执行，且此操作可以安全重试；原执行结果仍保留为未知。"}[outcome]
+        reconciliation = {"status": "resolved", "checked_at": stamp,
+                          "message": message,
+                          "evidence": evidence}
+        with self.db.tx() as conn:
+            row = conn.execute("SELECT * FROM session_write_ops WHERE incident_id=? AND action_key=?",
+                               (incident_id, action_key)).fetchone()
+            if not row or row["status"] != "unknown":
+                return {"ok": False, "error": "bad_state"}
+            changed = conn.execute("UPDATE session_write_ops SET status=?,adjudication=?,adjudicated_at=?,"
+                                   "adjudication_reason=?,reconciliation_json=?,lease_expires_at=0"
+                                   " WHERE id=? AND status='unknown'",
+                                   (status, {"executed": "auto_verified", "not_executed": "auto_not_executed", "retry_safe": "auto_retry_safe"}[outcome],
+                                    stamp, str(evidence.get("summary") or outcome)[:200],
+                                    json.dumps(reconciliation, ensure_ascii=False), row["id"])).rowcount
+            if not changed:
+                return {"ok": False, "error": "bad_state"}
+            self.db.audit("system", "write_observer", "write_result_auto_verified", incident_id=incident_id,
+                          asset_id=row["target"], action_id=action_key, channel="system",
+                          detail={"outcome": outcome, "evidence": evidence, "original_result": row["result"]})
+            if row["session_id"]:
+                self.duty.record_event(row["session_id"], type="write_result_auto_verified",
+                                       title=reconciliation["message"],
+                                       payload={"action_key": action_key, "outcome": outcome, "evidence": evidence})
+        return {"ok": True, "status": status, "action_key": action_key, "reconciliation": reconciliation}
 
     def release_write(
         self, incident_id: str, action_key: str, *, confirmed_safe: bool = False, reason: str = ""
@@ -801,11 +866,28 @@ class SessionBridge:
         """本会话待核销的写结果（claimed/unknown），供执行与验证面板人工核销。"""
         rows = self.db.query(
             "SELECT id, incident_id, session_id, action_key, status, result, target, params_hash,"
-            " claimed_by, created_at, updated_at, adjudication FROM session_write_ops"
+            " claimed_by, created_at, updated_at, adjudication, operation_json, reconciliation_json FROM session_write_ops"
             " WHERE session_id=? AND status IN ('claimed','unknown') ORDER BY created_at DESC LIMIT ?",
             (session_id, int(limit)),
         )
-        return [dict(r) for r in rows]
+        results = []
+        for row in rows:
+            item = dict(row)
+            operation_json = item.pop("operation_json")
+            reconciliation_json = item.pop("reconciliation_json")
+            try:
+                operation = json.loads(operation_json or "{}")
+                observation = json.loads(reconciliation_json or "{}")
+                if not isinstance(operation, dict) or not isinstance(observation, dict):
+                    operation, observation = {}, {}
+            except (TypeError, ValueError):
+                operation, observation = {}, {}
+            item["tool"] = operation.get("tool") or ("host.exec" if ":exec_shell:" in item["action_key"] else "")
+            item["reconciliation"] = observation if item["status"] == "unknown" else {}
+            if item["status"] == "unknown" and not observation:
+                item["reconciliation"] = {"status": "unsupported", "message": "原始执行凭据不足，系统暂时无法可靠确认结果；相关变更已暂缓，无需猜测执行结果。"}
+            results.append(item)
+        return results
 
     def is_write_done(self, incident_id: str, action_key: str) -> bool:
         row = self.db.query_one(

@@ -553,7 +553,11 @@ class OpsTools:
         action_key = br.make_action_key(sid, name, args, context="mcp-tool-write")
         payload = {"_ayana_session_id": sid, "_ayana_tool": name, "_ayana_arguments": args}
         # 逐动作审批已删除：直接 claim → 执行 → 审计/unknown
-        claim = br.claim_write(incident_id, action_key, params=payload, claimed_by="mcp_agent", authority_session_id=sid)
+        operation = {"tool": name}
+        if name.startswith("config.prom_target_"):
+            operation["arguments"] = args
+        claim = br.claim_write(incident_id, action_key, params=payload, claimed_by="mcp_agent",
+                               authority_session_id=sid, operation=operation)
         if not claim.get("claimed"):
             return {"ok": False, "error": "idempotent_block", "detail": claim, "action_key": action_key}
         try:
@@ -562,14 +566,23 @@ class OpsTools:
                     incident_id=str(args.get("incident_id") or args.get("source_incident") or "")):
                 out = await fn(args)
         except Exception as exc:
-            if getattr(exc, "dispatch_not_started", False):
+            detail = getattr(exc, "detail", {})
+            facts = detail.get("execution_facts", {}) if isinstance(detail, dict) else {}
+            if facts.get("transaction_rolled_back") is True:
+                br.complete_write(incident_id, action_key, ok=False,
+                                  result=json.dumps({"error": getattr(exc, "code", "failed"), "execution_facts": facts}),
+                                  observed_result=True)
+                br.set_write_observation(incident_id, action_key, reconciliation={"status": "resolved",
+                    "message": "变更未通过检查，系统已恢复原配置；本次变更没有生效。", "evidence": facts})
+            elif getattr(exc, "dispatch_not_started", False):
                 br.release_write(incident_id, action_key, confirmed_safe=True, reason=getattr(exc, "code", "failed"))
             else:
                 code = str(getattr(exc, "code", "") or type(exc).__name__)
                 reason = code + (": " + str(exc)[:300] if str(exc) and str(exc) != code else "")
                 br.mark_unknown(incident_id, action_key, reason=reason)
             raise
-        br.complete_write(incident_id, action_key, ok=out.get("ok", True), result=json.dumps(out, default=str))
+        br.complete_write(incident_id, action_key, ok=out.get("ok", True), result=json.dumps(out, default=str),
+                          observed_result=True)
         self._audit_write("", name, "success" if out.get("ok", True) else "failed", sid)
         return out
 
@@ -750,6 +763,7 @@ class OpsTools:
                     action_key,
                     ok=(state == "success"),
                     result=(detail or "")[:500],
+                    observed_result=True,
                 )
         self._audit_write(asset_id, command, state, (detail or "")[:200], channel=channel,
                           ssh_account=getattr(res, "account", "") or "",
@@ -1187,7 +1201,7 @@ class OpsTools:
                 **options,
             )
         except Exception as e:  # noqa: BLE001
-            raise McpToolError(getattr(e, "code", "promconfig_failed"), str(e)[:300]) from e
+            raise self._promconfig_error(e) from e
 
     async def config_prom_target_update(self, args: dict[str, Any]) -> dict[str, Any]:
         self._require_write_mode("config.prom_target_update")
@@ -1202,7 +1216,7 @@ class OpsTools:
                 actor="mcp_agent",
             )
         except Exception as e:  # noqa: BLE001
-            raise McpToolError(getattr(e, "code", "promconfig_failed"), str(e)[:300]) from e
+            raise self._promconfig_error(e) from e
 
     async def config_prom_target_delete(self, args: dict[str, Any]) -> dict[str, Any]:
         self._require_write_mode("config.prom_target_delete")
@@ -1215,7 +1229,16 @@ class OpsTools:
                 actor="mcp_agent",
             )
         except Exception as e:  # noqa: BLE001
-            raise McpToolError(getattr(e, "code", "promconfig_failed"), str(e)[:300]) from e
+            raise self._promconfig_error(e) from e
+
+    @staticmethod
+    def _promconfig_error(exc: Exception) -> McpToolError:
+        code = str(getattr(exc, "code", "promconfig_failed"))
+        preflight = (getattr(exc, "dispatch_not_started", False) or code.startswith("bad_") or
+                     code in {"job_not_managed", "target_exists", "target_not_found", "file_sd_invalid_json", "yaml_unsupported", "probe_job_conflict"})
+        return McpToolError(code, str(exc)[:300],
+                            {"execution_facts": getattr(exc, "execution_facts", {})},
+                            dispatch_not_started=bool(preflight))
 
     def _checks_service(self):
         svc = getattr(self.ctx, "checks", None)

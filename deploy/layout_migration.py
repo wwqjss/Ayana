@@ -18,6 +18,33 @@ import sys
 import tarfile
 import uuid
 
+DEDICATED_LOG_DIR = Path('/var/log/ayana')
+
+
+def dedicated_log_directory(config: dict, deployment):
+    """Only relocate the known Ayana-owned legacy log directory.
+
+    An arbitrary configured log directory can belong to a shared service.
+    Never move it merely because Ayana writes one file there.
+    """
+    configured = config.get('log_file')
+    if not configured or not Path(configured).is_absolute():
+        return None
+    path = Path(configured)
+    if not path.is_relative_to(DEDICATED_LOG_DIR):
+        return None
+    if any(item.is_symlink() for item in (DEDICATED_LOG_DIR, *DEDICATED_LOG_DIR.parents)):
+        raise deployment.InstallError('legacy log directory symlinks require a reviewed migration')
+    return DEDICATED_LOG_DIR
+
+
+def archive_tree(source: Path, destination: Path, name: str):
+    with tarfile.open(destination, 'w:gz') as archive:
+        def regular(entry):
+            return entry if entry.isfile() or entry.isdir() or entry.issym() or entry.islnk() else None
+        archive.add(source, arcname=name, recursive=True, filter=regular)
+    destination.chmod(0o600)
+
 
 def rewrite_paths(value: str, replacements: dict[Path, Path]) -> str:
     """Replace original paths once, without rewriting newly generated paths.
@@ -53,6 +80,8 @@ def rewrite_configuration(config: dict, replacements: dict[Path, Path]) -> dict:
 
 
 def _owned_copy(source: Path, target: Path):
+    # shutil.copytree passes strings to custom copy functions on Linux.
+    source, target = Path(source), Path(target)
     shutil.copy2(source, target)
     if os.name == 'posix' and os.geteuid() == 0:
         info = source.stat()
@@ -137,6 +166,20 @@ def _replace_json(path: Path, value: dict):
         temporary.unlink(missing_ok=True)
 
 
+def _replace_unit(path: Path, text: str):
+    temporary = path.with_name('.layout-' + uuid.uuid4().hex + '.conf')
+    try:
+        with temporary.open('x', encoding='utf-8', newline='\n') as stream:
+            stream.write(text)
+        shutil.copystat(path, temporary)
+        if os.name == 'posix' and os.geteuid() == 0:
+            info = path.stat()
+            os.chown(temporary, info.st_uid, info.st_gid)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _units(args, deployment):
     result = []
     for name in deployment.UNITS:
@@ -192,7 +235,8 @@ def _free_space(args, target, deployment):
     root_parent = args.root
     while not root_parent.exists():
         root_parent = root_parent.parent
-    data_bytes = _regular_bytes(args.data)
+    logs = dedicated_log_directory(deployment.read_json(args.conf_dir / 'config.json'), deployment)
+    data_bytes = _regular_bytes(args.data) + (_regular_bytes(logs) if logs else 0)
     venv_bytes = _regular_bytes(args.prefix / '.venv')
     backup_bytes = _regular_bytes(args.backup_dir)
     same_backup_device = args.backup_dir.exists() and args.backup_dir.stat().st_dev == root_parent.stat().st_dev
@@ -238,7 +282,7 @@ def migrate_layout(args, deployment):
     active = _active_units(args, deployment) if managed else []
     if managed and was_ready and not active:
         raise deployment.InstallError('an unmanaged Agent runtime is still active; stop and verify it before migration')
-    unit_paths = _units(args, deployment) if args.system or args.unit_dir_explicit else []
+    _units(args, deployment) if args.system or args.unit_dir_explicit else []
     mapping = {args.prefix: target.prefix, args.data: target.data, args.conf_dir: target.conf_dir,
                args.backup_dir: target.backup_dir / 'legacy'}
     ignored = []
@@ -269,24 +313,42 @@ def migrate_layout(args, deployment):
             deployment.run('systemctl', 'stop', 'ayana-agent-runtime.service')
             old_runtime_stopped = True
         deployment.ensure_quiescent(args)
+        # Preparing the venv may take minutes. Read the final offline facts,
+        # rather than overwrite settings/drop-ins changed during preparation.
+        config_bytes = (args.conf_dir / 'config.json').read_bytes()
+        cfg = json.loads(config_bytes.decode('utf-8'))
+        if deployment.configured_agent_mode(cfg) != old_mode:
+            raise deployment.InstallError('Agent mode changed during preparation; retry the migration')
+        deployment.validate_backup_scope(args)
+        unit_paths = _units(args, deployment) if args.system or args.unit_dir_explicit else []
+        logs = dedicated_log_directory(cfg, deployment)
+        if logs:
+            mapping[logs] = target.data / 'log'
+        _free_space(args, target, deployment)
         snapshot = deployment.backup(args)
         # The regular snapshot contains code/venv/config/SQLite/provider files.
         # Add the complete native history, knowledge and runtime data offline.
-        with tarfile.open(snapshot / 'runtime-data.tar.gz', 'w:gz') as archive:
-            def regular(entry):
-                return entry if entry.isfile() or entry.isdir() or entry.issym() or entry.islnk() else None
-            archive.add(args.data, arcname='data', recursive=True, filter=regular)
-        (snapshot / 'runtime-data.tar.gz').chmod(0o600)
+        archive_tree(args.data, snapshot / 'runtime-data.tar.gz', 'data')
+        if logs and logs.exists():
+            archive_tree(logs, snapshot / 'external-logs.tar.gz', 'log')
         for path in unit_paths:
             saved = snapshot / 'units' / path.relative_to(args.unit_dir)
             saved.parent.mkdir(parents=True, exist_ok=True)
-            if not saved.exists():
-                _owned_copy(path, saved)
+            _owned_copy(path, saved)
         report.update(status='copying', snapshot=str(snapshot), snapshot_usage='migration recovery; not a new-layout ordinary rollback snapshot')
         _replace_json(report_path, report)
         for source, destination in ((args.data, target.data), (args.conf_dir, target.conf_dir)):
             prepared.append(destination)
             copy_tree(source, destination, ignored)
+        if logs and logs.exists():
+            destination = target.data / 'log'
+            if destination.exists():
+                if not destination.is_dir() or destination.is_symlink() or any(destination.iterdir()):
+                    raise deployment.InstallError('both legacy data/log and external logs contain files; review before merging')
+                destination.rmdir()
+            copy_tree(logs, destination, ignored)
+        if (args.conf_dir / 'config.json').read_bytes() != config_bytes:
+            raise deployment.InstallError('configuration changed during copying; retry without concurrent edits')
         updated = rewrite_configuration(cfg, mapping)
         old_home = Path(cfg.get('agent_runtime_home') or args.data)
         has_mimo_history = (old_mode == 'mimo' or bool(cfg.get('mimo_config_dir') or cfg.get('mimo_workdir'))
@@ -302,7 +364,23 @@ def migrate_layout(args, deployment):
         deployment.set_permissions(target)
         preserve_ownership(args.data, target.data)
         preserve_ownership(args.conf_dir, target.conf_dir)
-        for source, destination in ((args.data, target.data), (args.conf_dir, target.conf_dir)):
+        if logs and logs.exists():
+            preserve_ownership(logs, target.data / 'log')
+        if (args.conf_dir / 'config.json').read_bytes() != config_bytes:
+            raise deployment.InstallError('configuration changed during copying; retry without concurrent edits')
+        if (args.system or args.unit_dir_explicit) and set(_units(args, deployment)) != set(unit_paths):
+            raise deployment.InstallError('service drop-ins changed during copying; retry without concurrent edits')
+        sources = [(args.data, target.data), (args.conf_dir, target.conf_dir)]
+        if logs and logs.exists():
+            sources.append((logs, target.data / 'log'))
+        scripts = args.prefix / 'scripts'
+        saved_scripts = snapshot / 'code/scripts'
+        if scripts.is_dir() and not scripts.is_symlink() and saved_scripts.is_dir() and tree_digest(scripts) == tree_digest(saved_scripts):
+            # Cron can still call the legacy public collector path. Move the
+            # entire directory into the rollback holding area before linking.
+            sources.append((scripts, target.prefix / 'scripts'))
+            report['legacy_scripts_compatibility_link'] = str(scripts)
+        for source, destination in sources:
             stash = source.with_name('.' + source.name + '-layout-' + token)
             if stash.exists() or stash.is_symlink():
                 raise deployment.InstallError('migration holding path already exists')
@@ -311,10 +389,12 @@ def migrate_layout(args, deployment):
             source.symlink_to(destination, target_is_directory=True)
         for path in unit_paths:
             saved = snapshot / 'units' / path.relative_to(args.unit_dir)
+            if path.read_bytes() != saved.read_bytes():
+                raise deployment.InstallError('service configuration changed during copying; retry without concurrent edits')
             original = saved.read_text(encoding='utf-8')
             revised = rewrite_paths(original, mapping)
-            path.write_text(revised, encoding='utf-8', newline='\n')
             changed_units.append(path)
+            _replace_unit(path, revised)
         if managed:
             deployment.run('systemctl', 'daemon-reload')
             if active:
@@ -340,6 +420,8 @@ def migrate_layout(args, deployment):
             previous = snapshot / ('venv' if name == '.venv' else 'code/' + name)
             if not old.exists():
                 continue
+            if old.is_symlink() and any(source == old for source, _, _ in stashes):
+                continue
             if old.is_symlink() or not previous.exists() or tree_digest(old) != tree_digest(previous):
                 preserved.append(str(old))
                 continue
@@ -358,7 +440,9 @@ def migrate_layout(args, deployment):
             if stash.parent != source.parent or stash.name != '.' + source.name + '-layout-' + token:
                 raise deployment.InstallError('unsafe holding directory cleanup')
         report.update(status='complete', snapshot=str(snapshot), preserved_legacy_files=preserved,
-                      active_services_preserved=active, old_path_compatibility_links=True)
+                      active_services_preserved=active, old_path_compatibility_links=True,
+                      relocated_log_directory=str(logs) if logs else None,
+                      external_log_file_preserved=cfg.get('log_file') if not logs else None)
         _replace_json(report_path, report)
         (target.backup_dir / 'MIGRATION-LAST').write_text(str(report_path), encoding='utf-8')
         committed = True
@@ -381,12 +465,13 @@ def migrate_layout(args, deployment):
             except OSError:
                 holding_copies.append(str(stash))
         known_new = {target.prefix, target.data, target.conf_dir, target.backup_dir}
+        known_new.update(source for source, _, _ in stashes)
         report['unrecognized_legacy_root_entries'] = [str(path) for path in args.prefix.iterdir()
                                                        if path not in known_new]
         report['preserved_legacy_files'] = preserved
         if holding_copies:
             report['holding_copies_to_review'] = holding_copies
-        if holding_copies or preserved or report['unrecognized_legacy_root_entries']:
+        if holding_copies or preserved or report['unrecognized_legacy_root_entries'] or logs:
             try:
                 _replace_json(report_path, report)
             except OSError:

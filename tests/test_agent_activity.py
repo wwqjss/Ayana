@@ -223,3 +223,32 @@ class NativeActivityWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["task_state"], "unknown")
         self.assertFalse(data["native_activity"]["available"])
         self.assertNotIn("SECRET", json.dumps(data["native_activity"]))
+
+    async def test_long_session_detail_includes_latest_automatic_result_in_order(self):
+        before = self.duty.record_event(self.sid, type="tool_result", title="oldest call")
+        other = self.duty.create(origin="manual")["session_id"]
+        for index in range(105):
+            self.duty.record_event(self.sid, type="tool_result", title=f"earlier call {index}")
+            self.duty.record_event(other, type="tool_result", title="another session")
+        latest = self.duty.record_event(self.sid, type="write_result_auto_verified",
+            title="系统已确认操作完成。", payload={"outcome": "executed",
+                "evidence": {"summary": "已从实际加载配置确认目标符合请求。"}})
+        response = await self.handler.api_agent_session_detail(SimpleNamespace(match_info={"sid": self.sid}))
+        events = json.loads(response.text)["events"]
+        self.assertEqual(len(events), 100)
+        self.assertEqual(events[-1]["id"], latest)
+        self.assertEqual(events[-1]["payload"]["outcome"], "executed")
+        self.assertEqual(events[-1]["payload"]["evidence"]["summary"], "已从实际加载配置确认目标符合请求。")
+        self.assertEqual([event["id"] for event in events], sorted(event["id"] for event in events))
+        self.assertTrue(all(event["session_id"] == self.sid for event in events))
+        self.assertNotIn(before, [event["id"] for event in events])
+
+    async def test_current_detail_does_not_change_incremental_event_cursor_semantics(self):
+        cursor = self.duty.record_event(self.sid, type="tool_result", title="cursor")
+        for index in range(110):
+            self.duty.record_event(self.sid, type="tool_result", title=f"next {index}")
+        expected = self.duty.events(self.sid, after_id=cursor, limit=3)
+        await self.handler.api_agent_session_detail(SimpleNamespace(match_info={"sid": self.sid}))
+        following = self.duty.events(self.sid, after_id=cursor, limit=3)
+        self.assertEqual(following, expected)
+        self.assertEqual([event["title"] for event in following], ["next 0", "next 1", "next 2"])

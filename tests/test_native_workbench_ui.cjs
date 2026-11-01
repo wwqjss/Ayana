@@ -132,6 +132,10 @@ function nested(root, predicate) {
   for (const child of root.children || []) { const found = nested(child, predicate); if (found) return found; }
   return null;
 }
+function visibleText(root) {
+  if (root.tagName === "DETAILS" && !root.open) return (root.children.find(child => child.tagName === "SUMMARY") || {}).textContent || "";
+  return (root._text || "") + (root.children || []).map(visibleText).join("");
+}
 const modalNode = (env, id) => nested(env.modals.at(-1).children[0], node => node.id === id);
 const modalButton = (env, text) => nested(env.modals.at(-1).children[0], node => node.tagName === "BUTTON" && node.textContent === text);
 const pollCallback = env => [...env.timers.values()].find(callback => callback.constructor.name === "AsyncFunction");
@@ -193,11 +197,140 @@ test("returned tools never clear unknown write protection or announce recovery",
       native_activity: { available: true, tools: [{ id: "returned", tool: "ayana_host_exec", status: "completed", target: "nerv", at: 40 }] } } : reply;
   });
   await env.window.renderAgentWorkbench();
-  assert.ok(env.nodes.get("aw-progress").textContent.includes("写结果尚未确认"));
+  assert.ok(env.nodes.get("aw-progress").textContent.includes("尚未收到可靠的完成结果"));
   const results = env.nodes.get("aw-results");
   assert.ok(results.textContent.includes("工具已返回"));
   assert.equal(results.textContent.includes("已恢复"), false);
   assert.equal(results.querySelectorAll("button").length, 3);
+  assert.equal(results.querySelectorAll("details")[0].open, false);
+  assert.equal(visibleText(results).includes("确认已生效"), false);
+  assert.ok(visibleText(results).includes("无需猜测执行结果"));
+});
+test("automatic result checks show the actual reason and next check without asking the user to decide", async () => {
+  const env = environment((call, normal) => {
+    const reply = normal(call);
+    return call.url === "/api/agent/sessions/sess_a" ? { ...reply, task_state: "unknown", task_state_label: "执行结果待核对",
+      pending_write_results: [{ id: "write-private", incident_id: "session:sess_private", tool: "config.prom_target_add", target: "kanata", status: "unknown", result: "unknown:timeout:private-raw-details",
+        reconciliation: { status: "pending", message: "系统正在读取监控配置，确认新目标是否已添加。", checked_at: 20, next_check_at: 40 } }] } : reply;
+  });
+  await env.window.renderAgentWorkbench();
+  const progress = env.nodes.get("aw-progress").textContent;
+  assert.ok(progress.includes("等待自动确认结果"));
+  assert.ok(progress.includes("系统将自动更新结果，无需手动判断"));
+  assert.equal(progress.includes("请先核对"), false);
+  const results = env.nodes.get("aw-results"), text = visibleText(results);
+  assert.ok(text.includes("添加监控目标 · kanata"));
+  assert.ok(text.includes("下次自动确认"));
+  assert.equal(text.includes("private-raw-details"), false);
+  assert.equal(text.includes("session:sess_private"), false);
+  assert.equal(text.includes("确认已生效"), false);
+  assert.ok(results.querySelectorAll("details")[0].textContent.includes("private-raw-details"));
+  assert.equal(env.calls.some(call => call.method !== "GET"), false);
+});
+test("unsupported historical writes do not pretend an automatic check is running", async () => {
+  const env = environment((call, normal) => {
+    const reply = normal(call);
+    return call.url === "/api/agent/sessions/sess_a" ? { ...reply, task_state: "unknown", pending_write_results: [{ id: "old", result: "unknown:promtool_failed:permission denied",
+      reconciliation: { status: "unsupported", message: "这条历史命令未保留可用于自动验证的检查条件。" } }] } : reply;
+  });
+  await env.window.renderAgentWorkbench();
+  const text = visibleText(env.nodes.get("aw-results"));
+  assert.ok(text.includes("历史命令未保留"));
+  assert.ok(text.includes("相关写入暂缓"));
+  assert.equal(text.includes("正在自动"), false);
+  assert.equal(text.includes("将自动"), false);
+  assert.equal(text.includes("permission denied"), false);
+});
+test("an automatically confirmed result remains visible after its pending record clears", async () => {
+  const env = environment((call, normal) => {
+    const reply = normal(call);
+    return call.url === "/api/agent/sessions/sess_a" ? { ...reply, task_state: "idle", pending_write_results: [],
+      events: [{ id: 7, type: "write_result_auto_verified", title: "系统已确认操作完成。", created_at: 40,
+        payload: { outcome: "executed", action_key: "private-operation-key", evidence: { summary: "已从配置文件和实际加载配置确认目标符合请求。" } } }],
+      native_activity: { available: true, tools: [{ id: "old", tool: "ayana_metrics_query", status: "error", at: 20, error: { message: "此前工具未连接。" } }] } } : reply;
+  });
+  await env.window.renderAgentWorkbench();
+  const results = env.nodes.get("aw-results"), text = visibleText(results);
+  assert.ok(results.children[0].textContent.includes("系统自动处理"));
+  assert.ok(results.children[0].textContent.includes("系统已确认操作完成"));
+  assert.ok(text.includes("实际加载配置确认目标符合请求"));
+  assert.ok(text.includes("后续恢复状态以业务检查为准"));
+  assert.ok(text.includes("此前调用记录"));
+  assert.ok(env.nodes.get("aw-progress").textContent.includes("最近自动处理：系统已确认操作完成"));
+  assert.equal(text.includes("private-operation-key"), false);
+  assert.equal(text.includes("已恢复"), false);
+  assert.equal(results.querySelectorAll("button").length, 0);
+});
+test("a safe retry conclusion never claims the original operation succeeded or was retried", async () => {
+  const env = environment((call, normal) => {
+    const reply = normal(call);
+    return call.url === "/api/agent/sessions/sess_a" ? { ...reply, task_state: "idle", pending_write_results: [],
+      events: [{ id: 9, type: "write_result_auto_verified", created_at: 50,
+        payload: { outcome: "retry_safe", evidence: { summary: "下载进程已结束，镜像拉取可安全重试。" } } }],
+      native_activity: { available: false, tools: [], message: "原生步骤暂不可读。" } } : reply;
+  });
+  await env.window.renderAgentWorkbench();
+  const results = visibleText(env.nodes.get("aw-results")), progress = env.nodes.get("aw-progress").textContent;
+  assert.ok(results.includes("可以安全重试"));
+  assert.ok(results.includes("原执行结果仍未知"));
+  assert.ok(progress.includes("最近自动处理"));
+  assert.equal(results.includes("操作完成"), false);
+  assert.equal(results.includes("已重新执行"), false);
+  assert.equal(results.includes("已恢复"), false);
+  assert.equal(env.calls.some(call => call.method !== "GET"), false);
+});
+test("an older automatic conclusion does not replace a new running task or another pending write", async () => {
+  let waiting = false;
+  const env = environment((call, normal) => {
+    const reply = normal(call);
+    return call.url === "/api/agent/sessions/sess_a" ? { ...reply, task_state: waiting ? "unknown" : "running",
+      pending_write_results: waiting ? [{ id: "new", status: "unknown", reconciliation: { status: "unsupported", message: "另一项变更仍缺少客观证据。" } }] : [],
+      events: [{ id: 9, type: "write_result_auto_verified", created_at: 40, payload: { outcome: "executed" } }],
+      native_activity: { available: true, tools: [{ id: "live", tool: "ayana_metrics_query", status: "running", channel: "read", at: 60 }] } } : reply;
+  });
+  await env.window.renderAgentWorkbench();
+  assert.ok(env.nodes.get("aw-progress").textContent.includes("正在调查"));
+  assert.equal(env.nodes.get("aw-progress").textContent.includes("最近自动处理"), false);
+  waiting = true; await pollCallback(env)();
+  assert.ok(env.nodes.get("aw-progress").textContent.includes("另一项变更仍缺少客观证据"));
+  assert.equal(env.nodes.get("aw-progress").textContent.includes("系统将自动"), false);
+});
+test("an active claimed write waits for its real execution instead of pretending reconciliation started", async () => {
+  const env = environment((call, normal) => {
+    const reply = normal(call);
+    return call.url === "/api/agent/sessions/sess_a" ? { ...reply, task_state: "running", pending_write_results: [{ id: "live", tool: "config.check_add", status: "claimed" }] } : reply;
+  });
+  await env.window.renderAgentWorkbench();
+  const text = visibleText(env.nodes.get("aw-results"));
+  assert.ok(text.includes("添加原生检查"));
+  assert.ok(text.includes("变更已派发"));
+  assert.equal(text.includes("自动确认"), false);
+  assert.equal(text.includes("无法"), false);
+});
+test("opening technical details survives polling and stays scoped to its session", async () => {
+  const env = environment((call, normal) => {
+    const reply = normal(call);
+    if (call.url.startsWith("/api/agent/sessions/sess_")) reply.pending_write_results = [{ id: "shared-local-id", status: "unknown" }];
+    return reply;
+  });
+  await env.window.renderAgentWorkbench();
+  const first = env.nodes.get("aw-results").querySelectorAll("details")[0];
+  first.open = true; first.listeners.toggle[0]();
+  await pollCallback(env)();
+  assert.equal(env.nodes.get("aw-results").querySelectorAll("details")[0].open, true);
+  await env.select("sess_b");
+  assert.equal(env.nodes.get("aw-results").querySelectorAll("details")[0].open, false);
+});
+test("older server errors are explained without exposing raw tracebacks in the normal result view", async () => {
+  const env = environment((call, normal) => {
+    const reply = normal(call);
+    return call.url === "/api/agent/sessions/sess_a" ? { ...reply, task_state: "unknown", pending_write_results: [{ id: "old", result: "unknown:promtool_failed:permission denied: /secret/config/path" }] } : reply;
+  });
+  await env.window.renderAgentWorkbench();
+  const text = visibleText(env.nodes.get("aw-results"));
+  assert.ok(text.includes("文件访问权限问题"));
+  assert.equal(text.includes("/secret/config/path"), false);
+  assert.equal(text.includes("正在自动"), false);
 });
 test("missing native progress never promotes historical tool calls into current activity", async () => {
   const env = environment((call, normal) => {
@@ -441,13 +574,26 @@ test("unknown write adjudication retains the exact operation and evidence while 
     return result;
   });
   await env.window.renderAgentWorkbench(); await env.attach();
-  const adjudicate = env.nodes.get("aw-results").querySelectorAll("button").find(b => b.textContent === "已执行");
+  const details = env.nodes.get("aw-results").querySelectorAll("details")[0];
+  assert.equal(details.open, false); details.open = true;
+  const adjudicate = details.querySelectorAll("button").find(b => b.textContent === "确认已生效");
   env.prompts.push("已核对目标主机日志");
   const first = adjudicate.click(); await adjudicate.click();
   const requests = env.calls.filter(c => c.url === "/api/agent/write-ops/write-a/adjudicate");
   assert.equal(requests.length, 1);
   assert.deepEqual(requests[0].body, { outcome: "executed", reason: "已核对目标主机日志" });
   pending.resolve({ ok: true }); await first;
+});
+test("manual resolution has no fabricated default evidence and refuses an empty explanation", async () => {
+  const env = environment((call, normal) => {
+    const reply = normal(call);
+    return call.url === "/api/agent/sessions/sess_a" ? { ...reply, pending_write_results: [{ id: "write-empty", status: "unknown" }] } : reply;
+  });
+  await env.window.renderAgentWorkbench();
+  env.prompts.push("   ");
+  await env.nodes.get("aw-results").querySelectorAll("button").find(button => button.textContent === "确认已生效").click();
+  assert.equal(env.calls.some(call => call.url.includes("/adjudicate")), false);
+  assert.ok(env.alerts.at(-1).includes("实际检查的证据"));
 });
 test("read-only viewers can inspect unknown writes without adjudication buttons becoming active", async () => {
   const env = environment((call, normal) => {

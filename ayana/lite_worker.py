@@ -104,6 +104,77 @@ class LiteInvestigator(AutoInvestigator):
         except Exception:
             return False
 
+    def resume_verified_writes(self) -> int:
+        """Resume a lite turn stopped specifically for an objectively settled write.
+
+        Queue admission keeps the original budget, cooldown and all operator
+        controls. Each verification can trigger at most one continuation.
+        """
+        if (self.cfg.get("agent_mode") != "lite" or not self.config.enabled
+                or self._stop.is_set()):
+            return 0
+        stamp = now()
+        resumed = 0
+        rows = self.db.query("SELECT * FROM investigation_jobs WHERE status IN ('partial','failed','timeout') ORDER BY updated_at LIMIT 100")
+        for row in rows:
+            try:
+                conclusion = json.loads(row["last_conclusion_json"] or "{}")
+                stop_reason = (conclusion.get("lite_agent") or {}).get("stop_reason")
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if stop_reason not in ("tool_result_unknown", "write_result_unknown") or row["last_error"] == "human_guidance":
+                continue
+            if int(row["rounds"] or 0) >= self.config.max_rounds or stamp < float(row["updated_at"] or 0) + self.config.cooldown_sec:
+                continue
+            iid, generation = row["incident_id"], int(row["generation"] or 1)
+            with self.db.tx() as conn:
+                if not conn.in_transaction:
+                    conn.execute("BEGIN IMMEDIATE")
+                current = conn.execute("SELECT status,generation,need_human FROM incidents WHERE id=?", (iid,)).fetchone()
+                if not current or current["status"] != "open" or int(current["generation"] or 1) != generation or current["need_human"]:
+                    continue
+                session = conn.execute("SELECT d.* FROM duty_sessions d JOIN session_incidents si ON d.id=si.session_id "
+                    "WHERE si.incident_id=? AND si.generation=? AND d.origin='auto' AND d.status='open' "
+                    "AND d.paused_at=0 AND d.delete_requested_at=0 AND d.deleted_at=0 ORDER BY d.created_at DESC LIMIT 1", (iid, generation)).fetchone()
+                if not session or session["human_message_revision"]:
+                    continue
+                sid = session["id"]
+                if self.bridge.duty.native_admission_blockers(sid, include_business=True):
+                    continue
+                if conn.execute("SELECT 1 FROM session_write_ops WHERE (session_id=? OR incident_id=?) AND status IN ('claimed','unknown')", (sid, iid)).fetchone():
+                    continue
+                if conn.execute("SELECT 1 FROM actions WHERE (incident_id=? OR (json_valid(params_json) AND json_extract(params_json,'$._ayana_session_id')=?)) "
+                                "AND state IN ('proposed','approved','dispatched','unknown','verifying')", (iid, sid)).fetchone():
+                    continue
+                evidence = conn.execute("SELECT id,adjudicated_at FROM session_write_ops WHERE incident_id=? AND session_id=? "
+                    "AND adjudication IN ('auto_verified','auto_not_executed','auto_retry_safe') AND adjudicated_at>=? ORDER BY adjudicated_at DESC", (iid, sid, row["created_at"])).fetchall()
+                unused = []
+                for write in evidence:
+                    key = f"lite_write_resume:{iid}:{generation}:{write['id']}:{write['adjudicated_at']}"
+                    if not conn.execute("SELECT 1 FROM meta WHERE key=?", (key,)).fetchone():
+                        unused.append((key, write["id"]))
+                if not unused:
+                    continue
+                changed = conn.execute("UPDATE investigation_jobs SET status='queued',phase='verified_write_resume',lease_expires_at=0,updated_at=? "
+                    "WHERE incident_id=? AND generation=? AND status IN ('partial','failed','timeout') AND updated_at=? AND rounds=?",
+                    (stamp, iid, generation, row["updated_at"], row["rounds"])).rowcount
+                if not changed:
+                    continue
+                for key, _ in unused:
+                    conn.execute("INSERT INTO meta(key,value) VALUES(?,?)", (key, str(stamp)))
+                detail = {"generation": generation, "rounds": row["rounds"], "write_ids": [write_id for _, write_id in unused],
+                          "previous_status": row["status"], "stop_reason": stop_reason}
+                self.db.audit("system", "lite_agent", "lite_resumed_after_write_verification", incident_id=iid,
+                              detail=detail, channel="agent")
+                self.bridge.duty.record_event(sid, type="lite_write_verified_resume", title="执行结果已自动确认，值班任务继续排队处理。",
+                                              incident_id=iid, payload=detail)
+                resumed += 1
+        return resumed
+
+    async def tick_once(self) -> int:
+        self.resume_verified_writes()
+        return await super().tick_once()
+
     def recover_interrupted(self) -> int:
         """Called only after acquiring the independent runtime's exclusive lock."""
         rows = self.db.query("SELECT * FROM investigation_jobs WHERE status='running' AND phase='lite'")

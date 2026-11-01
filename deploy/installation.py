@@ -386,7 +386,7 @@ def backup(args) -> Path:
             source.backup(target)
     units = destination / 'units'
     units.mkdir()
-    for name in UNITS:
+    for name in UNITS if args.system or args.unit_dir_explicit else ():
         if (args.unit_dir / name).is_file():
             shutil.copy2(args.unit_dir / name, units / name)
     write_json(destination / 'backup.json', {'prefix': str(args.prefix), 'data': str(args.data),

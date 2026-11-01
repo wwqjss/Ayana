@@ -669,6 +669,7 @@ class App:
         # 后台：outbox、周期对账、事件关联
         self._bg_tasks.append(asyncio.create_task(self._bg_outbox()))
         self._bg_tasks.append(asyncio.create_task(self._bg_reconcile()))
+        self._bg_tasks.append(asyncio.create_task(self._bg_write_results()))
         self._bg_tasks.append(asyncio.create_task(self._bg_correlate()))
         # 工作台：会话归档倒计时恢复 + 周期 tick
         try:
@@ -842,6 +843,26 @@ class App:
             except Exception as e:
                 log.warning("AM reconcile failed: %s", e)
             await asyncio.sleep(60)
+
+    async def _bg_write_results(self) -> None:
+        """Slow host observations must not delay alert ingestion."""
+        while not self._stop.is_set():
+            try:
+                await self._reconcile_write_results_once()
+            except Exception as error:
+                log.warning("write result observation failed: %s", type(error).__name__)
+            await asyncio.sleep(15)
+
+    async def _reconcile_write_results_once(self) -> int:
+        """Inspect uncertain effects without entering or replaying a model turn."""
+        from .write_observer import reconcile_write_results
+        from .write_reconcile import observe_host_write
+        serve = getattr(self, "mimo_serve", None)
+        async def host_observer(row, operation):
+            return await observe_host_write(self.db, self.ssh_transport, row, operation)
+        return await reconcile_write_results(self.db, self.session_bridge,
+            promconfig=getattr(self, "promconfig", None), native_client=serve.client() if serve else None,
+            host_observer=host_observer)
 
     async def _bg_mimo_serve(self) -> None:
         """拉起 mimo serve 并订阅 SSE，事件落库 + 环形缓冲供前端轮询。"""
