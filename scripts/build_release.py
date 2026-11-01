@@ -21,7 +21,7 @@ def build(root: Path, output: Path) -> dict:
     files = release_files(root)
     names = {path.relative_to(root).as_posix() for path in files}
     required = {'ayana/main.py', 'ayana/agent_runtime.py', 'deploy/install.sh',
-                'deploy/installation.py', 'deploy/ayana-agent-runtime.service', 'pyproject.toml',
+                'deploy/installation.py', 'deploy/layout_migration.py', 'deploy/ayana-agent-runtime.service', 'pyproject.toml',
                 'docs/README.md', 'docs/INSTALL.md', 'docs/CONFIGURATION.md',
                 'docs/OPERATIONS.md', 'docs/TESTING.md', 'docs/mcp-operations.md',
                 'ayana/static/index.html', 'ayana/static/app.js', 'ayana/static/app.css',

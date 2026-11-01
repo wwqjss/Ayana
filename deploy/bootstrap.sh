@@ -13,15 +13,17 @@ fetch() {
   else printf 'Need curl or wget\n' >&2; return 1; fi
 }
 # A bootstrap check neither downloads nor creates a work directory.
-CHECK=0; SYSTEM=0; NO_START=0; PREFIX=""; CONF_DIR=""; EXPLICIT_MIMO=0; AGENT_MODE=""; EXPLICIT_AGENT_MODE=0
+CHECK=0; SYSTEM=0; NO_START=0; PREFIX=""; EXPLICIT_PREFIX=0; CONF_DIR=""; INSTALL_ROOT=""; EXPLICIT_ROOT=0; EXPLICIT_MIMO=0; AGENT_MODE=""; EXPLICIT_AGENT_MODE=0
 for ((i=0; i<${#ARGS[@]}; i++)); do
   case "${ARGS[i]}" in
-    -h|--help) printf 'Usage: bootstrap.sh [--system|--user] [--agent-mode mimo|lite] [installer options]\n--agent-mode lite installs a background duty Agent without MiMoCode or a terminal.\nOmitting --agent-mode preserves the installed mode; new installations use mimo.\n--system prepares Linux dependencies; --user/--no-start use existing dependencies.\nAYANA_VERSION=latest or a release tag; SHA256 verification is required.\nAYANA_MIMO_VERSION=0.1.16 by default; AYANA_MIMO_INSTALL_PATH=/usr/local/bin/mimo.\n'; exit 0 ;;
+    -h|--help) printf 'Usage: bootstrap.sh [--system|--user] [--root PATH] [--agent-mode mimo|lite] [installer options]\nInteractive installation asks for lightweight automatic duty or the complete MiMo interface before making changes.\nNew non-interactive installations require --agent-mode lite|mimo; existing installations preserve their mode.\n--root selects a managed directory containing app/config/data/backups.\n--system prepares Linux dependencies; --user/--no-start use existing dependencies.\nAYANA_VERSION=latest or a release tag; SHA256 verification is required.\nAYANA_MIMO_VERSION=0.1.16 by default; AYANA_MIMO_INSTALL_PATH overrides the default app/bin/mimo.\n'; exit 0 ;;
     --check) CHECK=1 ;;
     --system) SYSTEM=1 ;;
     --no-start) NO_START=1 ;;
-    --prefix) PREFIX="${ARGS[i+1]:?missing prefix}" ;;
-    --prefix=*) PREFIX="${ARGS[i]#*=}" ;;
+    --root) INSTALL_ROOT="${ARGS[i+1]:?missing installation root}"; EXPLICIT_ROOT=1 ;;
+    --root=*) INSTALL_ROOT="${ARGS[i]#*=}"; EXPLICIT_ROOT=1 ;;
+    --prefix) PREFIX="${ARGS[i+1]:?missing prefix}"; EXPLICIT_PREFIX=1 ;;
+    --prefix=*) PREFIX="${ARGS[i]#*=}"; EXPLICIT_PREFIX=1 ;;
     --conf-dir|--conf) CONF_DIR="${ARGS[i+1]:?missing config directory}" ;;
     --conf-dir=*|--conf=*) CONF_DIR="${ARGS[i]#*=}" ;;
     --mimo-bin|--mimo-bin=*) EXPLICIT_MIMO=1 ;;
@@ -29,8 +31,25 @@ for ((i=0; i<${#ARGS[@]}; i++)); do
     --agent-mode=*) AGENT_MODE="${ARGS[i]#*=}"; EXPLICIT_AGENT_MODE=1 ;;
   esac
 done
+[[ "$EXPLICIT_ROOT" == 0 || -n "$INSTALL_ROOT" ]] || fail 'Installation root must not be empty.'
+if [[ -z "$INSTALL_ROOT" ]]; then
+  if [[ "$SYSTEM" == 1 ]]; then INSTALL_ROOT=/opt/ayana; else INSTALL_ROOT="$HOME/.local/share/ayana"; fi
+fi
+LEGACY_CONF=/etc/ayana
+[[ "$SYSTEM" == 1 ]] || LEGACY_CONF="$HOME/.config/ayana"
 if [[ -z "$CONF_DIR" ]]; then
-  if [[ "$SYSTEM" == 1 ]]; then CONF_DIR=/etc/ayana; else CONF_DIR="$HOME/.config/ayana"; fi
+  if [[ "$EXPLICIT_ROOT" == 0 && ! -f "$INSTALL_ROOT/config/config.json" && -f "$LEGACY_CONF/config.json" ]]; then
+    CONF_DIR="$LEGACY_CONF"
+  else
+    CONF_DIR="$INSTALL_ROOT/config"
+  fi
+fi
+if [[ -z "$PREFIX" ]]; then
+  if [[ "$EXPLICIT_ROOT" == 0 && "$CONF_DIR" == "$LEGACY_CONF" && -f "$LEGACY_CONF/config.json" ]]; then
+    PREFIX="$INSTALL_ROOT"
+  else
+    PREFIX="$INSTALL_ROOT/app"
+  fi
 fi
 case "$AGENT_MODE" in
   '') [[ "$EXPLICIT_AGENT_MODE" == 0 ]] || fail 'Agent mode must be mimo or lite.' ;;
@@ -38,8 +57,8 @@ case "$AGENT_MODE" in
   *) fail 'Agent mode must be mimo or lite.' ;;
 esac
 if [[ "$CHECK" == 1 ]]; then
-  if [[ -z "$PREFIX" ]]; then
-    if [[ "$SYSTEM" == 1 ]]; then PREFIX=/opt/ayana; else PREFIX="$HOME/.local/share/ayana"; fi
+  if [[ ! -f "$PREFIX/deploy/installation.py" && "$EXPLICIT_ROOT" == 0 && "$EXPLICIT_PREFIX" == 0 && -f "$INSTALL_ROOT/deploy/installation.py" ]]; then
+    PREFIX="$INSTALL_ROOT"
   fi
   if [[ -f "$PREFIX/deploy/installation.py" ]]; then
     exec "${PYTHON_BIN:-python3}" "$PREFIX/deploy/installation.py" install "${ARGS[@]}"
@@ -53,6 +72,72 @@ else
   [[ "$VERSION" =~ ^v?[0-9][0-9A-Za-z.-]*$ ]] || fail 'Invalid version'
   PART="download/$VERSION"; ASSET="ayana-${VERSION#v}-install.tar.gz"
 fi
+choose_agent_mode() {
+  [[ "$EXPLICIT_AGENT_MODE" == 0 ]] || return 0
+  local previous="" candidate menu_fd="" choice default="lite" installed=0
+  if [[ -f "$CONF_DIR/config.json" ]]; then
+    installed=1
+    # Menu selection must precede package installation and sudo. A working
+    # Python may read existing JSON, but it is not installed just to ask.
+    for candidate in "${PYTHON_BIN:-python3}" python3 python3.13 python3.12 python3.11; do
+      if command -v "$candidate" >/dev/null 2>&1; then
+        previous="$("$candidate" - "$CONF_DIR/config.json" 2>/dev/null <<'PY'
+import json, sys
+from pathlib import Path
+value = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8')).get('agent_mode', 'mimo')
+if value not in ('lite', 'mimo'):
+    raise SystemExit(1)
+print(value)
+PY
+)" || previous=""
+        [[ -z "$previous" ]] || break
+      fi
+    done
+    default="$previous"
+  elif [[ -f "$PREFIX/deploy/installation.py" || ( -d "$INSTALL_ROOT" && ! -x "$INSTALL_ROOT" ) ]]; then
+    # An inaccessible or partially removed installation cannot safely receive
+    # a guessed replacement mode on Enter.
+    installed=1
+    default=""
+  fi
+  if [[ -t 0 ]]; then
+    menu_fd=0
+  elif { exec {menu_fd}<>/dev/tty; } 2>/dev/null; then
+    :
+  else
+    if [[ "$installed" == 1 && -n "$previous" ]]; then
+      AGENT_MODE="$previous"
+      return 0
+    fi
+    fail '非交互安装请明确指定 --agent-mode lite 或 --agent-mode mimo；尚未下载或更改系统。'
+  fi
+  printf '\n请选择 Ayana 安装方式：\n  1) 轻量安装：后台自动值班、调查和修复；无聊天或交互终端；无需 MiMoCode/tmux，占用较低。\n  2) 完整安装：自动值班及 MiMo 聊天、终端、人工接管；额外安装 MiMoCode/tmux，占用较高。\n两种模式都调用远程模型 API，实际资源占用取决于任务数量。\n' >&2
+  case "$default" in
+    lite) printf '请输入 1 或 2 [回车：%s轻量安装]：' "$([[ "$installed" == 1 ]] && printf '沿用当前' || printf '默认')" >&2 ;;
+    mimo) printf '请输入 1 或 2 [回车：沿用当前完整安装]：' >&2 ;;
+    *) printf '无法读取现有安装模式，请明确输入 1 或 2：' >&2 ;;
+  esac
+  while true; do
+    if ! IFS= read -r choice <&"$menu_fd"; then
+      [[ "$menu_fd" == 0 ]] || exec {menu_fd}>&-
+      fail '未读取到安装选择，安装已停止；自动化运行可指定 --agent-mode lite 或 --agent-mode mimo。'
+    fi
+    case "$choice" in
+      1|lite) AGENT_MODE=lite ;;
+      2|mimo) AGENT_MODE=mimo ;;
+      '') AGENT_MODE="$default" ;;
+      *) AGENT_MODE="" ;;
+    esac
+    if [[ -n "$AGENT_MODE" ]]; then break; fi
+    printf '请输入 1（轻量）或 2（完整）：' >&2
+  done
+  [[ "$menu_fd" == 0 ]] || exec {menu_fd}>&-
+  # Pass a concrete choice through sudo so elevation never asks twice. The
+  # installer still observes the old mode before permitting an actual switch.
+  ARGS+=(--agent-mode "$AGENT_MODE")
+  EXPLICIT_AGENT_MODE=1
+}
+choose_agent_mode
 AUTO=0
 if [[ "$SYSTEM" == 1 && "$NO_START" == 0 ]]; then
   [[ "$(uname -s)" == Linux ]] || fail 'Automatic system installation requires Linux; use --user or --no-start with prepared dependencies.'
@@ -210,7 +295,10 @@ PY
     candidate="$(realpath "$candidate")"
     case "$candidate" in /root/*|/home/*) ;; *) ARGS+=(--mimo-bin "$candidate"); return 0 ;; esac
   fi
-  destination="${AYANA_MIMO_INSTALL_PATH:-/usr/local/bin/mimo}"
+  destination="${AYANA_MIMO_INSTALL_PATH:-}"
+  if [[ -z "$destination" ]]; then
+    destination="$(realpath -m -- "$PREFIX/bin/mimo")" || fail 'Could not resolve the program directory for MiMoCode.'
+  fi
   [[ "$destination" == /* ]] || fail 'AYANA_MIMO_INSTALL_PATH must be an absolute system-readable path.'
   # A home installation can shadow this public CLI in PATH, including after a
   # successful earlier run. Reuse the executable itself without replacing it.

@@ -248,15 +248,13 @@ class ProbeMcpTests(unittest.IsolatedAsyncioTestCase):
         spec = next(s for s in TOOL_SPECS if s["name"] == "config.prom_target_add")
         self.assertIn("probe", spec["inputSchema"]["properties"])
 
-    async def test_probe_write_obeys_readonly_and_manual_approval(self):
-        self.duty.set_settings({"auto_access_mode": "readonly", "auto_approval_mode": "automatic"})
+    async def test_probe_write_obeys_readonly_mode(self):
+        # PERM-03 removed the per-session access_mode switch; ctx.readonly is
+        # the live control and must still keep writes from reaching the service.
+        self.tools.ctx.readonly = True
         with self.assertRaises(McpToolError) as error:
             await self.tools.call("config.prom_target_add", self.args, invocation_context=self.meta)
         self.assertEqual(error.exception.code, "readonly_mode_rejects_write")
-        self.pc.add_target.assert_not_awaited()
-        self.duty.set_settings({"auto_access_mode": "readwrite", "auto_approval_mode": "manual"})
-        result = await self.tools.call("config.prom_target_add", self.args, invocation_context=self.meta)
-        self.assertEqual(result["error"], "approval_required")
         self.pc.add_target.assert_not_awaited()
 
     async def test_automatic_and_approved_calls_pass_probe_to_service(self):
@@ -265,10 +263,14 @@ class ProbeMcpTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.pc.add_target.assert_awaited_once_with(address=URL, labels=LABELS, probe=PROBE, actor="mcp_agent")
         self.pc.add_target.reset_mock()
-        self.duty.set_setting("auto_approval_mode", "manual")
-        result = await self.tools.call_approved("config.prom_target_add", self.args, authority_session_id=self.sid)
+        # Repeating an identical write is idempotent and correctly blocked from
+        # running twice, so the approval dispatch is exercised with a distinct write.
+        other_probe = {**PROBE, "job_name": "other-probe"}
+        other = {**self.args, "address": "http://172.16.0.14:9116/", "probe": other_probe}
+        result = await self.tools.call_approved("config.prom_target_add", other, authority_session_id=self.sid)
         self.assertTrue(result["ok"])
-        self.pc.add_target.assert_awaited_once_with(address=URL, labels=LABELS, probe=PROBE, actor="mcp_agent")
+        self.pc.add_target.assert_awaited_once_with(
+            address="http://172.16.0.14:9116/", labels=LABELS, probe=other_probe, actor="mcp_agent")
 
     async def test_normal_target_handler_does_not_add_probe_argument(self):
         self.duty.set_settings({"auto_access_mode": "readwrite", "auto_approval_mode": "automatic"})

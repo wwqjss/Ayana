@@ -86,6 +86,28 @@ def selected_agent_mode(args) -> str:
     return getattr(args, 'agent_mode', None) or configured
 
 
+def choose_agent_mode(args):
+    """Direct package installs use the same concise choice as bootstrap."""
+    if args.agent_mode is not None or args.check or args.command not in ('install', 'init', 'update') or not sys.stdin.isatty():
+        return
+    configured = (args.conf_dir / 'config.json').is_file()
+    previous = configured_agent_mode(effective_config(args)) if configured else 'lite'
+    default = '1' if previous == 'lite' else '2'
+    print('请选择安装模式：')
+    print('  1. 轻量安装：后台自动值班、调查、修复和复查；没有聊天/终端，不安装 MiMoCode/tmux，占用较低。')
+    print('  2. 完整安装：自动值班 + MiMo 交互、终端和人工接管；额外安装 MiMoCode/tmux，占用较高。')
+    print('两种模式均使用远程模型接口；实际占用随任务和并发数量变化。')
+    while True:
+        try:
+            answer = input(f'请输入 1 或 2 [默认 {default}]：').strip() or default
+        except EOFError as exc:
+            raise InstallError('choose --agent-mode lite or --agent-mode mimo') from exc
+        if answer in ('1', '2'):
+            args.agent_mode = 'lite' if answer == '1' else 'mimo'
+            return
+        print('请输入 1 或 2。')
+
+
 def db_path(args) -> Path:
     value = Path(effective_config(args).get('db_path') or args.data / 'ayana.db')
     return value if value.is_absolute() else args.conf_dir / value
@@ -276,12 +298,16 @@ def environment_report(args) -> list[str]:
 
 
 def render_units(args, template_root: Path) -> dict[str, str]:
-    replacements = {'/opt/ayana': str(args.prefix), '/var/lib/ayana': str(args.data),
-                    '/etc/ayana': str(args.conf_dir), 'User=ayana': f'User={args.service_user}',
+    replacements = {'@AYANA_APP@': str(args.prefix), '@AYANA_DATA@': str(args.data),
+                    '@AYANA_CONFIG@': str(args.conf_dir), 'User=ayana': f'User={args.service_user}',
                     'Group=ayana': f'Group={args.service_user}'}
     result = {}
     for name in UNITS:
         text = (template_root / 'deploy' / name).read_text(encoding='utf-8')
+        # Older release templates used concrete legacy paths. Convert them to
+        # placeholders before inserting new values, avoiding double rewrites.
+        for old, placeholder in (('/opt/ayana', '@AYANA_APP@'), ('/var/lib/ayana', '@AYANA_DATA@'), ('/etc/ayana', '@AYANA_CONFIG@')):
+            text = text.replace(old, placeholder)
         for before, after in replacements.items():
             text = text.replace(before, after)
         result[name] = text
@@ -335,7 +361,7 @@ def backup(args) -> Path:
     destination.mkdir(parents=True, mode=0o700)
     code = destination / 'code'
     code.mkdir()
-    for name in (*MANAGED_DIRS, *MANAGED_FILES):
+    for name in (*MANAGED_DIRS, *MANAGED_FILES, 'bin'):
         source = args.prefix / name
         if source.is_dir():
             shutil.copytree(source, code / name, symlinks=True)
@@ -366,6 +392,7 @@ def backup(args) -> Path:
     write_json(destination / 'backup.json', {'prefix': str(args.prefix), 'data': str(args.data),
                                            'conf_dir': str(args.conf_dir), 'database': str(database),
                                            'had_database': database.exists(), 'provider_files': provider_files,
+                                           'local_program_dirs': ['bin'] if (args.prefix / 'bin').is_dir() else [],
                                            'database_permissions': permission_record(database) if database.is_file() else None,
                                            'config_permissions': configuration_permissions(args.conf_dir),
                                            'units': [name for name in UNITS if (units / name).is_file()]})
@@ -423,6 +450,8 @@ def configure(args, source: Path):
     for folder in (args.data, args.data / 'log', args.data / 'knowledge', args.data / 'agent-workspace',
                    args.data / 'agent-runtime', args.conf_dir):
         folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if all(path.parent == args.root for path in (args.prefix, args.data, args.conf_dir, args.backup_dir)):
+        args.backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     config = args.conf_dir / 'config.json'
     mode = selected_agent_mode(args)
     if not config.exists():
@@ -437,7 +466,7 @@ def configure(args, source: Path):
         if mode == 'mimo':
             initial.update(mimo_workdir=str(args.data / 'agent-workspace'),
                            mimo_config_dir=str(args.data / '.config/mimocode'),
-                           mimo_bin=args.mimo_bin or '/usr/local/bin/mimo')
+                           mimo_bin=args.mimo_bin or str(args.prefix / 'bin/mimo'))
         write_json(config, initial)
     elif getattr(args, 'agent_mode', None) is not None:
         # Called only after the old owner was observed idle/stopped and backed up.
@@ -492,6 +521,9 @@ def set_permissions(args):
     except KeyError:
         run('useradd', '--system', '--home', str(args.data), '--shell', '/usr/sbin/nologin', args.service_user)
         account = pwd.getpwnam(args.service_user)
+    if all(path.parent == args.root for path in (args.prefix, args.data, args.conf_dir, args.backup_dir)):
+        args.root.chmod(0o750)
+        os.chown(args.root, 0, account.pw_gid)
     for path in [args.data, *args.data.rglob('*')]:
         if not path.is_symlink():
             os.chown(path, account.pw_uid, account.pw_gid)
@@ -653,7 +685,7 @@ def restore(args, snapshot: Path):
             parent_record = item.get('parent_permissions') or (permission_record(target.parent) if target.parent.is_dir() else None)
             if parent_record is not None:
                 provider_parent_permissions[str(target.parent)] = parent_record
-    for name in (*MANAGED_DIRS, *MANAGED_FILES, '.venv'):
+    for name in (*MANAGED_DIRS, *MANAGED_FILES, '.venv', *meta.get('local_program_dirs', [])):
         target = args.prefix / name
         if target.is_symlink():
             raise InstallError('unsafe restore target')
@@ -798,10 +830,11 @@ def install(args, source: Path):
 
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument('command', nargs='?', default='install', choices=['install', 'init', 'update', 'rollback', 'status', 'health'])
+    result.add_argument('command', nargs='?', default='install', choices=['install', 'init', 'update', 'rollback', 'status', 'health', 'migrate-layout'])
     mode = result.add_mutually_exclusive_group()
     mode.add_argument('--system', action='store_true')
     mode.add_argument('--user', action='store_true')
+    result.add_argument('--root', type=Path, help='Unified installation root containing app/config/data/backups')
     result.add_argument('--prefix', type=Path)
     result.add_argument('--data', type=Path)
     result.add_argument('--conf-dir', '--conf', dest='conf_dir', type=Path)
@@ -825,10 +858,32 @@ def parser():
 
 
 def normalise(args):
-    args.prefix = args.prefix or Path('/opt/ayana' if args.system else '~/.local/share/ayana').expanduser()
-    args.data = args.data or Path('/var/lib/ayana' if args.system else '~/.local/share/ayana-data').expanduser()
-    args.conf_dir = args.conf_dir or Path('/etc/ayana' if args.system else '~/.config/ayana').expanduser()
-    args.backup_dir = args.backup_dir or args.prefix.parent / (args.prefix.name + '-backups')
+    args.root_explicit = args.root is not None
+    unresolved_root = (args.root or Path('/opt/ayana' if args.system else '~/.local/share/ayana')).expanduser()
+    args.root = unresolved_root.resolve()
+    if args.root == Path(args.root.anchor) or any(path.is_symlink() for path in (unresolved_root, *unresolved_root.parents)):
+        raise InstallError('unsafe installation root')
+    legacy_conf = Path('/etc/ayana' if args.system else '~/.config/ayana').expanduser()
+    legacy_data = Path('/var/lib/ayana' if args.system else '~/.local/share/ayana-data').expanduser()
+    legacy_prefix = Path('/opt/ayana' if args.system else '~/.local/share/ayana').expanduser()
+    # New installs are consolidated. An ordinary upgrade must discover the
+    # installed config before choosing paths, rather than create a new database.
+    has_unified_config = (args.root / 'config/config.json').is_file()
+    has_legacy_config = (legacy_conf / 'config.json').is_file()
+    isolated_units = (args.no_start and args.unit_dir is not None
+                      and args.unit_dir.expanduser().resolve() != Path('/etc/systemd/system').resolve()
+                      and not any((args.unit_dir / name).exists() for name in UNITS))
+    if (args.root_explicit and args.system and has_legacy_config and not has_unified_config
+            and args.command != 'migrate-layout' and not isolated_units):
+        raise InstallError('existing legacy instance detected; use migrate-layout before installing into a new root')
+    legacy = (not has_unified_config and (not args.root_explicit or args.command == 'migrate-layout')
+              and has_legacy_config)
+    args.layout = 'legacy' if legacy else 'unified'
+    args.prefix = args.prefix or (legacy_prefix if legacy else args.root / 'app')
+    args.data = args.data or (legacy_data if legacy else args.root / 'data')
+    args.conf_dir = args.conf_dir or (legacy_conf if legacy else args.root / 'config')
+    old_migration_paths = args.command == 'migrate-layout' and args.prefix != args.root / 'app'
+    args.backup_dir = args.backup_dir or (args.prefix.parent / (args.prefix.name + '-backups') if legacy or old_migration_paths else args.root / 'backups')
     args.unit_dir_explicit = args.unit_dir is not None
     args.unit_dir = args.unit_dir or Path('/etc/systemd/system')
     validate_paths(args)
@@ -837,6 +892,7 @@ def normalise(args):
 
 def main(argv=None):
     args = normalise(parser().parse_args(argv))
+    choose_agent_mode(args)
     if args.check:
         missing = environment_report(args)
         print(json.dumps({'missing_prerequisites': missing, 'installed': (args.prefix / 'ayana/main.py').is_file(),
@@ -852,6 +908,13 @@ def main(argv=None):
     if args.command == 'health':
         health(args)
         return 0
+    if args.command == 'migrate-layout':
+        import importlib.util
+        from types import SimpleNamespace
+        spec = importlib.util.spec_from_file_location('ayana_layout_migration', Path(__file__).with_name('layout_migration.py'))
+        migration = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(migration)
+        return migration.migrate_layout(args, SimpleNamespace(**globals()))
     if args.command == 'rollback':
         snapshot = args.backup or Path((args.backup_dir / 'LAST').read_text())
         _, snapshot_meta = validate_snapshot(args, snapshot)

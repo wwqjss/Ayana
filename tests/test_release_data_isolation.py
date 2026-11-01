@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ayana import business, health, runbook, verify_profiles
-from ayana.main import DEFAULT_ASSETS, ensure_promconfig_admin_perms, seed_assets
+from ayana.main import DEFAULT_ASSETS, seed_assets
 from ayana.db import Database
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,7 +77,6 @@ class FreshInstallDbTests(unittest.TestCase):
         db = Database(Path(tmp.name) / "t.db")
         self.addCleanup(db.close)
         seed_assets(db)
-        ensure_promconfig_admin_perms(db)
         rows = {r["id"] for r in db.query("SELECT id FROM assets")}
         self.assertEqual(rows, {"demo-web", "demo-db"})
         self.assertFalse(rows & {"nerv", "sora", "kanata", "yomi"})

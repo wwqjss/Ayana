@@ -2,6 +2,8 @@
 
 MiMoCode 在当前原生会话中通过 MCP 调查、执行、验证和维护监控配置。本文说明当前接口的用途与约束，具体字段以运行时发现的工具定义为准。Web 手工表单与 MCP 共享监控配置校验。
 
+轻量后台 Agent 复用这些运维服务的受限子集，通过内部调用绑定当前工单、代次和账号组；它没有原生终端，也不开放这里全部配置工具。轻量模式的 `incident.verify` 是后台内部恢复检查入口，不是本文所列的公开 MiMo MCP 工具。
+
 `host.exec` 的主机权限来自所选 SSH 账号及其 sudo 配置。配置工具还会校验参数、可信会话和目标配置权限；Prometheus 文件变更包含校验、备份与失败回滚。账号组名称只是标签。
 
 ## 账号组（SSH 凭据选择）
@@ -65,10 +67,10 @@ MiMoCode 在当前原生会话中通过 MCP 调查、执行、验证和维护监
 | kind | 必填 params | 说明 |
 | --- | --- | --- |
 | `service` | `unit` | systemd 单元，`systemctl is-active` |
-| `port` | `proto`（tcp/udp/http/https）、`port`，http(s) 可带 `path`/`host` | 端口/HTTP 探测 |
-| `command` | `cmd` | 仅允许白名单程序；expect 只支持 `exit_code` |
+| `port` | `port`，可选 `protocol`（tcp/udp，默认 tcp） | 端口探测 |
+| `command` | `argv` 字符串数组 | 仅允许白名单程序；expect 只支持 `exit_code:0` |
 
-可选：`expect`（如 `{"active_state":"active"}`）、`interval_sec`（15–3600）、`fail_threshold`（1–20）、`severity`（info/warning/critical）。
+可选：`expect`（如 `{"active_state":"active"}`）、`interval_sec`（15–3600）、`fail_threshold`（1–10）、`severity`（info/warning/critical）。MCP 直接接收 `params.argv` 和 `params.protocol`；Web 表单中的命令文本与协议选择会先转换为这些字段，不能把表单字段名直接用于工具调用。
 
 示例——添加 Nginx 服务检查：
 

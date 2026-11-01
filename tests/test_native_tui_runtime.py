@@ -361,8 +361,8 @@ class RuntimePathsTests(unittest.TestCase):
         if os.name != "posix":
             self.skipTest("posix default")
         paths = runtime_paths({})
-        self.assertEqual(paths["home"], "/var/lib/ayana")
-        self.assertEqual(paths["workdir"], "/var/lib/ayana/agent-workspace")
+        self.assertEqual(paths["home"], "/opt/ayana/data")
+        self.assertEqual(paths["workdir"], "/opt/ayana/data/agent-workspace")
         self.assertTrue(paths["attestation"].endswith("attestation.json"))
 
     def test_overrides(self):

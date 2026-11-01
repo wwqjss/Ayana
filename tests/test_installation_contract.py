@@ -26,6 +26,10 @@ sys.path.insert(0, str(ROOT / 'scripts'))
 from release_manifest import release_files
 from build_release import build
 
+migration_spec = importlib.util.spec_from_file_location('layout_contract', ROOT / 'deploy/layout_migration.py')
+migration = importlib.util.module_from_spec(migration_spec)
+migration_spec.loader.exec_module(migration)
+
 
 class DeploymentFixture(unittest.TestCase):
     def setUp(self):
@@ -58,6 +62,250 @@ class DeploymentFixture(unittest.TestCase):
             connection.execute('CREATE TABLE IF NOT EXISTS facts(value TEXT)')
             connection.execute('DELETE FROM facts')
             connection.execute('INSERT INTO facts VALUES(?)', (value,))
+
+    def migration_args(self):
+        self.args.root = self.args.prefix
+        self.args.skip_pip = False
+        self.args.command = 'migrate-layout'
+        return self.args
+
+    def require_symlink(self):
+        target = self.base / 'link-target'
+        target.mkdir()
+        link = self.base / 'link-capability'
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError:
+            self.skipTest('directory symlink creation unavailable')
+        link.unlink()
+
+    def test_fresh_root_is_four_sibling_directories_and_renders_without_old_paths(self):
+        args = deployment.normalise(deployment.parser().parse_args([
+            '--system', '--no-start', '--skip-pip', '--agent-mode', 'lite', '--root', str(self.base / 'unified'),
+            '--unit-dir', str(self.base / 'new-units')]))
+        with contextlib.redirect_stdout(io.StringIO()):
+            deployment.install(args, self.source)
+        self.assertEqual(args.prefix, args.root / 'app')
+        self.assertEqual(args.data, args.root / 'data')
+        self.assertEqual(args.conf_dir, args.root / 'config')
+        self.assertTrue((args.root / 'backups').is_dir())
+        self.assertTrue((args.data / 'knowledge').is_dir())
+        for name in deployment.UNITS:
+            text = (args.unit_dir / name).read_text(encoding='utf-8')
+            self.assertNotIn('@AYANA_', text)
+            self.assertIn(str(args.prefix) + '/.venv', text)
+            self.assertNotIn('/var/lib/ayana', text)
+            self.assertNotIn('/etc/ayana', text)
+
+    def test_existing_legacy_config_is_discovered_without_creating_a_second_instance(self):
+        legacy = Path('/etc/ayana/config.json')
+        real = Path.is_file
+        with patch.object(Path, 'is_file', lambda path: path == legacy or real(path)):
+            args = deployment.normalise(deployment.parser().parse_args(['--system']))
+        self.assertEqual(args.prefix, Path('/opt/ayana').resolve())
+        self.assertEqual(args.conf_dir, legacy.parent.resolve())
+        self.assertEqual(args.layout, 'legacy')
+
+    def test_explicit_root_does_not_adopt_an_unrelated_legacy_configuration(self):
+        legacy = Path('/etc/ayana/config.json')
+        real = Path.is_file
+        with patch.object(Path, 'is_file', lambda path: path == legacy or real(path)):
+            args = deployment.normalise(deployment.parser().parse_args(['--system', '--no-start', '--root', str(self.base / 'independent'), '--unit-dir', str(self.base / 'isolated-units')]))
+        self.assertEqual(args.prefix, args.root / 'app')
+        self.assertEqual(args.conf_dir, args.root / 'config')
+
+    def test_explicit_root_cannot_bypass_an_existing_system_instance(self):
+        legacy = Path('/etc/ayana/config.json')
+        real = Path.is_file
+        with patch.object(Path, 'is_file', lambda path: path == legacy or real(path)):
+            for extra in ([], ['--no-start', '--unit-dir', '/etc/systemd/system']):
+                with self.subTest(extra=extra), self.assertRaisesRegex(deployment.InstallError, 'existing legacy instance'):
+                    deployment.normalise(deployment.parser().parse_args(['--system', '--root', str(self.base / 'new-root'), *extra]))
+
+    def test_filesystem_anchor_cannot_be_used_as_installation_root(self):
+        anchor = Path.cwd().anchor
+        with self.assertRaisesRegex(deployment.InstallError, 'unsafe installation root'):
+            deployment.normalise(deployment.parser().parse_args(['--system', '--root', anchor]))
+
+    def test_direct_interactive_install_chooses_lite_without_fake_resource_numbers(self):
+        with patch.object(deployment.sys.stdin, 'isatty', return_value=True), patch('builtins.input', return_value=''), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            deployment.choose_agent_mode(self.args)
+        self.assertEqual(self.args.agent_mode, 'lite')
+        self.assertIn('MiMoCode/tmux', output.getvalue())
+        self.assertNotIn('MB', output.getvalue())
+
+    def test_migration_preparation_failure_leaves_original_files_and_no_service_changes(self):
+        self.install()
+        self.make_db()
+        original_config = (self.args.conf_dir / 'config.json').read_bytes()
+        self.migration_args()
+        with patch.object(deployment, 'install_dependencies', side_effect=deployment.InstallError('dependency failure')):
+            with self.assertRaisesRegex(deployment.InstallError, 'dependency failure'), contextlib.redirect_stdout(io.StringIO()):
+                migration.migrate_layout(self.args, deployment)
+        self.assertTrue((self.args.prefix / 'ayana/main.py').is_file())
+        self.assertEqual((self.args.conf_dir / 'config.json').read_bytes(), original_config)
+        self.assertFalse((self.args.root / 'app').exists())
+        self.run.assert_not_called()
+
+    def test_layout_migration_preserves_database_history_provider_identity_and_dropins(self):
+        self.require_symlink()
+        self.install()
+        self.make_db()
+        history = self.args.data / '.local/share/mimocode/history.db'
+        history.parent.mkdir(parents=True)
+        history.write_bytes(b'original-native-history')
+        provider = self.args.conf_dir / 'mimo/mimocode.jsonc'
+        provider.parent.mkdir()
+        provider.write_text('{"provider":{"fixture":{"options":{"apiKey":"private-fixture"}}}}')
+        cfg = deployment.read_json(self.args.conf_dir / 'config.json')
+        cfg.update(mimo_config_dir=str(provider.parent), mimo_bin='')
+        cfg['auto_investigate'] = {'mimo_bin': str(self.args.data / '.mimocode/bin/mimo')}
+        (self.args.conf_dir / 'config.json').write_text(json.dumps(cfg))
+        old_config = self.args.conf_dir
+        old_data = self.args.data
+        old_backups = self.args.backup_dir
+        dropin = self.args.unit_dir / 'ayana.service.d/override.conf'
+        dropin.parent.mkdir()
+        dropin.write_text('Environment=PYTHONPATH=' + str(self.args.prefix) + '\nReadWritePaths=' + str(old_data) + '\n')
+        self.migration_args()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(migration.migrate_layout(self.args, deployment), 0)
+        root = self.args.root
+        self.assertTrue((root / 'app/ayana/main.py').is_file())
+        self.assertFalse((root / 'ayana').exists())
+        self.assertTrue(old_config.is_symlink())
+        self.assertTrue(old_data.is_symlink())
+        self.assertTrue(old_backups.is_symlink())
+        self.assertEqual((root / 'data/.local/share/mimocode/history.db').read_bytes(), b'original-native-history')
+        updated = deployment.read_json(root / 'config/config.json')
+        self.assertEqual(updated['mimo_config_dir'], str(provider.parent))
+        self.assertEqual(updated['mimo_workdir'], cfg['mimo_workdir'])
+        self.assertEqual(updated['mimo_bin'], str(root / 'data/.mimocode/bin/mimo'))
+        self.assertEqual(updated['auto_investigate']['mimo_bin'], updated['mimo_bin'])
+        self.assertIn(str(root / 'app'), dropin.read_text())
+        self.assertIn(str(root / 'data'), dropin.read_text())
+        self.assertNotIn(str(root / 'app/data'), dropin.read_text())
+        report = json.loads(Path((root / 'backups/MIGRATION-LAST').read_text()).read_text())
+        snapshot = Path(report['snapshot'])
+        self.assertTrue((snapshot / 'runtime-data.tar.gz').is_file())
+        self.assertEqual(deployment.read_json(snapshot / 'backup.json')['prefix'], str(root))
+        self.assertFalse((root / 'backups/LAST').exists())
+        with sqlite3.connect(root / 'data/ayana.db') as connection:
+            self.assertEqual(connection.execute('SELECT value FROM facts').fetchone()[0], 'before')
+        self.run.assert_not_called()
+
+    def test_late_migration_failure_restores_original_layout_after_backup_move(self):
+        self.require_symlink()
+        self.install()
+        self.make_db()
+        venv = self.args.prefix / '.venv/retain.txt'
+        venv.parent.mkdir()
+        venv.write_text('original-environment')
+        marker = self.args.prefix / 'unmanaged.txt'
+        marker.write_text('keep user file')
+        self.migration_args()
+        original_replace = migration._replace_json
+        def fail_commit(path, value):
+            if value.get('status') == 'complete':
+                raise OSError('commit marker failure')
+            return original_replace(path, value)
+        with patch.object(migration, '_replace_json', side_effect=fail_commit):
+            with self.assertRaisesRegex(OSError, 'commit marker failure'), contextlib.redirect_stdout(io.StringIO()):
+                migration.migrate_layout(self.args, deployment)
+        self.assertFalse(self.args.data.is_symlink())
+        self.assertFalse(self.args.conf_dir.is_symlink())
+        self.assertFalse(self.args.backup_dir.is_symlink())
+        self.assertTrue((self.args.prefix / 'ayana/main.py').is_file())
+        self.assertEqual(venv.read_text(), 'original-environment')
+        self.assertEqual(marker.read_text(), 'keep user file')
+        self.assertFalse((self.args.root / 'app').exists())
+        with sqlite3.connect(self.args.data / 'ayana.db') as connection:
+            self.assertEqual(connection.execute('SELECT value FROM facts').fetchone()[0], 'before')
+
+    def test_lite_migration_keeps_verified_mimo_credentials_and_literal_fingerprint(self):
+        from ayana.mimo_admin import MimoAdmin
+        self.require_symlink()
+        self.install()
+        self.make_db()
+        provider_dir = self.args.data / '.config/mimocode'
+        provider_dir.mkdir(parents=True)
+        provider = provider_dir / 'mimocode.jsonc'
+        provider.write_text(json.dumps({'model': 'fixture/test-model', 'provider': {
+            'fixture': {'options': {'apiKey': 'fixture-private-key', 'baseURL': 'https://provider.example/v1'},
+                        'models': {'test-model': {'name': 'test-model'}}}}}))
+        admin = MimoAdmin(config_dir=str(provider_dir))
+        fingerprint = admin._fingerprint(admin.resolve_provider())
+        state = json.dumps({'verified': True, 'fingerprint': fingerprint, 'last_test_at': 12345, 'last_result': 'ok'})
+        with sqlite3.connect(self.args.data / 'ayana.db') as connection:
+            connection.execute('CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)')
+            connection.execute("INSERT INTO meta VALUES('mimo_provider_state',?)", (state,))
+        cfg = deployment.read_json(self.args.conf_dir / 'config.json')
+        cfg.update(agent_mode='lite', mimo_config_dir=str(provider_dir))
+        (self.args.conf_dir / 'config.json').write_text(json.dumps(cfg))
+        original_provider = provider.read_bytes()
+        self.migration_args()
+        with contextlib.redirect_stdout(io.StringIO()):
+            migration.migrate_layout(self.args, deployment)
+        updated = deployment.read_json(self.args.root / 'config/config.json')
+        self.assertEqual(updated['mimo_config_dir'], str(provider_dir))
+        after = MimoAdmin(config_dir=updated['mimo_config_dir'])
+        self.assertEqual(after._fingerprint(after.resolve_provider()), fingerprint)
+        self.assertEqual(provider.read_bytes(), original_provider)
+        with sqlite3.connect(self.args.root / 'data/ayana.db') as connection:
+            self.assertEqual(connection.execute("SELECT value FROM meta WHERE key='mimo_provider_state'").fetchone()[0], state)
+
+    def test_new_service_health_failure_restores_old_units_and_data(self):
+        self.require_symlink()
+        self.install()
+        self.make_db()
+        old_units = {name: (self.args.unit_dir / name).read_bytes() for name in deployment.UNITS}
+        self.migration_args()
+        self.args.no_start = False
+        calls = []
+        with patch.object(deployment, 'run', side_effect=lambda *argv: calls.append(argv)), \
+                patch.object(deployment, 'set_permissions'), \
+                patch.object(deployment, 'wait_health', side_effect=deployment.InstallError('health failure')):
+            with self.assertRaisesRegex(deployment.InstallError, 'health failure'), contextlib.redirect_stdout(io.StringIO()):
+                migration.migrate_layout(self.args, deployment)
+        for name, content in old_units.items():
+            self.assertEqual((self.args.unit_dir / name).read_bytes(), content)
+        self.assertTrue((self.args.prefix / 'ayana/main.py').is_file())
+        self.assertFalse(self.args.data.is_symlink())
+        self.assertFalse((self.args.root / 'app').exists())
+        self.assertEqual(calls[-1], ('systemctl', 'start', *deployment.UNITS))
+
+    def test_dropin_directory_link_is_rejected_before_reading_or_writing_its_target(self):
+        directory = self.args.unit_dir / 'ayana.service.d'
+        original = Path.is_symlink
+        with patch.object(Path, 'is_symlink', lambda path: path == directory or original(path)):
+            with self.assertRaisesRegex(deployment.InstallError, 'symlinks require'):
+                migration._units(self.args, deployment)
+
+    def test_unit_rewrite_does_not_rewrite_new_data_path_as_program_path(self):
+        root = Path('/opt/ayana')
+        old_data = Path('/var/lib/ayana')
+        text = 'ExecStart=/opt/ayana/.venv/bin/python\nEnvironment=HOME=/var/lib/ayana\n'
+        output = migration.rewrite_paths(text, {root: root / 'app', old_data: root / 'data'})
+        self.assertIn('ExecStart=/opt/ayana/app/.venv/bin/python', output)
+        self.assertIn('Environment=HOME=/opt/ayana/data', output)
+        self.assertNotIn('/opt/ayana/app/data', output)
+
+    @unittest.skipUnless(os.name == 'posix', 'Unix IPC fixture')
+    def test_native_socket_is_skipped_while_persistent_runtime_files_are_migrated(self):
+        import socket
+        self.require_symlink()
+        self.install()
+        self.make_db()
+        sockfile = self.args.data / 'agent-runtime/tmux.sock'
+        with socket.socket(socket.AF_UNIX) as sock:
+            sock.bind(str(sockfile))
+        self.migration_args()
+        with contextlib.redirect_stdout(io.StringIO()):
+            migration.migrate_layout(self.args, deployment)
+        report = json.loads(Path((self.args.root / 'backups/MIGRATION-LAST').read_text()).read_text())
+        self.assertIn('agent-runtime/tmux.sock', report['ignored_transient_entries'])
+        self.assertFalse((self.args.root / 'data/agent-runtime/tmux.sock').exists())
 
     def test_install_configures_two_independent_units_and_shared_provider_path(self):
         self.install()

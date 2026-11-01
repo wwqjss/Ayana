@@ -2,12 +2,12 @@
 
 Ayana 是一个以事件为中心的运维工作台。接入告警后，Agent 调查原因、执行主机命令并核对恢复证据；主机连接、账号组、工单与审计由 Ayana 管理。
 
-当前发布版本：**v0.9.0**。
+当前发布版本：**v0.9.1**。
 
 ```text
 告警 / 业务检查 → 工单与故障代次 → 轻量后台 Agent 或 MiMoCode
                                   ↓
-                         MCP 查询与 host.exec
+                         状态查询与主机执行
                                   ↓
                    执行台账 / 恢复证据 / 通知与审计
 ```
@@ -29,32 +29,43 @@ Ayana 是一个以事件为中心的运维工作台。接入告警后，Agent �
 
 ## 安装
 
-在使用 systemd 的 Linux 服务器上复制执行以下命令。root 账号直接安装，普通账号会请求 sudo；脚本会自动准备系统依赖和官方 MiMoCode CLI，安装 Ayana、启动两个服务，并检查 Web 是否正常响应：
+在使用 systemd 的 Linux 服务器上复制执行以下命令。脚本会先询问安装方式，显示两种模式的功能和占用差别，再准备所需依赖、安装并启动程序：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/wwqjss/Ayana/main/deploy/bootstrap.sh -o ayana-bootstrap.sh &&
 bash ayana-bootstrap.sh --system
 ```
 
+| 安装方式 | 功能与占用 |
+| --- | --- |
+| **1. 轻量安装** | 后台自动值班、调查和修复；无聊天或交互终端，不安装 MiMoCode、tmux，占用较低 |
+| **2. 完整安装** | MiMoCode 交互、原生终端和人工接管；额外安装 MiMoCode、tmux，占用较高 |
+
+新安装回车选择轻量模式；已有安装回车沿用当前模式。实际内存、CPU 和模型费用随任务数量、模型及上下文变化，菜单不使用固定占用承诺。root 账号直接安装，普通账号会请求 sudo。
+
 完成后，终端会显示服务状态、访问方式和首次注册令牌的位置。在远程服务器安装时，按输出提示建立 SSH 转发，再用本机浏览器打开 `http://127.0.0.1:6200`；模型接口和 API Key 在页面中设置。
 
-脚本支持 apt、dnf 或 yum，要求系统软件源能提供 Python 3.11+。已有配置与可用 CLI 会沿用。Ayana 下载使用最新正式 Release 并校验 SHA256。系统安装默认使用：
+脚本支持 apt、dnf 或 yum，要求系统软件源能提供 Python 3.11+。已有配置与可用 CLI 会沿用。Ayana 下载使用最新正式 Release 并校验 SHA256。新安装将项目文件集中在一个根目录：
 
-- 程序：`/opt/ayana`
-- 配置：`/etc/ayana`
-- 数据与运行时：`/var/lib/ayana`
-- Web：`http://127.0.0.1:6200`
-- 服务：`ayana`、`ayana-agent-runtime`
+```text
+/opt/ayana/
+├── app/       程序与运行依赖
+├── config/    配置与密钥
+├── data/      数据库、账号组、会话、知识与审计
+└── backups/   升级与迁移备份
+```
 
-完整安装、固定版本、用户模式和升级步骤见 [安装手册](docs/INSTALL.md)。
+Web 默认地址为 `http://127.0.0.1:6200`。两个服务名仍为 `ayana`、`ayana-agent-runtime`；systemd 注册文件位于系统服务目录。新安装可用 `--root /srv/ayana` 选定其他根目录，已有实例改变目录时使用迁移流程。
 
-安装时可选择轻量后台值班：
+自动化安装可通过参数直接选择，跳过菜单：
 
 ```bash
 bash ayana-bootstrap.sh --system --agent-mode lite
 ```
 
-完整交互模式使用 `--agent-mode mimo`。全新安装未指定时默认 MiMo；升级未指定时沿用已有模式。轻量模式无需 MiMoCode 和 tmux，仍保留 Web 管理、监控、工单和审计；Agent 本身没有聊天、终端或人工接管界面。
+完整安装使用 `--agent-mode mimo`。没有可交互终端的新安装须显式指定模式；已有自动化升级未指定时沿用当前模式。两种模式均保留 Web 管理、监控、工单和审计。
+
+旧版分散目录会被识别，普通升级沿用原位置；使用新版的 `migrate-layout` 入口可在备份和任务空闲核对后迁入统一根目录。完整安装、目录迁移和回滚步骤见[安装手册](docs/INSTALL.md)。
 
 ## 第一次使用
 

@@ -12,6 +12,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -131,7 +132,13 @@ esac
                 entry.linkname = "deploy/install.sh"
                 archive.addfile(entry)
 
-    def run_bootstrap(self, *args: str, version: str | None = None, sha_mode="valid", extra_env=None):
+    def bootstrap_invocation(self, args, *, version=None, sha_mode="valid", extra_env=None, default_mode="mimo"):
+        # Most archive/dependency contracts select their mode explicitly. Menu
+        # contracts pass default_mode=None to exercise a genuinely omitted flag.
+        args = list(args or ("--user",))
+        if (default_mode is not None and not any(arg == "--agent-mode" or arg.startswith("--agent-mode=") for arg in args)
+                and not any(arg in ("--check", "--help", "-h") for arg in args)):
+            args.extend(("--agent-mode", default_mode))
         environment = dict(os.environ)
         for key in ("AYANA_VERSION", "AYANA_SHA256", "AYANA_REPO", "AYANA_MIMO_VERSION", "AYANA_MIMO_INSTALL_PATH", "BASH_ENV", "AYANA_BOOTSTRAP_ELEVATED"):
             environment.pop(key, None)
@@ -161,8 +168,55 @@ esac
         if version is not None:
             environment["AYANA_VERSION"] = version
         command = 'export PATH="$BOOTSTRAP_TEST_BIN:/usr/bin:/bin"; exec bash "$BOOTSTRAP_UNDER_TEST" "$@"'
-        return subprocess.run([self.bash, "--noprofile", "--norc", "-c", command, "bootstrap-contract", *args],
-                              env=environment, capture_output=True, timeout=30, encoding="utf-8", errors="replace")
+        return [self.bash, "--noprofile", "--norc", "-c", command, "bootstrap-contract", *args], environment
+
+    def run_bootstrap(self, *args: str, version: str | None = None, sha_mode="valid", extra_env=None, default_mode="mimo", cwd=None):
+        command, environment = self.bootstrap_invocation(args, version=version, sha_mode=sha_mode,
+                                                         extra_env=extra_env, default_mode=default_mode)
+        return subprocess.run(command, env=environment, capture_output=True, timeout=30, encoding="utf-8", errors="replace",
+                              start_new_session=os.name != "nt", cwd=cwd)
+
+    def run_interactive(self, *args, answer="\n", extra_env=None, stdin_pipe=False):
+        if os.name != "posix":
+            self.skipTest("PTY menu contracts require POSIX; also exercised by the Linux release smoke")
+        import pty
+        import select
+        command, environment = self.bootstrap_invocation(args, extra_env=extra_env, default_mode=None)
+        master, slave = pty.openpty()
+        def terminal_session():
+            import fcntl
+            import termios
+            os.setsid()
+            fcntl.ioctl(1, termios.TIOCSCTTY, 0)
+
+        process = subprocess.Popen(command, env=environment, stdin=subprocess.DEVNULL if stdin_pipe else slave,
+                                   stdout=slave, stderr=slave, start_new_session=not stdin_pipe,
+                                   preexec_fn=terminal_session if stdin_pipe else None)
+        os.close(slave)
+        output = bytearray()
+        deadline = time.monotonic() + 30
+        try:
+            os.write(master, answer.encode())
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.1)[0]:
+                    try:
+                        block = os.read(master, 65536)
+                    except OSError:
+                        break
+                    if not block:
+                        break
+                    output.extend(block)
+                elif process.poll() is not None:
+                    break
+            else:
+                self.fail("interactive bootstrap did not terminate")
+            process.wait(timeout=5)
+            return process.returncode, output.decode("utf-8", errors="replace")
+        finally:
+            os.close(master)
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
 
     def assert_rejected(self, result):
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -175,7 +229,7 @@ esac
             "https://github.com/wwqjss/Ayana/releases/latest/download/ayana-install.tar.gz",
             "https://github.com/wwqjss/Ayana/releases/latest/download/ayana-install.tar.gz.sha256",
         ])
-        self.assertEqual(self.execution.read_text().splitlines(), ["--user"])
+        self.assertEqual(self.execution.read_text().splitlines(), ["--user", "--agent-mode", "mimo"])
         self.assertEqual(list(self.work.iterdir()), [], "Bootstrap temporary directory was not removed")
 
     def test_explicit_release_selects_the_versioned_asset_and_passes_installer_options(self):
@@ -185,7 +239,7 @@ esac
             "https://github.com/wwqjss/Ayana/releases/download/v0.8.1/ayana-0.8.1-install.tar.gz",
             "https://github.com/wwqjss/Ayana/releases/download/v0.8.1/ayana-0.8.1-install.tar.gz.sha256",
         ])
-        self.assertEqual(self.execution.read_text().splitlines(), ["--system", "--no-start"])
+        self.assertEqual(self.execution.read_text().splitlines(), ["--system", "--no-start", "--agent-mode", "mimo"])
 
     def test_checksum_mismatch_never_executes_the_package(self):
         result = self.run_bootstrap(sha_mode="mismatch")
@@ -289,7 +343,7 @@ printf '%s\0' "$@" > "$BOOTSTRAP_TEST_SUDO_LOG"
         for key, value in values.items():
             if key not in {"UNRELATED_SECRET", "AYANA_UNRELATED"}:
                 self.assertEqual(passed[key], value)
-        self.assertEqual(logged[command_at + 1:], [bash_path(ROOT / "deploy/bootstrap.sh"), *args])
+        self.assertEqual(logged[command_at + 1:], [bash_path(ROOT / "deploy/bootstrap.sh"), *args, "--agent-mode", "mimo"])
         self.assertFalse(self.urls.exists())
         self.assertFalse(self.package_log.exists())
         self.assertFalse(self.execution.exists())
@@ -363,11 +417,116 @@ printf '%s\0' "$@" > "$BOOTSTRAP_TEST_SUDO_LOG"
         self.assertIn('background automatic duty only', result.stdout)
         self.assertIn('--agent-mode\nlite', self.execution.read_text())
 
+    def test_fresh_noninteractive_install_requires_a_mode_before_any_changes(self):
+        self.reject_mktemp()
+        result = self.run_bootstrap(default_mode=None)
+        self.assert_rejected(result)
+        self.assertIn('--agent-mode lite', result.stderr)
+        self.assertFalse(self.urls.exists())
+        self.assertFalse(self.package_log.exists())
+        self.assertFalse(self.mktemp_log.exists())
+
+    def test_interactive_default_selects_lightweight_before_download(self):
+        code, output = self.run_interactive('--user', answer='\n')
+        self.assertEqual(code, 0, output)
+        self.assertIn('轻量安装', output)
+        self.assertIn('完整安装', output)
+        self.assertIn('占用较低', output)
+        self.assertLess(output.index('请选择 Ayana'), output.index('Downloading Ayana'))
+        self.assertEqual(self.execution.read_text().splitlines(), ['--user', '--agent-mode', 'lite'])
+        self.assertFalse(self.mimo_log.exists())
+
+    def test_interactive_invalid_input_can_be_corrected_to_complete_mode(self):
+        code, output = self.run_interactive('--user', answer='invalid\n2\n')
+        self.assertEqual(code, 0, output)
+        self.assertIn('请输入 1（轻量）或 2（完整）', output)
+        self.assertEqual(self.execution.read_text().splitlines()[-2:], ['--agent-mode', 'mimo'])
+
+    def test_interactive_eof_stops_without_download_or_installation(self):
+        code, output = self.run_interactive('--user', answer='\x04')
+        self.assertNotEqual(code, 0, output)
+        self.assertIn('未读取到安装选择', output)
+        self.assertFalse(self.urls.exists())
+        self.assertFalse(self.package_log.exists())
+        self.assertFalse(self.execution.exists())
+
+    def test_interactive_upgrade_defaults_to_its_current_mode(self):
+        (self.conf_dir / 'config.json').write_text(json.dumps({'agent_mode': 'mimo'}))
+        code, output = self.run_interactive('--user', '--conf-dir', bash_path(self.conf_dir), answer='\n')
+        self.assertEqual(code, 0, output)
+        self.assertIn('沿用当前完整安装', output)
+        self.assertEqual(self.execution.read_text().splitlines()[-2:], ['--agent-mode', 'mimo'])
+
+    def test_interactive_choice_is_forwarded_to_sudo_without_reprompting(self):
+        env = self.non_root_system()
+        self.write_shell('id', r'''#!/usr/bin/env bash
+if [[ "${AYANA_BOOTSTRAP_ELEVATED:-0}" == 1 ]]; then printf '0\n'; else printf '1000\n'; fi
+''')
+        self.write_shell('sudo', r'''#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\0' "$@" > "$BOOTSTRAP_TEST_SUDO_LOG"
+[[ "${1:-}" != -H ]] || shift
+exec "$@"
+''')
+        code, output = self.run_interactive(*self.system_args(), answer='1\n', extra_env=env)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output.count('请选择 Ayana 安装方式'), 1)
+        logged = self.sudo_log.read_bytes().decode().rstrip('\0').split('\0')
+        self.assertEqual(logged[-2:], ['--agent-mode', 'lite'])
+        self.assertTrue(self.execution.exists())
+        self.assertFalse(self.mimo_log.exists())
+
+    def test_interactive_menu_reads_the_controlling_terminal_when_stdin_is_piped(self):
+        code, output = self.run_interactive('--user', answer='1\n', stdin_pipe=True)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.execution.read_text().splitlines()[-2:], ['--agent-mode', 'lite'])
+
+    def test_explicit_mode_skips_the_interactive_menu(self):
+        result = self.run_bootstrap('--user', '--agent-mode', 'lite', default_mode=None)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn('请选择 Ayana', result.stdout + result.stderr)
+        self.assertIn('--agent-mode\nlite', self.execution.read_text())
+
+    def test_root_discovers_saved_mode_and_keeps_all_installer_arguments(self):
+        managed = self.folder / 'managed'
+        (managed / 'config').mkdir(parents=True)
+        (managed / 'config/config.json').write_text(json.dumps({'agent_mode': 'lite'}))
+        result = self.run_bootstrap('--user', '--root', bash_path(managed), default_mode=None)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.execution.read_text().splitlines(), ['--user', '--root', bash_path(managed)])
+        self.assertIn('Agent mode: lite', result.stdout)
+        self.assertFalse(self.mimo_log.exists())
+
+    def test_new_full_install_places_its_cli_under_the_program_directory(self):
+        env = self.automatic_system()
+        env['AYANA_MIMO_INSTALL_PATH'] = ''
+        result = self.run_bootstrap(*self.system_args(), extra_env=env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        destination = self.folder / 'app/bin/mimo'
+        self.assertTrue(destination.is_file())
+        self.assertEqual(self.execution.read_text().splitlines()[-2:], ['--mimo-bin', bash_path(destination)])
+
+    def test_relative_root_still_places_the_cli_in_the_resolved_app_directory(self):
+        env = self.automatic_system()
+        env['AYANA_MIMO_INSTALL_PATH'] = ''
+        result = self.run_bootstrap('--system', '--root', 'managed', extra_env=env, cwd=self.folder)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        destination = self.folder / 'managed/app/bin/mimo'
+        self.assertTrue(destination.is_file())
+        passed = self.execution.read_text().splitlines()[-2:]
+        self.assertEqual(passed[0], '--mimo-bin')
+        if os.name == 'nt':
+            converted = subprocess.run([self.bash, '--noprofile', '--norc', '-c', 'cygpath -w "$1"', 'path-check', passed[1]],
+                                       capture_output=True, text=True, check=True, timeout=5)
+            self.assertEqual(Path(converted.stdout.strip()).resolve(), destination.resolve())
+        else:
+            self.assertEqual(Path(passed[1]).resolve(), destination.resolve())
+
     def test_omitted_mode_preserves_an_installed_lite_configuration(self):
         path = self.conf_dir / 'config.json'
         original = json.dumps({'agent_mode': 'lite', 'mimo_bin': '/old/unavailable/mimo'})
         path.write_text(original)
-        result = self.run_bootstrap(*self.system_args(), extra_env=self.automatic_system(missing='tmux'))
+        result = self.run_bootstrap(*self.system_args(), extra_env=self.automatic_system(missing='tmux'), default_mode=None)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         if self.package_log.exists():
             self.assertNotIn('tmux', self.package_log.read_text())
@@ -656,6 +815,49 @@ exit 97
         self.assertFalse(self.urls.exists())
         self.assertFalse(self.mktemp_log.exists())
         self.assertFalse(self.execution.exists())
+
+    def test_unified_root_check_invokes_only_the_local_app_verifier(self):
+        self.reject_mktemp()
+        managed = self.folder / 'managed'
+        (managed / 'app/deploy').mkdir(parents=True)
+        (managed / 'app/deploy/installation.py').write_text(
+            "import json, os, pathlib, sys\n"
+            "pathlib.Path(os.environ['BOOTSTRAP_TEST_CHECK_LOG_NATIVE']).write_text(json.dumps(sys.argv[1:]))\n",
+            encoding='utf-8')
+        result = self.run_bootstrap('--check', '--root', bash_path(managed), default_mode=None)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        logged = json.loads(self.check_log.read_text())
+        self.assertEqual(logged[:3], ['install', '--check', '--root'])
+        self.assertEqual(Path(logged[3]).resolve(), managed.resolve())
+        self.assertFalse(self.urls.exists())
+        self.assertFalse(self.mktemp_log.exists())
+
+    def test_default_check_can_find_a_legacy_user_verifier_without_configuration(self):
+        self.reject_mktemp()
+        managed = self.home / '.local/share/ayana'
+        (managed / 'deploy').mkdir(parents=True)
+        (managed / 'deploy/installation.py').write_text(
+            "import json, os, pathlib, sys\n"
+            "pathlib.Path(os.environ['BOOTSTRAP_TEST_CHECK_LOG_NATIVE']).write_text(json.dumps(sys.argv[1:]))\n",
+            encoding='utf-8')
+        result = self.run_bootstrap('--user', '--check', default_mode=None)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(self.check_log.read_text()), ['install', '--user', '--check'])
+        self.assertFalse(self.urls.exists())
+        self.assertFalse(self.mktemp_log.exists())
+
+    def test_explicit_missing_prefix_does_not_fall_back_to_another_installation(self):
+        self.reject_mktemp()
+        managed = self.home / '.local/share/ayana'
+        (managed / 'deploy').mkdir(parents=True)
+        (managed / 'deploy/installation.py').write_text(
+            "import os, pathlib\npathlib.Path(os.environ['BOOTSTRAP_TEST_CHECK_LOG_NATIVE']).write_text('wrong verifier')\n",
+            encoding='utf-8')
+        result = self.run_bootstrap('--user', '--check', '--prefix', bash_path(self.folder / 'absent'), default_mode=None)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertFalse(self.check_log.exists())
+        self.assertFalse(self.urls.exists())
+        self.assertFalse(self.mktemp_log.exists())
 
 
 if __name__ == "__main__":

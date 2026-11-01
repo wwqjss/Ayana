@@ -19,8 +19,20 @@ from pathlib import Path
 
 DB_PATH = "/usr/trim/var/backup_service/basic_backup.db3"
 LOG_PATH = "/usr/trim/logs/backup_service.log"
-STATE_PATH = "/var/lib/ayana/ext-collector-state.json"
-CONFIG_PATH = "/etc/ayana/ext-collector.json"
+def collector_paths(root: Path, legacy_config: Path = Path("/etc/ayana/ext-collector.json"),
+                    legacy_state: Path = Path("/var/lib/ayana/ext-collector-state.json")) -> tuple[str, str]:
+    config = root / "config/ext-collector.json"
+    state = root / "data/ext-collector-state.json"
+    if not config.is_file() and legacy_config.is_file():
+        config, state = legacy_config, legacy_state
+    return str(config), str(state)
+
+
+_program = Path(__file__).resolve().parent.parent
+_root = _program.parent if _program.name == "app" else Path("/opt/ayana")
+CONFIG_PATH, STATE_PATH = collector_paths(_root)
+CONFIG_PATH = os.environ.get("AYANA_EXT_COLLECTOR_CONFIG") or CONFIG_PATH
+STATE_PATH = os.environ.get("AYANA_EXT_COLLECTOR_STATE") or STATE_PATH
 AYANA_URL = "http://127.0.0.1:6200"
 
 ERROR_CODE_HINTS = {

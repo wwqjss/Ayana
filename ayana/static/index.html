@@ -66,7 +66,7 @@
         </div>
         <div class="auth-fields">
           <label for="setup-token">初始化 Token<input id="setup-token" type="text" autocomplete="one-time-code" placeholder="粘贴 setup-admin.token 内容" required></label>
-          <p class="auth-hint" id="setup-token-hint">Token 文件：与数据库同目录的 <code>setup-admin.token</code>（权限 600）。系统安装时通常为 <code>/var/lib/ayana/setup-admin.token</code>，用户安装为数据目录下同名文件。</p>
+          <p class="auth-hint" id="setup-token-hint">初始化令牌位于数据目录的 <code>setup-admin.token</code>；具体位置会在安装完成时显示。</p>
           <label for="setup-username">用户名<input id="setup-username" type="text" autocomplete="username" placeholder="2–32 位字母/数字/._-" required></label>
           <label for="setup-password">密码<input id="setup-password" type="password" autocomplete="new-password" minlength="10" required></label>
           <label for="setup-confirm">确认密码<input id="setup-confirm" type="password" autocomplete="new-password" minlength="10" required></label>

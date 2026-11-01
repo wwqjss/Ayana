@@ -107,6 +107,18 @@ class ConfigError(Exception):
     pass
 
 
+def default_config_path() -> str:
+    """Find a local development config or the installed unified/legacy config."""
+    program = Path(__file__).resolve().parent.parent
+    candidates = [Path.cwd() / "config.json"]
+    if program.name == "app":
+        candidates.append(program.parent / "config" / "config.json")
+    candidates.extend((Path("/opt/ayana/config/config.json"), Path("/etc/ayana/config.json"),
+                       Path.home() / ".local/share/ayana/config/config.json",
+                       Path.home() / ".config/ayana/config.json"))
+    return str(next((path for path in candidates if path.is_file()), Path("config.json")))
+
+
 def _read_json(path: Path) -> dict:
     if not path.exists():
         return {}

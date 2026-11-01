@@ -1,7 +1,6 @@
-# Independent native task owner. Stopping/restarting the Web unit leaves this
-# unit and its MiMo server/tmux panes running. Drain tasks before runtime restart.
+# Independent Agent task owner. Drain tasks before runtime restart.
 [Unit]
-Description=Ayana native MiMo task runtime
+Description=Ayana Agent task runtime
 After=network-online.target
 Wants=network-online.target
 Before=ayana.service
@@ -10,8 +9,8 @@ Before=ayana.service
 Type=simple
 User=ayana
 Group=ayana
-WorkingDirectory=/var/lib/ayana/agent-workspace
-ExecStart=/opt/ayana/.venv/bin/python -m ayana.agent_runtime /etc/ayana/config.json
+WorkingDirectory=@AYANA_DATA@/agent-workspace
+ExecStart=@AYANA_APP@/.venv/bin/python -m ayana.agent_runtime @AYANA_CONFIG@/config.json
 Restart=on-failure
 RestartSec=5
 KillMode=control-group
@@ -19,12 +18,12 @@ TimeoutStopSec=30
 UMask=0077
 
 Environment=PYTHONUNBUFFERED=1
-Environment=PYTHONPATH=/opt/ayana
-Environment=HOME=/var/lib/ayana
-Environment=XDG_CONFIG_HOME=/var/lib/ayana/.config
-Environment=XDG_DATA_HOME=/var/lib/ayana/.local/share
-Environment=XDG_STATE_HOME=/var/lib/ayana/.local/state
-Environment=XDG_CACHE_HOME=/var/lib/ayana/.cache
+Environment=PYTHONPATH=@AYANA_APP@
+Environment=HOME=@AYANA_DATA@
+Environment=XDG_CONFIG_HOME=@AYANA_DATA@/.config
+Environment=XDG_DATA_HOME=@AYANA_DATA@/.local/share
+Environment=XDG_STATE_HOME=@AYANA_DATA@/.local/state
+Environment=XDG_CACHE_HOME=@AYANA_DATA@/.cache
 Environment=LANG=C.UTF-8
 UnsetEnvironment=MIMOCODE_HOME
 
@@ -32,7 +31,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/ayana
+ReadWritePaths=@AYANA_DATA@
 # Local Prometheus config management: add the configured local_dir to
 # ReadWritePaths in BOTH this unit and ayana.service via drop-ins.
 ProtectKernelTunables=true

@@ -6,7 +6,7 @@ PUBLIC_FILES = (
     'docs/README.md', 'docs/INSTALL.md', 'docs/CONFIGURATION.md', 'docs/OPERATIONS.md',
     'docs/TESTING.md', 'docs/mcp-operations.md',
     'deploy/bootstrap.sh', 'deploy/install.sh', 'deploy/ayana-setup.sh',
-    'deploy/installation.py', 'deploy/ayana.service', 'deploy/ayana-agent-runtime.service',
+    'deploy/installation.py', 'deploy/layout_migration.py', 'deploy/ayana.service', 'deploy/ayana-agent-runtime.service',
     'scripts/gen-secrets.py', 'scripts/export_retired_tables.py',
     'scripts/mcp_stdio_launcher.py', 'scripts/fnbk_collector.py',
     'scripts/migrate_monitor_config.py', 'scripts/build_release.py', 'scripts/release_manifest.py',

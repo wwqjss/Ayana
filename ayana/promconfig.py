@@ -2194,6 +2194,7 @@ class PromConfigService:
         """管理机统一安装包路径（可选配置）。"""
         for p in (
             getattr(self, "package_dir", "") or "",
+            "/opt/ayana/data/packages/node_exporter/node_exporter",
             "/data/ayana/packages/node_exporter/node_exporter",
             "/opt/ayana/packages/node_exporter/node_exporter",
         ):
@@ -2788,5 +2789,6 @@ def build_prom_config_service(
         local_assets=list(pc.get("local_assets") or []),
         require_promtool=bool(pc.get("require_promtool", True)),
     )
-    svc.package_dir = str(pc.get("package_dir") or "/data/ayana/packages/node_exporter")
+    data = Path(str(cfg.get("agent_runtime_home") or Path(str(cfg.get("db_path") or "/opt/ayana/data/ayana.db")).parent))
+    svc.package_dir = str(pc.get("package_dir") or data / "packages/node_exporter/node_exporter")
     return svc

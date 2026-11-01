@@ -1,6 +1,6 @@
 # 运维手册
 
-适用于 **Ayana v0.9.0**，系统路径以默认安装为例。
+适用于 **Ayana v0.9.1**，系统路径以默认安装为例。
 
 ## 日常使用
 
@@ -47,8 +47,8 @@ curl --fail http://127.0.0.1:6200/health
 也可使用安装时提供的状态与健康检查入口：
 
 ```bash
-sudo bash /opt/ayana/deploy/ayana-setup.sh status --system
-sudo bash /opt/ayana/deploy/ayana-setup.sh health --system
+sudo bash /opt/ayana/app/deploy/ayana-setup.sh status --system
+sudo bash /opt/ayana/app/deploy/ayana-setup.sh health --system
 ```
 
 Web 与 Agent 运行时分别管理；`ayana-agent-runtime` 根据模式持有 MiMo 原生服务或轻量后台值班进程。只需刷新 Web 进程时可运行：
@@ -65,14 +65,14 @@ sudo systemctl restart ayana
 
 | 内容 | 默认位置 |
 | --- | --- |
-| 程序、依赖和版本 | `/opt/ayana`，包括虚拟环境 |
-| 配置和所有加密秘密 | `/etc/ayana` |
-| SQLite、知识库和运行数据 | `/var/lib/ayana` |
+| 程序、依赖和版本 | `/opt/ayana/app`，包括虚拟环境 |
+| 配置和所有加密秘密 | `/opt/ayana/config` |
+| SQLite、知识库和运行数据 | `/opt/ayana/data` |
 | 两个服务定义及自定义覆盖 | systemd 单元与对应的 drop-in 目录 |
 
 数据库和秘密应成套保存。只保留程序无法恢复凭据、工单或执行台账。
 
-安装器会报告更新备份位置，默认位于 `/opt/ayana-backups`。安装器快照覆盖受管程序、虚拟环境、配置、模型配置文件、SQLite 和服务单元；知识库及其他运行数据需要另行完整备份。
+安装器会报告更新备份位置，默认位于 `/opt/ayana/backups`。安装器快照覆盖受管程序、虚拟环境、配置、模型配置文件、SQLite 和服务单元；知识库及其他运行数据需要另行完整备份。
 
 可以在确认任务空闲后制作完整停机快照。以下命令只停止 Ayana 自身服务，不操作受管主机业务：
 
@@ -81,20 +81,20 @@ backup_dir="/var/backups/ayana/$(date +%Y%m%d-%H%M%S)"
 sudo install -d -m 700 "$backup_dir"
 sudo systemctl stop ayana ayana-agent-runtime
 sudo tar -czpf "$backup_dir/snapshot.tar.gz" -C / \
-  opt/ayana etc/ayana var/lib/ayana \
+  opt/ayana \
   etc/systemd/system/ayana.service \
   etc/systemd/system/ayana-agent-runtime.service
 sudo systemctl start ayana-agent-runtime ayana
 ```
 
-如使用了自定义路径或 systemd drop-in，请把相应路径加入快照。停机后整体保存数据目录可以一并保存 SQLite 的数据库和 WAL 文件；运行中备份数据库则应使用 SQLite 在线备份接口，不能只复制单个 `.db`。
+如使用了自定义根目录、外置模型配置、共享 MiMo CLI 或 systemd drop-in，请把相应路径加入快照。停机后整体保存数据目录可以一并保存 SQLite 的数据库和 WAL 文件；运行中备份数据库则应使用 SQLite 在线备份接口，不能只复制单个 `.db`。上面的根目录快照也会包含 `backups` 中已有备份。
 
 托管升级优先使用安装器报告的配对备份回滚。核对版本、路径、时间和需要保留的新执行事实后执行：
 
 ```bash
-sudo python3 /opt/ayana/deploy/installation.py rollback --system \
-  --backup-dir /opt/ayana-backups \
-  --backup /opt/ayana-backups/CHOSEN-BACKUP
+sudo python3 /opt/ayana/app/deploy/installation.py rollback --system \
+  --backup-dir /opt/ayana/backups \
+  --backup /opt/ayana/backups/CHOSEN-BACKUP
 curl --fail http://127.0.0.1:6200/health
 ```
 
@@ -115,7 +115,7 @@ curl --fail http://127.0.0.1:6200/health
 先核对用户名、TOTP、时间同步和登录锁定状态。忘记密码时，用实际注册的用户名执行本机重置：
 
 ```bash
-sudo -u ayana /opt/ayana/.venv/bin/python -m ayana.main /etc/ayana/config.json \
+sudo -u ayana /opt/ayana/app/.venv/bin/python -m ayana.main /opt/ayana/config/config.json \
   --reset-admin-password --reset-admin-user YOUR_USERNAME
 ```
 
@@ -123,9 +123,9 @@ sudo -u ayana /opt/ayana/.venv/bin/python -m ayana.main /etc/ayana/config.json \
 
 ### Web 能打开，Agent 暂不可用
 
-在模型设置中核对 CLI 路径、Base URL、模型 ID、API Key 和“已保存配置”的验证状态。检查原生运行时日志，确认 tmux、CLI 及其依赖对服务用户可用。
+先确认安装模式。轻量模式在模型设置中核对 Base URL、模型 ID、API Key，并查看 `ayana-agent-runtime` 日志和工单记录；它不需要 MiMo CLI 或 tmux。完整模式另外核对 CLI 路径和“已保存配置”的验证状态，确认 tmux、CLI 及其依赖对服务用户可用。
 
-首次模型尚未配置时，运行时等待配置是正常现象。模型验证通过后再连接会话；不用反复重装程序或删除运行数据。
+首次模型尚未配置时，运行时等待配置是正常现象。完整模式验证通过后再连接会话，轻量模式配置完成后处理后续自动值班任务；不用反复重装程序或删除运行数据。
 
 ### 连接测试失败
 

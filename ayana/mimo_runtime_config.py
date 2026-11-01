@@ -8,7 +8,11 @@ from .knowledge import knowledge_root
 
 
 def runtime_paths(cfg: dict[str, Any]) -> dict[str, str]:
-    home = str(cfg.get("agent_runtime_home") or ("/var/lib/ayana" if os.name == "posix" else Path.home()))
+    database = Path(str(cfg.get("db_path") or "ayana.db"))
+    fallback = (database.parent if database.is_absolute() else
+                Path("/var/lib/ayana") if str(cfg.get("base_dir") or "") == "/etc/ayana" else
+                Path("/opt/ayana/data") if os.name == "posix" else Path.home() / ".local/share/ayana/data")
+    home = str(cfg.get("agent_runtime_home") or fallback)
     workdir = str(cfg.get("mimo_workdir") or Path(home) / "agent-workspace")
     state = str(cfg.get("agent_runtime_state_dir") or Path(home) / "agent-runtime")
     return {"home": home, "workdir": workdir, "state_dir": state, "attestation": str(Path(state) / "attestation.json")}

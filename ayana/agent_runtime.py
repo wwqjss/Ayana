@@ -112,7 +112,8 @@ async def run(config_path: str) -> None:
         db.close()
 
 def main() -> None:
+    from .config import default_config_path
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    asyncio.run(run(sys.argv[1] if len(sys.argv)>1 else "/etc/ayana/config.json"))
+    asyncio.run(run(sys.argv[1] if len(sys.argv)>1 else default_config_path()))
 
 if __name__ == "__main__": main()

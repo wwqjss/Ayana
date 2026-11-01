@@ -1,16 +1,16 @@
 # 配置说明
 
-适用于 **Ayana v0.9.0**。系统安装路径以安装器默认值为例；自定义路径时请对应替换。
+适用于 **Ayana v0.9.1**。系统安装路径以安装器默认值为例；自定义路径时请对应替换。
 
 ## 配置放在哪里
 
 | 位置 | 内容 |
 | --- | --- |
-| `/etc/ayana/config.json` | 监听地址、数据路径、运行时路径及接入设置 |
-| `/etc/ayana/secrets.json` | 认证、加密和渠道所需的秘密 |
-| `/var/lib/ayana/ayana.db` | 主机、账号组、工单、会话、执行台账、审计及 Web 设置 |
-| `/var/lib/ayana/agent-workspace` | MiMoCode 工作目录 |
-| `/var/lib/ayana/agent-runtime` | 原生运行时状态 |
+| `/opt/ayana/config/config.json` | 监听地址、数据路径、运行时路径及接入设置 |
+| `/opt/ayana/config/secrets.json` | 认证、加密和渠道所需的秘密 |
+| `/opt/ayana/data/ayana.db` | 主机、账号组、工单、会话、执行台账、审计及 Web 设置 |
+| `/opt/ayana/data/agent-workspace` | MiMoCode 工作目录 |
+| `/opt/ayana/data/agent-runtime` | 原生运行时状态 |
 | `mimo_config_dir` 指定的目录 | 服务用户的 MiMoCode 模型与 API Key 配置，文件权限为 0600 |
 
 安装器生成初始配置和秘密，已有秘密不会被覆盖。备份时应同时保留数据库和对应的秘密文件：丢失加密密钥会影响已保存凭据的解密。
@@ -21,7 +21,7 @@ Web 保存的模型配置、监控地址和账号组选择存于数据库或受�
 
 ## 首次登录与模型
 
-顶层配置 `agent_mode` 可设为 `mimo` 或 `lite`，默认 `mimo`。安装时推荐使用 `--agent-mode` 选择；切换模式应先等待任务空闲并通过安装器更新，不在执行期间直接重启切换。
+顶层配置 `agent_mode` 可设为 `mimo` 或 `lite`。安装器将菜单选择写入配置，新安装菜单回车默认轻量；旧配置省略该字段时按 `mimo` 处理。自动化可用 `--agent-mode` 直接选择。切换模式应先等待任务空闲并通过安装器更新，不在执行期间直接重启切换。
 
 轻量模式只处理自动值班，没有聊天、终端或人工接管。它使用兼容 OpenAI Chat Completions 且支持工具调用的模型接口：
 
@@ -61,7 +61,7 @@ Web 保存的模型配置、监控地址和账号组选择存于数据库或受�
 
 模型 API Key 保存在服务用户的本地 MiMoCode 配置文件中；它与保存在数据库中的 SSH 凭据是不同的数据。备份应覆盖该配置目录，通常位于数据目录的 `.config/mimocode` 下。
 
-正常系统引导安装会自动准备缺少的官方 MiMoCode CLI，已有 CLI 和配置沿用。自行指定的 CLI 必须能由运行 Ayana 的用户执行，并支持当前原生会话、回执、恢复和终端接口。模型设置中的安装状态有助于判断可执行文件路径；路径变更请在 `config.json` 中设置 `mimo_bin`，并在任务空闲时重启相关服务。安装脚本不会代填模型 API Key；首次尚未配置模型时，原生运行时可以保持运行并等待配置，先在 Web 中完成模型验证即可。
+完整模式的正常系统引导安装会自动准备缺少的官方 MiMoCode CLI，新准备的专用程序默认位于 `/opt/ayana/app/bin/mimo`；已有共享 CLI 和配置沿用。自行指定的 CLI 必须能由运行 Ayana 的用户执行，并支持当前原生会话、回执、恢复和终端接口。模型设置中的安装状态有助于判断可执行文件路径；路径变更请在 `config.json` 中设置 `mimo_bin`，并在任务空闲时重启相关服务。安装脚本不会代填模型 API Key；首次尚未配置模型时，原生运行时可以保持运行并等待配置，先在 Web 中完成模型验证即可。
 
 ## SSH 账号组
 
@@ -78,7 +78,7 @@ Web 保存的模型配置、监控地址和账号组选择存于数据库或受�
 | 配置项 | 默认值 | 用途 |
 | --- | --- | --- |
 | `http_host` / `http_port` | `127.0.0.1` / `6200` | Web 控制台和 HTTP 接入 |
-| `agent_mode` | `mimo` | `mimo` 交互模式或 `lite` 纯后台自动值班 |
+| `agent_mode` | 安装菜单写入；旧配置省略时为 `mimo` | `mimo` 交互模式或 `lite` 纯后台自动值班 |
 | `ws_host` / `ws_port` | `127.0.0.1` / `6199` | 可选 OneBot 反向 WebSocket |
 | `mimo_serve_port` | `6290` | 本机 MiMoCode 服务 |
 | `agent_tui_proxy_port` | `6291` | 原生终端代理 |
@@ -86,7 +86,7 @@ Web 保存的模型配置、监控地址和账号组选择存于数据库或受�
 | `knowledge_dir` | 安装器设置的数据目录 | 运维知识库 |
 | `mimo_bin` | 安装时指定的绝对路径 | 兼容 MiMoCode CLI |
 | `mimo_serve_external` | 系统安装为 `true` | 由独立原生服务持有模型进程 |
-| `agent_tui_enabled` | 系统安装为 `true` | 启用原生终端代理 |
+| `agent_tui_enabled` | MiMo 安装为 `true`，轻量安装为 `false` | 启用原生终端代理 |
 | `agent_runtime_home` / `mimo_workdir` | 数据目录及其 `agent-workspace` 子目录 | 原生服务的 HOME 和工作目录 |
 | `mimo_config_dir` | 数据目录下的 `.config/mimocode` | 受管模型配置目录 |
 

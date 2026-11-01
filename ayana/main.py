@@ -17,7 +17,7 @@ from . import VERSION
 from .agent_query import AgentQueryService
 from .alertmanager import AlertIngest
 from .auth import AuthService
-from .config import load_config
+from .config import default_config_path, load_config
 from .db import Database, now
 from .incidents import IncidentService
 from .auto_investigate import AutoInvestigator, InvestConfig
@@ -192,6 +192,8 @@ class App:
             if cand and os.path.exists(cand):
                 return cand
             for p in (
+                str(Path(__file__).resolve().parent.parent / "bin/mimo"),
+                str(Path("/opt/ayana/data/.mimocode/bin/mimo")),
                 str(Path.home() / ".mimocode/bin/mimo"),
                 str(Path("/var/lib/ayana/.mimocode/bin/mimo")),
                 str(Path("/usr/local/bin/mimo")),
@@ -1172,7 +1174,7 @@ def _reset_admin_password(cfg: dict, username: str) -> int:
 
 def cli() -> None:
     parser = argparse.ArgumentParser(prog="ayana")
-    parser.add_argument("config", nargs="?", default="config.json")
+    parser.add_argument("config", nargs="?", default=default_config_path())
     parser.add_argument("--seed-only", action="store_true")
     parser.add_argument(
         "--reset-admin-password",

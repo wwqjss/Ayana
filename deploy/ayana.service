@@ -9,19 +9,19 @@ Wants=network-online.target ayana-agent-runtime.service
 Type=simple
 User=ayana
 Group=ayana
-WorkingDirectory=/opt/ayana
-ExecStart=/opt/ayana/.venv/bin/python -m ayana.main /etc/ayana/config.json
+WorkingDirectory=@AYANA_APP@
+ExecStart=@AYANA_APP@/.venv/bin/python -m ayana.main @AYANA_CONFIG@/config.json
 Restart=on-failure
 RestartSec=5
 KillMode=mixed
 TimeoutStopSec=20
 
 Environment=PYTHONUNBUFFERED=1
-Environment=HOME=/var/lib/ayana
-Environment=XDG_CONFIG_HOME=/var/lib/ayana/.config
-Environment=XDG_DATA_HOME=/var/lib/ayana/.local/share
-Environment=XDG_STATE_HOME=/var/lib/ayana/.local/state
-Environment=XDG_CACHE_HOME=/var/lib/ayana/.cache
+Environment=HOME=@AYANA_DATA@
+Environment=XDG_CONFIG_HOME=@AYANA_DATA@/.config
+Environment=XDG_DATA_HOME=@AYANA_DATA@/.local/share
+Environment=XDG_STATE_HOME=@AYANA_DATA@/.local/state
+Environment=XDG_CACHE_HOME=@AYANA_DATA@/.cache
 Environment=LANG=C.UTF-8
 UnsetEnvironment=MIMOCODE_HOME
 # Environment=AYANA_* 可覆盖非秘密项
@@ -30,7 +30,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/ayana
+ReadWritePaths=@AYANA_DATA@
 # Local Prometheus config management: add the configured local_dir to
 # ReadWritePaths in BOTH this unit and ayana-agent-runtime.service via drop-ins.
 ProtectKernelTunables=true
